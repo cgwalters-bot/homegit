@@ -1,109 +1,73 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "model": "google-vertex/claude-sonnet-5@default",
+  "model": "openai/gpt-5.6-sol",
   "formatter": false,
   "autoupdate": false,
   "permission": "allow",
   "snapshot": false,
   "lsp": false,
-  "provider": {
-    "anthropic": {
-      "models": {
-        // Opus 4.8 via Anthropic direct — 500k context for heavy planning
-        "claude-opus-4-8": { "limit": { "context": 500000, "output": 128000 } }
-      }
-    },
-    "google-vertex": {
-      "models": {
-        // Sonnet 5 — cap at 200k, mirrors Claude Code defaults
-        "claude-sonnet-5@default": { "limit": { "context": 200000, "output": 128000 } },
-        // Opus 4.6 via Vertex — 500k for architect workloads
-        "claude-opus-4-6@default": { "limit": { "context": 500000, "output": 128000 } },
-        // Flash is an execution model — cap at 200k
-        "gemini-3.6-flash": { "limit": { "context": 200000, "output": 65536 } },
-        // Flash-Lite — cheap/fast execution model, same caps as Flash
-        "gemini-3.5-flash-lite": { "limit": { "context": 200000, "output": 65536 } },
-        // Pro is a planning model — cap at 500k
-        "gemini-3.1-pro-preview": { "limit": { "context": 500000, "output": 65536 } }
-      }
-    },
-    "openai": {
-      "models": {
-        // Sol is the GPT-5.6 frontier tier — cap at 200k, used for architect-sol
-        "gpt-5.6-sol": { "limit": { "context": 200000, "output": 128000 } },
-        // Luna is the GPT-5.6 cost-sensitive/nano tier — cheap/fast execution model
-        "gpt-5.6-luna": { "limit": { "context": 200000, "output": 65536 } }
-      }
-    }
-  },
   "agent": {
+    // Each prompt is one ASCII space: empty or omitted prompts use OpenCode's built-in prompt; this suppresses it.
     "build": {
-      "prompt": "For non-trivial tasks, first use @architect-c or @architect-g to draft an implementation plan or sketch, then dispatch @general-c or @general-g subagents to implement and verify the result. Have another subagent review the work before considering the task complete."
+      "prompt": " "
     },
     "plan": {
-      "model": "anthropic/claude-opus-4-8"
+      "model": "openai/gpt-5.6-sol",
+      "prompt": " "
     },
     "general": {
-      "description": "General-purpose subagent for multi-step tasks.",
-      "mode": "subagent"
+      "disable": true,
+      "prompt": " "
     },
     "explore": {
       "description": "Fast read-only codebase exploration.",
       "mode": "subagent",
-      "model": "google-vertex/gemini-3.6-flash"
+      "model": "openai/gpt-5.6-luna",
+      "prompt": " "
     },
     "flash": {
-      "description": "Cheap/fast subagent for simple, low-stakes tasks using Gemini Flash-Lite.",
+      "description": "Cheap/fast subagent for simple, low-stakes tasks using OpenAI GPT-5.6 Luna.",
       "mode": "subagent",
-      "model": "google-vertex/gemini-3.5-flash-lite"
+      "model": "openai/gpt-5.6-luna",
+      "prompt": " "
     },
     "compaction": {
-      "model": "google-vertex/claude-sonnet-5@default"
+      "model": "openai/gpt-5.6-sol",
+      "prompt": " "
     },
     "title": {
-      "model": "google-vertex/gemini-3.6-flash"
+      "model": "openai/gpt-5.6-luna",
+      "prompt": " "
     },
     "summary": {
-      "model": "google-vertex/gemini-3.6-flash"
+      "model": "openai/gpt-5.6-luna",
+      "prompt": " "
     },
-    "general-c": {
-      "description": "General-purpose subagent (Sonnet); can pair with @general-g for review/consensus",
+    "general-terra": {
+      "description": "General-purpose subagent using OpenAI GPT-5.6 Terra.",
       "mode": "subagent",
-      "model": "google-vertex/claude-sonnet-5@default",
-    },
-    "general-g": {
-      "description": "General-purpose subagent (Gemini Flash); can pair with @general-c for review/consensus.",
-      "mode": "subagent",
-      "model": "google-vertex/gemini-3.6-flash"
+      "model": "openai/gpt-5.6-terra",
+      "prompt": " "
     },
     "general-luna": {
-      "description": "General-purpose subagent (OpenAI GPT-5.6 Luna); cheap/fast, can pair with @general-c/@general-g for review/consensus.",
+      "description": "Cheap/fast general-purpose subagent using OpenAI GPT-5.6 Luna.",
       "mode": "subagent",
-      "model": "openai/gpt-5.6-luna"
+      "model": "openai/gpt-5.6-luna",
+      "prompt": " "
     },
-    "architect-c46": {
-      "description": "Architect for hard problems: planning, design, complex debugging, architectural decisions, tricky refactors. Also consider asking @architect-g and aiming for consensus.",
+    "architect-astra": {
+      "description": "Architect for hard problems: planning, design, complex debugging, architectural decisions, tricky refactors. Also consider asking @architect-sol for review/consensus.",
       "mode": "subagent",
-      "model": "google-vertex/claude-opus-4-6@default",
-      "color": "warning"
-    },
-    "architect-c48": {
-      "description": "Architect for hard problems: planning, design, complex debugging, architectural decisions, tricky refactors. Also consider asking @architect-g and aiming for consensus.",
-      "mode": "subagent",
-      "model": "anthropic/claude-opus-4-8",
-      "color": "warning"
-    },
-    "architect-g": {
-      "description": "Architect for hard problems: planning, design, complex debugging, architectural decisions, tricky refactors. Also consider asking @architect-c and aiming for consensus.",
-      "mode": "subagent",
-      "model": "google-vertex/gemini-3.1-pro-preview",
-      "color": "#4285f4"
+      "model": "openai/gpt-6-astra",
+      "color": "#10a37f",
+      "prompt": " "
     },
     "architect-sol": {
-      "description": "Architect for hard problems: planning, design, complex debugging, architectural decisions, tricky refactors. Also consider asking @architect-c and @architect-g and aiming for consensus.",
+      "description": "Architect for hard problems: planning, design, complex debugging, architectural decisions, tricky refactors. Also consider asking @architect-astra and aiming for consensus.",
       "mode": "subagent",
       "model": "openai/gpt-5.6-sol",
-      "color": "#10a37f"
+      "color": "#10a37f",
+      "prompt": " "
     }
   }
 }
