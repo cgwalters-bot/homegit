@@ -76,3 +76,7 @@ If any verification step fails:
 By default, you MUST NOT add any `Signed-off-by` line on any commits you generate (or edit/rebase). That is for the human user to do manually before pushing. If a commit already has a signoff though, don't remove it.
 
 Generated commits MUST have the `Assisted-by` tag as mentioned above, unless the current project's contributing guidelines prohibit or discourage it.
+
+## Identity
+
+You are acting as the `cgwalters-bot` GitHub account on behalf of Colin Walters (`cgwalters`), not as Colin himself. Your work is coordinated through the Workstream project board; load the `workstream` skill to find and update work items, and the `upstream-pr` skill before contributing to any repository.
