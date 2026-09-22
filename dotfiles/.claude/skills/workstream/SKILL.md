@@ -72,14 +72,20 @@ field_id() { # field_id <field name>
 }
 STATUS_FIELD_ID=$(field_id Status)
 WHY_FIELD_ID=$(field_id Why)
-# Look up a Status option ID by name, e.g. status_option "In Progress"
-status_option() {
+PRIORITY_FIELD_ID=$(field_id Priority)
+# Look up a single-select option ID by field and option name,
+# e.g. field_option Status "In Progress"
+field_option() {
   gh project field-list "$NUM" --owner "$OWNER" --format json \
-    --jq ".fields[] | select(.name == \"Status\") | .options[] | select(.name == \"$1\") | .id"
+    --jq ".fields[] | select(.name == \"$1\") | .options[] | select(.name == \"$2\") | .id"
 }
 set_status() { # set_status <item-id> <status name>
   gh project item-edit --project-id "$PROJECT_ID" --id "$1" \
-    --field-id "$STATUS_FIELD_ID" --single-select-option-id "$(status_option "$2")"
+    --field-id "$STATUS_FIELD_ID" --single-select-option-id "$(field_option Status "$2")"
+}
+set_priority() { # set_priority <item-id> <P0|P1|P2>
+  gh project item-edit --project-id "$PROJECT_ID" --id "$1" \
+    --field-id "$PRIORITY_FIELD_ID" --single-select-option-id "$(field_option Priority "$2")"
 }
 set_why() { # set_why <item-id> <text>
   gh project item-edit --project-id "$PROJECT_ID" --id "$1" \
@@ -97,26 +103,31 @@ Each item has `id` (the project item ID, `PVTI_...`, used by `item-edit`),
 `content` (`type` is `Issue`, `PullRequest`, or `DraftIssue`, plus `url`,
 `number`, `repository` for real issues and `id` for drafts), and one key per
 field, named after the field with only the first letter lowercased: `status`,
-`assignees`, `why`, `"linked pull requests"` (a list of PR URLs; access it as
+`priority`, `assignees`, `why`, `"linked pull requests"` (a list of PR URLs; access it as
 `."linked pull requests"`), ... Fields with no value are simply absent.
 
 ```bash
 # Everything, in board order
 gh project item-list "$NUM" --owner "$OWNER" --format json --limit 500 \
-  --jq '.items[] | {id, status, title, type: .content.type, url: .content.url, assignees}'
+  --jq '.items[] | {id, status, priority, title, type: .content.type, url: .content.url, assignees}'
 
 # Already-claimed work: resume this before taking anything new
 gh project item-list "$NUM" --owner "$OWNER" --format json --limit 500 \
   --jq '.items[] | select(.status == "In Progress")'
 
-# Candidate Todo items not assigned to someone else
+# Candidate Todo items not assigned to someone else, highest priority first
+# (P0 < P1 < P2 sorts correctly as strings; unset priority sorts last)
 gh project item-list "$NUM" --owner "$OWNER" --format json --limit 500 \
-  --jq '.items[] | select(.status == "Todo")
-        | select((.assignees // []) - ["cgwalters", "cgwalters-bot"] | length == 0)'
+  --jq '[.items[] | select(.status == "Todo")
+        | select((.assignees // []) - ["cgwalters", "cgwalters-bot"] | length == 0)]
+        | sort_by(.priority // "P9") | .[]'
 ```
 
-Take the first candidate in board order; the human orders the Todo column by
-priority. Read the issue itself (`gh issue view <url> --comments`) before
+The **Priority** field ranks work: **P0** is urgent or blocking cgwalters
+right now (a request he made directly, his own PR stuck on CI or conflicts),
+**P1** should happen soon, **P2** is nice to have. Take the first candidate
+by priority, then board order within the same priority. A human may change
+priorities at any time; never lower one that a human set. Read the issue itself (`gh issue view <url> --comments`) before
 claiming, and if it turns out to be already fixed or not actionable, record
 that in the Why field and set Needs human rather than silently skipping it.
 

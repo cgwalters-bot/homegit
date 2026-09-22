@@ -157,8 +157,18 @@ Skip:
 - Anything in a repository that is not public (search results carry
   `.repository.isPrivate`; for events, check the repo as described above).
 
-Rank by value: explicit requests to the bot first, then things blocking
-cgwalters' own PRs, then everything else. **Add at most about 10 items per run.**
+Rank by value and assign every item a **Priority** (see the `workstream`
+skill for what each level means):
+
+- **P0**: explicit requests to the bot from cgwalters, and his own open PRs
+  that are blocked on failing CI, merge conflicts, or unanswered review.
+- **P1**: concrete asks from cgwalters ("we should", "needs a test", a bug he
+  confirmed) in active repositories, and review requests where a pre-review,
+  reproduction, or bisect would clearly help.
+- **P2**: everything else worth tracking: nice-to-haves, older threads, and
+  speculative follow-ups.
+
+**Add at most about 10 items per run**, highest priority first.
 
 ## 4. Add items
 
@@ -180,12 +190,16 @@ $SHORT_SUMMARY" --format json --jq .id)
 ```
 
 Then record the rationale in the **Why** field, one sentence quoting or linking
-the triggering comment:
+the triggering comment, and set its priority (helpers from the `workstream`
+skill):
 
 ```bash
-gh project item-edit --project-id "$PROJECT_ID" --id "$ITEM_ID" \
-  --field-id "$WHY_FIELD_ID" --text "cgwalters: \"we should add a test for this\" ($COMMENT_URL)"
+set_why "$ITEM_ID" "cgwalters: \"we should add a test for this\" ($COMMENT_URL)"
+set_priority "$ITEM_ID" P1
 ```
+
+Items already on the board are never re-added, but if one has no priority
+yet, set one; never change a priority that is already set.
 
 ## 5. Status policy
 
@@ -226,6 +240,6 @@ Needs human, In Review or Done while planning.
 
 ## 6. Report
 
-End with a short summary: what was added (URL, status, one-line why), and
+End with a short summary: what was added (URL, priority, status, one-line why), and
 what was considered but skipped and why. Mention it if the cap was hit so the
 human knows there is more to triage.
