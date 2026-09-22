@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Run one non-interactive cgwalters-bot session against the Workstream board.
+set -euo pipefail
+
+readonly DEFAULT_AGENT=opencode
+readonly BOT_LOGIN=cgwalters-bot
+readonly BOARD_URL=https://github.com/users/${BOT_LOGIN}/projects/1
+readonly LOCK_FILE=${XDG_RUNTIME_DIR:-/tmp}/bot-work.lock
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--agent opencode|claude] [--plan [--since YYYY-MM-DD]] [EXTRA INSTRUCTIONS...]
+
+Run an agent non-interactively to pick up or advance the next item on the
+cgwalters-bot Workstream board (${BOARD_URL}).
+
+Options:
+  --agent AGENT  Agent CLI to use: opencode (default) or claude
+  --plan         Refill the board from recent GitHub activity (backlog-planning
+                 skill) instead of working on an item
+  --since DATE   With --plan, look back to DATE instead of the last 7 days
+  -h, --help     Show this help
+
+Any remaining arguments are appended to the prompt as extra instructions.
+
+gh must be authenticated as ${BOT_LOGIN}, and only one run at a time is
+allowed (lock file: ${LOCK_FILE}).
+EOF
+}
+
+fatal() {
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
+}
+
+agent=${DEFAULT_AGENT}
+plan=false
+since=
+while test $# -gt 0; do
+    case "$1" in
+        --agent) test $# -ge 2 || fatal "--agent requires an argument"; agent=$2; shift 2 ;;
+        --agent=*) agent=${1#--agent=}; shift ;;
+        --plan) plan=true; shift ;;
+        --since) test $# -ge 2 || fatal "--since requires a date"; since=$2; shift 2 ;;
+        --since=*) since=${1#--since=}; shift ;;
+        -h|--help) usage; exit 0 ;;
+        --) shift; break ;;
+        -*) fatal "unknown option: $1 (see --help)" ;;
+        *) break ;;
+    esac
+done
+case "${agent}" in
+    opencode|claude) ;;
+    *) fatal "unknown agent '${agent}' (expected opencode or claude)" ;;
+esac
+if test -n "${since}"; then
+    ${plan} || fatal "--since only applies with --plan"
+    since_date=$(date -u -d "${since}" +%F 2>/dev/null) || fatal "invalid --since date '${since}' (expected YYYY-MM-DD)"
+    since=${since_date}
+fi
+
+if ${plan}; then
+    prompt="Load the backlog-planning skill and follow it to review recent GitHub activity and add missing items to the Workstream board (${BOARD_URL}). Do not modify anything outside the board."
+    if test -n "${since}"; then
+        prompt="${prompt} Use a lookback window starting at ${since}."
+    fi
+else
+    prompt="Load the workstream skill and follow it: pick up or advance exactly one item on the Workstream board (${BOARD_URL}), keeping its status accurate. Load the upstream-pr skill before making changes to any repository."
+fi
+if test $# -gt 0; then
+    prompt="${prompt}
+
+Additional instructions: $*"
+fi
+
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${BOT_LOGIN}"
+require_cmd flock "install util-linux"
+case "${agent}" in
+    opencode)
+        require_cmd opencode "install it from https://opencode.ai and run 'opencode auth login' (OpenAI)"
+        cmd=(opencode run "${prompt}")
+        ;;
+    claude)
+        require_cmd claude "install Claude Code and set CLAUDE_CODE_OAUTH_TOKEN (see 'claude setup-token')"
+        # Unattended: there is nobody to answer permission prompts.
+        cmd=(claude -p --dangerously-skip-permissions "${prompt}")
+        ;;
+esac
+
+# Everything the agent does on GitHub is attributed to this login, so make
+# sure it's the bot and not e.g. a personal token that happens to be around.
+login=$(gh api user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN} ('gh auth login' or GH_TOKEN)"
+test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}; log in as the bot ('gh auth login', or set GH_TOKEN to the bot's token)"
+
+# Two sessions working the board at once would race to claim the same item.
+# The lock is taken on an fd that the exec'd agent inherits, so the agent
+# stays the direct child of whatever launched us (signals and exit status
+# pass straight through) and the lock is held exactly as long as the agent
+# runs, plus anything it leaves running in the background with the fd open.
+exec {lock_fd}>"${LOCK_FILE}" || fatal "cannot open lock file ${LOCK_FILE}"
+flock -n "${lock_fd}" || fatal "another bot-work run is still active (it holds ${LOCK_FILE}); wait for it to finish"
+exec "${cmd[@]}"
