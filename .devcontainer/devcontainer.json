@@ -6,9 +6,6 @@
       "extensions": [
         "rust-lang.rust-analyzer"
       ]
-    },
-    "devaipod": {
-      "nestedContainers": true
     }
   },
   "features": {},
