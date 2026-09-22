@@ -5,7 +5,7 @@ default-image = "ghcr.io/bootc-dev/devenv-debian"
 src = "~/src"
 
 [dotfiles]
-url = "https://github.com/cgwalters/homegit"
+url = "https://github.com/cgwalters-bot/homegit"
 script = "install-dotfiles.sh"
 
 # These are needed by the agent

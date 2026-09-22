@@ -1,5 +1,5 @@
 "$schema" = "https://jj-vcs.github.io/jj/latest/config-schema.json"
 
 [user]
-name = "Colin Walters"
-email = "walters@verbum.org"
+name = "cgwalters-bot"
+email = "walters+llm@verbum.org"
