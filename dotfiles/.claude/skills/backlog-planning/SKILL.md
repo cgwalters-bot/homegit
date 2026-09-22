@@ -86,6 +86,10 @@ WHY_FIELD_ID=$(gh project field-list 1 --owner cgwalters-bot --format json \
 
 ## 2. Gather activity
 
+The events feed is capped at 300 events, so for a busy account it may not
+reach back to `$SINCE`. Treat it as a supplement; the searches below are the
+authoritative source for the whole window.
+
 For cgwalters:
 
 ```bash
@@ -161,8 +165,12 @@ Rank by value and assign every item a **Priority** (see the `workstream`
 skill for what each level means):
 
 - **P0**: explicit requests to the bot from cgwalters, and his own open PRs
-  that are blocked on failing CI, merge conflicts, or unanswered review.
-- **P1**: concrete asks from cgwalters ("we should", "needs a test", a bug he
+  that he is actively working on (updated in the last ~2 weeks) and are
+  blocked on failing CI, merge conflicts, or unanswered review. The same
+  kind of blockage on a dormant PR is P1.
+- **P1**: the bot's own open PRs with failing CI, conflicts, or unanswered
+  review (unless cgwalters asked for the fix, which makes it an explicit
+  request and P0); concrete asks from cgwalters ("we should", "needs a test", a bug he
   confirmed) in active repositories, and review requests where a pre-review,
   reproduction, or bisect would clearly help.
 - **P2**: everything else worth tracking: nice-to-haves, older threads, and
@@ -171,6 +179,10 @@ skill for what each level means):
 **Add at most about 10 items per run**, highest priority first.
 
 ## 4. Add items
+
+Cache `gh project field-list` output once per run instead of letting every
+helper call re-fetch it. A listing done right after `item-create` may briefly
+omit the new item, so re-list before concluding something is missing.
 
 Real issues and PRs go on the board directly:
 
@@ -219,6 +231,10 @@ have verified that the actor is the `cgwalters` login, as recorded by GitHub:
   ```
 
   (The `pulls/...` endpoints return 404 for a plain issue; that's expected.)
+
+- An actionable review comment from cgwalters on one of the bot's own PRs
+  ("needs rebasing", "please add a test") counts as an explicit request
+  too, verified the same way.
 
 - An assignment: the `actor` of the `assigned` event in the timeline. (Don't
   use `mentioned` events for this; their actor is the account that was
