@@ -1,0 +1,438 @@
+#!/usr/bin/env bash
+# Manage ephemeral devspace runners (GitHub Actions runners reachable over
+# the tailnet) for building and testing the bot's work.
+set -euo pipefail
+
+readonly REPO=bootc-dev/cgwalters-devspace-sandbox
+readonly WORKFLOW=devspace.yml
+readonly WORKFLOW_PATH=.github/workflows/${WORKFLOW}
+# Only REST endpoints are used: the GraphQL quota is shared with the board
+# tooling and easily exhausted by parallel agents.
+readonly RUNS_API="repos/${REPO}/actions/workflows/${WORKFLOW}/runs?event=workflow_dispatch&per_page=100"
+readonly HOST_PREFIX=cgwalters-devspace-
+readonly SSH_USER=runner
+readonly ALIAS_PREFIX=devspace-
+readonly STATE_ROOT=${XDG_STATE_HOME:-$HOME/.local/state}/bot-devspace
+readonly DEFAULT_REF=${BOT_DEVSPACE_REF:-main}
+readonly DEFAULT_CORES=16
+readonly DEFAULT_DURATION=240
+readonly VALID_CORES=(4 16 64)
+readonly VALID_DURATIONS=(30 60 120 240)
+# Covers queueing for a runner plus the workflow's setup steps, which
+# normally take 1-3 minutes in total.
+readonly SSH_TIMEOUT=${BOT_DEVSPACE_SSH_TIMEOUT:-900}
+readonly CORRELATE_TIMEOUT=90
+readonly STOP_TIMEOUT=180
+readonly POLL_INTERVAL=5
+readonly API_ATTEMPTS=3
+# Returned by api() when GitHub says the resource does not exist.
+readonly EX_NOTFOUND=4
+# Baseline toolchain; all of these exist in RHEL 10 (+ EPEL, which the
+# workflow enables).
+readonly PROVISION_PACKAGES=(
+    podman buildah skopeo
+    gcc gcc-c++ make pkgconf openssl-devel
+    rust cargo rustfmt clippy
+    python3 git
+)
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") COMMAND [ARGS...]
+
+Manage ephemeral devspace runners dispatched from ${REPO}
+and reachable over the tailnet as ${SSH_USER}@${HOST_PREFIX}<run id>.
+
+Commands:
+  start [--ref REF] [--cores N] [--duration MIN] [--no-provision] [--keep-on-failure] NAME
+                     Dispatch a devspace, wait for SSH, provision it and
+                     print its host name. REF defaults to \$BOT_DEVSPACE_REF
+                     or main (currently: ${DEFAULT_REF}); cores are one of
+                     ${VALID_CORES[*]} (default ${DEFAULT_CORES}); duration in minutes is
+                     one of ${VALID_DURATIONS[*]} (default ${DEFAULT_DURATION}). If start fails or is
+                     interrupted after dispatching, the run is cancelled
+                     unless --keep-on-failure is given.
+  provision NAME     Install the baseline dev toolchain (idempotent)
+  ssh NAME [CMD...]  Run CMD on the devspace, or an interactive shell
+  ssh-config NAME    Print the path of an ssh_config defining Host ${ALIAS_PREFIX}NAME,
+                     for use with 'ssh -F' and GIT_SSH_COMMAND="ssh -F <path>"
+  list               List known devspaces with their live run status
+  stop NAME          Cancel the run and remove local state
+  -h, --help         Show this help
+
+State (keys, known_hosts, ssh_config) lives in ${STATE_ROOT}/NAME.
+BOT_DEVSPACE_SSH_TIMEOUT (seconds, default 900) bounds the wait for SSH.
+Runners are billed while they run: stop them when done. Never copy
+credentials (GitHub tokens etc.) to a devspace.
+EOF
+}
+
+fatal() {
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+info() {
+    echo "$*" 1>&2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
+}
+
+one_of() { # one_of VALUE CHOICES...
+    local value=$1 choice
+    shift
+    for choice in "$@"; do
+        test "${value}" = "${choice}" && return 0
+    done
+    return 1
+}
+
+validate_name() {
+    local name=$1
+    [[ "${name}" =~ ^[a-z0-9][a-z0-9_.-]{0,62}$ ]] ||
+        fatal "invalid devspace name '${name}': use lowercase letters, digits, '-', '_' or '.' (at most 63 characters)"
+}
+
+state_dir() {
+    echo "${STATE_ROOT}/$1"
+}
+
+run_url() {
+    echo "https://github.com/${REPO}/actions/runs/$1"
+}
+
+# A read-only REST call, retried on transient failures. Returns EX_NOTFOUND
+# without retrying on a 404. Never use this for POSTs: a retried dispatch
+# could start a second runner.
+api() {
+    local attempt err out
+    err=$(mktemp)
+    for attempt in $(seq "${API_ATTEMPTS}"); do
+        if out=$(gh api "$@" 2>"${err}"); then
+            rm -f "${err}"
+            test -z "${out}" || printf '%s\n' "${out}"
+            return 0
+        fi
+        if grep -q 'HTTP 404' "${err}"; then
+            rm -f "${err}"
+            return "${EX_NOTFOUND}"
+        fi
+        test "${attempt}" -eq "${API_ATTEMPTS}" || sleep 3
+    done
+    cat "${err}" 1>&2
+    rm -f "${err}"
+    return 1
+}
+
+# Prints the run id of a known devspace, failing if there is none.
+run_id_of() {
+    local name=$1 dir
+    dir=$(state_dir "${name}")
+    test -d "${dir}" || fatal "no devspace named '${name}' (see '$(basename "$0") list')"
+    test -s "${dir}/run_id" || fatal "devspace '${name}' never finished starting; '$(basename "$0") stop ${name}' cleans it up"
+    cat "${dir}/run_id"
+}
+
+# Prints "status conclusion" for a run. The conclusion is empty while the
+# run is active, and a run that no longer exists is "gone deleted".
+run_state() {
+    local id=$1 details rc=0 path status conclusion
+    details=$(api "repos/${REPO}/actions/runs/${id}" \
+        --jq '"\(.path | sub("@.*$"; "")) \(.status) \(.conclusion // "")"') || rc=$?
+    if test "${rc}" -eq "${EX_NOTFOUND}"; then
+        echo "gone deleted"
+        return 0
+    fi
+    test "${rc}" -eq 0 || fatal "cannot query run ${id} with gh"
+    read -r path status conclusion <<<"${details}"
+    test "${path}" = "${WORKFLOW_PATH}" || fatal "run ${id} is not a ${WORKFLOW} run"
+    echo "${status} ${conclusion}"
+}
+
+is_active_status() {
+    case "$1" in
+        requested|waiting|pending|queued|in_progress) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Prints "id status" for the recent runs titled for NAME.
+titled_runs() {
+    api "${RUNS_API}" --jq ".workflow_runs[] | select(.display_title == \"Devspace $1\") | \"\(.id) \(.status)\""
+}
+
+# new_runs DIR RUNS: prints the ids in RUNS ("id status" lines) that are
+# not listed in DIR/prior_runs.
+new_runs() {
+    awk '{ print $1 }' <<<"$2" | grep -vxF -f "$1/prior_runs" || true
+}
+
+write_ssh_config() {
+    local name=$1 dir=$2 id=$3
+    cat >"${dir}/ssh_config" <<EOF
+# Generated by bot-devspace for run $(run_url "${id}")
+Host ${ALIAS_PREFIX}${name}
+    HostName ${HOST_PREFIX}${id}
+    User ${SSH_USER}
+    IdentityFile "${dir}/id_ed25519"
+    IdentitiesOnly yes
+    UserKnownHostsFile "${dir}/known_hosts"
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 30
+    ServerAliveCountMax 4
+EOF
+}
+
+ssh_probe() {
+    local name=$1 dir
+    dir=$(state_dir "${name}")
+    timeout 20 ssh -F "${dir}/ssh_config" -o BatchMode=yes -o ConnectTimeout=8 \
+        "${ALIAS_PREFIX}${name}" true </dev/null >/dev/null 2>&1
+}
+
+wait_for_ssh() {
+    local name=$1 id=$2 deadline state status conclusion last=
+    deadline=$((SECONDS + SSH_TIMEOUT))
+    while test "${SECONDS}" -lt "${deadline}"; do
+        state=$(run_state "${id}")
+        read -r status conclusion <<<"${state}"
+        is_active_status "${status}" ||
+            fatal "run ${id} finished (${conclusion:-unknown}) before SSH became ready; see $(run_url "${id}")"
+        if test "${status}" != "${last}"; then
+            info "Run ${id} is ${status}; waiting for SSH..."
+            last=${status}
+        fi
+        if test "${status}" = in_progress && ssh_probe "${name}"; then
+            return 0
+        fi
+        sleep "${POLL_INTERVAL}"
+    done
+    fatal "SSH to ${HOST_PREFIX}${id} was not ready within ${SSH_TIMEOUT}s; check $(run_url "${id}") (is this machine on the tailnet?)"
+}
+
+# EXIT trap for start: a runner that never became usable must not keep
+# running (and billing) unnoticed.
+start_cleanup() {
+    local rc=$1 name=$2 keep=$3
+    test "${rc}" -ne 0 || return 0
+    if ${keep}; then
+        info "Keeping devspace '${name}' after the failure; '$(basename "$0") stop ${name}' removes it"
+        return 0
+    fi
+    info "Start failed; cancelling devspace '${name}'"
+    (cmd_stop "${name}") ||
+        info "warning: cleanup failed; run '$(basename "$0") stop ${name}' to avoid leaving a billed runner"
+}
+
+cmd_start() {
+    local ref=${DEFAULT_REF} cores=${DEFAULT_CORES} duration=${DEFAULT_DURATION} provision=true keep=false name
+    while test $# -gt 0; do
+        case "$1" in
+            --ref) test $# -ge 2 || fatal "--ref requires an argument"; ref=$2; shift 2 ;;
+            --ref=*) ref=${1#--ref=}; shift ;;
+            --cores) test $# -ge 2 || fatal "--cores requires an argument"; cores=$2; shift 2 ;;
+            --cores=*) cores=${1#--cores=}; shift ;;
+            --duration) test $# -ge 2 || fatal "--duration requires an argument"; duration=$2; shift 2 ;;
+            --duration=*) duration=${1#--duration=}; shift ;;
+            --no-provision) provision=false; shift ;;
+            --keep-on-failure) keep=true; shift ;;
+            -*) fatal "unknown option for start: $1 (see --help)" ;;
+            *) break ;;
+        esac
+    done
+    test $# -eq 1 || fatal "usage: $(basename "$0") start [--ref REF] [--cores N] [--duration MIN] [--no-provision] [--keep-on-failure] NAME"
+    name=$1
+    validate_name "${name}"
+    one_of "${cores}" "${VALID_CORES[@]}" || fatal "--cores must be one of: ${VALID_CORES[*]} (got '${cores}')"
+    one_of "${duration}" "${VALID_DURATIONS[@]}" || fatal "--duration must be one of: ${VALID_DURATIONS[*]} (got '${duration}')"
+    test -n "${ref}" || fatal "--ref must not be empty"
+
+    local dir existing state status conclusion runs
+    dir=$(state_dir "${name}")
+    if test -e "${dir}"; then
+        test -s "${dir}/run_id" ||
+            fatal "devspace '${name}' has leftover state from an incomplete start; run '$(basename "$0") stop ${name}' first"
+        existing=$(cat "${dir}/run_id")
+        state=$(run_state "${existing}")
+        read -r status conclusion <<<"${state}"
+        if is_active_status "${status}"; then
+            fatal "devspace '${name}' is already active (run ${existing}, ${status}); reuse it or '$(basename "$0") stop ${name}' first"
+        fi
+        info "Removing stale state for finished run ${existing} (${conclusion:-unknown})"
+        rm -rf -- "${dir}"
+    fi
+    # Also catch a devspace of the same name started from another machine.
+    # The ids seen now are excluded when finding our run below, which avoids
+    # relying on the local clock agreeing with GitHub's.
+    runs=$(titled_runs "${name}") || fatal "cannot list runs of ${REPO} with gh"
+    existing=$(awk '$2 ~ /^(requested|waiting|pending|queued|in_progress)$/ { print $1; exit }' <<<"${runs}")
+    test -z "${existing}" ||
+        fatal "an active run titled 'Devspace ${name}' already exists: $(run_url "${existing}"); pick another name"
+
+    mkdir -p "${STATE_ROOT}"
+    chmod 700 "${STATE_ROOT}"
+    mkdir -m 700 "${dir}"
+    ssh-keygen -q -t ed25519 -N '' -C "bot-devspace-${name}" -f "${dir}/id_ed25519"
+    : >"${dir}/known_hosts"
+    awk '{ print $1 }' <<<"${runs}" >"${dir}/prior_runs"
+
+    trap 'start_cleanup $? "${name}" "${keep}"' EXIT
+    trap 'exit 130' INT TERM
+    local started=${SECONDS}
+    gh api -X POST "repos/${REPO}/actions/workflows/${WORKFLOW}/dispatches" -f ref="${ref}" \
+        -f "inputs[ssh_public_key]=$(cat "${dir}/id_ed25519.pub")" -f "inputs[session_name]=${name}" \
+        -f "inputs[duration]=${duration}" -f "inputs[cores]=${cores}" >/dev/null ||
+        fatal "dispatching ${WORKFLOW} on ${REPO}@${ref} failed; in the unlikely case a run titled 'Devspace ${name}' shows up anyway, cancel it at https://github.com/${REPO}/actions"
+    # From here on, stop looks for the run even if we never learn its id.
+    date +%s >"${dir}/dispatched"
+    info "Dispatched ${WORKFLOW} (ref ${ref}, ${cores} cores, ${duration} min) as 'Devspace ${name}'"
+
+    local deadline ids id=
+    deadline=$((SECONDS + CORRELATE_TIMEOUT))
+    while test "${SECONDS}" -lt "${deadline}"; do
+        sleep 2
+        runs=$(titled_runs "${name}") || continue
+        ids=$(new_runs "${dir}" "${runs}")
+        test -n "${ids}" || continue
+        test "$(wc -l <<<"${ids}")" -eq 1 ||
+            fatal "several new runs are titled 'Devspace ${name}' (${ids//$'\n'/ })"
+        id=${ids}
+        break
+    done
+    test -n "${id}" || fatal "no run titled 'Devspace ${name}' appeared within ${CORRELATE_TIMEOUT}s; check https://github.com/${REPO}/actions"
+    echo "${id}" >"${dir}/run_id"
+    write_ssh_config "${name}" "${dir}" "${id}"
+    info "Run ${id}: $(run_url "${id}")"
+
+    wait_for_ssh "${name}" "${id}"
+    info "SSH ready on ${HOST_PREFIX}${id} $((SECONDS - started))s after dispatch"
+    if ${provision}; then
+        # stdout is reserved for the host name.
+        cmd_provision "${name}" 1>&2
+    fi
+    trap - EXIT INT TERM
+    echo "${HOST_PREFIX}${id}"
+}
+
+cmd_provision() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") provision NAME"
+    local name=$1
+    validate_name "${name}"
+    run_id_of "${name}" >/dev/null
+    info "Provisioning ${name}: ${PROVISION_PACKAGES[*]}"
+    # Only call dnf for what is missing, so re-running is quick and quiet.
+    ssh -F "$(state_dir "${name}")/ssh_config" "${ALIAS_PREFIX}${name}" \
+        bash -s -- "${PROVISION_PACKAGES[@]}" <<'EOF' || fatal "provisioning ${name} failed"
+set -euo pipefail
+missing=()
+for pkg in "$@"; do
+    rpm -q --whatprovides "${pkg}" >/dev/null 2>&1 || missing+=("${pkg}")
+done
+if test "${#missing[@]}" -eq 0; then
+    echo "All packages already installed"
+    exit 0
+fi
+sudo dnf install -y -q "${missing[@]}" >/dev/null
+echo "Installed: ${missing[*]}"
+EOF
+}
+
+cmd_ssh() {
+    test $# -ge 1 || fatal "usage: $(basename "$0") ssh NAME [CMD...]"
+    local name=$1
+    shift
+    validate_name "${name}"
+    run_id_of "${name}" >/dev/null
+    exec ssh -F "$(state_dir "${name}")/ssh_config" "${ALIAS_PREFIX}${name}" "$@"
+}
+
+cmd_ssh_config() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") ssh-config NAME"
+    validate_name "$1"
+    run_id_of "$1" >/dev/null
+    echo "$(state_dir "$1")/ssh_config"
+}
+
+cmd_list() {
+    test $# -eq 0 || fatal "usage: $(basename "$0") list"
+    local dirs=("${STATE_ROOT}"/*/) dir name id state
+    test -d "${dirs[0]}" || return 0
+    {
+        printf 'NAME\tRUN\tSTATUS\tHOST\n'
+        for dir in "${dirs[@]}"; do
+            name=$(basename "${dir}")
+            if test -s "${dir}/run_id"; then
+                id=$(cat "${dir}/run_id")
+                state=$(run_state "${id}" 2>/dev/null) || state=unknown
+                state=${state% }
+                state=${state/ /:}
+                printf '%s\t%s\t%s\t%s\n' "${name}" "${id}" "${state}" "${HOST_PREFIX}${id}"
+            else
+                printf '%s\t-\tincomplete-start\t-\n' "${name}"
+            fi
+        done
+    } | column -t -s $'\t'
+}
+
+cmd_stop() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") stop NAME"
+    local name=$1 dir ids id state status conclusion deadline runs dispatched
+    validate_name "${name}"
+    dir=$(state_dir "${name}")
+    test -d "${dir}" || fatal "no devspace named '${name}' (see '$(basename "$0") list')"
+    if test -s "${dir}/run_id"; then
+        ids=$(cat "${dir}/run_id")
+    elif test -e "${dir}/dispatched"; then
+        # A start that never recorded its run id: find the active runs with
+        # our title that did not exist before the dispatch.
+        runs=$(titled_runs "${name}") || fatal "cannot list runs of ${REPO} with gh"
+        ids=$(new_runs "${dir}" "$(awk '$2 ~ /^(requested|waiting|pending|queued|in_progress)$/' <<<"${runs}")")
+        dispatched=$(cat "${dir}/dispatched")
+        if test -z "${ids}" && test $(($(date +%s) - dispatched)) -lt "${CORRELATE_TIMEOUT}"; then
+            fatal "the run for '${name}' may not be listed yet; retry '$(basename "$0") stop ${name}' in a minute"
+        fi
+    else
+        ids=
+    fi
+    for id in ${ids}; do
+        state=$(run_state "${id}")
+        read -r status conclusion <<<"${state}"
+        if is_active_status "${status}"; then
+            gh api -X POST "repos/${REPO}/actions/runs/${id}/cancel" >/dev/null ||
+                info "warning: cancelling run ${id} failed; it may be finishing on its own"
+        fi
+        deadline=$((SECONDS + STOP_TIMEOUT))
+        while is_active_status "${status}"; do
+            test "${SECONDS}" -lt "${deadline}" ||
+                fatal "run ${id} is still ${status} after ${STOP_TIMEOUT}s; state kept in ${dir}, retry '$(basename "$0") stop ${name}'"
+            sleep "${POLL_INTERVAL}"
+            state=$(run_state "${id}")
+            read -r status conclusion <<<"${state}"
+        done
+        info "Run ${id} finished (${conclusion:-unknown})"
+    done
+    rm -rf -- "${dir}"
+    info "Removed state for ${name}"
+}
+
+test $# -gt 0 || { usage 1>&2; exit 1; }
+command=$1
+shift
+case "${command}" in
+    -h|--help|help) usage; exit 0 ;;
+    start|provision|ssh|ssh-config|list|stop) ;;
+    *) fatal "unknown command '${command}' (see --help)" ;;
+esac
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
+require_cmd ssh "install openssh-clients"
+require_cmd ssh-keygen "install openssh-clients"
+case "${command}" in
+    start) cmd_start "$@" ;;
+    provision) cmd_provision "$@" ;;
+    ssh) cmd_ssh "$@" ;;
+    ssh-config) cmd_ssh_config "$@" ;;
+    list) cmd_list "$@" ;;
+    stop) cmd_stop "$@" ;;
+esac
