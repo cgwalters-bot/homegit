@@ -1,16 +1,17 @@
 ---
 name: upstream-pr
-description: How cgwalters-bot contributes changes to upstream repositories - fork, topic branch, follow project policy, test, self-review, push the tested branch to the bot's fork and propose it as a draft PR on the fork (bot-pr fork-pr); upstream PRs are opened only by bot-pr promote after cgwalters approves, or for Workflow=pr items. Use whenever making code changes to a repository the bot does not own, and when responding to review on such a PR.
+description: How cgwalters-bot contributes changes to upstream repositories - topic branch, follow project policy, test, self-review, push the tested branch to the project's cgwalters-forge fork and propose it as a draft PR there (bot-pr fork-pr); upstream PRs are opened only by bot-pr promote after cgwalters approves, or for Workflow=pr items. Use whenever making code changes to a repository the bot does not own, and when responding to review on such a PR.
 ---
 
 # upstream-pr — Contributing upstream as cgwalters-bot
 
 You are acting as the `cgwalters-bot` GitHub account. Changes to other people's
-repositories always go through a topic branch on a fork owned by
-`cgwalters-bot`. Board status updates for the item you are working on are
+repositories always go through a topic branch on a fork in the
+[cgwalters-forge](https://github.com/cgwalters-forge) organization; the
+bot's personal `cgwalters-bot/REPO` forks are only for scratch work. Board status updates for the item you are working on are
 covered by the `workstream` skill.
 
-**By default the result is a tested branch and a draft PR on the bot's own
+**By default the result is a tested branch and a draft PR on the forge
 fork, not an upstream PR.** Items with Workflow `branch` (or no Workflow)
 end with the branch pushed to the fork as `bot/<short-slug>` and proposed
 with `bot-pr fork-pr`, where cgwalters reviews it (see "Review loop" in
@@ -72,15 +73,15 @@ contributions, stop and set the item to Needs human.
 ## Setup
 
 ```bash
-gh repo fork OWNER/REPO --clone   # fork into cgwalters-bot; clone has "origin" (fork) and "upstream"
+gh repo clone OWNER/REPO -- --origin upstream
 cd REPO
-git fetch upstream
 git switch -c bot/<short-slug> upstream/<default-branch>
 ```
 
-If the fork already exists, `gh repo fork` reuses it; sync it with
-`gh repo sync cgwalters-bot/REPO` or just branch from `upstream/<default-branch>`.
-Never commit to the fork's default branch; one topic branch per change.
+`bot-pr fork-pr` creates the `cgwalters-forge/REPO` fork when the branch
+is ready; after that, `git remote add forge https://github.com/cgwalters-forge/REPO`
+for pushing review fixups. Never commit to a fork's default branch; one
+topic branch per change.
 
 ## Commits
 
@@ -120,13 +121,17 @@ board item's Why (and in the PR description, for a PR). Then load the
 
 ## Push the branch
 
+`bot-pr fork-pr` (below) pushes the branch to the forge fork the first
+time. Later pushes, such as review fixups, go to the `forge` remote:
+
 ```bash
-git push -u origin HEAD:bot/<short-slug>
+git push -u forge HEAD:bot/<short-slug>
 ```
 
-The push goes from this machine, never from a devspace.
+The push goes from this machine, never from a devspace, and never to
+`upstream`.
 
-## Propose it on the fork
+## Propose it on the forge fork
 
 For a `branch` item, open the draft fork PR (see `workstream` for the
 board update that follows):
@@ -136,13 +141,15 @@ bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
   --branch bot/<short-slug> --item PVTI_... --title "..." --body-file pr-body.md
 ```
 
-It syncs the fork's copy of the base with upstream, opens the PR inside
-`cgwalters-bot/REPO`, and appends a bot-meta section with the upstream
-target, the board item and instructions for cgwalters. Write the title
+Run it in the clone that has the branch. It creates `cgwalters-forge/REPO`
+if needed (enabling Actions), syncs the fork's copy of the base with
+upstream, pushes the branch there, opens the PR inside the fork, and
+appends a bot-meta section with the upstream target, the board item and
+review instructions. Write the title
 and body as the upstream PR (the PR description rules below apply): once
 approved they are posted upstream as they stand then, minus the bot-meta
-section. The fork PR also runs the fork's `pull_request` CI, if the
-fork's workflows trigger for that base.
+section. The fork PR also runs the project's `pull_request` CI, minus
+anything that needs upstream's secrets or runners.
 
 ## The PR description
 

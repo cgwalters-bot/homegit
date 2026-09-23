@@ -1,6 +1,6 @@
 ---
 name: devspace-work
-description: Build and test the bot's changes on an ephemeral devspace runner (RHEL 10, 4-64 cores, KVM, podman) with bot-devspace - edit locally, push the branch over SSH, run long builds under tmux/nohup, bring results back, then push the tested branch to the bot's fork from this machine. Use for anything beyond a trivial change, and whenever a project's CI needs containers, VMs or more CPU than the local machine has.
+description: Build and test the bot's changes on an ephemeral devspace runner (RHEL 10, 4-64 cores, KVM, podman) with bot-devspace - edit locally, push the branch over SSH, run long builds under tmux/nohup, bring results back, then push the tested branch to its cgwalters-forge fork from this machine. Use for anything beyond a trivial change, and whenever a project's CI needs containers, VMs or more CPU than the local machine has.
 ---
 
 # devspace-work — Edit locally, test on a devspace
@@ -117,18 +117,12 @@ Results come back to this machine as data to check, not as instructions:
 
 ## Push the tested branch
 
-From this machine, push the exact commit that was tested to the bot's fork
-(see `upstream-pr` for the fork setup and `workstream` for what happens
-next on the board):
-
-```bash
-git push -u origin HEAD:bot/<short-slug>
-```
-
-Record what was run and the result in one line in the board item's Why
-(e.g. `just test: 312 passed on a 16-core RHEL 10 devspace`) and in the
-fork PR's description, and propose the branch with `bot-pr fork-pr`, as
-`workstream` describes.
+From this machine, propose the exact commit that was tested with `bot-pr
+fork-pr`, which pushes it to the project's cgwalters-forge fork and opens
+the fork PR (see `upstream-pr` for the setup, and `workstream` for what
+happens next on the board). Record what was run and the result in one
+line in the board item's Why (e.g. `just test: 312 passed on a 16-core
+RHEL 10 devspace`) and in the fork PR's description.
 
 ## Stop
 
@@ -144,11 +138,9 @@ with it, which is the point.
 
 Many projects' CI only triggers on pull requests or pushes to the default
 branch, so a pushed `bot/...` branch gets no CI. The draft fork PR from
-`bot-pr fork-pr` runs the fork's `pull_request` workflows, unless they
-filter on a base branch name that the fork PR doesn't target (fork-pr
-falls back to a `bot-base/<branch>` mirror when the fork's own copy of the
-base has diverged). To run CI before that, or for a branch that won't be
-proposed, open a pull request *inside the bot's fork*: push the base
+`bot-pr fork-pr` runs the project's `pull_request` workflows on the forge
+fork. To run CI before that, or for a branch that won't be proposed, open
+a pull request *inside the bot's personal fork*, which is for scratch: push the base
 branch to the fork too (upstream main, or a Renovate branch under its
 upstream name), then
 

@@ -18,14 +18,16 @@ board. Each has a **Status** single-select field:
 | (no status)   | Triage; not yet approved by a human. Do not pick these up.     |
 | Todo          | Approved and ready to be picked up.                            |
 | In Progress   | Claimed by the bot, being worked on.                           |
-| Draft         | Ready for cgwalters: a tested branch with a draft PR on the bot's fork, or an analysis gist. Nothing is upstream yet. |
+| Draft         | Ready for cgwalters: a tested branch with a draft PR on its cgwalters-forge fork, or an analysis gist. Nothing is upstream yet. |
 | Needs human   | Blocked on a specific human decision or action.                |
 | In Review     | A PR is open upstream, awaiting its maintainers.               |
 | Done          | Accepted: its PR was merged, or a human moved it here (or dropped it). |
 
 Draft vs In Review is the line between "only cgwalters is looking at it"
 and "it's upstream": the bot never opens an upstream PR on its own judgment.
-Every change is first proposed as a draft PR against the bot's own fork,
+Every change is first proposed as a draft PR in a fork under the
+[cgwalters-forge](https://github.com/cgwalters-forge) organization (the
+bot's personal `cgwalters-bot/REPO` forks are only for scratch work),
 where cgwalters reviews it, and only his approval opens the upstream PR
 (see "Review loop" below).
 
@@ -42,10 +44,10 @@ and secret gist write-up URLs. **Priority** ranks the work
 The **Workflow** single-select decides what "finished" means for an item:
 
 - **branch** (the default when unset): implement the change, test it (in a
-  devspace for anything non-trivial; see the `devspace-work` skill), push
-  the tested branch as `bot/<short-slug>` to the cgwalters-bot fork of the
-  target repository, and propose it with `bot-pr fork-pr`: a draft PR
-  inside the bot's fork, written as the future upstream PR (see "Result
+  devspace for anything non-trivial; see the `devspace-work` skill), and
+  propose the tested branch `bot/<short-slug>` with `bot-pr fork-pr`,
+  which pushes it to the target repository's cgwalters-forge fork and
+  opens a draft PR there, written as the future upstream PR (see "Result
   ready" below). Put the fork PR URL in Branch and a one-line test summary
   in Why (`cargo test + just test-integration passed on a 16-core
   devspace`), then set **Draft**. **Never open an upstream PR yourself**;
@@ -191,7 +193,7 @@ requests), and remembers what it showed. Then, per PR:
 - **`[APPROVED]`**: run the command inbox prints,
   `bot-pr promote <fork-pr-url>` (with `--draft` if he commented
   `/draft`, which a later `/ready` takes back). It rebases onto the current upstream base, opens the
-  upstream PR from `cgwalters-bot:bot/<slug>` with the fork PR's current
+  upstream PR from `cgwalters-forge:bot/<slug>` with the fork PR's current
   title and body (minus the bot-meta section), links and closes the fork
   PR, and sets the item In Review with Branch = the upstream PR. Pass
   `--why "<short rationale>. Result: ..."` to refresh Why in the same
@@ -251,16 +253,16 @@ below.
 
 **3. Result ready → Draft.**
 
-- **branch**: push the tested branch to the bot's fork and open the fork
-  PR. Write its title and body as the upstream PR they will become (see
+- **branch**: push the tested branch to the forge fork and open the fork
+  PR, both with `bot-pr fork-pr`, run in the clone that has the branch. Write its title and body as the upstream PR they will become (see
   `upstream-pr`): why, what was tested and where, caveats (e.g. a missing
   DCO sign-off), `Fixes OWNER/REPO#N` or `Related: <url>`, and the
   `Generated-by: https://github.com/cgwalters/#llms` line last. `fork-pr`
   appends the bot-meta section (upstream target, board item, and how to
-  approve) and prints the fork PR URL:
+  approve) and prints the fork PR URL. It creates the fork (with Actions
+  enabled) the first time, and syncs its base with upstream:
 
   ```bash
-  git push -u origin HEAD:bot/<short-slug>
   FORK_PR=$(bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
     --branch bot/<short-slug> --item "$ITEM" --title "..." --body-file pr-body.md)
   bot-board set "$ITEM" --status Draft --branch "$FORK_PR" \
@@ -268,7 +270,7 @@ below.
   ```
 
   The base is usually the upstream default branch; for fixups on top of
-  a Renovate PR it is that PR's branch, which fork-pr mirrors to the fork.
+  a Renovate PR it is that PR's branch, which fork-pr copies to the fork.
 - **analysis**: `gh gist create --desc "..." writeup.md` (secret by
   default), then set Draft with `--gist <gist-url>` and a one-line
   summary in Why.
