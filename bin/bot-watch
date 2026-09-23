@@ -11,9 +11,10 @@ shopt -s inherit_errexit
 readonly BOT_LOGIN=cgwalters-bot
 # Comments by this login are flagged: they may be requests.
 readonly REQUESTER=cgwalters
-# PRs in repositories of these owners are the bot's fork PRs: cgwalters'
-# comments and reviews on them, and his closing them, are for
-# 'bot-pr inbox'; here they only get their head and CI watched.
+# The bot's PRs in repositories of these owners are its fork PRs, the ones
+# 'bot-pr inbox' searches: cgwalters' comments and reviews on them, and
+# his closing them, are for inbox; here they only get their head and CI
+# watched. Anything else there (issues, PRs by others) is swept in full.
 readonly FORK_OWNERS='["cgwalters-forge", "cgwalters-bot"]'
 readonly STATE_NAME=watch
 readonly STATE_VERSION=1
@@ -55,8 +56,8 @@ sweep saw and report:
   - pushes to a PR's head by anyone but ${BOT_LOGIN};
   - CI turning red (or green again), flagged on the bot's own branches.
 
-On the bot's fork PRs (in ${FORK_OWNERS}) only pushes and CI are
-reported; 'bot-pr inbox' covers cgwalters' review there. A URL seen for
+On the bot's fork PRs (its PRs in ${FORK_OWNERS}) only pushes and CI
+are reported; 'bot-pr inbox' covers cgwalters' review there. A URL seen for
 the first time is only recorded, unless CI on the bot's branch fails.
 
 Then suggest board bookkeeping: an item whose upstream PRs were merged
@@ -263,9 +264,10 @@ probe() {
     kind=${BASH_REMATCH[2]}
     number=${BASH_REMATCH[3]}
     local fork=false
-    jq -e --arg o "${repo%%/*}" 'index($o)' <<<"${FORK_OWNERS}" >/dev/null && fork=true
     if test "${kind}" = pull; then
         data=$(rest_get "repos/${repo}/pulls/${number}") || return
+        fork=$(jq --arg bot "${BOT_LOGIN}" --arg owner "${repo%%/*}" --argjson forks "${FORK_OWNERS}" \
+            '.user.login == $bot and ($forks | index($owner)) != null' <<<"${data}") || return
         cur=$(jq -c '{updated_at, state: (if .merged then "merged" else .state end), head_sha: .head.sha}' <<<"${data}")
         info=$(jq -c --arg bot "${BOT_LOGIN}" --argjson fork "${fork}" --argjson forks "${FORK_OWNERS}" '
             {kind: "pr", fork: $fork, title,
@@ -273,7 +275,7 @@ probe() {
     else
         data=$(rest_get "repos/${repo}/issues/${number}") || return
         cur=$(jq -c '{updated_at, state}' <<<"${data}")
-        info=$(jq -c --argjson fork "${fork}" '{kind: "issue", fork: $fork, title}' <<<"${data}")
+        info=$(jq -c '{kind: "issue", fork: false, title}' <<<"${data}")
     fi
     local prev_updated prev_state state
     prev_updated=$(jq -r '.updated_at // empty' <<<"${prev}")

@@ -184,8 +184,10 @@ reports what changed since its last sweep, per item: new comments and
 reviews (their author and first line; cgwalters' are marked
 `(operator)`), merged/closed/reopened, pushes to a PR head by anyone but
 the bot, and CI turning red (flagged on the bot's own branches) or green
-again. On forge fork PRs it only reports pushes and CI, since
-`bot-pr inbox` covers his review there. `--json` prints the same as one
+again. On the bot's fork PRs (its own PRs in cgwalters-forge and
+cgwalters-bot repositories) it only reports pushes and CI, since
+`bot-pr inbox` covers his review there; other issues and PRs in those
+repositories get the full report. `--json` prints the same as one
 object. `--apply` does the bookkeeping itself: an item whose upstream PR
 merged goes Done, and one whose upstream PR was closed unmerged goes
 Needs human with the question in Why, but only from Todo, Draft or In
