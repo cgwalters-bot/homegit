@@ -139,6 +139,26 @@ bot-devspace stop "$NAME"
 state (key, known_hosts, ssh_config). Anything left on the devspace is gone
 with it, which is the point.
 
+## Running upstream CI on a branch
+
+Many projects' CI only triggers on pull requests or pushes to the default
+branch, so a pushed `bot/...` branch gets no CI. To run it anyway without
+touching upstream, open a pull request *inside the bot's fork*: push the
+base branch to the fork too (upstream main, or a Renovate branch under its
+upstream name), then
+
+```bash
+gh api -X POST repos/cgwalters-bot/REPO/pulls -f base=<base-branch> \
+  -f head=bot/<slug> -f title='[bot test] <slug>' \
+  -f body='CI test run inside the bot fork; not for upstream.'
+```
+
+That runs the fork's `pull_request` workflows (make sure Actions is enabled
+on the fork). Workflows that need upstream secrets or runners won't work
+there; say so rather than treating those failures as real. Close the
+fork-internal PR when done. For `workflow_dispatch` workflows, dispatch on
+the fork directly via `repos/cgwalters-bot/REPO/actions/workflows/<file>/dispatches`.
+
 ## Rate limits
 
 `bot-devspace` only uses GitHub's REST API. Board operations use the bot's
