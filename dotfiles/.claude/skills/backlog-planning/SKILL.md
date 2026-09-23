@@ -80,6 +80,17 @@ planning, just list in the report what is waiting (approved fork PRs,
 new comments, fork PRs he closed). `--dry-run` leaves the activity marked
 unseen, so the next work session's `bot-pr inbox` still shows it.
 
+Likewise, see what changed on the items already on the board:
+
+```bash
+bot-watch --dry-run
+```
+
+Report the highlights (comments by cgwalters, merged or closed PRs, red
+CI on the bot's branches) without acting on them; `--dry-run` keeps its
+state, so the next work session gets the same report. Don't add items
+for what it lists: they are on the board already.
+
 ## 1. Load what is already on the board
 
 Dedupe against this before adding anything. Draft items are deduped by the

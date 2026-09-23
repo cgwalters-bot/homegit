@@ -13,8 +13,9 @@ readonly BOT_LOGIN=cgwalters-bot
 readonly REQUESTER=cgwalters
 # Fork PRs in the forge are handled by 'bot-pr inbox'.
 readonly FORGE_ORG=cgwalters-forge
-# Notification reasons that ask something of the bot; the rest (subscribed,
-# ci_activity, ...) are ignored.
+# Notification reasons that ask something of the bot. The rest (comment,
+# author, state_change, ci_activity, subscribed) are about threads the bot
+# already follows, which are on the board, where bot-watch reports them.
 readonly SELECT_REASONS='["mention", "team_mention", "review_requested", "assign"]'
 readonly API=https://api.github.com
 readonly DEFAULT_LOOKBACK_DAYS=7

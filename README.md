@@ -54,6 +54,13 @@ item (`bot-state: notifications`), so any machine can pick up where the
 last run stopped. Agents run it at the start of each session and planning
 pass for now; running it on a schedule comes later.
 
+Pings are only part of it: `bot-watch` sweeps the issues and PRs of the
+items on the board and reports what changed on each since it last
+looked (new comments and reviews, merges and closes, pushes by others,
+CI going red), and with `--apply` moves items whose upstream PR merged to
+Done, and those closed unmerged to Needs human. Its last-seen state is
+another archived item, `bot-state: watch`.
+
 ### Overnight working model
 
 The agents run on a trusted machine that holds the clones and the bot's
@@ -70,7 +77,8 @@ ever copied to a devspace; see the `devspace-work` skill. `bot-devspace
 stop` cancels the runner, since they're billed while they run.
 
 `bot-board` is a small CLI over `gh project` for the Workstream board
-(`list`, `show`, `add`, `draft`, `set`), which caches reads because the
+(`list`, `show`, `add`, `draft`, `set`, and `state-get`/`state-put` for
+the scripts' state items), which caches reads because the
 bot's GraphQL quota is shared by every agent. Each item's Workflow field
 says what the bot delivers: a tested branch proposed as a draft PR on a
 forge fork (`branch`, the default), a write-up in a secret gist (`analysis`), a

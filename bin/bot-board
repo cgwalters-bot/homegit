@@ -29,6 +29,7 @@ readonly EX_RATELIMIT=75
 readonly STATE_PREFIX='bot-state: '
 readonly -A STATE_ITEMS=(
     [notifications]=PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk
+    [watch]=PVTI_lAHOAQ_SPs4Bj2Gizg8bu2Q
 )
 
 usage() {

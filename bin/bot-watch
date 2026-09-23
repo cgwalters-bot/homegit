@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+# Sweep the upstream issues and PRs of the Workstream board's items and
+# report what changed since the last sweep: new comments and reviews,
+# merges and closes, pushes by others, CI going red. Only board
+# bookkeeping follows from it, and only with --apply.
+# jq programs hold literal $variables.
+# shellcheck disable=SC2016
+set -euo pipefail
+shopt -s inherit_errexit
+
+readonly BOT_LOGIN=cgwalters-bot
+# Comments by this login are flagged: they may be requests.
+readonly REQUESTER=cgwalters
+# PRs in repositories of these owners are the bot's fork PRs: cgwalters'
+# comments and reviews on them, and his closing them, are for
+# 'bot-pr inbox'; here they only get their head and CI watched.
+readonly FORK_OWNERS='["cgwalters-forge", "cgwalters-bot"]'
+readonly STATE_NAME=watch
+readonly STATE_VERSION=1
+# Items in these statuses or workflows are not swept.
+readonly SKIP_STATUSES='["Done"]'
+readonly SKIP_WORKFLOWS='["manual"]'
+# --apply only moves items out of these statuses: never an untriaged item,
+# one someone is working on, or one waiting for a human.
+readonly APPLY_FROM='["Todo", "Draft", "In Review"]'
+readonly MERGED_STATUS=Done
+readonly CLOSED_STATUS='Needs human'
+readonly WHY_MAX=400
+readonly EXCERPT_LEN=100
+readonly SHORT_SHA=10
+readonly CHECKS_PER_PAGE=100
+# Conditional requests answered 304 are free; the cache is local and only
+# an HTTP cache, so it is written even in a dry run.
+readonly ETAG_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-watch/etags
+readonly LOCK_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-watch
+# Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
+readonly EX_RATELIMIT=75
+# Returned by rest_get() when GitHub says the resource does not exist.
+readonly EX_NOTFOUND=4
+BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
+readonly BOT_BOARD
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--dry-run] [--apply] [--json]
+
+Sweep the upstream issues and PRs of the Workstream board's items (not
+${SKIP_STATUSES}, not Workflow ${SKIP_WORKFLOWS}): each item's own issue or PR, and
+the PR URLs in its Branch field. For each, compare with what the last
+sweep saw and report:
+
+  - new comments and reviews by anyone but ${BOT_LOGIN}, with their
+    author and first line (those by ${REQUESTER} flagged);
+  - state changes: merged, closed, reopened;
+  - pushes to a PR's head by anyone but ${BOT_LOGIN};
+  - CI turning red (or green again), flagged on the bot's own branches.
+
+On the bot's fork PRs (in ${FORK_OWNERS}) only pushes and CI are
+reported; 'bot-pr inbox' covers cgwalters' review there. A URL seen for
+the first time is only recorded, unless CI on the bot's branch fails.
+
+Then suggest board bookkeeping: an item whose upstream PRs were merged
+(one at least, the rest closed) is ${MERGED_STATUS}; one whose upstream PRs were all
+closed without merging needs a human.
+Only --apply makes these changes, through bot-board, and only for items in
+${APPLY_FROM}.
+
+Options:
+  --dry-run   Report only: apply nothing and keep the last-seen state
+  --apply     Make the suggested status changes
+  --json      Print one JSON object for agents instead of the report
+  -h, --help  Show this help
+
+The last-seen state (url -> updated_at, state, head_sha, checks) lives in
+the archived 'bot-state: ${STATE_NAME}' draft item on the board, read and
+written with 'bot-board state-get/state-put' (one GraphQL call each), and
+advances only after a sweep in which every URL was read. The board listing
+comes from bot-board's cache; everything else is REST, with ETags.
+EOF
+}
+
+fatal() {
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+warn() {
+    echo "warning: $*" 1>&2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
+}
+
+rate_limited() {
+    echo "error: GitHub is rate limiting the bot ($1); retry after $(gh api rate_limit --jq '.resources.core.reset | todate' 2>/dev/null || echo "the reset")" 1>&2
+    exit "${EX_RATELIMIT}"
+}
+
+# check_rate_limit ERRFILE: exits if ERRFILE reports rate limiting.
+check_rate_limit() {
+    local reason
+    if reason=$(grep -iE -m1 'rate limit|abuse' "$1"); then
+        rate_limited "${reason}"
+    fi
+}
+
+# board_failed STATUS MESSAGE: after a failed bot-board call, pass a
+# rate-limit exit through (bot-board printed why), else fail.
+board_failed() {
+    test "$1" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
+    fatal "$2"
+}
+
+dry_run=false
+apply=false
+json=false
+# Hidden test hooks: sweep the items of a 'bot-board list --json' array in
+# a file instead of the board (--apply then only prints the bot-board
+# calls), and keep the state in a file instead of on the board.
+board_file=
+state_file=
+while test $# -gt 0; do
+    case "$1" in
+        --dry-run) dry_run=true; shift ;;
+        --apply) apply=true; shift ;;
+        --json) json=true; shift ;;
+        --board-file) test $# -ge 2 || fatal "--board-file requires a file"; board_file=$2; shift 2 ;;
+        --state-file) test $# -ge 2 || fatal "--state-file requires a file"; state_file=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) fatal "unknown argument: $1 (see --help)" ;;
+    esac
+done
+
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${BOT_LOGIN}"
+require_cmd jq "install jq"
+require_cmd flock "install util-linux"
+
+scratch=$(mktemp -d)
+trap 'rm -rf "${scratch}"' EXIT
+
+# ghapi ARGS...: 'gh api', turning rate limiting into a clear exit and a
+# 404 into EX_NOTFOUND.
+ghapi() {
+    local rc=0
+    gh api "$@" 2>"${scratch}/err" || rc=$?
+    if test "${rc}" -ne 0; then
+        check_rate_limit "${scratch}/err"
+        grep -q 'HTTP 404' "${scratch}/err" && return "${EX_NOTFOUND}"
+        cat "${scratch}/err" 1>&2
+    fi
+    return "${rc}"
+}
+
+# rest_get PATH: prints the JSON at PATH, sending the ETag of the cached
+# copy so that an unchanged resource costs no quota.
+rest_get() {
+    local path=$1 key etag_file body_file args rc=0 status etag
+    key=$(printf '%s' "${path}" | sha256sum | cut -c1-32)
+    etag_file=${ETAG_DIR}/${key}.etag
+    body_file=${ETAG_DIR}/${key}.json
+    args=(-i "${path}")
+    if test -s "${etag_file}" && test -s "${body_file}"; then
+        args+=(-H "If-None-Match: $(<"${etag_file}")")
+    fi
+    gh api "${args[@]}" >"${scratch}/raw" 2>"${scratch}/err" || rc=$?
+    tr -d '\r' <"${scratch}/raw" | sed '/^$/q' >"${scratch}/headers"
+    status=$(awk 'NR == 1 { print $2 }' "${scratch}/headers")
+    case "${status}" in
+        304) cat "${body_file}" ;;
+        200)
+            tr -d '\r' <"${scratch}/raw" | sed '1,/^$/d' >"${scratch}/body"
+            etag=$(awk 'tolower($0) ~ /^etag:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "${scratch}/headers")
+            if test -n "${etag}"; then
+                mkdir -p "${ETAG_DIR}"
+                cp "${scratch}/body" "${body_file}.tmp.$$"
+                mv -f "${body_file}.tmp.$$" "${body_file}"
+                printf '%s\n' "${etag}" >"${etag_file}"
+            fi
+            cat "${scratch}/body"
+            ;;
+        404) return "${EX_NOTFOUND}" ;;
+        *)
+            check_rate_limit "${scratch}/err"
+            cat "${scratch}/err" 1>&2
+            test "${rc}" -ne 0 || rc=1
+            return "${rc}"
+            ;;
+    esac
+}
+
+login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
+test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}"
+
+# Two sweeps on one machine must not race on the state (or both apply).
+mkdir -p "${LOCK_DIR}"
+exec {lock_fd}>"${LOCK_DIR}/lock" || fatal "cannot open ${LOCK_DIR}/lock"
+flock -n "${lock_fd}" || fatal "another $(basename "$0") run holds ${LOCK_DIR}/lock"
+
+# --- Board and state -------------------------------------------------------
+
+if test -n "${board_file}"; then
+    board=$(jq -ce 'if type == "array" then . else error("not an array") end' "${board_file}") ||
+        fatal "--board-file ${board_file} is not a 'bot-board list --json' array"
+    warn "testing: sweeping the items in ${board_file}; board changes are only printed"
+else
+    board=$("${BOT_BOARD}" list --json) || board_failed $? "listing the board failed"
+fi
+if test -n "${state_file}"; then
+    state=$(if test -s "${state_file}"; then cat "${state_file}"; else echo '{}'; fi)
+    warn "testing: keeping the state in ${state_file}"
+else
+    state=$("${BOT_BOARD}" state-get "${STATE_NAME}") || board_failed $? "reading the last-seen state failed"
+fi
+seen=$(jq -ce --argjson v "${STATE_VERSION}" '
+    if (.version // $v) != $v then error("unsupported version \(.version)") else .items // {} end' <<<"${state}") ||
+    fatal "cannot use the last-seen state (bot-state: ${STATE_NAME}); fix it, or empty it to start over"
+
+# One record per swept URL, with the board items it belongs to.
+watch=$(jq -c --argjson skip_status "${SKIP_STATUSES}" --argjson skip_workflow "${SKIP_WORKFLOWS}" '
+    [.[] | select((.status // "") as $s | $skip_status | index($s) | not)
+         | select((.workflow // "") as $w | $skip_workflow | index($w) | not)
+         | {id, title, status, workflow, why} as $item
+         | ((if .content.type == "Issue" or .content.type == "PullRequest" then .content.url else empty end),
+            ((.branch // "") | split(" ")[]
+             | capture("^(?<u>https://github\\.com/[^/]+/[^/]+/pull/[0-9]+)(?:[/#?]|$)").u))
+         | {url: ., item: $item}]
+    | group_by(.url) | map({url: .[0].url, items: [.[].item] | unique_by(.id)})' <<<"${board}")
+nurls=$(jq length <<<"${watch}")
+nitems=$(jq '[.[].items[].id] | unique | length' <<<"${watch}")
+
+# --- Sweep -----------------------------------------------------------------
+
+excerpt_jq="def excerpt: (. // \"\") | [splits(\"\\r?\\n\") | select(test(\"\\\\S\"))] | (first // \"\")
+    | gsub(\"\\\\s+\"; \" \") | if length > ${EXCERPT_LEN} then .[:${EXCERPT_LEN}] + \"...\" else . end;"
+
+# checks_state REPO SHA: prints failure, pending, success or none for the
+# check runs and commit statuses of SHA, plus the failing names:
+# {checks, failing}.
+checks_state() {
+    # Too big for jq's argument list.
+    {
+        rest_get "repos/$1/commits/$2/check-runs?per_page=${CHECKS_PER_PAGE}" || exit 1
+        rest_get "repos/$1/commits/$2/status" || exit 1
+    } | jq -sc '.[0] as $runs | .[1] as $status
+        | ([$runs.check_runs[] | select(.conclusion | IN("failure", "timed_out", "startup_failure")) | .name]
+         + [$status.statuses[] | select(.state | IN("failure", "error")) | .context]) as $failing
+        | {failing: $failing,
+           checks: (if ($failing | length) > 0 then "failure"
+                    elif any($runs.check_runs[]; .status != "completed")
+                         or ($status.total_count > 0 and $status.state == "pending") then "pending"
+                    elif ($runs.total_count + $status.total_count) > 0 then "success"
+                    else "none" end)}'
+}
+
+# probe URL PREV: prints {cur, changes, info} for one issue or PR, where
+# cur is what the state keeps, and PREV what the last sweep kept (null
+# the first time).
+probe() {
+    local url=$1 prev=$2 repo kind number data cur changes='[]' info
+    [[ "${url}" =~ ^https://github\.com/([^/]+/[^/]+)/(issues|pull)/([0-9]+)$ ]] || return 1
+    repo=${BASH_REMATCH[1]}
+    kind=${BASH_REMATCH[2]}
+    number=${BASH_REMATCH[3]}
+    local fork=false
+    jq -e --arg o "${repo%%/*}" 'index($o)' <<<"${FORK_OWNERS}" >/dev/null && fork=true
+    if test "${kind}" = pull; then
+        data=$(rest_get "repos/${repo}/pulls/${number}") || return
+        cur=$(jq -c '{updated_at, state: (if .merged then "merged" else .state end), head_sha: .head.sha}' <<<"${data}")
+        info=$(jq -c --arg bot "${BOT_LOGIN}" --argjson fork "${fork}" --argjson forks "${FORK_OWNERS}" '
+            {kind: "pr", fork: $fork, title,
+             bot_branch: (.user.login == $bot or ((.head.repo.owner.login // "") as $o | $forks | index($o)) != null)}' <<<"${data}")
+    else
+        data=$(rest_get "repos/${repo}/issues/${number}") || return
+        cur=$(jq -c '{updated_at, state}' <<<"${data}")
+        info=$(jq -c --argjson fork "${fork}" '{kind: "issue", fork: $fork, title}' <<<"${data}")
+    fi
+    local prev_updated prev_state state
+    prev_updated=$(jq -r '.updated_at // empty' <<<"${prev}")
+    prev_state=$(jq -r '.state // empty' <<<"${prev}")
+    state=$(jq -r .state <<<"${cur}")
+
+    # New comments and reviews, if anything moved; on fork PRs they're
+    # 'bot-pr inbox' business.
+    if test -n "${prev_updated}" && ! ${fork} &&
+        [[ "$(jq -r .updated_at <<<"${cur}")" > "${prev_updated}" ]]; then
+        local found
+        found=$({
+            ghapi --paginate "repos/${repo}/issues/${number}/comments?per_page=100&since=${prev_updated}" \
+                --jq '.[] | {type: "comment", author: .user.login, at: .created_at, link: .html_url, body}' || exit 1
+            if test "${kind}" = pull; then
+                ghapi --paginate "repos/${repo}/pulls/${number}/reviews?per_page=100" \
+                    --jq '.[] | {type: "review", author: .user.login, at: .submitted_at, link: .html_url, body, review_state: .state}' || exit 1
+            fi
+        } | jq -sc --arg since "${prev_updated}" --arg bot "${BOT_LOGIN}" --arg req "${REQUESTER}" "${excerpt_jq}"'
+            [.[] | select(.author != $bot and (.at // "") > $since)
+                 | .excerpt = (.body | excerpt) | del(.body)
+                 | .from_requester = (.author == $req)] | sort_by(.at)') || return 1
+        changes=$(jq -c --argjson f "${found}" '. + $f' <<<"${changes}")
+    fi
+
+    if test -n "${prev_state}" && test "${prev_state}" != "${state}" && ! ${fork}; then
+        changes=$(jq -c --arg from "${prev_state}" --arg to "${state}" '. + [{type: "state", from: $from, to: $to}]' <<<"${changes}")
+    fi
+
+    if test "${kind}" = pull && test "${state}" = open; then
+        local head prev_head
+        head=$(jq -r .head_sha <<<"${cur}")
+        prev_head=$(jq -r '.head_sha // empty' <<<"${prev}")
+        if test -n "${prev_head}" && test "${prev_head}" != "${head}"; then
+            local commit by
+            commit=$(rest_get "repos/${repo}/commits/${head}") || return 1
+            # Who committed it is the best guess at who pushed it, unless
+            # GitHub did (web-flow: a merge or "update branch" button).
+            by=$(jq -r '(.committer.login // "") as $c
+                | if $c != "" and $c != "web-flow" then $c else .author.login // .commit.author.name end' <<<"${commit}")
+            if test "${by}" != "${BOT_LOGIN}"; then
+                changes=$(jq -c --arg from "${prev_head}" --arg to "${head}" --arg by "${by}" \
+                    '. + [{type: "push", from: $from, to: $to, by: $by}]' <<<"${changes}")
+            fi
+        fi
+        local ci prev_checks checks
+        ci=$(checks_state "${repo}" "${head}") || return 1
+        checks=$(jq -r .checks <<<"${ci}")
+        cur=$(jq -c --arg c "${checks}" '.checks = $c' <<<"${cur}")
+        prev_checks=$(jq -r '.checks // empty' <<<"${prev}")
+        # A URL seen for the first time: only the bot's own red CI is news.
+        if test "${checks}" = failure && test "${prev_checks}" != failure &&
+            { test "${prev}" != null || jq -e .bot_branch <<<"${info}" >/dev/null; }; then
+            changes=$(jq -c --argjson ci "${ci}" --arg head "${head}" --argjson info "${info}" \
+                '. + [{type: "ci_red", head: $head, failing: $ci.failing, bot_branch: $info.bot_branch}]' <<<"${changes}")
+        elif test "${checks}" = success && test "${prev_checks}" = failure; then
+            changes=$(jq -c --arg head "${head}" '. + [{type: "ci_green", head: $head}]' <<<"${changes}")
+        fi
+    elif test "${kind}" = pull; then
+        # Closed: nothing runs any more; keep what was last seen.
+        cur=$(jq -c --arg c "$(jq -r '.checks // empty' <<<"${prev}")" '.checks = (if $c == "" then null else $c end)' <<<"${cur}")
+    fi
+    jq -cn --argjson cur "${cur}" --argjson changes "${changes}" --argjson info "${info}" \
+        '{cur: $cur, changes: $changes, info: $info}'
+}
+
+results='{}'
+new_seen='{}'
+failed='[]'
+gone='[]'
+new_urls='[]'
+while IFS= read -r url; do
+    test -n "${url}" || continue
+    prev=$(jq -c --arg u "${url}" '.[$u]' <<<"${seen}")
+    rc=0
+    r=$(probe "${url}" "${prev}") || rc=$?
+    case "${rc}" in
+        0)
+            results=$(jq -c --arg u "${url}" --argjson r "${r}" '.[$u] = $r' <<<"${results}")
+            new_seen=$(jq -c --arg u "${url}" --argjson r "${r}" '.[$u] = $r.cur' <<<"${new_seen}")
+            test "${prev}" != null || new_urls=$(jq -c --arg u "${url}" '. + [$u]' <<<"${new_urls}")
+            ;;
+        "${EX_RATELIMIT}") exit "${EX_RATELIMIT}" ;;
+        "${EX_NOTFOUND}")
+            # Deleted, or the repository went private: reported once.
+            if test "$(jq -r '.state // empty' <<<"${prev}")" != gone; then
+                gone=$(jq -c --arg u "${url}" '. + [$u]' <<<"${gone}")
+            fi
+            new_seen=$(jq -c --arg u "${url}" '.[$u] = {state: "gone"}' <<<"${new_seen}")
+            ;;
+        *)
+            warn "reading ${url} failed; will retry next sweep"
+            failed=$(jq -c --arg u "${url}" '. + [$u]' <<<"${failed}")
+            # Keep its last-seen state, so that nothing is skipped.
+            test "${prev}" = null || new_seen=$(jq -c --arg u "${url}" --argjson p "${prev}" '.[$u] = $p' <<<"${new_seen}")
+            ;;
+    esac
+done < <(jq -r '.[].url' <<<"${watch}")
+
+# --- Per item: changes and bookkeeping --------------------------------------
+
+# Through a file: it can outgrow an argument.
+printf '%s\n' "${results}" >"${scratch}/results.json"
+report=$(jq -c --slurpfile results "${scratch}/results.json" --argjson gone "${gone}" \
+    --argjson apply_from "${APPLY_FROM}" --arg merged_status "${MERGED_STATUS}" --arg closed_status "${CLOSED_STATUS}" '
+    $results[0] as $results
+    | [.[] | . as $w | .items[] | {item: ., url: $w.url}]
+    | group_by(.item.id)
+    | map(.[0].item as $item | [.[].url] as $urls
+        | [$urls[] | select($results[.] != null) | {url: ., r: $results[.]}] as $probed
+        | ([$probed[] | .url as $u | .r.changes[] | {url: $u} + .]
+           + [$urls[] | select(. as $u | $gone | index($u)) | {url: ., type: "gone"}]) as $changes
+        | [$probed[] | select(.r.info.kind == "pr" and (.r.info.fork | not))] as $upstream
+        # Done once one merged and none is still open (a backport, say).
+        | [if any($upstream[]; .r.cur.state == "merged") and all($upstream[]; .r.cur.state != "open") then
+               {status: $merged_status, reason: "merged", url: ([$upstream[] | select(.r.cur.state == "merged") | .url] | first)}
+           elif ($item.status // "") != $closed_status and ($upstream | length) > 0
+                and all($upstream[]; .r.cur.state == "closed") then
+               {status: $closed_status, reason: "closed", url: ($upstream[0].url)}
+           else empty end] as $actions
+        | {id: $item.id, title: $item.title, status: $item.status, workflow: $item.workflow, why: $item.why,
+           changes: $changes,
+           actions: [$actions[] | . + {allowed: (($item.status // "") as $s | $apply_from | index($s) != null)}]})
+    | map(select((.changes | length) > 0 or (.actions | length) > 0))' <<<"${watch}")
+
+# why_for ITEM ACTION: the Why of an item moved to CLOSED_STATUS: the
+# question first, then as much of the old Why as fits.
+why_for() {
+    jq -r --argjson max "${WHY_MAX}" '.[1] as $a | .[0] as $i
+        | "Q: \($a.url) was closed without merging; drop this (Done) or redo it?" as $q
+        | if ($i.why // "") == "" then $q else "\($q) | was: \($i.why)" end
+        | if length > $max then .[:$max - 3] + "..." else . end' <<<"[$1, $2]"
+}
+
+napplied=0
+napply_failed=0
+while IFS= read -r entry; do
+    test -n "${entry}" || continue
+    item=$(jq -c .item <<<"${entry}")
+    action=$(jq -c .action <<<"${entry}")
+    id=$(jq -r .id <<<"${item}")
+    status=$(jq -r .status <<<"${action}")
+    args=(set "${id}" --status "${status}")
+    test "${status}" != "${CLOSED_STATUS}" || args+=(--why "$(why_for "${item}" "${action}")")
+    result=applied
+    if test -n "${board_file}" || ${dry_run}; then
+        result=would-apply
+        test -z "${board_file}" || echo "testing: would run: bot-board $(printf "%q " "${args[@]}")" 1>&2
+    elif "${BOT_BOARD}" "${args[@]}" >/dev/null; then
+        napplied=$((napplied + 1))
+    else
+        rc=$?
+        test "${rc}" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
+        warn "setting ${id} to ${status} failed"
+        result=failed
+        napply_failed=$((napply_failed + 1))
+    fi
+    report=$(jq -c --arg id "${id}" --arg r "${result}" \
+        'map(if .id == $id then .actions |= map(if .allowed then .result = $r else . end) else . end)' <<<"${report}")
+done < <(${apply} && jq -c '.[] | {item: {id, why}, action: (.actions[] | select(.allowed))}' <<<"${report}")
+
+# --- Report ----------------------------------------------------------------
+
+advance=true
+if test "$(jq length <<<"${failed}")" -gt 0; then
+    advance=false
+    why_kept="$(jq length <<<"${failed}") URL(s) failed"
+elif ${dry_run}; then
+    advance=false
+    why_kept="dry run"
+fi
+
+if ${json}; then
+    jq --argjson new "${new_urls}" --argjson failed "${failed}" \
+        --argjson gone "${gone}" --argjson nurls "${nurls}" --argjson nitems "${nitems}" \
+        --argjson advance "${advance}" \
+        '{swept: {urls: $nurls, items: $nitems}, items: ., new_urls: $new,
+          failed_urls: $failed, gone_urls: $gone, state_advanced: $advance}' <<<"${report}"
+else
+    jq -r --argjson sha "${SHORT_SHA}" '
+        def short: .[:$sha];
+        def repo_ref: capture("github\\.com/(?<r>[^/]+/[^/]+)/(issues|pull)/(?<n>[0-9]+)") | "\(.r)#\(.n)";
+        .[] | .status as $status | "\(.title)  [\($status // "no status")]  \(.id)",
+        (.changes | group_by(.url)[] | "  \(.[0].url | repo_ref)",
+            (.[] | "    " + (
+                if .type == "comment" then "comment by @\(.author)\(if .from_requester then " (operator)" else "" end): \(.excerpt)\n      \(.link)"
+                elif .type == "review" then "review \(.review_state) by @\(.author)\(if .from_requester then " (operator)" else "" end)\(if .excerpt != "" then ": " + .excerpt else "" end)\n      \(.link)"
+                elif .type == "state" then "\(.from) -> \(.to)"
+                elif .type == "push" then "pushed by @\(.by): \(.from | short) -> \(.to | short)"
+                elif .type == "ci_red" then "CI failing\(if .bot_branch then " on the bot'"'"'s branch" else "" end) at \(.head | short): \(.failing | join(", "))"
+                elif .type == "ci_green" then "CI passing again at \(.head | short)"
+                elif .type == "gone" then "gone (404): deleted, or no longer public"
+                else tojson end))),
+        (.actions[] | "  -> \(.url | repo_ref) was \(.reason): set \(.status)"
+            + if .result == "applied" then " (done)"
+              elif .result == "would-apply" then " (--apply would do it)"
+              elif .result == "failed" then " (FAILED)"
+              elif .allowed then " (with --apply)"
+              else " (not applied from \($status // "no status"); a human decides)" end),
+        ""' <<<"${report}"
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${report}") items with news, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+fi
+
+if ! ${advance}; then
+    echo "State unchanged (${why_kept})." 1>&2
+    test "$(jq length <<<"${failed}")" -eq 0 || exit 1
+    test "${napply_failed}" -eq 0 || exit 1
+    exit 0
+fi
+new_state=$(jq -nc --argjson v "${STATE_VERSION}" --argjson items "${new_seen}" \
+    --arg now "$(date -u +%FT%TZ)" --arg host "$(hostname)" \
+    '{version: $v, updated_at: $now, host: $host, items: $items}')
+if test -n "${state_file}"; then
+    printf '%s\n' "${new_state}" >"${state_file}"
+else
+    "${BOT_BOARD}" state-put "${STATE_NAME}" "${new_state}" || board_failed $? "recording the last-seen state failed; the next sweep reports these changes again"
+fi
+echo "State advanced; ${napplied} item(s) updated on the board." 1>&2
+test "${napply_failed}" -eq 0 || exit 1

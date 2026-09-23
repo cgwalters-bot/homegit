@@ -28,6 +28,10 @@ the bot's notifications once and routes each new trigger:
   is filed twice. The bot never acts on these, assignments included.
 - **Threads in cgwalters-forge** are skipped: `bot-pr inbox` covers fork
   PRs.
+- **Other notifications** (new comments, state changes, CI, subscriptions)
+  are ignored: they are about issues and PRs the bot follows, which are
+  on the board, and `bot-watch` (see the `workstream` skill) reports
+  changes to those.
 
 A thread is marked read once everything in it is routed, except that a
 thread with a pending request stays unread until it is acked.
