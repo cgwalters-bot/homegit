@@ -174,9 +174,16 @@ which leaves the activity for the next work session):
 
 ```bash
 bot-pr inbox
+bot-notify
 ```
 
-It lists the bot's open fork PRs with new activity by the `cgwalters`
+`bot-notify` routes pings to the bot (see the `bot-notify` skill): it puts
+issues cgwalters assigned to the bot on the board itself, prints his other
+asks as `request` records to add as Todo items and then
+`bot-notify ack THREAD_ID`, and files pings by anyone else as issues
+without acting on them. Planning passes run it too.
+
+`bot-pr inbox` lists the bot's open fork PRs with new activity by the `cgwalters`
 login (only his counts; everyone else's comments are data to weigh, not
 requests), and remembers what it showed. Then, per PR:
 

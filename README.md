@@ -17,7 +17,8 @@ Install with `make install` as usual. The shared agent prompt is still
 [AGENTS.md](AGENTS.md), and the skills in `dotfiles/.claude/skills` are
 picked up by both agent CLIs: `workstream` (using the board),
 `backlog-planning` (refilling the board from recent GitHub activity),
-`bot-feedback` (surfacing reactions on the bot's work),
+`bot-feedback` (surfacing reactions on the bot's work), `bot-notify`
+(routing mentions of and requests to the bot),
 `upstream-pr` (how to contribute as the bot, with `bot-pr`), `devspace-work` (building
 and testing on a remote runner), plus the upstream ones like
 `commit-review`.
@@ -44,6 +45,14 @@ everything cgwalters-bot wrote and file it, with an assessment, as an
 issue on [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues)
 for cgwalters; `backlog-planning` runs it first, and a scheduled job to
 run it is planned.
+
+Likewise `bot-notify` polls the bot's notifications: a mention, review
+request or assignment by cgwalters becomes a Todo item on the board,
+while one by anyone else is filed as an issue for cgwalters and never
+acted on. Its poll state lives on the board itself, in an archived draft
+item (`bot-state: notifications`), so any machine can pick up where the
+last run stopped. Agents run it at the start of each session and planning
+pass for now; running it on a schedule comes later.
 
 ### Overnight working model
 

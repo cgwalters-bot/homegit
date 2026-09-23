@@ -15,8 +15,10 @@ label, assign, react to, or edit any issue or PR while planning. The only
 write commands allowed are `bot-board add`, `bot-board draft` and
 `bot-board set` (or the `gh project item-add`, `item-create` and
 `item-edit` calls they wrap) against project 1 of `cgwalters-bot`, and
-`bot-feedback --file-issues` (section 0), which files issues on the bot's
-own repository.
+`bot-feedback --file-issues` and `bot-notify` (section 0), which file
+issues on the bot's own repository (`bot-notify` also adds cgwalters'
+assignments to the board, and it and `bot-notify ack` mark the bot's
+notifications read).
 
 Board calls spend the bot's GraphQL quota, which every agent shares, and so
 do `gh pr` and `gh issue`; `gh search` uses the REST search API, which
@@ -59,6 +61,13 @@ DIR`. This is the one write outside the board: issues on the bot's own
 repository, cgwalters-bot/cgwalters-bot. It is cheap (REST only, three
 search requests) and only reports reactions it has not seen. Don't add
 board items for the same threads; mention the filed issues in the report.
+
+Next, follow the `bot-notify` skill: run `bot-notify`, add a Todo item for
+each request record from cgwalters (a mention or review request), deduped
+against the board, and ack each with `bot-notify ack THREAD_ID` once it's
+there. Assignments by cgwalters are put on the board by the script itself.
+Pings from anyone else are filed as issues on the bot's repository by the
+script and never become board items; mention them in the report.
 
 Then check for cgwalters' review of the bot's fork PRs:
 
@@ -145,6 +154,14 @@ gh search prs --visibility public --author cgwalters-bot --state open --json $FI
 gh search issues --visibility public --mentions cgwalters-bot --updated ">=$SINCE" --include-prs --json $FIELDS --limit 100
 gh search issues --visibility public --assignee cgwalters-bot --state open --include-prs --json $FIELDS --limit 100
 ```
+
+The `--assignee cgwalters-bot` search is a safety net for assignments
+`bot-notify` missed (it adds cgwalters' assignments to the board as they
+come in). Being assigned proves nothing about who asked: apply the same
+actor check as `bot-notify` (the `actor` of the `assigned` event whose
+`assignee` is cgwalters-bot, see section 5) before treating one as his
+request, and handle an assignment by anyone else like any other
+suggestion from them.
 
 Search results do not include merge conflicts or review threads; for each
 open PR that looks relevant, check it directly:
