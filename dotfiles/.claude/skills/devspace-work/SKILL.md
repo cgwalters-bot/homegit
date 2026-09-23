@@ -147,3 +147,18 @@ running as the bot, so use `bot-board` (it caches) rather than raw `gh
 project` calls, and update the board only at meaningful transitions:
 claimed, blocked, branch pushed, done. Polling a build never needs the
 board.
+
+`gh pr`, `gh issue` and `gh gist` also spend GraphQL points, so for reads
+(PR metadata, comments, reviews, check runs, job logs) prefer the REST API
+via `gh api repos/OWNER/REPO/...`. `gh run` and `gh workflow` are REST.
+If GraphQL is exhausted (`gh api graphql -f query='{ rateLimit { remaining
+resetAt } }'`; don't trust `gh api rate_limit` for this), keep working on
+REST and report the board updates you would have made instead of retrying
+in a loop.
+
+## Local scratch space
+
+Several agents often run at once on the same machine, sharing clones and
+temporary directories. Work in a worktree of your own (`git worktree add
+../<repo>-<task>`) rather than switching branches in a shared clone, and
+keep scratch files in a directory named after your task.
