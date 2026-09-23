@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+# Surface emoji reactions on content authored by cgwalters-bot, so that
+# feedback on the bot (especially 👎 and 😕) is never missed.
+set -euo pipefail
+shopt -s inherit_errexit
+
+readonly BOT_LOGIN=cgwalters-bot
+readonly DEFAULT_LOOKBACK_DAYS=14
+readonly API=https://api.github.com
+readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-feedback
+readonly STATE_FILE=${STATE_DIR}/seen.json
+readonly STATE_VERSION=1
+# Reactions that ask for a human to look; the others are just reported.
+readonly NEGATIVE_JQ='["-1", "confused"]'
+# Reactors that are never reported: the bot itself, and cgwalters, who
+# already knows what he reacted to. Overridable, e.g. to test with a
+# reaction added by the bot.
+readonly IGNORE_LOGINS=${BOT_FEEDBACK_IGNORE-${BOT_LOGIN} cgwalters}
+# One search per query below, each paginated 100 at a time; the search
+# API allows only 30 requests a minute.
+readonly SEARCH_QUALIFIERS=(commenter author reviewed-by)
+readonly SEARCH_PER_PAGE=100
+readonly EXCERPT_LEN=160
+# Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
+readonly EX_RATELIMIT=75
+BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
+readonly BOT_BOARD
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--since DATE] [--board] [--dry-run]
+
+Report new emoji reactions on content authored by ${BOT_LOGIN}: the bodies
+of issues and PRs it opened, its issue and PR comments, and its inline PR
+review comments, in threads updated since the lookback window started.
+
+Options:
+  --since DATE  Look at threads updated since DATE (default: ${DEFAULT_LOOKBACK_DAYS} days ago)
+  --board       Create a Workstream board item (P0, Needs human, manual)
+                for each new 👎 or 😕, via bot-board
+  --dry-run     Report, but don't record anything in the state file
+  -h, --help    Show this help
+
+Only reactions not seen before are reported; what was seen is kept in
+${STATE_FILE}.
+Reactions by these logins are never reported: ${IGNORE_LOGINS:-(none)}
+(set BOT_FEEDBACK_IGNORE to a space-separated list to change that).
+
+Limitations: only REST is used, since the GraphQL quota is shared by all
+agents, and REST exposes no reactions on the summary body of a PR review.
+A reaction does not bump a thread's update time, so a reaction on an old
+thread is only found while the thread is within the window; widen it with
+--since if needed.
+EOF
+}
+
+fatal() {
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+warn() {
+    echo "warning: $*" 1>&2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
+}
+
+rate_limited() {
+    echo "error: GitHub is rate limiting the bot ($1); retry after $(gh api rate_limit --jq ".resources.$2.reset | todate" 2>/dev/null || echo "the reset")" 1>&2
+    exit "${EX_RATELIMIT}"
+}
+
+# ghapi ARGS...: 'gh api', turning rate limiting into a clear exit.
+ghapi() {
+    local out err rc=0
+    err=$(mktemp)
+    out=$(gh api "$@" 2>"${err}") || rc=$?
+    if test "${rc}" -ne 0; then
+        if grep -qiE 'rate limit|abuse' "${err}"; then
+            local reason
+            reason=$(grep -iE -m1 'rate limit|abuse' "${err}")
+            rm -f "${err}"
+            rate_limited "${reason}" core
+        fi
+        cat "${err}" 1>&2
+        rm -f "${err}"
+        return "${rc}"
+    fi
+    rm -f "${err}"
+    printf '%s\n' "${out}"
+}
+
+since=
+board=false
+dry_run=false
+while test $# -gt 0; do
+    case "$1" in
+        --since) test $# -ge 2 || fatal "--since requires a date"; since=$2; shift 2 ;;
+        --since=*) since=${1#--since=}; shift ;;
+        --board) board=true; shift ;;
+        --dry-run) dry_run=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) fatal "unknown argument: $1 (see --help)" ;;
+    esac
+done
+if ${board} && ${dry_run}; then
+    fatal "--board and --dry-run can't be combined: filed items would not be recorded, and would be filed again"
+fi
+if test -z "${since}"; then
+    since=$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%F)
+else
+    since=$(date -u -d "${since}" +%F 2>/dev/null) || fatal "invalid --since date (expected YYYY-MM-DD)"
+fi
+
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${BOT_LOGIN}"
+require_cmd jq "install jq"
+require_cmd flock "install util-linux"
+if ${board}; then
+    test -x "${BOT_BOARD}" || fatal "--board needs bot-board next to this script (${BOT_BOARD})"
+fi
+
+login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
+test "${login}" = "${BOT_LOGIN}" ||
+    fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}; searches would miss private repositories only the bot can see"
+
+# A timer run and a manual run must not both update the state.
+mkdir -p "${STATE_DIR}"
+exec {lock_fd}>"${STATE_DIR}/lock" || fatal "cannot open ${STATE_DIR}/lock"
+flock -n "${lock_fd}" || fatal "another $(basename "$0") run holds ${STATE_DIR}/lock"
+
+# State: {version, items: {URL: {counts: {REACTION: N}, reactions: {ID:
+# {content, user, filed}}}}}. Reactions are keyed by id, so a new one is
+# one whose id was never seen; 'filed' records that --board made an item.
+if test -s "${STATE_FILE}"; then
+    STATE=$(jq -c --argjson v "${STATE_VERSION}" 'if .version == $v then . else error("unsupported state version \(.version)") end' "${STATE_FILE}") ||
+        fatal "cannot parse ${STATE_FILE}; move it away to start over (all current reactions will then be reported as new)"
+else
+    STATE=$(jq -nc --argjson v "${STATE_VERSION}" '{version: $v, items: {}}')
+fi
+
+save_state() {
+    ${dry_run} && return 0
+    printf '%s\n' "${STATE}" >"${STATE_FILE}.tmp.$$"
+    mv -f "${STATE_FILE}.tmp.$$" "${STATE_FILE}"
+}
+
+# 1. Find the threads with bot content. Each query is one search request
+# per 100 results; check the quota up front rather than failing halfway.
+search_left=$(gh api rate_limit --jq .resources.search.remaining 2>/dev/null) || search_left=
+if test -n "${search_left}" && test "${search_left}" -lt "${#SEARCH_QUALIFIERS[@]}"; then
+    rate_limited "only ${search_left} search requests left" search
+fi
+threads=$(for qualifier in "${SEARCH_QUALIFIERS[@]}"; do
+    ghapi -X GET search/issues --paginate -f q="${qualifier}:${BOT_LOGIN} updated:>=${since}" \
+        -f per_page="${SEARCH_PER_PAGE}" \
+        --jq '.items[] | {url: .html_url, number, title, author: .user.login,
+                          repo: (.repository_url | ltrimstr("'"${API}"'/repos/")),
+                          is_pr: (.pull_request != null), body, reactions}' ||
+        fatal "searching for ${qualifier}:${BOT_LOGIN} failed"
+done | jq -sc 'unique_by(.url) | .[]')
+
+# 2. Collect every piece of bot-authored content in those threads, as
+# {url, thread, repo, number, title, kind, excerpt, reactions}.
+excerpt_jq="(.body // \"\" | gsub(\"\\\\s+\"; \" \") | if length > ${EXCERPT_LEN} then .[:${EXCERPT_LEN}] + \"...\" else . end)"
+content=$(while IFS= read -r thread; do
+    test -n "${thread}" || continue
+    repo=$(jq -r .repo <<<"${thread}")
+    number=$(jq -r .number <<<"${thread}")
+    meta=$(jq -c '{thread: .url, repo, number, title}' <<<"${thread}")
+    endpoints=("issues/${number}/comments")
+    if test "$(jq -r .is_pr <<<"${thread}")" = true; then
+        endpoints+=("pulls/${number}/comments")
+    fi
+    {
+        jq -c --arg bot "${BOT_LOGIN}" "select(.author == \$bot)
+            | {url, kind: (if .is_pr then \"PR description\" else \"issue description\" end),
+               excerpt: ${excerpt_jq}, reactions}" <<<"${thread}"
+        for ep in "${endpoints[@]}"; do
+            kind=comment
+            test "${ep}" = "${endpoints[0]}" || kind="review comment"
+            if ! ghapi --paginate "repos/${repo}/${ep}?per_page=100" \
+                --jq ".[] | select(.user.login == \"${BOT_LOGIN}\")
+                      | {url: .html_url, kind: \"${kind}\", excerpt: ${excerpt_jq}, reactions}"; then
+                warn "cannot list the ${kind}s in ${repo}#${number}; skipping them"
+            fi
+        done
+    } | jq -c --argjson meta "${meta}" '$meta + .'
+done <<<"${threads}")
+nthreads=$(grep -c . <<<"${threads}" || true)
+nitems=$(grep -c . <<<"${content}" || true)
+
+# 3. For content whose reaction counts changed since the last run (or that
+# is new to us and has any), fetch who reacted and pick out unseen ids.
+counts_jq='.reactions | del(.url, .total_count)'
+new_reactions=()
+while IFS= read -r item; do
+    test -n "${item}" || continue
+    url=$(jq -r .url <<<"${item}")
+    counts=$(jq -c "${counts_jq}" <<<"${item}")
+    if jq -e --arg url "${url}" --argjson counts "${counts}" \
+        '(.items[$url].counts // {}) as $old
+         | $old == $counts or ($old == {} and ($counts | add) == 0)' <<<"${STATE}" >/dev/null; then
+        continue
+    fi
+    reactions_url=$(jq -r .reactions.url <<<"${item}")
+    if ! current=$(ghapi --paginate "${reactions_url#"${API}"/}?per_page=100" \
+        --jq '.[] | {id: (.id | tostring), content, user: .user.login}' | jq -sc .); then
+        warn "cannot list the reactions on ${url}; will retry next run"
+        continue
+    fi
+    # Keep what we knew about reactions still present, add the new ones,
+    # and drop the ones that were removed.
+    prev=$(jq -c --arg url "${url}" '.items[$url].reactions // {}' <<<"${STATE}")
+    while IFS= read -r r; do
+        test -n "${r}" || continue
+        new_reactions+=("$(jq -c --argjson item "${item}" '. + {item: $item}' <<<"${r}")")
+    done < <(jq -c --argjson prev "${prev}" --arg ignore "${IGNORE_LOGINS}" \
+        '.[] | select($prev[.id] == null) | select(.user as $u | $ignore | split(" ") | index($u) | not)' <<<"${current}")
+    STATE=$(jq -c --arg url "${url}" --argjson counts "${counts}" --argjson current "${current}" \
+        --argjson prev "${prev}" --argjson item "${item}" --arg ignore "${IGNORE_LOGINS}" --argjson neg "${NEGATIVE_JQ}" '
+        .items[$url] = {counts: $counts, thread: $item.thread, repo: $item.repo,
+                        number: $item.number, title: $item.title, kind: $item.kind,
+                        excerpt: $item.excerpt,
+                        reactions: ($current | map({key: .id, value: {content, user,
+                            # Only negative reactions by others need filing;
+                            # everything else counts as already filed.
+                            filed: ($prev[.id].filed
+                                    // ((.content as $c | $neg | index($c)) == null
+                                        or (.user as $u | $ignore | split(" ") | index($u)) != null))}})
+                            | from_entries)}' <<<"${STATE}")
+done <<<"${content}"
+save_state
+
+# 4. Report.
+emoji() {
+    case "$1" in
+        +1) echo "👍" ;; -1) echo "👎" ;; laugh) echo "😄" ;; confused) echo "😕" ;;
+        heart) echo "❤️" ;; hooray) echo "🎉" ;; rocket) echo "🚀" ;; eyes) echo "👀" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+echo "Checked ${nitems} bot comments and descriptions in ${nthreads} threads updated since ${since}."
+if test "${#new_reactions[@]}" -eq 0; then
+    echo "No new reactions."
+else
+    # Negative first.
+    printf '%s\n' "${new_reactions[@]}" | jq -sc --argjson neg "${NEGATIVE_JQ}" \
+        'sort_by(.content as $c | $neg | index($c) | not) | .[]' |
+        while IFS= read -r r; do
+            content_=$(jq -r .content <<<"${r}")
+            jq -r --arg e "$(emoji "${content_}")" --argjson neg "${NEGATIVE_JQ}" '
+                "\(if (.content as $c | $neg | index($c)) then "NEGATIVE " else "" end)\($e) \(.content) from @\(.user) on the \(.item.kind) in \(.item.repo)#\(.item.number)",
+                "  \(.item.url)",
+                "  > \(.item.excerpt)"' <<<"${r}"
+        done
+fi
+
+# 5. File board items for negative reactions not yet filed. This also
+# picks up ones seen by an earlier run without --board.
+${board} || exit 0
+declare -A private_repo=()
+is_private() {
+    local repo=$1
+    if test -z "${private_repo[${repo}]:-}"; then
+        # Unknown visibility is treated as private.
+        private_repo[${repo}]=$(ghapi "repos/${repo}" --jq .private 2>/dev/null || echo true)
+    fi
+    test "${private_repo[${repo}]}" = true
+}
+pending=$(jq -c '.items | to_entries[] | .key as $url | .value as $item
+    | $item.reactions | to_entries[] | select(.value.filed == false)
+    | {id: .key, content: .value.content, user: .value.user, url: $url,
+       item: ($item | del(.reactions, .counts))}' <<<"${STATE}")
+nfiled=0
+while IFS= read -r p; do
+    test -n "${p}" || continue
+    id=$(jq -r .id <<<"${p}")
+    url=$(jq -r .url <<<"${p}")
+    repo=$(jq -r .item.repo <<<"${p}")
+    e=$(emoji "$(jq -r .content <<<"${p}")")
+    title=$(jq -r --arg e "${e}" '"Feedback: \($e) from @\(.user) on \(.item.repo)#\(.item.number)"' <<<"${p}")
+    # The board may be public: for a private repository, links only.
+    if is_private "${repo}"; then
+        body=$(jq -r --arg e "${e}" '"Source: \(.url)\n\n\($e) from @\(.user) on the bot'"'"'s \(.item.kind) (private repository).\n\nReaction id: \(.id)"' <<<"${p}")
+    else
+        body=$(jq -r --arg e "${e}" '"Source: \(.url)\n\n\($e) from @\(.user) on the bot'"'"'s \(.item.kind) in \(.item.thread) (\(.item.title))\n\n> \(.item.excerpt)\n\nReaction id: \(.id)"' <<<"${p}")
+    fi
+    why=$(jq -r --arg e "${e}" '"@\(.user) reacted \($e) to the bot'"'"'s \(.item.kind) (\(.url)); read the thread and decide what the bot should change."' <<<"${p}")
+    item_id=$("${BOT_BOARD}" draft "${title}" "${body}") || fatal "creating a board item for ${url} failed"
+    # Recorded before setting the fields, so a failure there can't lead
+    # to a duplicate item on the next run.
+    STATE=$(jq -c --arg url "${url}" --arg id "${id}" '.items[$url].reactions[$id].filed = true' <<<"${STATE}")
+    save_state
+    "${BOT_BOARD}" set "${item_id}" --priority P0 --status "Needs human" --workflow manual --why "${why}" >/dev/null ||
+        fatal "created ${item_id} for ${url}, but setting its fields failed; set P0, Needs human and manual by hand"
+    echo "Filed ${item_id}: ${title}"
+    nfiled=$((nfiled + 1))
+done <<<"${pending}"
+test "${nfiled}" -gt 0 || echo "No negative reactions to file on the board."
