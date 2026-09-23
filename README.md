@@ -41,10 +41,8 @@ People often react to the bot with an emoji rather than a comment, so
 `bot-feedback` reports new reactions on everything cgwalters-bot wrote
 (its comments and the issues and PRs it opened), and with `--board` files
 each new 👎 or 😕 as a P0 Needs human item. It is a plain script, not an
-agent session; `backlog-planning` runs it first, and
-`dotfiles/.config/systemd/user/bot-feedback.timer` runs it every two
-hours. `make install` puts the units in place but doesn't enable them:
-`systemctl --user enable --now bot-feedback.timer`.
+agent session; `backlog-planning` runs it first, and a scheduled job to
+run it is planned.
 
 ### Overnight working model
 
