@@ -90,6 +90,20 @@ Never commit to the fork's default branch; one topic branch per change.
 - AI disclosure per project policy; by default end each commit message with
   an `Assisted-by: AI` trailer.
 - Keep commits well-scoped; prep commits are welcome.
+- **Identity.** Every commit the bot creates or rewrites must say so. On a
+  machine whose global git identity is a human's (not a devspace with the
+  bot's dotfiles), run git with
+  `GIT_AUTHOR_NAME=cgwalters-bot GIT_AUTHOR_EMAIL=walters+llm@verbum.org
+  GIT_COMMITTER_NAME=cgwalters-bot GIT_COMMITTER_EMAIL=walters+llm@verbum.org`
+  for new commits, and at least the two `GIT_COMMITTER_*` variables for
+  rebases, which keep each commit's original author. Check with
+  `git log --format='%an <%ae> / %cn <%ce>'` before pushing.
+- **Never change the content of someone else's commits.** Especially a
+  signed-off one: its `Signed-off-by` would then vouch for code its author
+  never saw, and on an approved PR it silently changes what was approved.
+  A rebase that only resolves conflicts is fine. New code (fixes, review
+  follow-ups) goes in separate `fixup!` or `squash!` commits authored by the
+  bot, with the AI trailer, for the human to squash and re-sign.
 
 ## Verify
 

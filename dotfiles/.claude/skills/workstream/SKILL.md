@@ -232,7 +232,8 @@ unprompted. The output instead is, by Workflow:
 
 - **branch**: a branch on the bot's fork with the proposed fixup commits
   on top of his PR head (`gh pr checkout` in a clone of the bot's fork,
-  then commit with `--fixup` so he can squash them), pushed to
+  then commit with `--fixup` so he can squash them; never amend or
+  autosquash into his commits, see `upstream-pr`), pushed to
   `cgwalters-bot/REPO`. Link it as a compare against his PR's head branch,
   so the diff shows only the fixups, e.g.
   `Fixups for the clippy failure: https://github.com/cgwalters/REPO/compare/<pr-branch>...cgwalters-bot:bot/<short-slug>`.
