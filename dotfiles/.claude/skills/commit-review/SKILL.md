@@ -59,7 +59,7 @@ Specifically avoid in the body:
 - Restating the subject line in prose
 
 Trailers to check:
-- `Assisted-by:` present (unless the project explicitly prohibits it)
+- AI trailer present: `Generated-by: AI` by default, `Assisted-by: AI` if a human wrote a substantial part (unless the project says otherwise)
 - No `Signed-off-by:` (that's for the human to add manually before push)
 - `Closes: #N` if the commit resolves a tracked issue
 

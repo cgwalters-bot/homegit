@@ -88,7 +88,8 @@ Never commit to the fork's default branch; one topic branch per change.
   requires DCO sign-off, leave it out anyway and note in the PR that a human
   needs to sign off before merge.
 - AI disclosure per project policy; by default end each commit message with
-  an `Assisted-by: AI` trailer.
+  a `Generated-by: AI` trailer (`Assisted-by: AI` only when a human wrote
+  a substantial part of the change).
 - Keep commits well-scoped; prep commits are welcome.
 - **Identity.** Every commit the bot creates or rewrites must say so. On a
   machine whose global git identity is a human's (not a devspace with the
