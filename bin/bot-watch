@@ -36,8 +36,9 @@ readonly ETAG_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-watch/etags
 readonly LOCK_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-watch
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
-# Returned by rest_get() when GitHub says the resource does not exist.
-readonly EX_NOTFOUND=4
+# Returned by rest_get() and ghapi() when GitHub says the resource does
+# not exist (any more): EX_NOINPUT, distinct from gh's own exit statuses.
+readonly EX_NOTFOUND=66
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
 
@@ -141,13 +142,13 @@ scratch=$(mktemp -d)
 trap 'rm -rf "${scratch}"' EXIT
 
 # ghapi ARGS...: 'gh api', turning rate limiting into a clear exit and a
-# 404 into EX_NOTFOUND.
+# 404 or 410 into EX_NOTFOUND.
 ghapi() {
     local rc=0
     gh api "$@" 2>"${scratch}/err" || rc=$?
     if test "${rc}" -ne 0; then
         check_rate_limit "${scratch}/err"
-        grep -q 'HTTP 404' "${scratch}/err" && return "${EX_NOTFOUND}"
+        grep -qE 'HTTP (404|410)' "${scratch}/err" && return "${EX_NOTFOUND}"
         cat "${scratch}/err" 1>&2
     fi
     return "${rc}"
@@ -180,7 +181,7 @@ rest_get() {
             fi
             cat "${scratch}/body"
             ;;
-        404) return "${EX_NOTFOUND}" ;;
+        404|410) return "${EX_NOTFOUND}" ;;
         *)
             check_rate_limit "${scratch}/err"
             cat "${scratch}/err" 1>&2
@@ -239,11 +240,11 @@ excerpt_jq="def excerpt: (. // \"\") | [splits(\"\\r?\\n\") | select(test(\"\\\\
 # check runs and commit statuses of SHA, plus the failing names:
 # {checks, failing}.
 checks_state() {
+    local runs status
+    runs=$(rest_get "repos/$1/commits/$2/check-runs?per_page=${CHECKS_PER_PAGE}") || return
+    status=$(rest_get "repos/$1/commits/$2/status") || return
     # Too big for jq's argument list.
-    {
-        rest_get "repos/$1/commits/$2/check-runs?per_page=${CHECKS_PER_PAGE}" || exit 1
-        rest_get "repos/$1/commits/$2/status" || exit 1
-    } | jq -sc '.[0] as $runs | .[1] as $status
+    printf '%s\n%s\n' "${runs}" "${status}" | jq -sc '.[0] as $runs | .[1] as $status
         | ([$runs.check_runs[] | select(.conclusion | IN("failure", "timed_out", "startup_failure")) | .name]
          + [$status.statuses[] | select(.state | IN("failure", "error")) | .context]) as $failing
         | {failing: $failing,
@@ -252,6 +253,12 @@ checks_state() {
                          or ($status.total_count > 0 and $status.state == "pending") then "pending"
                     elif ($runs.total_count + $status.total_count) > 0 then "success"
                     else "none" end)}'
+}
+
+# sub_status STATUS: the status for probe to return after a failed
+# secondary fetch: only its main resource missing means it is gone.
+sub_status() {
+    if test "$1" -eq "${EX_NOTFOUND}"; then echo 1; else echo "$1"; fi
 }
 
 # probe URL PREV: prints {cur, changes, info} for one issue or PR, where
@@ -289,15 +296,15 @@ probe() {
         local found
         found=$({
             ghapi --paginate "repos/${repo}/issues/${number}/comments?per_page=100&since=${prev_updated}" \
-                --jq '.[] | {type: "comment", author: .user.login, at: .created_at, link: .html_url, body}' || exit 1
+                --jq '.[] | {type: "comment", author: .user.login, at: .created_at, link: .html_url, body}' || exit
             if test "${kind}" = pull; then
                 ghapi --paginate "repos/${repo}/pulls/${number}/reviews?per_page=100" \
-                    --jq '.[] | {type: "review", author: .user.login, at: .submitted_at, link: .html_url, body, review_state: .state}' || exit 1
+                    --jq '.[] | {type: "review", author: .user.login, at: .submitted_at, link: .html_url, body, review_state: .state}' || exit
             fi
         } | jq -sc --arg since "${prev_updated}" --arg bot "${BOT_LOGIN}" --arg req "${REQUESTER}" "${excerpt_jq}"'
             [.[] | select(.author != $bot and (.at // "") > $since)
                  | .excerpt = (.body | excerpt) | del(.body)
-                 | .from_requester = (.author == $req)] | sort_by(.at)') || return 1
+                 | .from_requester = (.author == $req)] | sort_by(.at)') || return "$(sub_status $?)"
         changes=$(jq -c --argjson f "${found}" '. + $f' <<<"${changes}")
     fi
 
@@ -311,7 +318,7 @@ probe() {
         prev_head=$(jq -r '.head_sha // empty' <<<"${prev}")
         if test -n "${prev_head}" && test "${prev_head}" != "${head}"; then
             local commit by
-            commit=$(rest_get "repos/${repo}/commits/${head}") || return 1
+            commit=$(rest_get "repos/${repo}/commits/${head}") || return "$(sub_status $?)"
             # Who committed it is the best guess at who pushed it, unless
             # GitHub did (web-flow: a merge or "update branch" button).
             by=$(jq -r '(.committer.login // "") as $c
@@ -322,7 +329,7 @@ probe() {
             fi
         fi
         local ci prev_checks checks
-        ci=$(checks_state "${repo}" "${head}") || return 1
+        ci=$(checks_state "${repo}" "${head}") || return "$(sub_status $?)"
         checks=$(jq -r .checks <<<"${ci}")
         cur=$(jq -c --arg c "${checks}" '.checks = $c' <<<"${cur}")
         prev_checks=$(jq -r '.checks // empty' <<<"${prev}")
@@ -351,9 +358,13 @@ while IFS= read -r url; do
     test -n "${url}" || continue
     prev=$(jq -c --arg u "${url}" '.[$u]' <<<"${seen}")
     rc=0
-    r=$(probe "${url}" "${prev}") || rc=$?
+    # In the background, because in 'r=$(probe ...) || rc=$?' errexit would
+    # be off throughout probe; this way a failing step stops it.
+    probe "${url}" "${prev}" >"${scratch}/probe.json" &
+    wait "$!" || rc=$?
     case "${rc}" in
         0)
+            r=$(<"${scratch}/probe.json")
             results=$(jq -c --arg u "${url}" --argjson r "${r}" '.[$u] = $r' <<<"${results}")
             new_seen=$(jq -c --arg u "${url}" --argjson r "${r}" '.[$u] = $r.cur' <<<"${new_seen}")
             test "${prev}" != null || new_urls=$(jq -c --arg u "${url}" '. + [$u]' <<<"${new_urls}")
@@ -467,7 +478,7 @@ else
                 elif .type == "push" then "pushed by @\(.by): \(.from | short) -> \(.to | short)"
                 elif .type == "ci_red" then "CI failing\(if .bot_branch then " on the bot'"'"'s branch" else "" end) at \(.head | short): \(.failing | join(", "))"
                 elif .type == "ci_green" then "CI passing again at \(.head | short)"
-                elif .type == "gone" then "gone (404): deleted, or no longer public"
+                elif .type == "gone" then "gone (404 or 410): deleted, or no longer public"
                 else tojson end))),
         (.actions[] | "  -> \(.url | repo_ref) was \(.reason): set \(.status)"
             + if .result == "applied" then " (done)"
