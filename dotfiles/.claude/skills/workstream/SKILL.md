@@ -188,11 +188,13 @@ again. On the bot's fork PRs (its own PRs in cgwalters-forge and
 cgwalters-bot repositories) it only reports pushes and CI, since
 `bot-pr inbox` covers his review there; other issues and PRs in those
 repositories get the full report. `--json` prints the same as one
-object. `--apply` does the bookkeeping itself: an item whose upstream PR
-merged goes Done, and one whose upstream PR was closed unmerged goes
-Needs human with the question in Why, but only from Todo, Draft or In
-Review; for other statuses it just suggests the change. Everything else
-is yours to act on:
+object. `--apply` does the bookkeeping itself, but only when that sweep
+saw one of the item's PRs merge or close, only once none of them (its
+fork PRs included) is still open, and only from Todo,
+Draft or In Review: with a PR merged the item goes Done; with all its
+upstream PRs closed unmerged it goes Needs human with the question in
+Why. For other statuses (In Progress, Needs human) it only suggests the
+change, once, and you decide. Everything else is yours to act on:
 
 - A comment by cgwalters on an item is his input: an answer to a Needs
   human question (move it back to In Progress), review to address on
@@ -385,8 +387,10 @@ on what `bot-watch` reported for In Review and Needs human items before
 taking new Todo work: a reviewer may have left comments to address on
 the bot's own upstream PR (handle them with fixup commits per
 `upstream-pr`, and keep the status In Review), or cgwalters may have
-answered your question (move back to In Progress). Merged PRs were
-already moved to Done by `bot-watch --apply`.
+answered your question (move back to In Progress). An In Review item
+whose PR merged was already moved to Done by `bot-watch --apply`; for a
+Needs human or In Progress one it only suggested Done, so decide
+yourself (anything left to do on it?).
 
 Only an answer from cgwalters unblocks a Needs human item: an edit to the
 board item itself (its Why field or draft body), or a comment whose author is

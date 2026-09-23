@@ -61,15 +61,18 @@ On the bot's fork PRs (its PRs in ${FORK_OWNERS}) only pushes and CI
 are reported; 'bot-pr inbox' covers cgwalters' review there. A URL seen for
 the first time is only recorded, unless CI on the bot's branch fails.
 
-Then suggest board bookkeeping: an item whose upstream PRs were merged
-(one at least, the rest closed) is ${MERGED_STATUS}; one whose upstream PRs were all
-closed without merging needs a human.
-Only --apply makes these changes, through bot-board, and only for items in
-${APPLY_FROM}.
+Then suggest board bookkeeping, for an item one of whose PRs this sweep
+saw merge or close (open at the last sweep), once none of the PRs it
+lists (fork PRs included) is open: with one of its upstream PRs merged
+it is ${MERGED_STATUS}; with all of them closed unmerged it needs a human.
+Only --apply makes these changes, through bot-board (on a fresh board
+listing), and only for items in ${APPLY_FROM}. Each change is suggested
+once: the next sweep sees no transition any more.
 
 Options:
   --dry-run   Report only: apply nothing and keep the last-seen state
-  --apply     Make the suggested status changes
+  --apply     Make the suggested status changes (a run without --apply
+              or --dry-run only reports them, and the next doesn't)
   --json      Print one JSON object for agents instead of the report
   -h, --help  Show this help
 
@@ -80,7 +83,8 @@ write only when something changed), and must stay under the ~64KB a
 draft body holds (a few hundred URLs). It advances per URL: one that could
 not be read keeps its last-seen state, so a later sweep reports its
 changes, and the sweep exits nonzero. The board listing comes from
-bot-board's cache; everything else is REST, with ETags.
+bot-board's cache (refreshed for --apply); everything else is REST, with
+ETags.
 EOF
 }
 
@@ -209,7 +213,10 @@ if test -n "${board_file}"; then
         fatal "--board-file ${board_file} is not a 'bot-board list --json' array"
     warn "testing: sweeping the items in ${board_file}; board changes are only printed"
 else
-    board=$("${BOT_BOARD}" list --json) || board_failed $? "listing the board failed"
+    # Changing statuses by a stale listing could undo a recent move.
+    refresh=()
+    ! ${apply} || ${dry_run} || refresh=(--refresh)
+    board=$("${BOT_BOARD}" "${refresh[@]}" list --json) || board_failed $? "listing the board failed"
 fi
 if test -n "${state_file}"; then
     state=$(if test -s "${state_file}"; then cat "${state_file}"; else echo '{}'; fi)
@@ -348,8 +355,8 @@ probe() {
         # Closed: nothing runs any more; keep what was last seen.
         cur=$(jq -c --arg c "$(jq -r '.checks // empty' <<<"${prev}")" '.checks = (if $c == "" then null else $c end)' <<<"${cur}")
     fi
-    jq -cn --argjson cur "${cur}" --argjson changes "${changes}" --argjson info "${info}" \
-        '{cur: $cur, changes: $changes, info: $info}'
+    jq -cn --argjson cur "${cur}" --argjson changes "${changes}" --argjson info "${info}" --arg prev_state "${prev_state}" \
+        '{cur: $cur, changes: $changes, info: $info, prev_state: $prev_state}'
 }
 
 results='{}'
@@ -393,7 +400,7 @@ done < <(jq -r '.[].url' <<<"${watch}")
 
 # Through a file: it can outgrow an argument.
 printf '%s\n' "${results}" >"${scratch}/results.json"
-report=$(jq -c --slurpfile results "${scratch}/results.json" --argjson gone "${gone}" \
+report=$(jq -c --slurpfile results "${scratch}/results.json" --argjson gone "${gone}" --argjson failed "${failed}" \
     --argjson apply_from "${APPLY_FROM}" --arg merged_status "${MERGED_STATUS}" --arg closed_status "${CLOSED_STATUS}" '
     $results[0] as $results
     | [.[] | . as $w | .items[] | {item: ., url: $w.url}]
@@ -402,25 +409,50 @@ report=$(jq -c --slurpfile results "${scratch}/results.json" --argjson gone "${g
         | [$urls[] | select($results[.] != null) | {url: ., r: $results[.]}] as $probed
         | ([$probed[] | .url as $u | .r.changes[] | {url: $u} + .]
            + [$urls[] | select(. as $u | $gone | index($u)) | {url: ., type: "gone"}]) as $changes
-        | [$probed[] | select(.r.info.kind == "pr" and (.r.info.fork | not))] as $upstream
-        # Done once one merged and none is still open (a backport, say).
-        | [if any($upstream[]; .r.cur.state == "merged") and all($upstream[]; .r.cur.state != "open") then
-               {status: $merged_status, reason: "merged", url: ([$upstream[] | select(.r.cur.state == "merged") | .url] | first)}
-           elif ($item.status // "") != $closed_status and ($upstream | length) > 0
-                and all($upstream[]; .r.cur.state == "closed") then
-               {status: $closed_status, reason: "closed", url: ($upstream[0].url)}
+        | [$probed[] | select(.r.info.kind == "pr")] as $prs
+        | [$prs[] | select(.r.info.fork | not)] as $upstream
+        # Only what this sweep saw happen: the current state alone would
+        # redo (or undo) a human'"'"'s triage on every sweep. The last of its
+        # PRs to end may be the bot'"'"'s fork PR of a redo.
+        | [$prs[] | select(.r.prev_state == "open" and .r.cur.state != "open")] as $ended
+        # Unknown because a URL failed: decided by a later sweep.
+        | (($ended | length) > 0 and any($urls[]; . as $u | $failed | index($u))) as $retry
+        | [if ($ended | length) == 0 or $retry or any($prs[]; .r.cur.state == "open") then empty
+           elif any($upstream[]; .r.cur.state == "merged") then
+               {status: $merged_status, reason: "merged",
+                url: ([$upstream[] | select(.r.cur.state == "merged") | .url] | first)}
+           elif ($upstream | length) > 0 then
+               {status: $closed_status, reason: "closed",
+                url: ([$ended[] | select(.r.info.fork | not) | .url] + [$upstream[0].url] | first)}
            else empty end] as $actions
         | {id: $item.id, title: $item.title, status: $item.status, workflow: $item.workflow, why: $item.why,
-           changes: $changes,
-           actions: [$actions[] | . + {allowed: (($item.status // "") as $s | $apply_from | index($s) != null)}]})
-    | map(select((.changes | length) > 0 or (.actions | length) > 0))' <<<"${watch}")
+           changes: $changes, retry: $retry,
+           actions: [$actions[] | . + {allowed: (($item.status // "") as $s | $apply_from | index($s) != null)}]})' <<<"${watch}")
+retry_ids=$(jq -r '.[] | select(.retry) | .id' <<<"${report}")
+report=$(jq -c 'map(select((.changes | length) > 0 or (.actions | length) > 0) | del(.retry))' <<<"${report}")
+
+# keep_last_seen ITEM: puts the URLs of ITEM back to their last-seen
+# state, so that the next sweep sees their transitions again (and
+# reports their other changes again, also for other items sharing them).
+keep_last_seen() {
+    new_seen=$(jq -c --arg id "$1" --argjson seen "${seen}" --argjson watch "${watch}" \
+        'reduce ($watch[] | select(any(.items[]; .id == $id)) | .url) as $u (.;
+            if $seen | has($u) then .[$u] = $seen[$u] else del(.[$u]) end)' <<<"${new_seen}")
+}
+while IFS= read -r id; do
+    test -z "${id}" || keep_last_seen "${id}"
+done <<<"${retry_ids}"
 
 # why_for ITEM ACTION: the Why of an item moved to CLOSED_STATUS: the
-# question first, then as much of the old Why as fits.
+# question first, then as much of the old Why as fits, without an
+# earlier question.
 why_for() {
     jq -r --argjson max "${WHY_MAX}" '.[1] as $a | .[0] as $i
         | "Q: \($a.url) was closed without merging; drop this (Done) or redo it?" as $q
-        | if ($i.why // "") == "" then $q else "\($q) | was: \($i.why)" end
+        | " | was: " as $sep
+        | ($i.why // "") as $old
+        | (if $old | startswith("Q: ") then $old | split($sep) | .[1:] | join($sep) else $old end) as $old
+        | if $old == "" then $q else "\($q)\($sep)\($old)" end
         | if length > $max then .[:$max - 3] + "..." else . end' <<<"[$1, $2]"
 }
 
@@ -443,9 +475,10 @@ while IFS= read -r entry; do
     else
         rc=$?
         test "${rc}" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
-        warn "setting ${id} to ${status} failed"
+        warn "setting ${id} to ${status} failed; the next sweep retries it"
         result=failed
         napply_failed=$((napply_failed + 1))
+        keep_last_seen "${id}"
     fi
     report=$(jq -c --arg id "${id}" --arg r "${result}" \
         'map(if .id == $id then .actions |= map(if .allowed then .result = $r else . end) else . end)' <<<"${report}")

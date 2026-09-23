@@ -57,9 +57,10 @@ pass for now; running it on a schedule comes later.
 Pings are only part of it: `bot-watch` sweeps the issues and PRs of the
 items on the board and reports what changed on each since it last
 looked (new comments and reviews, merges and closes, pushes by others,
-CI going red), and with `--apply` moves items whose upstream PR merged to
-Done, and those closed unmerged to Needs human. Its last-seen state is
-another archived item, `bot-state: watch`.
+CI going red), and with `--apply`, when it sees an item's upstream PR
+merge or close, moves it to Done or Needs human (from Todo, Draft or In
+Review only). Its last-seen state is another archived item,
+`bot-state: watch`.
 
 ### Overnight working model
 
