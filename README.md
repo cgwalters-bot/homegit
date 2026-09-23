@@ -38,10 +38,10 @@ activity (the last week, or `--since YYYY-MM-DD`) and adds candidate items
 to the board for triage.
 
 People often react to the bot with an emoji rather than a comment, so
-`bot-feedback` reports new reactions on everything cgwalters-bot wrote
-(its comments and the issues and PRs it opened), and with `--board` files
-each new 👎 or 😕 as a P0 Needs human item. It is a plain script, not an
-agent session; `backlog-planning` runs it first, and a scheduled job to
+the `bot-feedback` skill has an agent review each new 👎 or 😕 on
+everything cgwalters-bot wrote and file it, with an assessment, as an
+issue on [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues)
+for cgwalters; `backlog-planning` runs it first, and a scheduled job to
 run it is planned.
 
 ### Overnight working model

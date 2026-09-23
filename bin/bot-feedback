@@ -23,28 +23,45 @@ readonly SEARCH_PER_PAGE=100
 readonly EXCERPT_LEN=160
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
-BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
-readonly BOT_BOARD
+# Where --file-issues files feedback, and who it notifies there.
+readonly DEFAULT_ISSUE_REPO=cgwalters-bot/cgwalters-bot
+readonly MENTION_LOGIN=cgwalters
+# Hidden marker in each filed issue's body, so a reaction is never filed
+# twice even if the state file is lost.
+readonly MARKER_PREFIX='bot-feedback-reaction:'
+# jq def that keeps "@login" in text from notifying anyone.
+readonly UNMENTION_JQ='def unmention: gsub("@(?=[A-Za-z0-9])"; "@\u200b");'
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--since DATE] [--board] [--dry-run]
+Usage: $(basename "$0") [--since DATE] [--dry-run]
+       $(basename "$0") [--since DATE] --file-issues [--repo OWNER/REPO]
+                    [--assessment-dir DIR] [--no-mention]
 
 Report new emoji reactions on content authored by ${BOT_LOGIN}: the bodies
 of issues and PRs it opened, its issue and PR comments, and its inline PR
 review comments, in threads updated since the lookback window started.
+Then list the negative reactions (👎, 😕) not filed yet, with their ids.
 
 Options:
-  --since DATE  Look at threads updated since DATE (default: ${DEFAULT_LOOKBACK_DAYS} days ago)
-  --board       Create a Workstream board item (P0, Needs human, manual)
-                for each new 👎 or 😕, via bot-board
-  --dry-run     Report, but don't record anything in the state file
-  -h, --help    Show this help
+  --since DATE          Look at threads updated since DATE (default: ${DEFAULT_LOOKBACK_DAYS} days ago)
+  --dry-run             Report, but don't record anything in the state file
+  --file-issues         Open one issue per unfiled negative reaction, in
+                        ${DEFAULT_ISSUE_REPO} unless --repo is given
+  --repo OWNER/REPO     Repository to file issues in
+  --assessment-dir DIR  Include the text of DIR/REACTION_ID.md in the issue
+                        for that reaction; reactions without such a file
+                        are left unfiled for a later run
+  --no-mention          Don't mention @${MENTION_LOGIN} in filed issues (for testing)
+  -h, --help            Show this help
 
-Only reactions not seen before are reported; what was seen is kept in
-${STATE_FILE}.
+Only reactions not seen before are reported; what was seen and filed is
+kept in ${STATE_FILE}.
 Reactions by these logins are never reported: ${IGNORE_LOGINS:-(none)}
 (set BOT_FEEDBACK_IGNORE to a space-separated list to change that).
+
+When the source repository isn't public, a filed issue has links only: no
+excerpt of the bot's text and no assessment.
 
 Limitations: only REST is used, since the GraphQL quota is shared by all
 agents, and REST exposes no reactions on the summary body of a PR review.
@@ -93,20 +110,35 @@ ghapi() {
 }
 
 since=
-board=false
+file_issues=false
+issue_repo=${DEFAULT_ISSUE_REPO}
+assessment_dir=
+mention=true
 dry_run=false
 while test $# -gt 0; do
     case "$1" in
         --since) test $# -ge 2 || fatal "--since requires a date"; since=$2; shift 2 ;;
         --since=*) since=${1#--since=}; shift ;;
-        --board) board=true; shift ;;
+        --file-issues) file_issues=true; shift ;;
+        --repo) test $# -ge 2 || fatal "--repo requires OWNER/REPO"; issue_repo=$2; shift 2 ;;
+        --repo=*) issue_repo=${1#--repo=}; shift ;;
+        --assessment-dir) test $# -ge 2 || fatal "--assessment-dir requires a directory"; assessment_dir=$2; shift 2 ;;
+        --assessment-dir=*) assessment_dir=${1#--assessment-dir=}; shift ;;
+        --no-mention) mention=false; shift ;;
         --dry-run) dry_run=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) fatal "unknown argument: $1 (see --help)" ;;
     esac
 done
-if ${board} && ${dry_run}; then
-    fatal "--board and --dry-run can't be combined: filed items would not be recorded, and would be filed again"
+if ${file_issues} && ${dry_run}; then
+    fatal "--file-issues and --dry-run can't be combined: filed issues would not be recorded"
+fi
+if ! ${file_issues} && { test "${issue_repo}" != "${DEFAULT_ISSUE_REPO}" || test -n "${assessment_dir}" || ! ${mention}; }; then
+    fatal "--repo, --assessment-dir and --no-mention only apply with --file-issues"
+fi
+[[ "${issue_repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fatal "--repo must be OWNER/REPO, not '${issue_repo}'"
+if test -n "${assessment_dir}"; then
+    test -d "${assessment_dir}" || fatal "--assessment-dir ${assessment_dir} is not a directory"
 fi
 if test -z "${since}"; then
     since=$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%F)
@@ -117,22 +149,20 @@ fi
 require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${BOT_LOGIN}"
 require_cmd jq "install jq"
 require_cmd flock "install util-linux"
-if ${board}; then
-    test -x "${BOT_BOARD}" || fatal "--board needs bot-board next to this script (${BOT_BOARD})"
-fi
 
 login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
 test "${login}" = "${BOT_LOGIN}" ||
     fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}; searches would miss private repositories only the bot can see"
 
-# A timer run and a manual run must not both update the state.
+# Two runs (say, by two agents) must not both update the state or file.
 mkdir -p "${STATE_DIR}"
 exec {lock_fd}>"${STATE_DIR}/lock" || fatal "cannot open ${STATE_DIR}/lock"
 flock -n "${lock_fd}" || fatal "another $(basename "$0") run holds ${STATE_DIR}/lock"
 
 # State: {version, items: {URL: {counts: {REACTION: N}, reactions: {ID:
 # {content, user, filed}}}}}. Reactions are keyed by id, so a new one is
-# one whose id was never seen; 'filed' records that --board made an item.
+# one whose id was never seen; 'filed' records that the reaction needs no
+# issue or --file-issues opened one (then its URL is in 'issue').
 if test -s "${STATE_FILE}"; then
     STATE=$(jq -c --argjson v "${STATE_VERSION}" 'if .version == $v then . else error("unsupported state version \(.version)") end' "${STATE_FILE}") ||
         fatal "cannot parse ${STATE_FILE}; move it away to start over (all current reactions will then be reported as new)"
@@ -223,12 +253,13 @@ while IFS= read -r item; do
         .items[$url] = {counts: $counts, thread: $item.thread, repo: $item.repo,
                         number: $item.number, title: $item.title, kind: $item.kind,
                         excerpt: $item.excerpt,
-                        reactions: ($current | map({key: .id, value: {content, user,
+                        reactions: ($current | map({key: .id, value: ({content, user,
                             # Only negative reactions by others need filing;
                             # everything else counts as already filed.
                             filed: ($prev[.id].filed
                                     // ((.content as $c | $neg | index($c)) == null
-                                        or (.user as $u | $ignore | split(" ") | index($u)) != null))}})
+                                        or (.user as $u | $ignore | split(" ") | index($u)) != null))}
+                            + ($prev[.id] | if .issue then {issue} else {} end))})
                             | from_entries)}' <<<"${STATE}")
 done <<<"${content}"
 save_state
@@ -258,45 +289,92 @@ else
         done
 fi
 
-# 5. File board items for negative reactions not yet filed. This also
-# picks up ones seen by an earlier run without --board.
-${board} || exit 0
+
+# 5. List the negative reactions not filed yet, including ones seen by an
+# earlier run, with the ids that name their assessment files.
+pending=$(jq -c '.items | to_entries[] | .key as $url | .value as $item
+    | $item.reactions | to_entries[] | select(.value.filed == false)
+    | {id: .key, content: .value.content, user: .value.user, url: $url,
+       item: ($item | del(.reactions, .counts))}' <<<"${STATE}")
+if test -z "${pending}"; then
+    echo "No negative reactions left to file."
+    exit 0
+fi
+echo
+echo "Negative reactions not filed yet:"
+while IFS= read -r p; do
+    jq -r --arg e "$(emoji "$(jq -r .content <<<"${p}")")" \
+        '"  reaction \(.id): \($e) from @\(.user) on the \(.item.kind) in \(.item.repo)#\(.item.number)\n    \(.url)"' <<<"${p}"
+done <<<"${pending}"
+
+# 6. File them as issues.
+${file_issues} || exit 0
 declare -A private_repo=()
 is_private() {
     local repo=$1
     if test -z "${private_repo[${repo}]:-}"; then
         # Unknown visibility is treated as private.
-        private_repo[${repo}]=$(ghapi "repos/${repo}" --jq .private 2>/dev/null || echo true)
+        private_repo[${repo}]=$(ghapi "repos/${repo}" --jq '.visibility != "public"' 2>/dev/null || echo true)
     fi
     test "${private_repo[${repo}]}" = true
 }
-pending=$(jq -c '.items | to_entries[] | .key as $url | .value as $item
-    | $item.reactions | to_entries[] | select(.value.filed == false)
-    | {id: .key, content: .value.content, user: .value.user, url: $url,
-       item: ($item | del(.reactions, .counts))}' <<<"${STATE}")
+is_private "${issue_repo}" && warn "${issue_repo} is not public; filing there anyway"
+# Reactions already filed in the target repository, per the markers in
+# issue bodies. Listing is exact where search would lag, and the repo is
+# small.
+filed_markers=$(ghapi --paginate "repos/${issue_repo}/issues?state=all&per_page=100" \
+    --jq ".[] | .html_url as \$u | .body // \"\" | scan(\"${MARKER_PREFIX}([0-9]+)\") | \"\(.[0]) \(\$u)\"") ||
+    fatal "cannot list the issues in ${issue_repo}; does it exist, with issues enabled?"
+# record_filed ID URL ISSUE_URL: mark a reaction as filed, right away, so
+# a later failure can't lead to a duplicate.
+record_filed() {
+    STATE=$(jq -c --arg url "$2" --arg id "$1" --arg issue "$3" \
+        '.items[$url].reactions[$id] += {filed: true, issue: $issue}' <<<"${STATE}")
+    save_state
+}
 nfiled=0
+nskipped=0
 while IFS= read -r p; do
-    test -n "${p}" || continue
     id=$(jq -r .id <<<"${p}")
     url=$(jq -r .url <<<"${p}")
     repo=$(jq -r .item.repo <<<"${p}")
+    existing=$(awk -v id="${id}" '$1 == id { print $2; exit }' <<<"${filed_markers}")
+    if test -n "${existing}"; then
+        echo "Reaction ${id} is already filed as ${existing}; recording that"
+        record_filed "${id}" "${url}" "${existing}"
+        continue
+    fi
+    assessment="_Not assessed._"
+    if test -n "${assessment_dir}"; then
+        if ! test -s "${assessment_dir}/${id}.md"; then
+            warn "no ${assessment_dir}/${id}.md; leaving reaction ${id} (${url}) for a later run"
+            nskipped=$((nskipped + 1))
+            continue
+        fi
+        assessment=$(<"${assessment_dir}/${id}.md")
+    fi
     e=$(emoji "$(jq -r .content <<<"${p}")")
     title=$(jq -r --arg e "${e}" '"Feedback: \($e) from @\(.user) on \(.item.repo)#\(.item.number)"' <<<"${p}")
-    # The board may be public: for a private repository, links only.
+    # The target repository is public: for any other source, links only.
+    # Only MENTION_LOGIN is to be notified, so '@' in the reactor's login,
+    # the quoted text and the assessment gets a zero-width space.
     if is_private "${repo}"; then
-        body=$(jq -r --arg e "${e}" '"Source: \(.url)\n\n\($e) from @\(.user) on the bot'"'"'s \(.item.kind) (private repository).\n\nReaction id: \(.id)"' <<<"${p}")
+        body=$(jq -r --arg e "${e}" "${UNMENTION_JQ}"'
+            "\($e) from \("@" + .user | unmention) on the bot'"'"'s \(.item.kind): \(.url)\n\nThread: \(.item.thread)\n\nThe source repository is not public, so there is no excerpt or assessment here; read the thread."' <<<"${p}")
     else
-        body=$(jq -r --arg e "${e}" '"Source: \(.url)\n\n\($e) from @\(.user) on the bot'"'"'s \(.item.kind) in \(.item.thread) (\(.item.title))\n\n> \(.item.excerpt)\n\nReaction id: \(.id)"' <<<"${p}")
+        body=$(jq -r --arg e "${e}" --arg assessment "${assessment}" "${UNMENTION_JQ}"'
+            "\($e) from \("@" + .user | unmention) on the bot'"'"'s \(.item.kind): \(.url)\n\nThread: \(.item.thread) (\(.item.title))\n\n> \(.item.excerpt | unmention)\n\n## Assessment\n\n\($assessment | unmention)"' <<<"${p}")
     fi
-    why=$(jq -r --arg e "${e}" '"@\(.user) reacted \($e) to the bot'"'"'s \(.item.kind) (\(.url)); read the thread and decide what the bot should change."' <<<"${p}")
-    item_id=$("${BOT_BOARD}" draft "${title}" "${body}") || fatal "creating a board item for ${url} failed"
-    # Recorded before setting the fields, so a failure there can't lead
-    # to a duplicate item on the next run.
-    STATE=$(jq -c --arg url "${url}" --arg id "${id}" '.items[$url].reactions[$id].filed = true' <<<"${STATE}")
-    save_state
-    "${BOT_BOARD}" set "${item_id}" --priority P0 --status "Needs human" --workflow manual --why "${why}" >/dev/null ||
-        fatal "created ${item_id} for ${url}, but setting its fields failed; set P0, Needs human and manual by hand"
-    echo "Filed ${item_id}: ${title}"
+    if ${mention}; then
+        body+=$'\n\n'"@${MENTION_LOGIN}, please take a look."
+    fi
+    body+=$'\n\n'"<!-- ${MARKER_PREFIX}${id} -->"
+    issue_url=$(ghapi -X POST "repos/${issue_repo}/issues" -f title="${title}" -f body="${body}" --jq .html_url) ||
+        fatal "creating an issue in ${issue_repo} for ${url} failed"
+    record_filed "${id}" "${url}" "${issue_url}"
+    echo "Filed ${issue_url}: ${title}"
     nfiled=$((nfiled + 1))
 done <<<"${pending}"
-test "${nfiled}" -gt 0 || echo "No negative reactions to file on the board."
+summary="Filed ${nfiled} issues in ${issue_repo}"
+test "${nskipped}" -eq 0 || summary+="; ${nskipped} left without an assessment"
+echo "${summary}."

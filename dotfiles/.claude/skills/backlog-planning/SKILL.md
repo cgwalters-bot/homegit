@@ -14,7 +14,9 @@ the `bot-board` tool) so a human can triage it.
 label, assign, react to, or edit any issue or PR while planning. The only
 write commands allowed are `bot-board add`, `bot-board draft` and
 `bot-board set` (or the `gh project item-add`, `item-create` and
-`item-edit` calls they wrap) against project 1 of `cgwalters-bot`.
+`item-edit` calls they wrap) against project 1 of `cgwalters-bot`, and
+`bot-feedback --file-issues` (section 0), which files issues on the bot's
+own repository.
 
 Board calls spend the bot's GraphQL quota, which every agent shares, and so
 do `gh pr` and `gh issue`; `gh search` uses the REST search API, which
@@ -50,16 +52,13 @@ Everything below uses public APIs and works with the bot's own token.
 
 ## 0. Surface feedback on the bot
 
-Start every planning pass by filing new negative reactions on the bot's own
-comments and PRs (see the `bot-feedback` skill):
-
-```bash
-bot-feedback --board
-```
-
-It is cheap (REST only, three search requests) and only reports reactions
-it has not seen. The items it creates are Needs human and manual; don't
-add other items for the same threads. Mention what it found in the report.
+Start every planning pass by following the `bot-feedback` skill: run
+`bot-feedback`, assess each new 👎/😕 on the bot's own comments and PRs in
+context, and file them with `bot-feedback --file-issues --assessment-dir
+DIR`. This is the one write outside the board: issues on the bot's own
+repository, cgwalters-bot/cgwalters-bot. It is cheap (REST only, three
+search requests) and only reports reactions it has not seen. Don't add
+board items for the same threads; mention the filed issues in the report.
 
 ## 1. Load what is already on the board
 
