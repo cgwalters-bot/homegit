@@ -100,30 +100,26 @@ source URL recorded in their body.
 bot-board list --json | jq -r '.[] | .content.url // .content.body' > board.txt
 ```
 
-Archived items do not show up in `item-list`: the GraphQL `items` connection
-defaults to `archivedStates: [NOT_ARCHIVED]` and gh has no option to change
-that. An archived item is one a human already triaged away, so re-adding it is
-exactly the wrong thing; append the archived items to the dedupe list too:
+Archived items are not in that list, and no query finds them: the
+GraphQL `items` connection ignores `archivedStates: [ARCHIVED]` and
+returns nothing, and the REST items endpoint omits them too. An archived
+item is one a human already triaged away, so re-adding it is exactly the
+wrong thing. So before adding an issue or PR that is not in `board.txt`,
+check whether the bot ever added it to a project (it has only this
+board); the issue events record that, whether the item was archived or
+removed since:
 
 ```bash
-gh api graphql --paginate -f query='
-  query($endCursor: String) {
-    user(login: "cgwalters-bot") {
-      projectV2(number: 1) {
-        items(first: 100, after: $endCursor, archivedStates: [ARCHIVED]) {
-          pageInfo { hasNextPage endCursor }
-          nodes {
-            content {
-              ... on Issue { url }
-              ... on PullRequest { url }
-              ... on DraftIssue { body }
-            }
-          }
-        }
-      }
-    }
-  }' --jq '.data.user.projectV2.items.nodes[].content | .url // .body' >> board.txt
+[[ "$URL" =~ ^https://github\.com/([^/]+/[^/]+)/(issues|pull)/([0-9]+) ]] &&
+  gh api --paginate "repos/${BASH_REMATCH[1]}/issues/${BASH_REMATCH[3]}/events?per_page=100" \
+    --jq '.[] | select(.event == "added_to_project_v2" and .actor.login == "cgwalters-bot") | .created_at'
 ```
+
+Any output means it was on the board before: skip it. That is a REST
+call per candidate, so run it only for the few you are about to add.
+This misses archived drafts, which can't be found at all, and items
+that someone other than the bot put on the board, so those may be
+proposed again.
 
 ## 2. Gather activity
 
@@ -255,8 +251,9 @@ Skip:
   advisories, "please don't discuss publicly").
 - Items someone else is clearly already handling (assigned to another person,
   or someone said they're on it, or has a linked open PR).
-- Anything already on the board, including archived items (by content URL,
-  or source URL in a draft).
+- Anything already on the board (by content URL, or source URL in a
+  draft), or that the bot added to it before (archived or removed since;
+  see section 1).
 - Anything in a repository that is not public (search results carry
   `.repository.isPrivate`; for events, check the repo as described above).
 
