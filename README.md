@@ -7,15 +7,17 @@ used as the dotfiles and prompt repository for the
 bot that helps with upstream contributions. Commits made from this
 environment are authored as `cgwalters-bot`, and the agents' work is
 coordinated through the [Workstream](https://github.com/users/cgwalters-bot/projects/1)
-project board: a human moves items into Todo, the bot claims them, opens
-draft PRs from its forks, and moves them through In Progress, Needs human
-and In Review; only a human's acceptance makes something Done.
+project board: a human moves items into Todo, the bot claims them, pushes
+tested branches (or, when asked, draft PRs) to its forks, and moves them
+through In Progress, Needs human and In Review; only a human's acceptance
+makes something Done.
 
 Install with `make install` as usual. The shared agent prompt is still
 [AGENTS.md](AGENTS.md), and the skills in `dotfiles/.claude/skills` are
 picked up by both agent CLIs: `workstream` (using the board),
 `backlog-planning` (refilling the board from recent GitHub activity),
-`upstream-pr` (how to contribute as the bot), plus the upstream ones like
+`upstream-pr` (how to contribute as the bot), `devspace-work` (building
+and testing on a remote runner), plus the upstream ones like
 `commit-review`.
 
 The bot uses two agents, each on its own subscription. opencode is
@@ -32,10 +34,30 @@ opencode and picks up or advances the next board item; `bot-work --agent
 claude` uses Claude Code instead, and any extra arguments are passed along
 as additional instructions. `bot-work --plan` instead reviews recent GitHub
 activity (the last week, or `--since YYYY-MM-DD`) and adds candidate items
-to the board for triage. For now these runs happen locally; running them
-remotely in a sandbox via
-[bootc-dev/cgwalters-devspace-sandbox](https://github.com/bootc-dev/cgwalters-devspace-sandbox)
-is planned.
+to the board for triage.
+
+### Overnight working model
+
+The agents run on a trusted machine that holds the clones and the bot's
+credentials, and borrow compute for building and testing. `bot-devspace`
+(installed by `make install` like the rest of `bin/`) dispatches an
+ephemeral RHEL 10 runner from
+[bootc-dev/cgwalters-devspace-sandbox](https://github.com/bootc-dev/cgwalters-devspace-sandbox),
+waits for it to be reachable over the tailnet, installs a toolchain
+(podman, gcc, Rust, ...) and hands out an ssh_config, so an agent edits
+locally, pushes its branch to the devspace with plain git over SSH, runs
+the project's tests there (KVM is available for VM tests), and pushes the
+tested branch to the bot's fork from the local machine. No credentials are
+ever copied to a devspace; see the `devspace-work` skill. `bot-devspace
+stop` cancels the runner, since they're billed while they run.
+
+`bot-board` is a small CLI over `gh project` for the Workstream board
+(`list`, `show`, `add`, `draft`, `set`), which caches reads because the
+bot's GraphQL quota is shared by every agent. Each item's Workflow field
+says what the bot delivers: a tested branch on its fork (`branch`, the
+default), a write-up in a secret gist (`analysis`), a draft PR (`pr`, set
+only by a human), or nothing (`manual`). In the morning, In Review items
+link to what's ready.
 
 To pick up changes from the upstream repository:
 
