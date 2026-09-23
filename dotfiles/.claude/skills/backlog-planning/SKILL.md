@@ -48,6 +48,19 @@ SINCE=${SINCE:-$(date -u -d '7 days ago' +%F)}
 
 Everything below uses public APIs and works with the bot's own token.
 
+## 0. Surface feedback on the bot
+
+Start every planning pass by filing new negative reactions on the bot's own
+comments and PRs (see the `bot-feedback` skill):
+
+```bash
+bot-feedback --board
+```
+
+It is cheap (REST only, three search requests) and only reports reactions
+it has not seen. The items it creates are Needs human and manual; don't
+add other items for the same threads. Mention what it found in the report.
+
 ## 1. Load what is already on the board
 
 Dedupe against this before adding anything. Draft items are deduped by the
