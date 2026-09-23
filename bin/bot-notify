@@ -1,0 +1,768 @@
+#!/usr/bin/env bash
+# Route cgwalters-bot's GitHub notifications (mentions, review requests,
+# assignments): requests from cgwalters become request records for the
+# agent to put on the board; anything from anyone else is filed as an issue
+# for cgwalters and never acted on.
+# GraphQL queries and jq programs hold literal $variables.
+# shellcheck disable=SC2016
+set -euo pipefail
+shopt -s inherit_errexit
+
+readonly BOT_LOGIN=cgwalters-bot
+# The only login whose asks are acted on.
+readonly REQUESTER=cgwalters
+# Fork PRs in the forge are handled by 'bot-pr inbox'.
+readonly FORGE_ORG=cgwalters-forge
+# Notification reasons that ask something of the bot; the rest (subscribed,
+# ci_activity, ...) are ignored.
+readonly SELECT_REASONS='["mention", "team_mention", "review_requested", "assign"]'
+readonly API=https://api.github.com
+readonly DEFAULT_LOOKBACK_DAYS=7
+readonly PER_PAGE=50
+readonly EXCERPT_LEN=300
+# Poll state lives on the Workstream board, in an archived draft item, so
+# it is shared by every machine the bot runs on.
+readonly PROJECT_OWNER=cgwalters-bot
+readonly PROJECT_NUMBER=1
+readonly STATE_TITLE='bot-state: notifications'
+# The state item's id; if it is empty or gone, the item is looked up by
+# title among the archived items, and created if missing.
+readonly STATE_ITEM_ID=PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk
+readonly ARCHIVED_PAGE=100
+# Local to this machine: the lock, the requests printed but not acked yet
+# (plus recently acked ones, so they aren't printed again), and the
+# triggers already filed as issues.
+readonly LOCAL_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-notify
+readonly PENDING_FILE=${LOCAL_DIR}/pending.json
+readonly FILED_FILE=${LOCAL_DIR}/filed.json
+readonly LOCAL_VERSION=1
+# Acked requests are remembered this long, well past any notification lag.
+readonly ACKED_KEEP_DAYS=30
+# What an assignment by REQUESTER becomes on the board.
+readonly ASSIGN_STATUS=Todo
+readonly ASSIGN_PRIORITY=P1
+# Where issues about asks by others are filed, and who they notify.
+readonly DEFAULT_ISSUE_REPO=cgwalters-bot/cgwalters-bot
+# Hidden marker in each filed issue's body, keyed by the trigger's URL, so
+# a retried run never files the same trigger twice.
+readonly MARKER_PREFIX='bot-notify-trigger:'
+# jq def that keeps "@login" in text from notifying anyone.
+readonly UNMENTION_JQ='def unmention: gsub("@(?=[A-Za-z0-9])"; "@​");'
+# Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
+readonly EX_RATELIMIT=75
+# Returned by ghapi() when GitHub says the resource does not exist.
+readonly EX_NOTFOUND=4
+BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
+readonly BOT_BOARD
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--dry-run] [--repo OWNER/REPO] [--no-mention]
+       $(basename "$0") ack THREAD_ID...
+
+Poll ${BOT_LOGIN}'s GitHub notifications once, and route every new
+mention, team mention, review request and assignment:
+
+  - an assignment by ${REQUESTER} (by GitHub login) in a public repository:
+    add the issue or PR to the board as ${ASSIGN_STATUS}, ${ASSIGN_PRIORITY}, unless it is on it already;
+  - any other ask by ${REQUESTER}: print a 'request' record, one JSON object
+    per line, for the agent to turn into a board item. Every run prints
+    them again until 'ack THREAD_ID' says they're on the board, which
+    also marks the thread read;
+  - from anyone else: file an issue in ${DEFAULT_ISSUE_REPO} mentioning
+    @${REQUESTER}, once per trigger (deduped locally, then by a hidden
+    marker in the issues); the bot never acts on it. For a non-public
+    source the issue has links only.
+
+Threads in ${FORGE_ORG} are skipped: 'bot-pr inbox' covers them. Other
+threads are marked read once routed, unless they hold unacked requests.
+Unacked requests and filed triggers are kept in ${LOCAL_DIR}.
+The poll state (since, Last-Modified) is kept in the archived
+'${STATE_TITLE}' draft item on the board, created on the first run, and
+only advances when every thread was routed, so a failed run is retried.
+A 304 from GitHub means nothing new and costs no write.
+
+Options:
+  --dry-run           Report only: file and add nothing, mark nothing read,
+                      record nothing locally, keep the state
+  --repo OWNER/REPO   Repository to file issues in (default: ${DEFAULT_ISSUE_REPO})
+  --no-mention        Don't mention @${REQUESTER} in filed issues (for testing)
+  -h, --help          Show this help
+
+This is a one-shot command; it prints GitHub's X-Poll-Interval, the
+minimum time to wait before polling again. The token needs the classic
+'notifications' scope. REST is used for everything but the state (one
+GraphQL read per run, one write per poll that saw changes).
+EOF
+}
+
+fatal() {
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+warn() {
+    echo "warning: $*" 1>&2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
+}
+
+rate_limited() {
+    echo "error: GitHub is rate limiting the bot ($1); retry after $(gh api rate_limit --jq ".resources.$2.reset | todate" 2>/dev/null || echo "the reset")" 1>&2
+    exit "${EX_RATELIMIT}"
+}
+
+# check_rate_limit ERRFILE RESOURCE: exits if ERRFILE reports rate limiting.
+check_rate_limit() {
+    local reason
+    if reason=$(grep -iE -m1 'rate limit|abuse' "$1"); then
+        rm -f "$1"
+        rate_limited "${reason}" "$2"
+    fi
+}
+
+# ghapi ARGS...: 'gh api', turning rate limiting into a clear exit and a
+# 404 into EX_NOTFOUND (with no output).
+ghapi() {
+    local out err rc=0
+    err=$(mktemp)
+    out=$(gh api "$@" 2>"${err}") || rc=$?
+    if test "${rc}" -ne 0; then
+        check_rate_limit "${err}" core
+        if grep -q 'HTTP 404' "${err}"; then
+            rm -f "${err}"
+            return "${EX_NOTFOUND}"
+        fi
+        cat "${err}" 1>&2
+        rm -f "${err}"
+        return "${rc}"
+    fi
+    rm -f "${err}"
+    test -z "${out}" || printf '%s\n' "${out}"
+}
+
+# gql QUERY [ARGS...]: a GraphQL call; prints .data.
+gql() {
+    local query=$1 out err rc=0
+    shift
+    err=$(mktemp)
+    out=$(gh api graphql -f query="${query}" "$@" --jq .data 2>"${err}") || rc=$?
+    if test "${rc}" -ne 0; then
+        check_rate_limit "${err}" graphql
+        cat "${err}" 1>&2
+        rm -f "${err}"
+        return "${rc}"
+    fi
+    rm -f "${err}"
+    printf '%s\n' "${out}"
+}
+
+iso_now() {
+    date -u +%FT%TZ
+}
+
+dry_run=false
+issue_repo=${DEFAULT_ISSUE_REPO}
+mention=true
+# Hidden test hook: a JSON array of notification threads, processed as if
+# the poll had returned them too (the real poll still runs).
+from_file=
+subcmd=poll
+ack_ids=()
+if test "${1:-}" = ack; then
+    subcmd=ack
+    shift
+    test $# -gt 0 || fatal "usage: $(basename "$0") ack THREAD_ID..."
+    for id in "$@"; do
+        [[ "${id}" =~ ^[0-9]+$ ]] || fatal "not a notification thread id: '${id}'"
+    done
+    ack_ids=("$@")
+    set --
+fi
+while test $# -gt 0; do
+    case "$1" in
+        --dry-run) dry_run=true; shift ;;
+        --repo) test $# -ge 2 || fatal "--repo requires OWNER/REPO"; issue_repo=$2; shift 2 ;;
+        --repo=*) issue_repo=${1#--repo=}; shift ;;
+        --no-mention) mention=false; shift ;;
+        --from-file) test $# -ge 2 || fatal "--from-file requires a file"; from_file=$2; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) fatal "unknown argument: $1 (see --help)" ;;
+    esac
+done
+[[ "${issue_repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fatal "--repo must be OWNER/REPO, not '${issue_repo}'"
+if test -n "${from_file}"; then
+    jq -e 'type == "array"' "${from_file}" >/dev/null 2>&1 || fatal "--from-file ${from_file} is not a JSON array of notification threads"
+fi
+# Logins whose asks are acted on. Test hook: BOT_NOTIFY_TRUSTED adds one
+# (the bot, say, since only it can assign in a throwaway repository), and
+# only together with --from-file, so it can't leak into a real run.
+trusted=("${REQUESTER}")
+if test -n "${BOT_NOTIFY_TRUSTED:-}"; then
+    test -n "${from_file}" || fatal "BOT_NOTIFY_TRUSTED is a test hook and needs --from-file"
+    trusted+=("${BOT_NOTIFY_TRUSTED}")
+    warn "testing: treating @${BOT_NOTIFY_TRUSTED} like @${REQUESTER}"
+fi
+
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${BOT_LOGIN}"
+require_cmd jq "install jq"
+require_cmd flock "install util-linux"
+
+login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
+test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}; these would be someone else's notifications"
+
+# Two runs on this machine must not both route the same threads or race on
+# the state. (Runs on different machines are serialized by nothing but the
+# issue dedupe, which keeps them safe.)
+mkdir -p "${LOCAL_DIR}"
+exec {lock_fd}>"${LOCAL_DIR}/lock" || fatal "cannot open ${LOCAL_DIR}/lock"
+flock -n "${lock_fd}" || fatal "another $(basename "$0") run holds ${LOCAL_DIR}/lock"
+
+# --- Local state ----------------------------------------------------------
+
+# load_local FILE KEY...: prints FILE's JSON, or a fresh object with the
+# given keys as empty objects if FILE doesn't exist yet.
+load_local() {
+    local file=$1
+    shift
+    if test -s "${file}"; then
+        jq -ce --argjson v "${LOCAL_VERSION}" 'if .version == $v then . else error("unsupported version \(.version)") end' "${file}" ||
+            fatal "cannot parse ${file}; fix it or move it away (unacked requests in it would be lost)"
+    else
+        jq -nc --argjson v "${LOCAL_VERSION}" '$ARGS.positional | map({(.): {}}) | add + {version: $v}' --args "$@"
+    fi
+}
+
+# save_local FILE JSON: atomically replaces FILE (not in a dry run).
+save_local() {
+    ${dry_run} && return 0
+    printf '%s\n' "$2" >"$1.tmp.$$"
+    mv -f "$1.tmp.$$" "$1"
+}
+
+# {pending: {TRIGGER_URL: record}, acked: {TRIGGER_URL: time}}
+PENDING_JSON=$(load_local "${PENDING_FILE}" pending acked)
+# {filed: {TRIGGER_URL: issue URL}}
+FILED_JSON=$(load_local "${FILED_FILE}" filed)
+
+mark_read() {
+    local rc=0
+    ${dry_run} && return 0
+    ghapi -X PATCH "notifications/threads/$1" >/dev/null || rc=$?
+    case "${rc}" in
+        0) ;;
+        "${EX_NOTFOUND}") warn "thread $1 no longer exists; nothing to mark read" ;;
+        *) warn "marking thread $1 read failed"; return 1 ;;
+    esac
+}
+
+# print_pending: prints every request not acked yet, one record per line.
+print_pending() {
+    local n
+    n=$(jq '.pending | length' <<<"${PENDING_JSON}")
+    test "${n}" -gt 0 || return 0
+    echo "${n} requests from ${REQUESTER} to put on the board; then 'bot-notify ack THREAD_ID...':"
+    jq -c '.pending | to_entries | sort_by(.value.thread_id, .key) | .[].value | {type: "request"} + .' <<<"${PENDING_JSON}" |
+        sed 's/^/request /'
+}
+
+if test "${subcmd}" = ack; then
+    now=$(iso_now)
+    rc=0
+    for id in "${ack_ids[@]}"; do
+        n=$(jq --arg id "${id}" '[.pending[] | select(.thread_id == $id)] | length' <<<"${PENDING_JSON}")
+        test "${n}" -gt 0 || warn "thread ${id} has no pending request on this machine; marking it read anyway"
+        mark_read "${id}" || { rc=1; continue; }
+        PENDING_JSON=$(jq -c --arg id "${id}" --arg now "${now}" '
+            ([.pending | to_entries[] | select(.value.thread_id == $id) | .key]) as $urls
+            | .acked += ($urls | map({(.): $now}) | add // {})
+            | .pending |= with_entries(select(.value.thread_id != $id))' <<<"${PENDING_JSON}")
+        save_local "${PENDING_FILE}" "${PENDING_JSON}"
+        echo "Acked thread ${id} (${n} requests); marked it read."
+    done
+    exit "${rc}"
+fi
+
+PENDING_JSON=$(jq -c --arg cutoff "$(date -u -d "${ACKED_KEEP_DAYS} days ago" +%FT%TZ)" \
+    '.acked |= with_entries(select(.value >= $cutoff))' <<<"${PENDING_JSON}")
+
+# --- State on the board ---------------------------------------------------
+
+STATE_ITEM=
+STATE_DRAFT=
+STATE_JSON='{}'
+
+# state_body JSON: the draft body holding JSON.
+state_body() {
+    printf '%s\n\n```json\n%s\n```\n' \
+        "Poll state of bin/bot-notify (cgwalters-bot/homegit). Archived on purpose; only the script edits it." \
+        "$(jq . <<<"$1")"
+}
+
+# parse_state BODY: prints the JSON of the first fenced json block, or {}.
+parse_state() {
+    local json
+    json=$(awk '/^```json[[:space:]]*$/ { inblock = 1; next }
+                inblock && /^```[[:space:]]*$/ { exit }
+                inblock { print }' <<<"$1")
+    test -n "${json}" || json='{}'
+    jq -ce 'if type == "object" then . else error("not an object") end' <<<"${json}" ||
+        fatal "the state item ${STATE_ITEM} has no valid JSON block; fix or delete it (a fresh state starts ${DEFAULT_LOOKBACK_DAYS} days back)"
+}
+
+readonly NODE_QUERY='query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
+    id isArchived content { ... on DraftIssue { id title body } } } } }'
+
+# load_state_item ID: loads the item if it exists and is ours; false if not.
+load_state_item() {
+    local data
+    data=$(gql "${NODE_QUERY}" -f id="$1" 2>/dev/null) || return 1
+    jq -e --arg t "${STATE_TITLE}" '.node.content.title == $t' <<<"${data}" >/dev/null || return 1
+    STATE_ITEM=$1
+    STATE_DRAFT=$(jq -r .node.content.id <<<"${data}")
+    STATE_JSON=$(parse_state "$(jq -r .node.content.body <<<"${data}")")
+    jq -e .node.isArchived <<<"${data}" >/dev/null ||
+        warn "the state item ${STATE_ITEM} is not archived; it shows on the board"
+}
+
+# find_archived_state: prints the id of the archived item titled
+# STATE_TITLE, if any.
+find_archived_state() {
+    local cursor='' page
+    while :; do
+        page=$(gql 'query($owner: String!, $number: Int!, $first: Int!, $after: String) {
+            user(login: $owner) { projectV2(number: $number) {
+              items(first: $first, after: $after, archivedStates: [ARCHIVED]) {
+                pageInfo { hasNextPage endCursor }
+                nodes { id content { ... on DraftIssue { title } } } } } } }' \
+            -f owner="${PROJECT_OWNER}" -F number="${PROJECT_NUMBER}" -F first="${ARCHIVED_PAGE}" \
+            ${cursor:+-f after="${cursor}"}) ||
+            fatal "listing the archived items of the board failed"
+        jq -r --arg t "${STATE_TITLE}" '.user.projectV2.items.nodes[]
+            | select(.content.title == $t) | .id' <<<"${page}" | head -n1 | grep . && return 0
+        jq -e .user.projectV2.items.pageInfo.hasNextPage <<<"${page}" >/dev/null || return 0
+        cursor=$(jq -r .user.projectV2.items.pageInfo.endCursor <<<"${page}")
+    done
+}
+
+create_state_item() {
+    local id project
+    id=$("${BOT_BOARD}" draft "${STATE_TITLE}" "$(state_body '{}')") ||
+        fatal "creating the '${STATE_TITLE}' draft item failed"
+    "${BOT_BOARD}" set "${id}" --workflow manual >/dev/null ||
+        fatal "setting Workflow=manual on the new state item ${id} failed; archive it by hand"
+    project=$(gql 'query($owner: String!, $number: Int!) { user(login: $owner) { projectV2(number: $number) { id } } }' \
+        -f owner="${PROJECT_OWNER}" -F number="${PROJECT_NUMBER}" | jq -r .user.projectV2.id) ||
+        fatal "looking up the project id failed; archive ${id} by hand"
+    gql 'mutation($project: ID!, $item: ID!) { archiveProjectV2Item(input: {projectId: $project, itemId: $item}) { item { id } } }' \
+        -f project="${project}" -f item="${id}" >/dev/null ||
+        fatal "archiving the state item ${id} failed; archive it by hand"
+    echo "Created and archived the state item ${id}; set STATE_ITEM_ID in $(basename "$0") to it" 1>&2
+    load_state_item "${id}" || fatal "cannot read back the new state item ${id}"
+}
+
+write_state() {
+    local body
+    body=$(state_body "$1")
+    gql 'mutation($id: ID!, $body: String!) { updateProjectV2DraftIssue(input: {draftIssueId: $id, body: $body}) { draftIssue { id } } }' \
+        -f id="${STATE_DRAFT}" -f body="${body}" >/dev/null
+}
+
+if test -z "${STATE_ITEM_ID}" || ! load_state_item "${STATE_ITEM_ID}"; then
+    test -z "${STATE_ITEM_ID}" || warn "state item ${STATE_ITEM_ID} not found; looking it up by title"
+    found=$(find_archived_state)
+    if test -n "${found}"; then
+        load_state_item "${found}" || fatal "cannot read the state item ${found}"
+        echo "Using the state item ${found}; set STATE_ITEM_ID in $(basename "$0") to it" 1>&2
+    elif ${dry_run}; then
+        warn "no state item yet; --dry-run doesn't create it"
+    else
+        create_state_item
+    fi
+fi
+since=$(jq -r '.since // empty' <<<"${STATE_JSON}")
+last_modified=$(jq -r '.last_modified // empty' <<<"${STATE_JSON}")
+test -n "${since}" || since=$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%FT%TZ)
+
+# --- Poll -----------------------------------------------------------------
+
+scratch=$(mktemp -d)
+trap 'rm -rf "${scratch}"' EXIT
+
+# fetch_page PATH [IF_MODIFIED_SINCE]: GETs PATH with headers into
+# ${scratch}/headers and the body into ${scratch}/body; prints the status.
+fetch_page() {
+    local args=(-i "$1") rc=0 status
+    test -z "${2:-}" || args+=(-H "If-Modified-Since: $2")
+    gh api "${args[@]}" >"${scratch}/raw" 2>"${scratch}/err" || rc=$?
+    tr -d '\r' <"${scratch}/raw" | sed '/^$/q' >"${scratch}/headers"
+    tr -d '\r' <"${scratch}/raw" | sed '1,/^$/d' >"${scratch}/body"
+    status=$(awk 'NR == 1 { print $2 }' "${scratch}/headers")
+    # gh fails on a 304, which is an answer, not an error.
+    if test "${rc}" -ne 0 && test "${status}" != 304; then
+        check_rate_limit "${scratch}/err" core
+        cat "${scratch}/err" 1>&2
+        return 1
+    fi
+    echo "${status}"
+}
+
+header() {
+    awk -v name="$1" 'index(tolower($0), tolower(name) ":") == 1 {
+        sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "${scratch}/headers"
+}
+
+poll_start=$(iso_now)
+status=$(fetch_page "notifications?all=true&since=${since}&per_page=${PER_PAGE}" "${last_modified}") ||
+    fatal "polling the notifications failed"
+poll_interval=$(header X-Poll-Interval)
+if server_date=$(header Date) && test -n "${server_date}"; then
+    # GitHub's clock, so that local skew can't skip notifications.
+    poll_start=$(date -u -d "${server_date}" +%FT%TZ)
+fi
+new_last_modified=${last_modified}
+threads='[]'
+case "${status}" in
+    304)
+        # Unacked requests are still printed below.
+        echo "Nothing new since ${last_modified} (304 Not Modified); poll again in ${poll_interval:-?}s at the earliest."
+        ;;
+    200)
+        # An empty list has no Last-Modified; its Date works just as well
+        # for If-Modified-Since.
+        new_last_modified=$(header Last-Modified)
+        test -n "${new_last_modified}" || new_last_modified=${server_date:-${last_modified}}
+        threads=$(jq -c . "${scratch}/body")
+        next=$(header Link | grep -oP '<\K[^>]+(?=>; rel="next")' || true)
+        while test -n "${next}"; do
+            status=$(fetch_page "${next#"${API}"/}") || fatal "fetching ${next} failed"
+            threads=$(jq -c --slurpfile page "${scratch}/body" '. + $page[0]' <<<"${threads}")
+            next=$(header Link | grep -oP '<\K[^>]+(?=>; rel="next")' || true)
+        done
+        echo "$(jq length <<<"${threads}") notification threads updated since ${since}; poll again in ${poll_interval:-?}s at the earliest."
+        ;;
+    *) fatal "unexpected HTTP status '${status}' polling notifications" ;;
+esac
+if test -n "${from_file}"; then
+    threads=$(jq -c --slurpfile extra "${from_file}" '. + $extra[0]' <<<"${threads}")
+    echo "Added $(jq -c --slurpfile extra "${from_file}" -n '$extra[0] | length') threads from ${from_file}."
+fi
+
+# --- Find what triggered each thread -------------------------------------
+
+excerpt_jq="(. // \"\" | gsub(\"\\\\s+\"; \" \") | if length > ${EXCERPT_LEN} then .[:${EXCERPT_LEN}] + \"...\" else . end)"
+
+# triggers THREAD: prints one JSON object per new trigger in the thread:
+# {author, author_type, url, body, located}. Nothing if the thread has no
+# trigger newer than its last read; fails if GitHub can't be read.
+triggers() {
+    local thread=$1 reason type subject_url latest last_read repo number
+    reason=$(jq -r .reason <<<"${thread}")
+    type=$(jq -r .subject.type <<<"${thread}")
+    subject_url=$(jq -r '.subject.url // empty' <<<"${thread}")
+    latest=$(jq -r '.subject.latest_comment_url // empty' <<<"${thread}")
+    last_read=$(jq -r '.last_read_at // empty' <<<"${thread}")
+    repo=$(jq -r .repository.full_name <<<"${thread}")
+    local found='' issue html
+    if [[ "${type}" =~ ^(Issue|PullRequest)$ ]] && [[ "${subject_url}" =~ /([0-9]+)$ ]]; then
+        number=${BASH_REMATCH[1]}
+        issue=$(ghapi "repos/${repo}/issues/${number}") || return 1
+        html=$(jq -r .html_url <<<"${issue}")
+        case "${reason}" in
+            mention|team_mention)
+                local pattern candidates
+                # A login ends at a character that can't be part of one.
+                if test "${reason}" = mention; then
+                    pattern="@${BOT_LOGIN}(?![A-Za-z0-9-])"
+                else
+                    pattern='@[A-Za-z0-9-]+/[A-Za-z0-9_.-]+'
+                fi
+                candidates=$(
+                    jq -c --arg lr "${last_read}" 'select($lr == "" or .created_at > $lr)
+                        | {author: .user.login, author_type: .user.type, url: .html_url, body, at: .created_at}' <<<"${issue}"
+                    ghapi --paginate "repos/${repo}/issues/${number}/comments?per_page=100${last_read:+&since=${last_read}}" \
+                        --jq '.[] | {author: .user.login, author_type: .user.type, url: .html_url, body, at: .updated_at}' || exit 1
+                    if test "${type}" = PullRequest; then
+                        ghapi --paginate "repos/${repo}/pulls/${number}/comments?per_page=100${last_read:+&since=${last_read}}" \
+                            --jq '.[] | {author: .user.login, author_type: .user.type, url: .html_url, body, at: .updated_at}' || exit 1
+                        ghapi --paginate "repos/${repo}/pulls/${number}/reviews?per_page=100" \
+                            --jq '.[] | {author: .user.login, author_type: .user.type, url: .html_url, body, at: .submitted_at}' || exit 1
+                    fi
+                ) || return 1
+                found=$(jq -c --arg lr "${last_read}" --arg re "${pattern}" \
+                    'select(($lr == "" or .at > $lr) and (.body // "" | test($re; "i")))
+                     | del(.at) + {located: true}' <<<"${candidates}")
+                ;;
+            review_requested|assign)
+                local filter
+                if test "${reason}" = assign; then
+                    filter="select(.event == \"assigned\" and .assignee.login == \"${BOT_LOGIN}\")"
+                else
+                    filter="select(.event == \"review_requested\" and (.requested_reviewer.login == \"${BOT_LOGIN}\" or .requested_team != null))"
+                fi
+                found=$(ghapi --paginate "repos/${repo}/issues/${number}/events?per_page=100" --jq ".[] | ${filter}" |
+                    jq -c --arg lr "${last_read}" --arg html "${html}" 'select($lr == "" or .created_at > $lr)
+                        | {author: .actor.login, author_type: .actor.type,
+                           url: "\($html)#event-\(.id)", body: "", located: true}') || return 1
+                # The thread's own text is the context of a request.
+                if test -n "${found}"; then
+                    found=$(jq -c --argjson issue "${issue}" '.body = "\($issue.title)\n\n\($issue.body // "")"' <<<"${found}")
+                fi
+                ;;
+        esac
+        if test -z "${found}" && test -n "${last_read}"; then
+            # Read before, and nothing new that concerns the bot.
+            return 0
+        fi
+    fi
+    if test -z "${found}"; then
+        # Some other subject (a discussion, a commit...), or the trigger
+        # wasn't found: fall back to the latest comment, without trusting
+        # it as a request unless its login says so.
+        if test -n "${latest}"; then
+            found=$(ghapi "${latest#"${API}"/}" --jq '{author: .user.login, author_type: .user.type,
+                url: .html_url, body: (.body // ""), located: false}') || return 1
+        else
+            found=$(jq -c '{author: null, author_type: null, url: .repository.html_url,
+                body: "", located: false}' <<<"${thread}")
+        fi
+    fi
+    printf '%s\n' "${found}"
+}
+
+# --- Route ----------------------------------------------------------------
+
+declare -A private_repo=()
+is_private() {
+    local repo=$1
+    if test -z "${private_repo[${repo}]:-}"; then
+        # Unknown visibility is treated as private.
+        private_repo[${repo}]=$(ghapi "repos/${repo}" --jq '.visibility != "public"' 2>/dev/null || echo true)
+    fi
+    test "${private_repo[${repo}]}" = true
+}
+
+
+filed_markers=
+markers_loaded=false
+load_markers() {
+    ${markers_loaded} && return 0
+    # Exact where search would lag, and the repository is small.
+    filed_markers=$(ghapi --paginate "repos/${issue_repo}/issues?state=all&per_page=100" \
+        --jq ".[] | .html_url as \$u | .body // \"\" | scan(\"${MARKER_PREFIX}(\\\\S+) -->\") | \"\(.[0]) \(\$u)\"") ||
+        { warn "cannot list the issues in ${issue_repo}; does it exist, with issues enabled?"; return 1; }
+    markers_loaded=true
+}
+
+# record_filed TRIGGER_URL ISSUE_URL
+record_filed() {
+    FILED_JSON=$(jq -c --arg url "$1" --arg issue "$2" '.filed[$url] = $issue' <<<"${FILED_JSON}")
+    save_local "${FILED_FILE}" "${FILED_JSON}"
+}
+
+# file_issue TRIGGER: files (once) an issue about a trigger by someone
+# other than REQUESTER.
+file_issue() {
+    local t=$1 url existing title body
+    url=$(jq -r .url <<<"${t}")
+    # The local record first: the issue list lags behind a new issue.
+    existing=$(jq -r --arg url "${url}" '.filed[$url] // empty' <<<"${FILED_JSON}")
+    if test -z "${existing}"; then
+        load_markers || return 1
+        existing=$(awk -v url="${url}" '$1 == url { print $2; exit }' <<<"${filed_markers}")
+        test -z "${existing}" || record_filed "${url}" "${existing}"
+    fi
+    if test -n "${existing}"; then
+        echo "  already filed as ${existing}"
+        return 0
+    fi
+    title=$(jq -r '"\({mention: "Mention", team_mention: "Team mention", review_requested: "Review request",
+                       assign: "Assignment"}[.reason] // "Notification"): \(if .author then "@" + .author else "someone" end) on \(.repo)#\(.number // "?")"' <<<"${t}")
+    if ${dry_run}; then
+        echo "  would file: ${title}"
+        nfiled=$((nfiled + 1))
+        return 0
+    fi
+    # The issue repository is public: for any other source, links only.
+    # Only REQUESTER is to be notified, so every other '@' is defused.
+    local what='"\(if .author then "@" + .author | unmention else "Someone (author unknown)" end) \({mention: "mentioned the bot",
+        team_mention: "mentioned a team the bot is in", review_requested: "requested a review from the bot",
+        assign: "assigned the bot"}[.reason] // "notified the bot (\(.reason))") in \(.repo)#\(.number // "?"): \(.url)\n\nThread: \(.thread_url)"'
+    if test "$(jq -r .private <<<"${t}")" = true || is_private "$(jq -r .repo <<<"${t}")"; then
+        body=$(jq -r "${UNMENTION_JQ} ${what}"' + "\n\nThe source repository is not public, so there is no excerpt here; read the thread."' <<<"${t}")
+    else
+        body=$(jq -r "${UNMENTION_JQ} ${what}"' + " (\(.title | unmention))"
+            + (if .excerpt != "" then "\n\n> \(.excerpt | unmention)" else "" end)
+            + (if .located then "" else "\n\nThe trigger could not be located; this is the latest comment in the thread." end)' <<<"${t}")
+    fi
+    body+=$'\n\n'"${BOT_LOGIN} does not act on requests from anyone but its operator; this is for a human to decide on."
+    if ${mention}; then
+        body+=$'\n\n'"@${REQUESTER}, please take a look."
+    fi
+    body+=$'\n\n'"<!-- ${MARKER_PREFIX}${url} -->"
+    local issue_url
+    issue_url=$(ghapi -X POST "repos/${issue_repo}/issues" -f title="${title}" -f body="${body}" --jq .html_url) ||
+        { warn "creating an issue in ${issue_repo} for ${url} failed"; return 1; }
+    record_filed "${url}" "${issue_url}"
+    echo "  filed ${issue_url}: ${title}"
+    nfiled=$((nfiled + 1))
+}
+
+# is_trusted AUTHOR AUTHOR_TYPE: whether GitHub recorded one of the
+# trusted logins (a user, not a bot or an organization).
+is_trusted() {
+    local login
+    test "$2" = User || return 1
+    for login in "${trusted[@]}"; do
+        test "$1" = "${login}" && return 0
+    done
+    return 1
+}
+
+readonly ITEM_STATUS_QUERY='query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
+    fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }'
+
+# add_assignment TRIGGER: puts an issue or PR assigned to the bot by a
+# trusted login on the board, unless it is there already.
+add_assignment() {
+    local t=$1 issue_url event_url author id status=
+    issue_url=$(jq -r .thread_url <<<"${t}")
+    event_url=$(jq -r .url <<<"${t}")
+    author=$(jq -r .author <<<"${t}")
+    if ${dry_run}; then
+        echo "  would add ${issue_url} to the board as ${ASSIGN_STATUS}, ${ASSIGN_PRIORITY}"
+        return 0
+    fi
+    id=$("${BOT_BOARD}" list --json | jq -r --arg url "${issue_url}" '.[] | select(.content.url == $url) | .id' | head -n1) ||
+        { warn "listing the board failed"; return 1; }
+    if test -z "${id}"; then
+        # The listing lags behind writes by minutes; adding an item that is
+        # already there returns the existing one, whose Status then shows it.
+        id=$("${BOT_BOARD}" add "${issue_url}") || { warn "adding ${issue_url} to the board failed"; return 1; }
+        status=$(gql "${ITEM_STATUS_QUERY}" -f id="${id}" | jq -r '.node.fieldValueByName.name // empty') ||
+            { warn "reading the status of board item ${id} failed"; return 1; }
+        if test -z "${status}"; then
+            "${BOT_BOARD}" set "${id}" --status "${ASSIGN_STATUS}" --priority "${ASSIGN_PRIORITY}" \
+                --why "Assigned to the bot by ${author} (${event_url})." >/dev/null ||
+                { warn "setting up board item ${id} for ${issue_url} failed"; return 1; }
+            echo "  added to the board as ${id}: ${ASSIGN_STATUS}, ${ASSIGN_PRIORITY}"
+            return 0
+        fi
+    fi
+    echo "  already on the board as ${id}${status:+ (${status})}; left as is"
+}
+
+# ack_trigger URL: remembers a trigger as handled.
+ack_trigger() {
+    PENDING_JSON=$(jq -c --arg url "$1" --arg now "$(iso_now)" '.acked[$url] = $now | del(.pending[$url])' <<<"${PENDING_JSON}")
+    save_local "${PENDING_FILE}" "${PENDING_JSON}"
+}
+
+# add_pending TRIGGER: keeps a request until 'ack' says it's on the board.
+add_pending() {
+    PENDING_JSON=$(jq -c --argjson t "$1" '.pending[$t.url] = $t' <<<"${PENDING_JSON}")
+    save_local "${PENDING_FILE}" "${PENDING_JSON}"
+}
+
+nselected=0
+nrequests=0
+nassigned=0
+nfiled=0
+nfailed=0
+nskipped=0
+while IFS= read -r thread; do
+    test -n "${thread}" || continue
+    id=$(jq -r .id <<<"${thread}")
+    desc=$(jq -r '"\(.reason) in \(.repository.full_name): \(.subject.title) [thread \(.id)]"' <<<"${thread}")
+    # Already routed (only this script reads the bot's notifications), and
+    # not updated since.
+    if jq -e '.unread == false and .last_read_at != null and .last_read_at >= .updated_at' <<<"${thread}" >/dev/null; then
+        continue
+    fi
+    nselected=$((nselected + 1))
+    if test "$(jq -r .repository.owner.login <<<"${thread}")" = "${FORGE_ORG}"; then
+        echo "Skipped ${desc}: ${FORGE_ORG} fork PRs are for 'bot-pr inbox'"
+        nskipped=$((nskipped + 1))
+        mark_read "${id}" || nfailed=$((nfailed + 1))
+        continue
+    fi
+    echo "Thread ${desc}"
+    if ! found=$(triggers "${thread}"); then
+        warn "cannot read what triggered thread ${id}; will retry next run"
+        nfailed=$((nfailed + 1))
+        continue
+    fi
+    if test -z "${found}"; then
+        echo "  nothing new for the bot since it was last read"
+    fi
+    ok=true
+    while IFS= read -r trig; do
+        test -n "${trig}" || continue
+        # Everything a record or an issue needs, in one object.
+        t=$(jq -c --argjson th "${thread}" "(.body | ${excerpt_jq}) as \$ex
+            | {reason: \$th.reason, repo: \$th.repository.full_name, private: \$th.repository.private,
+               number: ((\$th.subject.url // \"\" | capture(\"/(?<n>[0-9]+)\$\") | .n) // null),
+               title: \$th.subject.title, thread_url: (.url | sub(\"#.*\"; \"\")),
+               thread_id: \$th.id, author, url, excerpt: \$ex, located}" <<<"${trig}")
+        url=$(jq -r .url <<<"${t}")
+        author=$(jq -r '.author // "unknown"' <<<"${trig}")
+        # Only the login GitHub recorded counts, never what the text says.
+        if ! is_trusted "${author}" "$(jq -r '.author_type // ""' <<<"${trig}")"; then
+            echo "  from @${author} (not ${REQUESTER}): filing, never acting on it"
+            file_issue "${t}" || ok=false
+        elif jq -e --arg url "${url}" '.acked[$url]' <<<"${PENDING_JSON}" >/dev/null; then
+            echo "  request ${url} already acked"
+        elif test "$(jq -r .reason <<<"${t}")" = assign && jq -e '.located' <<<"${t}" >/dev/null &&
+            ! { test "$(jq -r .private <<<"${t}")" = true || is_private "$(jq -r .repo <<<"${t}")"; }; then
+            echo "  assigned by @${author}"
+            if add_assignment "${t}"; then
+                ack_trigger "${url}"
+                nassigned=$((nassigned + 1))
+            else
+                ok=false
+            fi
+        elif jq -e --arg url "${url}" '.pending[$url]' <<<"${PENDING_JSON}" >/dev/null; then
+            echo "  request from @${author}, already pending"
+        else
+            # A private source never goes on the board; the agent reports it.
+            add_pending "${t}"
+            nrequests=$((nrequests + 1))
+            echo "  request from @${author}, pending until acked"
+        fi
+    done <<<"${found}"
+    if ! ${ok}; then
+        nfailed=$((nfailed + 1))
+    elif jq -e --arg id "${id}" 'any(.pending[]; .thread_id == $id)' <<<"${PENDING_JSON}" >/dev/null; then
+        echo "  left unread until 'bot-notify ack ${id}'"
+    else
+        mark_read "${id}" || nfailed=$((nfailed + 1))
+    fi
+done < <(jq -c --argjson reasons "${SELECT_REASONS}" '.[] | select(.reason as $r | $reasons | index($r))' <<<"${threads}")
+
+filed_verb=filed
+! ${dry_run} || filed_verb="to file"
+echo "Routed ${nselected} threads: ${nrequests} new requests and ${nassigned} assignments from ${REQUESTER}, ${nfiled} triggers by others ${filed_verb}, ${nskipped} skipped."
+print_pending
+
+
+# --- Advance the state ---------------------------------------------------
+
+if test "${nfailed}" -gt 0; then
+    echo "${nfailed} threads failed; the state stays at since=${since} so the next run retries them." 1>&2
+    exit 1
+fi
+if ${dry_run}; then
+    echo "Dry run: state unchanged (since=${since})."
+    exit 0
+fi
+if test "$(jq length <<<"${threads}")" -eq 0 && test "${new_last_modified}" = "${last_modified}"; then
+    echo "No changes; state unchanged."
+    exit 0
+fi
+test -n "${STATE_DRAFT}" || fatal "no state item to record the poll in"
+new_state=$(jq -nc --arg since "${poll_start}" --arg lm "${new_last_modified}" --arg now "$(iso_now)" \
+    --arg host "$(hostname)" '{since: $since, last_modified: $lm, updated_at: $now, host: $host}')
+write_state "${new_state}" || fatal "recording the state in ${STATE_ITEM} failed; the next run will redo this poll"
+echo "State advanced to since=${poll_start}."
