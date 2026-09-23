@@ -75,9 +75,12 @@ Options:
 
 The last-seen state (url -> updated_at, state, head_sha, checks) lives in
 the archived 'bot-state: ${STATE_NAME}' draft item on the board, read and
-written with 'bot-board state-get/state-put' (one GraphQL call each), and
-advances only after a sweep in which every URL was read. The board listing
-comes from bot-board's cache; everything else is REST, with ETags.
+written with 'bot-board state-get/state-put' (one GraphQL call each; the
+write only when something changed), and must stay under the ~64KB a
+draft body holds (a few hundred URLs). It advances per URL: one that could
+not be read keeps its last-seen state, so a later sweep reports its
+changes, and the sweep exits nonzero. The board listing comes from
+bot-board's cache; everything else is REST, with ETags.
 EOF
 }
 
@@ -450,13 +453,16 @@ done < <(${apply} && jq -c '.[] | {item: {id, why}, action: (.actions[] | select
 
 # --- Report ----------------------------------------------------------------
 
+nfailed=$(jq length <<<"${failed}")
+# Written unless it's a dry run or nothing changed: a board write costs
+# GraphQL quota, and the state's timestamp alone isn't worth it.
 advance=true
-if test "$(jq length <<<"${failed}")" -gt 0; then
-    advance=false
-    why_kept="$(jq length <<<"${failed}") URL(s) failed"
-elif ${dry_run}; then
+if ${dry_run}; then
     advance=false
     why_kept="dry run"
+elif jq -e --argjson new "${new_seen}" '. == $new' <<<"${seen}" >/dev/null; then
+    advance=false
+    why_kept="nothing new"
 fi
 
 if ${json}; then
@@ -490,19 +496,23 @@ else
     echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${report}") items with news, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
+# Failed URLs kept their last-seen state in new_seen, so their changes
+# are reported by a later sweep; the others advance.
 if ! ${advance}; then
     echo "State unchanged (${why_kept})." 1>&2
-    test "$(jq length <<<"${failed}")" -eq 0 || exit 1
-    test "${napply_failed}" -eq 0 || exit 1
-    exit 0
-fi
-new_state=$(jq -nc --argjson v "${STATE_VERSION}" --argjson items "${new_seen}" \
-    --arg now "$(date -u +%FT%TZ)" --arg host "$(hostname)" \
-    '{version: $v, updated_at: $now, host: $host, items: $items}')
-if test -n "${state_file}"; then
-    printf '%s\n' "${new_state}" >"${state_file}"
 else
-    "${BOT_BOARD}" state-put "${STATE_NAME}" "${new_state}" || board_failed $? "recording the last-seen state failed; the next sweep reports these changes again"
+    new_state=$(jq -nc --argjson v "${STATE_VERSION}" --argjson items "${new_seen}" \
+        --arg now "$(date -u +%FT%TZ)" --arg host "$(hostname)" \
+        '{version: $v, updated_at: $now, host: $host, items: $items}')
+    if test -n "${state_file}"; then
+        printf '%s\n' "${new_state}" >"${state_file}"
+    else
+        "${BOT_BOARD}" state-put "${STATE_NAME}" "${new_state}" || board_failed $? "recording the last-seen state failed; the next sweep reports these changes again"
+    fi
+    echo "State advanced; ${napplied} item(s) updated on the board." 1>&2
 fi
-echo "State advanced; ${napplied} item(s) updated on the board." 1>&2
+if test "${nfailed}" -gt 0; then
+    echo "${nfailed} URL(s) could not be read; they keep their last-seen state until a sweep reads them." 1>&2
+    exit 1
+fi
 test "${napply_failed}" -eq 0 || exit 1

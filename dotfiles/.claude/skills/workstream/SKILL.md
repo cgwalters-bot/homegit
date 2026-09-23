@@ -203,9 +203,9 @@ is yours to act on:
 - Red CI on the bot's branch: look at the failure; a real one is work on
   that item (an In Review PR stays In Review), a flake at most a rerun.
 
-Its last-seen state lives in the archived `bot-state: watch` board item,
-and advances only after a sweep in which every URL was read, so a
-failed sweep (nonzero exit) reports the same changes again. Planning
+Its last-seen state lives in the archived `bot-state: watch` board item
+and advances per URL: one that could not be read (the sweep then exits
+nonzero) keeps its old state, so a later sweep reports its changes. Planning
 passes use `--dry-run`, which applies nothing and keeps the state, so
 the next work session still sees everything.
 
