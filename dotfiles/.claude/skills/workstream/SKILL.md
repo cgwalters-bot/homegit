@@ -152,19 +152,19 @@ that in the Why field and set Needs human rather than silently skipping it.
 
 **1. Claim.** Listings are cached for a minute and other agents may be
 working the board, so re-read the item first and skip it if it is no
-longer Todo or someone else took it. Then set In Progress and assign
-yourself:
+longer Todo or someone else took it. Then set In Progress:
 
 ```bash
 bot-board --refresh show "$ITEM"
 bot-board set "$ITEM" --status "In Progress"
-gh issue edit "$ISSUE_URL" --add-assignee cgwalters-bot
 ```
 
-Assigning requires triage access to the repo; if it fails, carry on, since
-the board status is enough. Only if the issue has been open a long time or
-others have shown interest in fixing it, leave a one-line comment saying you
-are working on it, so nobody duplicates the work.
+The board status is the claim. Don't assign yourself or comment on the
+upstream issue: the bot usually lacks triage access, and while the output
+is an unsubmitted branch or a private write-up there is nothing for
+maintainers to see yet. Claiming upstream is for the `pr` workflow, and
+only when the issue has been open a long time or others have shown
+interest in fixing it, so nobody duplicates the work.
 
 **2. Work.** Do what the item's Workflow asks (see "Workflow" above).
 For code changes follow the `upstream-pr` skill (fork, topic branch,
