@@ -1,3 +1,5 @@
+.PHONY: all install install-bin install-dotfiles
+
 all:
 	echo "Targets: install install-bin install-dotfiles"
 
