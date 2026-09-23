@@ -133,6 +133,56 @@ gh pr view "$URL" --json mergeable,mergeStateStatus,reviewDecision,statusCheckRo
 For the bot's own PRs, a review or comment newer than the bot's last commit or
 reply means a response is owed.
 
+### Beyond direct activity
+
+When the direct sources above run dry (the board is mostly In Review), also
+look at these. All of them are REST.
+
+**Broken default branches** in the core repositories (bootc-dev/bootc,
+bootc-dev/bcvk, bootc-dev/infra, bootc-dev/actions, ostreedev/ostree,
+coreos/bootupd, composefs/composefs-rs):
+
+```bash
+BR=$(gh api repos/$R --jq .default_branch)
+gh api "repos/$R/actions/runs?branch=$BR&status=failure&created=>=$SINCE&per_page=20" \
+  --jq '.workflow_runs[] | {id, name, event, created_at, html_url}'
+# then: gh api repos/$R/actions/runs/$ID/jobs, gh api repos/$R/actions/jobs/$JOB/logs
+```
+
+Include scheduled runs, not just pushes; some breakage only shows on a
+weekly schedule. A job is *consistently failing* when the same job and step
+fail on two or more consecutive runs, and *resolved* when the latest run of
+that workflow on the default branch passed
+(`repos/$R/actions/workflows/<file>/runs?branch=$BR&per_page=1`). Registry
+5xx, "manifest unknown" on a pinned digest, and mirror 404s are flakes or
+pin rot: prefer an existing Renovate PR that bumps the pin over a new item.
+A consistently failing job is P0 or P1; add a draft with the run URLs.
+
+**Dependency PRs with failing checks.** Renovate and Dependabot PRs are
+authored by bot accounts under varying logins, so filter on the head branch
+(`bootc-renovate/`, `renovate/`, `dependabot/`) rather than the author.
+Look at the failing check run before deciding: "artifact not found" and
+mirror 404s mean rerun, not a branch. A mechanical fix (an API change after
+a crate bump) is a branch item whose branch carries fixups on top of the
+Renovate head.
+
+**Flakes.** Search issue titles (`flake`, `test flakes tracker`) as well as
+the `agent/flake-tracker` label. A flake item needs a recent failing run URL
+as evidence that it still recurs; a tracker issue itself is not an item.
+Root cause work is analysis, or branch when the fix is clear.
+
+**Older asks from cgwalters.**
+
+```bash
+gh search issues --visibility public --author cgwalters --state open --updated ">=$(date -u -d '180 days ago' +%F)" \
+  --owner bootc-dev --owner ostreedev --owner coreos --owner composefs --json $FIELDS --limit 100
+```
+
+Keep a hit only if its timeline has no open cross-referenced PR and no
+`agent/*` label, and prefer short issues with a concrete verb ("reduce X",
+"un-hide Y") that a devspace can turn into a tested branch in a few hours.
+Assigned issues older than a couple of years are almost never worth it.
+
 ## 3. Decide what counts
 
 Worth adding:
@@ -259,8 +309,17 @@ Mentions, assignments and requests from anyone else still get added if they
 look worthwhile, but with no status, and the Why field says who asked.
 
 Everything else is left with **no status**, which puts it in the board's
-"No Status" triage column; a human promotes it to Todo. Never set In Progress,
+"No Status" triage column; a human promotes it to Todo. The exception is a
+burn-down run that cgwalters explicitly authorized (the prompt says so):
+then clearly valuable, safe, self-contained items may go straight to Todo,
+while anything speculative, security-related or needing a design decision
+still gets no status. Never set In Progress,
 Needs human, In Review or Done while planning.
+
+When adding many items, write the `bot-board` calls into a script file and
+run it, instead of a quoted `bash -c '...'` string: an apostrophe in a Why
+silently truncates the batch. Link the real comment URL (from the API's
+`html_url`), never a placeholder anchor.
 
 ## 6. Report
 
