@@ -1,0 +1,326 @@
+#!/usr/bin/env bash
+# Thin CLI over 'gh project' for the cgwalters-bot Workstream board.
+set -euo pipefail
+
+readonly OWNER=cgwalters-bot
+readonly NUMBER=1
+readonly BOARD_URL=https://github.com/users/${OWNER}/projects/${NUMBER}
+readonly ITEM_LIMIT=1000
+readonly TITLE_WIDTH=70
+# Board fields that 'set' can change, and the option that sets each.
+readonly SET_OPTIONS=(--status --priority --workflow --why)
+# Every gh project call spends the bot's GraphQL quota (5000 points/hour),
+# which all agents share, so reads are cached on disk.
+readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-board
+readonly FIELDS_TTL=3600
+readonly ITEMS_TTL=60
+# Headroom to keep when checking the quota before a batch of edits.
+readonly QUOTA_MARGIN=20
+# Exit status for an exhausted quota (EX_TEMPFAIL), so callers can retry later.
+readonly EX_RATELIMIT=75
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--refresh] COMMAND [ARGS...]
+
+Read and update the Workstream board (${BOARD_URL}).
+
+Commands:
+  list [--status S] [--json]  List items by priority (P0 first): item id,
+                              priority, status, workflow, title, url.
+                              '--status none' lists untriaged items.
+  show ITEM                   Show all fields of one item
+  add URL                     Add an issue or PR; prints the new item id
+  draft TITLE BODY            Create a draft item; prints the new item id
+  set ITEM [--status S] [--priority P] [--workflow W] [--why TEXT]
+                              Update fields of an item
+  -h, --help                  Show this help
+
+Options:
+  --refresh                   Ignore cached board data and refetch it
+
+ITEM is a project item id (PVTI_...), an issue/PR URL, or OWNER/REPO#N.
+Valid values for Status, Priority and Workflow are read from the board.
+
+Board calls use the bot's GraphQL quota, shared by all agents, so field
+definitions are cached for ${FIELDS_TTL}s and the item list for ${ITEMS_TTL}s in
+${CACHE_DIR}; changes made through this tool invalidate the item cache.
+EOF
+}
+
+fatal() {
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
+}
+
+# rate_limited REASON: fails with the quota state and reset time. rate_limit
+# is a REST endpoint and does not count against the quota.
+rate_limited() {
+    local quota
+    quota=$(gh api rate_limit --jq '.resources.graphql
+        | "\(.remaining)/\(.limit) points left, resets at \(.reset | todate)"' 2>/dev/null) ||
+        quota="quota unknown"
+    echo "error: GitHub is rate limiting the bot (${1}; GraphQL: ${quota}); the quota is shared by all agents, so back off and retry later" 1>&2
+    exit "${EX_RATELIMIT}"
+}
+
+# fail_after STATUS MESSAGE: after a failed command substitution, pass a
+# rate-limit exit through (its error was already printed), else fail.
+fail_after() {
+    test "$1" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
+    fatal "$2"
+}
+
+# Runs a GraphQL-backed gh command, turning rate limiting into a clear error.
+ghq() {
+    local out err rc=0
+    err=$(mktemp)
+    out=$(gh "$@" 2>"${err}") || rc=$?
+    if test "${rc}" -ne 0; then
+        if grep -qi 'rate limit' "${err}"; then
+            local reason
+            reason=$(grep -i -m1 'rate limit' "${err}")
+            rm -f "${err}"
+            rate_limited "${reason}"
+        fi
+        cat "${err}" 1>&2
+        rm -f "${err}"
+        return "${rc}"
+    fi
+    rm -f "${err}"
+    printf '%s\n' "${out}"
+}
+
+refresh=false
+
+# cached FILE TTL CMD...: prints FILE if younger than TTL seconds, otherwise
+# runs CMD and stores its output there.
+cached() {
+    local file=${CACHE_DIR}/$1 ttl=$2 out mtime
+    shift 2
+    if ! ${refresh} && mtime=$(stat -c %Y "${file}" 2>/dev/null) &&
+        test $(($(date +%s) - mtime)) -lt "${ttl}"; then
+        cat "${file}"
+        return 0
+    fi
+    out=$("$@") || return
+    mkdir -p "${CACHE_DIR}"
+    printf '%s\n' "${out}" >"${file}.tmp.$$"
+    mv -f "${file}.tmp.$$" "${file}"
+    printf '%s\n' "${out}"
+}
+
+invalidate_items() {
+    rm -f "${CACHE_DIR}/items.json"
+}
+
+# Per-invocation copies of the caches. Loaded by calling the load_* functions
+# directly (not in a command substitution, which would discard the assignment).
+FIELDS_JSON=
+ITEMS_JSON=
+
+load_fields() {
+    test -n "${FIELDS_JSON}" && return 0
+    FIELDS_JSON=$(cached fields.json "${FIELDS_TTL}" \
+        ghq project field-list "${NUMBER}" --owner "${OWNER}" --format json) ||
+        fail_after $? "reading the board fields failed (gh needs the project scope)"
+}
+
+load_items() {
+    test -n "${ITEMS_JSON}" && return 0
+    ITEMS_JSON=$(cached items.json "${ITEMS_TTL}" \
+        ghq project item-list "${NUMBER}" --owner "${OWNER}" --format json --limit "${ITEM_LIMIT}") ||
+        fail_after $? "listing board items failed (gh needs the project scope)"
+}
+
+project_id() {
+    cached project_id "${FIELDS_TTL}" \
+        ghq project view "${NUMBER}" --owner "${OWNER}" --format json --jq .id
+}
+
+field_json() { # field_json NAME; requires load_fields
+    local field
+    field=$(jq -c --arg name "$1" '.fields[] | select(.name == $name)' <<<"${FIELDS_JSON}")
+    test -n "${field}" || fatal "the board has no '$1' field; its layout changed (try --refresh), or update $(basename "$0")"
+    echo "${field}"
+}
+
+option_names() { # option_names FIELD; requires load_fields
+    field_json "$1" | jq -r '[.options[].name] | join(", ")'
+}
+
+option_id() { # option_id FIELD VALUE; requires load_fields
+    local field id
+    field=$(field_json "$1")
+    id=$(jq -r --arg v "$2" '.options[] | select(.name == $v) | .id' <<<"${field}")
+    test -n "${id}" || fatal "invalid $1 '$2'; valid values: $(option_names "$1") (cached; --refresh rereads the board)"
+    echo "${id}"
+}
+
+# Prints the project item id for ITEM; requires load_items.
+resolve_item() {
+    local item=$1 id url
+    if [[ "${item}" == PVTI_* ]]; then
+        id=$(jq -r --arg id "${item}" '.items[] | select(.id == $id) | .id' <<<"${ITEMS_JSON}")
+    elif [[ "${item}" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$ ]]; then
+        url="https://github.com/${BASH_REMATCH[1]}/"
+        id=$(jq -r --arg prefix "${url,,}" --arg num "${BASH_REMATCH[2]}" \
+            '.items[] | select((.content.url // "" | ascii_downcase) as $u
+                                | $u == $prefix + "issues/" + $num or $u == $prefix + "pull/" + $num) | .id' \
+            <<<"${ITEMS_JSON}")
+    elif [[ "${item}" == https://* ]]; then
+        url=${item%%#*}
+        url=${url%/}
+        id=$(jq -r --arg url "${url}" '.items[] | select(.content.url == $url) | .id' <<<"${ITEMS_JSON}")
+    else
+        fatal "cannot parse item '${item}'; expected PVTI_..., an issue/PR URL or OWNER/REPO#N"
+    fi
+    test -n "${id}" || fatal "'${item}' is not on the board (${BOARD_URL}); if it was just added, retry with --refresh"
+    test "$(wc -l <<<"${id}")" -eq 1 || fatal "'${item}' matches several board items"
+    echo "${id}"
+}
+
+cmd_list() {
+    local status="" json=false
+    while test $# -gt 0; do
+        case "$1" in
+            --status) test $# -ge 2 || fatal "--status requires an argument"; status=$2; shift 2 ;;
+            --status=*) status=${1#--status=}; shift ;;
+            --json) json=true; shift ;;
+            *) fatal "unknown argument for list: $1 (see --help)" ;;
+        esac
+    done
+    if test -n "${status}" && test "${status}" != none; then
+        load_fields
+        option_id Status "${status}" >/dev/null
+    fi
+    load_items
+    # Unset priorities sort last; sort_by is stable, so board order is kept
+    # within a priority.
+    local sorted
+    sorted=$(jq --arg status "${status}" '
+        [.items[]
+         | select($status == "" or ($status == "none" and .status == null) or .status == $status)]
+        | sort_by(.priority // "P9")' <<<"${ITEMS_JSON}")
+    if ${json}; then
+        echo "${sorted}"
+        return 0
+    fi
+    jq -r --argjson width "${TITLE_WIDTH}" '
+        ["ITEM", "PRI", "STATUS", "WORKFLOW", "TITLE", "URL"],
+        (.[] | [.id, .priority // "-", .status // "-", .workflow // "-",
+                (.title | if length > $width then .[:$width - 3] + "..." else . end),
+                .content.url // "(draft)"])
+        | @tsv' <<<"${sorted}" | column -t -s $'\t'
+}
+
+cmd_show() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") show ITEM"
+    load_items
+    local id
+    id=$(resolve_item "$1")
+    jq -r --arg id "${id}" '
+        .items[] | select(.id == $id) | . as $item
+        | ([["item", .id], ["title", .title], ["type", .content.type],
+           ["url", .content.url // "-"],
+           ["draft id", (if .content.type == "DraftIssue" then .content.id else null end)],
+           ["status", .status // "-"], ["priority", .priority // "-"],
+           ["workflow", .workflow // "-"],
+           ["assignees", ((.assignees // []) | join(", "))],
+           ["linked PRs", ((."linked pull requests" // []) | join(" "))],
+           ["why", .why // "-"]]
+          | .[] | select(.[1] != null and .[1] != "") | "\(.[0]):\t\(.[1])"),
+          (if $item.content.type == "DraftIssue" and ($item.content.body // "") != ""
+           then "\n\($item.content.body)" else empty end)' <<<"${ITEMS_JSON}"
+}
+
+cmd_add() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") add URL"
+    [[ "$1" == https://github.com/* ]] || fatal "expected an issue or PR URL on github.com, got '$1'"
+    invalidate_items
+    ghq project item-add "${NUMBER}" --owner "${OWNER}" --url "$1" --format json --jq .id
+}
+
+cmd_draft() {
+    test $# -eq 2 || fatal "usage: $(basename "$0") draft TITLE BODY"
+    test -n "$1" || fatal "draft title must not be empty"
+    invalidate_items
+    ghq project item-create "${NUMBER}" --owner "${OWNER}" --title "$1" --body "$2" --format json --jq .id
+}
+
+cmd_set() {
+    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--why TEXT]"
+    local item=$1
+    shift
+    test $# -gt 0 || fatal "nothing to set; valid options: ${SET_OPTIONS[*]}"
+    # Resolve and validate everything before changing anything.
+    local field_ids=() args=() names=() field field_id option
+    load_fields
+    while test $# -gt 0; do
+        case "$1" in
+            --status|--priority|--workflow|--why)
+                test $# -ge 2 || fatal "$1 requires an argument"
+                field=${1#--}
+                field=${field^}
+                # Plain assignments, so that a failed lookup stops the script.
+                field_id=$(field_json "${field}")
+                field_ids+=("$(jq -r .id <<<"${field_id}")")
+                if test "${field}" = Why; then
+                    if test -n "$2"; then args+=("--text=$2"); else args+=(--clear); fi
+                else
+                    option=$(option_id "${field}" "$2")
+                    args+=("--single-select-option-id=${option}")
+                fi
+                names+=("${field} = $2")
+                shift 2
+                ;;
+            *) fatal "unknown option for set: '$1'; valid options: ${SET_OPTIONS[*]}" ;;
+        esac
+    done
+    local id project remaining i
+    # A project item id needs no lookup; anything else resolves via the list.
+    if [[ "${item}" == PVTI_* ]]; then
+        id=${item}
+    else
+        load_items
+        id=$(resolve_item "${item}")
+    fi
+    project=$(project_id) || fail_after $? "cannot look up the project id"
+    # Don't start a batch of edits that the quota can't finish.
+    remaining=$(gh api rate_limit --jq .resources.graphql.remaining 2>/dev/null) || remaining=
+    if test -n "${remaining}" && test "${remaining}" -lt $((${#field_ids[@]} + QUOTA_MARGIN)); then
+        rate_limited "only ${remaining} GraphQL points left, not starting ${#field_ids[@]} edit(s)"
+    fi
+    # Before and after the edits, so a concurrent listing can't cache the
+    # old values for long.
+    invalidate_items
+    for i in "${!field_ids[@]}"; do
+        ghq project item-edit --project-id "${project}" --id "${id}" \
+            --field-id "${field_ids[i]}" "${args[i]}" >/dev/null ||
+            fatal "setting ${names[i]} on ${id} failed"
+        echo "${id}: ${names[i]}"
+    done
+    invalidate_items
+}
+
+while test $# -gt 0; do
+    case "$1" in
+        --refresh) refresh=true; shift ;;
+        *) break ;;
+    esac
+done
+test $# -gt 0 || { usage 1>&2; exit 1; }
+command=$1
+shift
+case "${command}" in
+    -h|--help|help) usage; exit 0 ;;
+    list|show|add|draft|set) ;;
+    *) fatal "unknown command '${command}' (see --help)" ;;
+esac
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${OWNER}"
+require_cmd jq "install jq"
+"cmd_${command}" "$@"
