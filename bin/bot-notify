@@ -20,15 +20,10 @@ readonly API=https://api.github.com
 readonly DEFAULT_LOOKBACK_DAYS=7
 readonly PER_PAGE=50
 readonly EXCERPT_LEN=300
-# Poll state lives on the Workstream board, in an archived draft item, so
-# it is shared by every machine the bot runs on.
-readonly PROJECT_OWNER=cgwalters-bot
-readonly PROJECT_NUMBER=1
-readonly STATE_TITLE='bot-state: notifications'
-# The state item's id; if it is empty or gone, the item is looked up by
-# title among the archived items, and created if missing.
-readonly STATE_ITEM_ID=PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk
-readonly ARCHIVED_PAGE=100
+# Poll state lives on the Workstream board, in the archived draft item
+# 'bot-state: notifications' (see 'bot-board state-get'), so it is shared
+# by every machine the bot runs on.
+readonly STATE_NAME=notifications
 # Local to this machine: the lock, the requests printed but not acked yet
 # (plus recently acked ones, so they aren't printed again), and the
 # triggers already filed as issues.
@@ -78,7 +73,7 @@ Threads in ${FORGE_ORG} are skipped: 'bot-pr inbox' covers them. Other
 threads are marked read once routed, unless they hold unacked requests.
 Unacked requests and filed triggers are kept in ${LOCAL_DIR}.
 The poll state (since, Last-Modified) is kept in the archived
-'${STATE_TITLE}' draft item on the board, created on the first run, and
+'bot-state: ${STATE_NAME}' draft item on the board, created on the first run, and
 only advances when every thread was routed, so a failed run is retried.
 A 304 from GitHub means nothing new and costs no write.
 
@@ -290,98 +285,14 @@ PENDING_JSON=$(jq -c --arg cutoff "$(date -u -d "${ACKED_KEEP_DAYS} days ago" +%
 
 # --- State on the board ---------------------------------------------------
 
-STATE_ITEM=
-STATE_DRAFT=
-STATE_JSON='{}'
-
-# state_body JSON: the draft body holding JSON.
-state_body() {
-    printf '%s\n\n```json\n%s\n```\n' \
-        "Poll state of bin/bot-notify (cgwalters-bot/homegit). Archived on purpose; only the script edits it." \
-        "$(jq . <<<"$1")"
+# board_failed STATUS MESSAGE: after a failed bot-board call, pass a
+# rate-limit exit through (bot-board printed why), else fail.
+board_failed() {
+    test "$1" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
+    fatal "$2"
 }
 
-# parse_state BODY: prints the JSON of the first fenced json block, or {}.
-parse_state() {
-    local json
-    json=$(awk '/^```json[[:space:]]*$/ { inblock = 1; next }
-                inblock && /^```[[:space:]]*$/ { exit }
-                inblock { print }' <<<"$1")
-    test -n "${json}" || json='{}'
-    jq -ce 'if type == "object" then . else error("not an object") end' <<<"${json}" ||
-        fatal "the state item ${STATE_ITEM} has no valid JSON block; fix or delete it (a fresh state starts ${DEFAULT_LOOKBACK_DAYS} days back)"
-}
-
-readonly NODE_QUERY='query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
-    id isArchived content { ... on DraftIssue { id title body } } } } }'
-
-# load_state_item ID: loads the item if it exists and is ours; false if not.
-load_state_item() {
-    local data
-    data=$(gql "${NODE_QUERY}" -f id="$1" 2>/dev/null) || return 1
-    jq -e --arg t "${STATE_TITLE}" '.node.content.title == $t' <<<"${data}" >/dev/null || return 1
-    STATE_ITEM=$1
-    STATE_DRAFT=$(jq -r .node.content.id <<<"${data}")
-    STATE_JSON=$(parse_state "$(jq -r .node.content.body <<<"${data}")")
-    jq -e .node.isArchived <<<"${data}" >/dev/null ||
-        warn "the state item ${STATE_ITEM} is not archived; it shows on the board"
-}
-
-# find_archived_state: prints the id of the archived item titled
-# STATE_TITLE, if any.
-find_archived_state() {
-    local cursor='' page
-    while :; do
-        page=$(gql 'query($owner: String!, $number: Int!, $first: Int!, $after: String) {
-            user(login: $owner) { projectV2(number: $number) {
-              items(first: $first, after: $after, archivedStates: [ARCHIVED]) {
-                pageInfo { hasNextPage endCursor }
-                nodes { id content { ... on DraftIssue { title } } } } } } }' \
-            -f owner="${PROJECT_OWNER}" -F number="${PROJECT_NUMBER}" -F first="${ARCHIVED_PAGE}" \
-            ${cursor:+-f after="${cursor}"}) ||
-            fatal "listing the archived items of the board failed"
-        jq -r --arg t "${STATE_TITLE}" '.user.projectV2.items.nodes[]
-            | select(.content.title == $t) | .id' <<<"${page}" | head -n1 | grep . && return 0
-        jq -e .user.projectV2.items.pageInfo.hasNextPage <<<"${page}" >/dev/null || return 0
-        cursor=$(jq -r .user.projectV2.items.pageInfo.endCursor <<<"${page}")
-    done
-}
-
-create_state_item() {
-    local id project
-    id=$("${BOT_BOARD}" draft "${STATE_TITLE}" "$(state_body '{}')") ||
-        fatal "creating the '${STATE_TITLE}' draft item failed"
-    "${BOT_BOARD}" set "${id}" --workflow manual >/dev/null ||
-        fatal "setting Workflow=manual on the new state item ${id} failed; archive it by hand"
-    project=$(gql 'query($owner: String!, $number: Int!) { user(login: $owner) { projectV2(number: $number) { id } } }' \
-        -f owner="${PROJECT_OWNER}" -F number="${PROJECT_NUMBER}" | jq -r .user.projectV2.id) ||
-        fatal "looking up the project id failed; archive ${id} by hand"
-    gql 'mutation($project: ID!, $item: ID!) { archiveProjectV2Item(input: {projectId: $project, itemId: $item}) { item { id } } }' \
-        -f project="${project}" -f item="${id}" >/dev/null ||
-        fatal "archiving the state item ${id} failed; archive it by hand"
-    echo "Created and archived the state item ${id}; set STATE_ITEM_ID in $(basename "$0") to it" 1>&2
-    load_state_item "${id}" || fatal "cannot read back the new state item ${id}"
-}
-
-write_state() {
-    local body
-    body=$(state_body "$1")
-    gql 'mutation($id: ID!, $body: String!) { updateProjectV2DraftIssue(input: {draftIssueId: $id, body: $body}) { draftIssue { id } } }' \
-        -f id="${STATE_DRAFT}" -f body="${body}" >/dev/null
-}
-
-if test -z "${STATE_ITEM_ID}" || ! load_state_item "${STATE_ITEM_ID}"; then
-    test -z "${STATE_ITEM_ID}" || warn "state item ${STATE_ITEM_ID} not found; looking it up by title"
-    found=$(find_archived_state)
-    if test -n "${found}"; then
-        load_state_item "${found}" || fatal "cannot read the state item ${found}"
-        echo "Using the state item ${found}; set STATE_ITEM_ID in $(basename "$0") to it" 1>&2
-    elif ${dry_run}; then
-        warn "no state item yet; --dry-run doesn't create it"
-    else
-        create_state_item
-    fi
-fi
+STATE_JSON=$("${BOT_BOARD}" state-get "${STATE_NAME}") || board_failed $? "reading the poll state failed"
 since=$(jq -r '.since // empty' <<<"${STATE_JSON}")
 last_modified=$(jq -r '.last_modified // empty' <<<"${STATE_JSON}")
 test -n "${since}" || since=$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%FT%TZ)
@@ -761,8 +672,8 @@ if test "$(jq length <<<"${threads}")" -eq 0 && test "${new_last_modified}" = "$
     echo "No changes; state unchanged."
     exit 0
 fi
-test -n "${STATE_DRAFT}" || fatal "no state item to record the poll in"
 new_state=$(jq -nc --arg since "${poll_start}" --arg lm "${new_last_modified}" --arg now "$(iso_now)" \
     --arg host "$(hostname)" '{since: $since, last_modified: $lm, updated_at: $now, host: $host}')
-write_state "${new_state}" || fatal "recording the state in ${STATE_ITEM} failed; the next run will redo this poll"
+"${BOT_BOARD}" state-put "${STATE_NAME}" "${new_state}" ||
+    board_failed $? "recording the state failed; the next run will redo this poll"
 echo "State advanced to since=${poll_start}."

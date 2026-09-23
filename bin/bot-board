@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Thin CLI over 'gh project' for the cgwalters-bot Workstream board.
+# GraphQL queries hold literal $variables.
+# shellcheck disable=SC2016
 set -euo pipefail
 
 readonly OWNER=cgwalters-bot
@@ -20,6 +22,14 @@ readonly ITEMS_TTL=60
 readonly QUOTA_MARGIN=20
 # Exit status for an exhausted quota (EX_TEMPFAIL), so callers can retry later.
 readonly EX_RATELIMIT=75
+# Scripts keep state shared across machines in archived draft items titled
+# STATE_PREFIX + NAME, holding a fenced JSON block. GitHub's API doesn't
+# list archived items (it ignores archivedStates), so they can't be found
+# by title: their ids are recorded here once state-put has created them.
+readonly STATE_PREFIX='bot-state: '
+readonly -A STATE_ITEMS=(
+    [notifications]=PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk
+)
 
 usage() {
     cat <<EOF
@@ -41,6 +51,11 @@ Commands:
                               pushed branches), Gist the write-up URL(s);
                               separate several with spaces.
                               An empty value clears a text field.
+  state-get NAME              Print the JSON state kept in the archived
+                              draft item '${STATE_PREFIX}NAME' ({} if it
+                              doesn't exist yet)
+  state-put NAME JSON         Replace that state, creating (and archiving)
+                              the item if needed
   -h, --help                  Show this help
 
 Options:
@@ -52,6 +67,7 @@ Valid values for Status, Priority and Workflow are read from the board.
 Board calls use the bot's GraphQL quota, shared by all agents, so field
 definitions are cached for ${FIELDS_TTL}s and the item list for ${ITEMS_TTL}s in
 ${CACHE_DIR}; changes made through this tool invalidate the item cache.
+state-get and state-put are one GraphQL call each.
 EOF
 }
 
@@ -340,6 +356,116 @@ cmd_set() {
     invalidate_items
 }
 
+# --- State items -----------------------------------------------------------
+
+# gqlq QUERY [ARGS...]: a GraphQL call through ghq; prints .data.
+gqlq() {
+    local query=$1
+    shift
+    ghq api graphql -f query="${query}" "$@" --jq .data
+}
+
+state_name_ok() {
+    [[ "$1" =~ ^[a-z0-9][a-z0-9-]*$ ]] || fatal "invalid state name '$1'; use lowercase letters, digits and dashes"
+}
+
+# state_body JSON: the draft body holding JSON, compact since the body
+# is limited in size.
+state_body() {
+    printf '%s\n\n```json\n%s\n```\n' \
+        "State of a script in bin/ of cgwalters-bot/homegit, shared by every machine it runs on. Archived on purpose; only the script edits it." \
+        "$(jq -c . <<<"$1")"
+}
+
+# parse_state ITEM BODY: prints the JSON of the body's first fenced json
+# block, or {}.
+parse_state() {
+    local json
+    json=$(awk '/^```json[[:space:]]*$/ { inblock = 1; next }
+                inblock && /^```[[:space:]]*$/ { exit }
+                inblock { print }' <<<"$2")
+    test -n "${json}" || json='{}'
+    jq -ce 'if type == "object" then . else error("not an object") end' <<<"${json}" ||
+        fatal "the state item $1 has no valid JSON block; fix or delete it"
+}
+
+readonly STATE_NODE_QUERY='query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
+    id isArchived content { ... on DraftIssue { id title body } } } } }'
+
+# Set by find_state.
+STATE_ITEM=
+STATE_DRAFT=
+STATE_BODY=
+
+# state_id NAME: prints the id of the state item NAME, from STATE_ITEMS or,
+# for one created since, the cache; nothing if it doesn't exist yet.
+state_id() {
+    local id=${STATE_ITEMS[$1]:-}
+    test -n "${id}" || read -r id 2>/dev/null <"${CACHE_DIR}/state-$1" || true
+    echo "${id}"
+}
+
+# find_state NAME: sets STATE_ITEM, STATE_DRAFT and STATE_BODY to the
+# state item, or returns 1 if there is none yet.
+find_state() {
+    local id data
+    id=$(state_id "$1")
+    test -n "${id}" || return 1
+    data=$(gqlq "${STATE_NODE_QUERY}" -f id="${id}") || fail_after $? "reading the state item ${id} failed"
+    jq -e --arg t "${STATE_PREFIX}$1" '.node.content.title == $t' <<<"${data}" >/dev/null ||
+        fatal "${id} is not the '${STATE_PREFIX}$1' draft item (deleted?); fix STATE_ITEMS in $(basename "$0"), or remove ${CACHE_DIR}/state-$1 to create a new one"
+    STATE_ITEM=${id}
+    STATE_DRAFT=$(jq -r .node.content.id <<<"${data}")
+    STATE_BODY=$(jq -r .node.content.body <<<"${data}")
+    jq -e .node.isArchived <<<"${data}" >/dev/null ||
+        echo "warning: the state item ${id} is not archived; it shows on the board" 1>&2
+}
+
+cmd_state_get() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") state-get NAME"
+    state_name_ok "$1"
+    if find_state "$1"; then
+        parse_state "${STATE_ITEM}" "${STATE_BODY}"
+    else
+        echo "warning: no '${STATE_PREFIX}$1' state item yet; state-put creates it" 1>&2
+        echo '{}'
+    fi
+}
+
+readonly DRAFT_UPDATE_MUTATION='mutation($id: ID!, $body: String!) {
+    updateProjectV2DraftIssue(input: {draftIssueId: $id, body: $body}) { draftIssue { id } } }'
+
+cmd_state_put() {
+    test $# -eq 2 || fatal "usage: $(basename "$0") state-put NAME JSON"
+    local name=$1 json body id project
+    state_name_ok "${name}"
+    json=$(jq -ce 'if type == "object" then . else error("not an object") end' <<<"$2" 2>/dev/null) ||
+        fatal "state-put expects a JSON object"
+    body=$(state_body "${json}")
+    if find_state "${name}"; then
+        gqlq "${DRAFT_UPDATE_MUTATION}" -f id="${STATE_DRAFT}" -f body="${body}" >/dev/null ||
+            fail_after $? "writing the state item ${STATE_ITEM} failed"
+        return 0
+    fi
+    # Workflow manual, so that nothing ever claims it, even unarchived.
+    load_fields
+    local workflow_field manual
+    workflow_field=$(field_json Workflow | jq -r .id)
+    manual=$(option_id Workflow manual)
+    id=$(ghq project item-create "${NUMBER}" --owner "${OWNER}" --title "${STATE_PREFIX}${name}" \
+        --body "${body}" --format json --jq .id) || fail_after $? "creating the state item failed"
+    project=$(project_id) || fail_after $? "cannot look up the project id; archive ${id} by hand"
+    ghq project item-edit --project-id "${project}" --id "${id}" --field-id "${workflow_field}" \
+        --single-select-option-id "${manual}" >/dev/null ||
+        fail_after $? "setting Workflow manual on the state item ${id} failed; set it and archive it by hand"
+    gqlq 'mutation($project: ID!, $item: ID!) { archiveProjectV2Item(input: {projectId: $project, itemId: $item}) { item { id } } }' \
+        -f project="${project}" -f item="${id}" >/dev/null ||
+        fail_after $? "archiving the state item ${id} failed; archive it by hand"
+    mkdir -p "${CACHE_DIR}"
+    echo "${id}" >"${CACHE_DIR}/state-${name}"
+    echo "Created and archived the state item ${id} ('${STATE_PREFIX}${name}'); add it to STATE_ITEMS in $(basename "$0")" 1>&2
+}
+
 while test $# -gt 0; do
     case "$1" in
         --refresh) refresh=true; shift ;;
@@ -352,6 +478,8 @@ shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
     list|show|add|draft|set) ;;
+    state-get) command=state_get ;;
+    state-put) command=state_put ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
 require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${OWNER}"

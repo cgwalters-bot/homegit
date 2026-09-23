@@ -118,10 +118,10 @@ The poll state (`since`, the start of the last fully routed poll, and
 GitHub's `Last-Modified` for `If-Modified-Since`) lives on the Workstream
 board in the draft item `bot-state: notifications`, which is archived so
 it doesn't show on the board and has Workflow manual. Never edit, unarchive
-or claim it. The script reads it with one GraphQL call per run and writes
-it once per poll that saw changes; a 304 costs no write. It is created (and
-archived) by the first run if it's missing, and found by title if its id
-in the script is stale. Next to the local lock, `pending.json` holds the
+or claim it. The script reads it through `bot-board state-get` (one
+GraphQL call per run) and writes it with `bot-board state-put` once per
+poll that saw changes; a 304 costs no write. GitHub can't list archived
+items, so bot-board knows the item by its id. Next to the local lock, `pending.json` holds the
 unacked requests (and, for 30 days, the acked ones, so a thread seen again
 doesn't bring them back) and `filed.json` the triggers already filed as
 issues, checked before the lagging issue list.
