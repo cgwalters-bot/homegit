@@ -30,6 +30,7 @@ readonly WHY_MAX=400
 readonly EXCERPT_LEN=100
 readonly SHORT_SHA=10
 readonly CHECKS_PER_PAGE=100
+readonly PER_PAGE=100
 # Conditional requests answered 304 are free; the cache is local and only
 # an HTTP cache, so it is written even in a dry run.
 readonly ETAG_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-watch/etags
@@ -54,7 +55,9 @@ sweep saw and report:
   - new comments and reviews by anyone but ${BOT_LOGIN}, with their
     author and first line (those by ${REQUESTER} flagged);
   - state changes: merged, closed, reopened;
-  - pushes to a PR's head by anyone but ${BOT_LOGIN};
+  - pushes to a PR's head: force pushes by anyone but ${BOT_LOGIN}, with
+    who made them; other new commits with their committer (GitHub
+    doesn't say who pushed them), unless that is ${BOT_LOGIN};
   - CI turning red (or green again), flagged on the bot's own branches.
 
 On the bot's fork PRs (its PRs in ${FORK_OWNERS}) only pushes and CI
@@ -198,6 +201,20 @@ rest_get() {
     esac
 }
 
+# rest_pages PATH: prints the elements of the JSON array at PATH, one per
+# line, from all its pages. For lists that only grow at the end (events,
+# comments), whose full pages then answer 304.
+rest_pages() {
+    local sep='?' page=1 body
+    [[ "$1" != *\?* ]] || sep='&'
+    while :; do
+        body=$(rest_get "$1${sep}per_page=${PER_PAGE}&page=${page}") || return
+        jq -c '.[]' <<<"${body}" || return
+        test "$(jq length <<<"${body}")" -ge "${PER_PAGE}" || return 0
+        page=$((page + 1))
+    done
+}
+
 login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
 test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}"
 
@@ -327,15 +344,30 @@ probe() {
         head=$(jq -r .head_sha <<<"${cur}")
         prev_head=$(jq -r '.head_sha // empty' <<<"${prev}")
         if test -n "${prev_head}" && test "${prev_head}" != "${head}"; then
-            local commit by
-            commit=$(rest_get "repos/${repo}/commits/${head}") || return "$(sub_status $?)"
-            # Who committed it is the best guess at who pushed it, unless
-            # GitHub did (web-flow: a merge or "update branch" button).
-            by=$(jq -r '(.committer.login // "") as $c
-                | if $c != "" and $c != "web-flow" then $c else .author.login // .commit.author.name end' <<<"${commit}")
-            if test "${by}" != "${BOT_LOGIN}"; then
-                changes=$(jq -c --arg from "${prev_head}" --arg to "${head}" --arg by "${by}" \
-                    '. + [{type: "push", from: $from, to: $to, by: $by}]' <<<"${changes}")
+            local events pusher push
+            # A force push has an event naming who made it; the bot's own
+            # aren't news.
+            events=$(rest_pages "repos/${repo}/issues/${number}/events") || return "$(sub_status $?)"
+            pusher=$(jq -rs --arg head "${head}" \
+                'map(select(.event == "head_ref_force_pushed" and .commit_id == $head)) | last | .actor.login // empty' <<<"${events}")
+            if test -n "${pusher}"; then
+                test "${pusher}" = "${BOT_LOGIN}" ||
+                    push=$(jq -nc --arg by "${pusher}" '{forced: true, by: $by}')
+            else
+                # A plain push has no such record: all there is to go by
+                # is the committer of the new head, who may not be the
+                # pusher. Only a login is compared, never a display name.
+                local commit committer
+                commit=$(rest_get "repos/${repo}/commits/${head}") || return "$(sub_status $?)"
+                committer=$(jq -r '.committer.login // ""' <<<"${commit}")
+                if test "${committer}" != "${BOT_LOGIN}"; then
+                    push=$(jq -c '{forced: false, committer: (.committer.login // .commit.committer.name // "unknown"),
+                                   committer_is_login: (.committer.login != null)}' <<<"${commit}")
+                fi
+            fi
+            if test -n "${push:-}"; then
+                changes=$(jq -c --arg from "${prev_head}" --arg to "${head}" --argjson push "${push}" \
+                    '. + [{type: "push", from: $from, to: $to} + $push]' <<<"${changes}")
             fi
         fi
         local ci prev_checks checks
@@ -514,7 +546,8 @@ else
                 if .type == "comment" then "comment by @\(.author)\(if .from_requester then " (operator)" else "" end): \(.excerpt)\n      \(.link)"
                 elif .type == "review" then "review \(.review_state) by @\(.author)\(if .from_requester then " (operator)" else "" end)\(if .excerpt != "" then ": " + .excerpt else "" end)\n      \(.link)"
                 elif .type == "state" then "\(.from) -> \(.to)"
-                elif .type == "push" then "pushed by @\(.by): \(.from | short) -> \(.to | short)"
+                elif .type == "push" and .forced then "force-pushed by @\(.by): \(.from | short) -> \(.to | short)"
+                elif .type == "push" then "new commits (committer \(if .committer_is_login then "@" else "" end)\(.committer)): \(.from | short) -> \(.to | short)"
                 elif .type == "ci_red" then "CI failing\(if .bot_branch then " on the bot'"'"'s branch" else "" end) at \(.head | short): \(.failing | join(", "))"
                 elif .type == "ci_green" then "CI passing again at \(.head | short)"
                 elif .type == "gone" then "gone (404 or 410): deleted, or no longer public"

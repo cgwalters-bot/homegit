@@ -182,8 +182,10 @@ bot-watch --apply
 own issue or PR, and PR URLs in Branch; not Done or manual items) and
 reports what changed since its last sweep, per item: new comments and
 reviews (their author and first line; cgwalters' are marked
-`(operator)`), merged/closed/reopened, pushes to a PR head by anyone but
-the bot, and CI turning red (flagged on the bot's own branches) or green
+`(operator)`), merged/closed/reopened, pushes to a PR head (force
+pushes by anyone but the bot, with who made them; other new commits
+with their committer, since GitHub doesn't record who pushed those),
+and CI turning red (flagged on the bot's own branches) or green
 again. On the bot's fork PRs (its own PRs in cgwalters-forge and
 cgwalters-bot repositories) it only reports pushes and CI, since
 `bot-pr inbox` covers his review there; other issues and PRs in those
