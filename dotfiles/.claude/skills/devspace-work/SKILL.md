@@ -36,7 +36,7 @@ Runners are billed while they run, and larger ones cost more. So:
   compose-style tests. Pick the shortest `--duration` that covers the work
   (30/60/120/240 minutes; default 240), since it's a hard upper bound.
 - **Stop it as soon as the task's testing is done**, and before parking
-  the item as In Review or Needs human. Never leave one running between
+  the item as Draft or Needs human. Never leave one running between
   tasks "just in case".
 
 ## Start (or reuse)
@@ -126,8 +126,9 @@ git push -u origin HEAD:bot/<short-slug>
 ```
 
 Record what was run and the result in one line in the board item's Why
-(e.g. `just test: 312 passed on a 16-core RHEL 10 devspace`), and the
-branch's compare URL in Branch, as `workstream` describes.
+(e.g. `just test: 312 passed on a 16-core RHEL 10 devspace`) and in the
+fork PR's description, and propose the branch with `bot-pr fork-pr`, as
+`workstream` describes.
 
 ## Stop
 
@@ -142,9 +143,13 @@ with it, which is the point.
 ## Running upstream CI on a branch
 
 Many projects' CI only triggers on pull requests or pushes to the default
-branch, so a pushed `bot/...` branch gets no CI. To run it anyway without
-touching upstream, open a pull request *inside the bot's fork*: push the
-base branch to the fork too (upstream main, or a Renovate branch under its
+branch, so a pushed `bot/...` branch gets no CI. The draft fork PR from
+`bot-pr fork-pr` runs the fork's `pull_request` workflows, unless they
+filter on a base branch name that the fork PR doesn't target (fork-pr
+falls back to a `bot-base/<branch>` mirror when the fork's own copy of the
+base has diverged). To run CI before that, or for a branch that won't be
+proposed, open a pull request *inside the bot's fork*: push the base
+branch to the fork too (upstream main, or a Renovate branch under its
 upstream name), then
 
 ```bash

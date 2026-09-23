@@ -37,8 +37,9 @@ Commands:
   set ITEM [--status S] [--priority P] [--workflow W] [--why TEXT]
            [--branch URL...] [--gist URL...]
                               Update fields of an item. Branch holds the
-                              compare URL(s) of pushed branches, Gist the
-                              write-up URL(s); separate several with spaces.
+                              fork or upstream PR URL (or compare URLs of
+                              pushed branches), Gist the write-up URL(s);
+                              separate several with spaces.
                               An empty value clears a text field.
   -h, --help                  Show this help
 

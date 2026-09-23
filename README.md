@@ -8,16 +8,16 @@ bot that helps with upstream contributions. Commits made from this
 environment are authored as `cgwalters-bot`, and the agents' work is
 coordinated through the [Workstream](https://github.com/users/cgwalters-bot/projects/1)
 project board: a human moves items into Todo, the bot claims them, pushes
-tested branches (or, when asked, draft PRs) to its forks, and moves them
-through In Progress, Needs human and In Review; only a human's acceptance
-makes something Done.
+tested branches to its forks and proposes them there as draft PRs (Draft),
+and only once cgwalters approves one does it go upstream (In Review);
+only a human's acceptance makes something Done.
 
 Install with `make install` as usual. The shared agent prompt is still
 [AGENTS.md](AGENTS.md), and the skills in `dotfiles/.claude/skills` are
 picked up by both agent CLIs: `workstream` (using the board),
 `backlog-planning` (refilling the board from recent GitHub activity),
 `bot-feedback` (surfacing reactions on the bot's work),
-`upstream-pr` (how to contribute as the bot), `devspace-work` (building
+`upstream-pr` (how to contribute as the bot, with `bot-pr`), `devspace-work` (building
 and testing on a remote runner), plus the upstream ones like
 `commit-review`.
 
@@ -62,10 +62,38 @@ stop` cancels the runner, since they're billed while they run.
 `bot-board` is a small CLI over `gh project` for the Workstream board
 (`list`, `show`, `add`, `draft`, `set`), which caches reads because the
 bot's GraphQL quota is shared by every agent. Each item's Workflow field
-says what the bot delivers: a tested branch on its fork (`branch`, the
-default), a write-up in a secret gist (`analysis`), a draft PR (`pr`, set
-only by a human), or nothing (`manual`). In the morning, In Review items
-link to what's ready.
+says what the bot delivers: a tested branch proposed as a draft PR on its
+fork (`branch`, the default), a write-up in a secret gist (`analysis`), a
+draft PR straight upstream (`pr`, set only by a human), or nothing
+(`manual`). In the morning, Draft items link to what's ready for review.
+
+### Reviewing the bot's work
+
+The bot doesn't open upstream PRs on its own. A finished `branch` item is
+a draft PR from `bot/<slug>` into the bot's fork (`cgwalters-bot/REPO`),
+linked from the item's Branch field, whose title and description are
+already written as the upstream PR. A trailing section between
+`<!-- bot-meta -->` markers names the upstream repository and base
+branch, and the board item. On that PR:
+
+- **Approve** it to have it opened upstream, ready for review.
+- Comment **`/draft`** and approve to have it opened upstream as a draft
+  (a later `/ready` takes that back).
+- **Comment** (inline or on the PR) to ask for changes, including commit
+  message rewording; the bot answers with squashed fixups and a reply.
+  An approval covers the commit you approved, so changes pushed after it
+  need another approval.
+- **Edit** the title and description as you like: they are copied
+  upstream as they stand at approval, minus the bot-meta section. (That
+  needs write access to the fork, which you only get as a collaborator;
+  otherwise ask in a comment.)
+- **Close** it to drop the change; the item becomes Done as dropped.
+
+`bot-pr` (REST only) implements the bot's side: `fork-pr` opens the fork
+PR, `inbox` lists your activity on them since its last run (only the
+`cgwalters` login counts), and `promote` rebases onto upstream, opens the
+upstream PR, closes the fork PR and moves the item to In Review. Agents
+run `bot-pr inbox` at the start of every session.
 
 To pick up changes from the upstream repository:
 

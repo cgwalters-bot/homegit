@@ -1,6 +1,6 @@
 ---
 name: upstream-pr
-description: How cgwalters-bot contributes changes to upstream repositories - fork, topic branch, follow project policy, test, self-review, push the tested branch to the bot's fork, and (only for Workflow=pr items) open a draft PR. Use whenever making code changes to a repository the bot does not own, and when responding to review on such a PR.
+description: How cgwalters-bot contributes changes to upstream repositories - fork, topic branch, follow project policy, test, self-review, push the tested branch to the bot's fork and propose it as a draft PR on the fork (bot-pr fork-pr); upstream PRs are opened only by bot-pr promote after cgwalters approves, or for Workflow=pr items. Use whenever making code changes to a repository the bot does not own, and when responding to review on such a PR.
 ---
 
 # upstream-pr — Contributing upstream as cgwalters-bot
@@ -10,12 +10,14 @@ repositories always go through a topic branch on a fork owned by
 `cgwalters-bot`. Board status updates for the item you are working on are
 covered by the `workstream` skill.
 
-**By default the result is a tested branch, not a PR.** Items with Workflow
-`branch` (or no Workflow) end with the branch pushed to the fork as
-`bot/<short-slug>` and its compare URL on the board; a human decides whether
-it becomes a PR. Open a PR only when the item's Workflow is `pr`, which only
-a human sets. Updating the bot's own existing PRs (e.g. addressing review,
-or a rebase cgwalters asked for) is fine under either.
+**By default the result is a tested branch and a draft PR on the bot's own
+fork, not an upstream PR.** Items with Workflow `branch` (or no Workflow)
+end with the branch pushed to the fork as `bot/<short-slug>` and proposed
+with `bot-pr fork-pr`, where cgwalters reviews it (see "Review loop" in
+`workstream`). **Upstream PRs are opened only by `bot-pr promote`**, after
+he approves the fork PR, or directly when the item's Workflow is `pr`,
+which only a human sets. Updating the bot's own existing PRs (e.g.
+addressing review, or a rebase cgwalters asked for) is fine under either.
 
 This skill is for changes the bot proposes as its own. For items that are
 cgwalters' own PRs or review requests, follow the "PR items" section of
@@ -122,31 +124,56 @@ board item's Why (and in the PR description, for a PR). Then load the
 git push -u origin HEAD:bot/<short-slug>
 ```
 
-The push goes from this machine, never from a devspace. For a `branch`
-item this is the end: record the compare URL against upstream,
-`https://github.com/OWNER/REPO/compare/<default-branch>...cgwalters-bot:bot/<short-slug>`
-(it shows the diff and gives a human a one-click "Create pull request"),
-in the board item's Branch field and the test summary in Why (see
-`workstream`). When the branch is updated or replaced later, update Branch.
+The push goes from this machine, never from a devspace.
 
-## Open the PR (Workflow `pr` only)
+## Propose it on the fork
+
+For a `branch` item, open the draft fork PR (see `workstream` for the
+board update that follows):
 
 ```bash
-gh pr create --repo OWNER/REPO --head cgwalters-bot:bot/<short-slug> --draft \
-  --title "..." --body-file pr-body.md
+bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
+  --branch bot/<short-slug> --item PVTI_... --title "..." --body-file pr-body.md
 ```
 
-PRs are drafts by default unless the work item says otherwise; a human marks
-them ready. The body explains the motivation and how it was tested, links the
-issue (`Fixes OWNER/REPO#N` when it fully resolves it), follows any PR template,
+It syncs the fork's copy of the base with upstream, opens the PR inside
+`cgwalters-bot/REPO`, and appends a bot-meta section with the upstream
+target, the board item and instructions for cgwalters. Write the title
+and body as the upstream PR (the PR description rules below apply): once
+approved they are posted upstream as they stand then, minus the bot-meta
+section. The fork PR also runs the fork's `pull_request` CI, if the
+fork's workflows trigger for that base.
+
+## The PR description
+
+Whether it goes on the fork first or (Workflow `pr`) straight upstream,
+the body explains the motivation and how it was tested, links the issue
+(`Fixes OWNER/REPO#N` when it fully resolves it), states caveats (such as
+commits that still need a human's DCO sign-off), follows any PR template,
 and ends with:
 
 ```
 Generated-by: https://github.com/cgwalters/#llms
 ```
 
-Then update the board item to In Review with the PR URL in Branch (see
-`workstream`).
+## Open the upstream PR
+
+Only two ways, never anything else:
+
+- **Promotion.** When cgwalters approved the fork PR,
+  `bot-pr promote <fork-pr-url>` opens the upstream PR (ready for review,
+  or a draft if he commented `/draft`), closes the fork PR and updates the
+  board; see "Review loop" in `workstream`.
+- **Workflow `pr`**, set by a human: open a draft PR directly, then set
+  the item In Review with the PR URL in Branch:
+
+  ```bash
+  gh pr create --repo OWNER/REPO --head cgwalters-bot:bot/<short-slug> --draft \
+    --title "..." --body-file pr-body.md
+  ```
+
+  PRs are drafts unless the work item says otherwise; a human marks them
+  ready.
 
 ## Responding to review
 
@@ -159,10 +186,15 @@ GIT_SEQUENCE_EDITOR=: git rebase -i --autosquash upstream/<default-branch>
 git push --force-with-lease --force-if-includes
 ```
 
-Force-pushing your own topic branch is fine. **Never force-push over someone
-else's commits**: if a maintainer pushed to your branch, fetch and rebase on
-top of their work first, and never force-push to branches you did not create.
-Reply to each review comment saying what changed, or why you disagree. If a
-comment needs a judgment call from Colin, put the question in the board item
-(see `workstream`) and set Needs human rather than asking on the PR; ask on
-the PR only when the question is for the maintainers.
+Force-pushing your own topic branch is fine. **Never force-push over
+someone else's commits**: if a maintainer pushed to your branch, fetch and
+rebase on top of their work first, and never force-push to branches you
+did not create. Reply to each review comment saying what changed, or why
+you disagree. If a comment on an upstream PR needs a judgment call from
+Colin, put the question in the board item (see `workstream`) and set
+Needs human rather than asking on the PR; ask on the PR only when the
+question is for the maintainers.
+
+cgwalters' comments on a fork PR are handled the same way, and the reply
+goes in the fork PR thread, which is also the place to ask him about that
+change: the item stays Draft.

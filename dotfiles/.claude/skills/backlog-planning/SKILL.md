@@ -60,6 +60,17 @@ repository, cgwalters-bot/cgwalters-bot. It is cheap (REST only, three
 search requests) and only reports reactions it has not seen. Don't add
 board items for the same threads; mention the filed issues in the report.
 
+Then check for cgwalters' review of the bot's fork PRs:
+
+```bash
+bot-pr inbox --dry-run
+```
+
+This is read-only here: don't address the feedback or promote while
+planning, just list in the report what is waiting (approved fork PRs,
+new comments, fork PRs he closed). `--dry-run` leaves the activity marked
+unseen, so the next work session's `bot-pr inbox` still shows it.
+
 ## 1. Load what is already on the board
 
 Dedupe against this before adding anything. Draft items are deduped by the
@@ -326,7 +337,7 @@ burn-down run that cgwalters explicitly authorized (the prompt says so):
 then clearly valuable, safe, self-contained items may go straight to Todo,
 while anything speculative, security-related or needing a design decision
 still gets no status. Never set In Progress,
-Needs human, In Review or Done while planning.
+Draft, Needs human, In Review or Done while planning.
 
 When adding many items, write the `bot-board` calls into a script file and
 run it, instead of a quoted `bash -c '...'` string: an apostrophe in a Why
