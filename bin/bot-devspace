@@ -32,6 +32,8 @@ readonly EX_NOTFOUND=4
 readonly PROVISION_PACKAGES=(
     podman buildah skopeo
     gcc gcc-c++ make pkgconf openssl-devel
+    # Build deps shared by bootc, ostree-ext and composefs-rs
+    libzstd-devel clang-devel ostree-devel glib2-devel
     rust cargo rustfmt clippy
     python3 git
 )
