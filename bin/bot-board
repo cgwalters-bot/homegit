@@ -8,7 +8,9 @@ readonly BOARD_URL=https://github.com/users/${OWNER}/projects/${NUMBER}
 readonly ITEM_LIMIT=1000
 readonly TITLE_WIDTH=70
 # Board fields that 'set' can change, and the option that sets each.
-readonly SET_OPTIONS=(--status --priority --workflow --why)
+readonly SET_OPTIONS=(--status --priority --workflow --why --branch --gist)
+# Free-text fields; the rest of SET_OPTIONS are single-selects.
+readonly TEXT_FIELDS=(Why Branch Gist)
 # Every gh project call spends the bot's GraphQL quota (5000 points/hour),
 # which all agents share, so reads are cached on disk.
 readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-board
@@ -33,7 +35,11 @@ Commands:
   add URL                     Add an issue or PR; prints the new item id
   draft TITLE BODY            Create a draft item; prints the new item id
   set ITEM [--status S] [--priority P] [--workflow W] [--why TEXT]
-                              Update fields of an item
+           [--branch URL...] [--gist URL...]
+                              Update fields of an item. Branch holds the
+                              compare URL(s) of pushed branches, Gist the
+                              write-up URL(s); separate several with spaces.
+                              An empty value clears a text field.
   -h, --help                  Show this help
 
 Options:
@@ -232,6 +238,7 @@ cmd_show() {
            ["workflow", .workflow // "-"],
            ["assignees", ((.assignees // []) | join(", "))],
            ["linked PRs", ((."linked pull requests" // []) | join(" "))],
+           ["branch", .branch], ["gist", .gist],
            ["why", .why // "-"]]
           | .[] | select(.[1] != null and .[1] != "") | "\(.[0]):\t\(.[1])"),
           (if $item.content.type == "DraftIssue" and ($item.content.body // "") != ""
@@ -252,8 +259,32 @@ cmd_draft() {
     ghq project item-create "${NUMBER}" --owner "${OWNER}" --title "$1" --body "$2" --format json --jq .id
 }
 
+one_of() { # one_of VALUE CHOICES...
+    local value=$1 choice
+    shift
+    for choice in "$@"; do
+        test "${value}" = "${choice}" && return 0
+    done
+    return 1
+}
+
+# Branch and Gist hold space-separated URLs, so tooling (and people) can
+# follow them without parsing prose.
+validate_links() {
+    local field=$1 value=$2 prefix url
+    case "${field}" in
+        Branch) prefix=https://github.com/ ;;
+        Gist) prefix=https://gist.github.com/ ;;
+        *) return 0 ;;
+    esac
+    for url in ${value}; do
+        [[ "${url}" == "${prefix}"* ]] ||
+            fatal "${field} expects space-separated URLs starting with ${prefix}, got '${url}'"
+    done
+}
+
 cmd_set() {
-    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--why TEXT]"
+    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--why TEXT] [--branch URL] [--gist URL]"
     local item=$1
     shift
     test $# -gt 0 || fatal "nothing to set; valid options: ${SET_OPTIONS[*]}"
@@ -262,14 +293,15 @@ cmd_set() {
     load_fields
     while test $# -gt 0; do
         case "$1" in
-            --status|--priority|--workflow|--why)
+            --status|--priority|--workflow|--why|--branch|--gist)
                 test $# -ge 2 || fatal "$1 requires an argument"
                 field=${1#--}
                 field=${field^}
                 # Plain assignments, so that a failed lookup stops the script.
                 field_id=$(field_json "${field}")
                 field_ids+=("$(jq -r .id <<<"${field_id}")")
-                if test "${field}" = Why; then
+                if one_of "${field}" "${TEXT_FIELDS[@]}"; then
+                    validate_links "${field}" "$2"
                     if test -n "$2"; then args+=("--text=$2"); else args+=(--clear); fi
                 else
                     option=$(option_id "${field}" "$2")
