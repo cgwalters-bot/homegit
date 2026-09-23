@@ -1,6 +1,6 @@
 ---
 name: devspace-work
-description: Build and test the bot's changes on an ephemeral devspace runner (RHEL 10, 4-64 cores, KVM, podman) with bot-devspace - edit locally, push the branch over SSH, run long builds under tmux/nohup, bring results back, then push the tested branch to its cgwalters-forge fork from this machine. Use for anything beyond a trivial change, and whenever a project's CI needs containers, VMs or more CPU than the local machine has.
+description: Build and test the bot's changes on an ephemeral devspace runner (RHEL 10, 4-64 cores, KVM, podman) with bot-devspace - edit locally, push the branch over SSH, run long builds under tmux/nohup, bring results back, then push the tested branch to its cgwalters-forge fork from this machine. Required for every compile, test, container build or VM run; the local machine is only for editing and git.
 ---
 
 # devspace-work — Edit locally, test on a devspace
@@ -16,7 +16,11 @@ The division of labor is strict:
 
 - **This machine** holds the clones, the credentials and the GitHub
   identity. Edit and commit here, and push to GitHub only from here.
-- **The devspace** only builds and tests. It gets source code over SSH and
+  Never build or test here: no `cargo build`/`check`/`test`/`clippy`,
+  `make`, `podman build` or VMs, not even "just a quick check". Tools
+  that don't compile anything (`cargo fmt`, shellcheck, actionlint) are
+  fine locally.
+- **The devspace** does all the building and testing. It gets source code over SSH and
   nothing else: **never copy a GitHub token, SSH private key, `gh` config,
   agent API key or any other credential to it**, and don't forward an agent.
   If a build needs network access to fetch dependencies, that's fine; if it
