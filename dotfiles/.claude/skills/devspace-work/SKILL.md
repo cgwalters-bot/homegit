@@ -126,8 +126,8 @@ git push -u origin HEAD:bot/<short-slug>
 ```
 
 Record what was run and the result in one line in the board item's Why
-(e.g. `just test: 312 passed on a 16-core RHEL 10 devspace`), as
-`workstream` describes.
+(e.g. `just test: 312 passed on a 16-core RHEL 10 devspace`), and the
+branch's compare URL in Branch, as `workstream` describes.
 
 ## Stop
 

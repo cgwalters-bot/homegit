@@ -125,7 +125,8 @@ The push goes from this machine, never from a devspace. For a `branch`
 item this is the end: record the compare URL against upstream,
 `https://github.com/OWNER/REPO/compare/<default-branch>...cgwalters-bot:bot/<short-slug>`
 (it shows the diff and gives a human a one-click "Create pull request"),
-and the test summary on the board (see `workstream`).
+in the board item's Branch field and the test summary in Why (see
+`workstream`). When the branch is updated or replaced later, update Branch.
 
 ## Open the PR (Workflow `pr` only)
 
@@ -143,7 +144,8 @@ and ends with:
 Generated-by: https://github.com/cgwalters/#llms
 ```
 
-Then update the board item to In Review (see `workstream`).
+Then update the board item to In Review with the PR URL in Branch (see
+`workstream`).
 
 ## Responding to review
 

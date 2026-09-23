@@ -23,8 +23,10 @@ board. Each has a **Status** single-select field:
 | Done          | Accepted: its PR was merged, or a human moved it here.         |
 
 Items also carry a **Why** text field. It holds the rationale for adding the
-item, and is where you put questions, status notes and result links for
-cgwalters (see below). Read it before starting. **Priority** ranks the work
+item, and is where you put the current result and questions for cgwalters
+(see below). Read it before starting. The **Branch** and **Gist** text
+fields hold result links: the compare URL(s) of pushed branches (or the
+bot's PR URL), and secret gist write-up URLs. **Priority** ranks the work
 (below), and **Workflow** says what kind of output the item wants.
 
 ## Workflow
@@ -35,25 +37,35 @@ The **Workflow** single-select decides what "finished" means for an item:
   devspace for anything non-trivial; see the `devspace-work` skill) and
   push the tested branch as `bot/<short-slug>` to the cgwalters-bot fork
   of the target repository. **Do not open a PR.** Put the compare URL
-  against upstream and a one-line test summary in Why, e.g.
-  `https://github.com/bootc-dev/bootc/compare/main...cgwalters-bot:bot/fix-foo — cargo test + just test-integration passed on a 16-core devspace`,
-  then set In Review. Pushing updates to the bot's own existing PR
-  branches (for example a rebase cgwalters asked for) is fine under
-  branch.
+  against upstream in Branch
+  (`https://github.com/bootc-dev/bootc/compare/main...cgwalters-bot:bot/fix-foo`)
+  and a one-line test summary in Why (`cargo test + just
+  test-integration passed on a 16-core devspace`), then set In Review.
+  Pushing updates to the bot's own existing PR branches (for example a
+  rebase cgwalters asked for) is fine under branch.
 - **analysis**: the output is a write-up, such as a pre-review, a
   reproduction, a bisect or an explainer. Publish it as a secret gist
   (`gh gist create --desc "..." writeup.md`; gists are secret unless
-  `--public` is given, which you never pass), put its URL and a one-line
-  summary in Why, and set In Review. Nothing is posted upstream.
+  `--public` is given, which you never pass), put its URL in Gist and a
+  one-line summary in Why, and set In Review. Nothing is posted upstream.
 - **pr**: like branch, but also open a draft PR following `upstream-pr`,
-  and link it in Why. Only open a PR when a human set this value; never
-  set it yourself.
+  and put the PR URL in Branch. Only open a PR when a human set this
+  value; never set it yourself.
 - **manual**: a human handles this item. Never touch it: don't claim it,
   change its fields or work on it.
 
 Why also holds the reason the item exists, so don't discard it when
-recording a result or a question: put the new text first and keep the old
-after it, e.g. `<result> | was: <previous Why>`.
+recording a result or a question. Keep the original rationale as a short
+first clause, then the latest result (the one-line test summary) and any
+open questions, e.g. `Flaky test from cgwalters' comment. Result: cargo
+test passed on a devspace. Q: also backport to 1.2?`. Overwrite older
+result text instead of chaining it, don't repeat the URLs from Branch or
+Gist, and keep Why under about 400 characters.
+
+When a branch is updated or replaced (review fixes, a rename), update
+Branch to match. For several branches or gists, list all their URLs,
+space-separated. At completion, set Status, Branch or Gist, and Why in one
+`bot-board set` call.
 
 Only a human changes an item's Workflow once it is set. If an item looks
 like it needs a different workflow (e.g. a branch item that turns out to
@@ -106,7 +118,8 @@ bot-board list                        # all items, P0 first
 bot-board list --status "In Progress" # already-claimed work: resume it first
 bot-board list --status Todo --json   # full item JSON, for jq
 bot-board show ITEM                   # every field, plus a draft's body
-bot-board set ITEM --status "In Review" --why "..."   # also --priority, --workflow
+bot-board set ITEM --status "In Review" --branch URL --why "..."
+                                      # also --gist, --priority, --workflow
 bot-board add URL                     # prints the new item id
 bot-board draft TITLE BODY            # prints the new item id
 ```
@@ -121,8 +134,8 @@ time it prints.
 Underneath, it uses `gh project field-list`/`item-list` (the item JSON has
 `id`, `content` with `type`, `url` and, for drafts, `id` and `body`, plus one
 key per field with only the first letter lowercased: `status`, `priority`,
-`workflow`, `why`, `"linked pull requests"`, ...; unset fields are absent)
-and `gh project item-edit --project-id ... --id ITEM --field-id ...` with
+`workflow`, `why`, `branch`, `gist`, `"linked pull requests"`, ...; unset
+fields are absent) and `gh project item-edit --project-id ... --id ITEM --field-id ...` with
 `--single-select-option-id` or `--text`. The `project` scope is required
 (`gh auth status` shows scopes; for an OAuth login use
 `gh auth refresh -s project`).
@@ -175,21 +188,22 @@ below.
 **3. Result ready → In Review.**
 
 - **branch**: push the tested branch to the bot's fork, record the compare
-  URL and test summary, and set In Review:
+  URL in Branch and the test summary in Why, and set In Review:
 
   ```bash
   git push -u origin HEAD:bot/<short-slug>
   bot-board set "$ITEM" --status "In Review" \
-    --why "https://github.com/OWNER/REPO/compare/<default-branch>...cgwalters-bot:bot/<short-slug> — <one-line test summary> | was: <previous Why>"
+    --branch "https://github.com/OWNER/REPO/compare/<default-branch>...cgwalters-bot:bot/<short-slug>" \
+    --why "<short rationale>. Result: <one-line test summary>"
   ```
 
 - **analysis**: `gh gist create --desc "..." writeup.md` (secret by
-  default), then set In Review with the gist URL and a one-line summary in
-  Why.
+  default), then set In Review with `--gist <gist-url>` and a one-line
+  summary in Why.
 - **pr**: open the draft PR per `upstream-pr`, referencing the issue in the
   PR body (`Fixes owner/repo#N`, or `Related: <url>` if it does not fully
   resolve it). GitHub then shows the link on the issue, so do not also
-  comment "Opened PR" there. Put the PR URL in Why and set In Review.
+  comment "Opened PR" there. Set In Review with `--branch <pr-url>`.
 
 **4. Blocked → Needs human.** When progress depends on a decision you cannot
 make (design choice, ambiguous requirement, missing access, conflicting
@@ -200,7 +214,7 @@ answer in one line. "What should I do?" is not a good question.
 
 ```bash
 bot-board set "$ITEM" --status "Needs human" \
-  --why "Q: <question>. Options: A) ... B) ... Recommend A because ..."
+  --why "<short rationale>. Q: <question>. Options: A) ... B) ... Recommend A because ..."
 ```
 
 Ask upstream (an issue or PR comment) only when the question is genuinely for
@@ -234,17 +248,19 @@ unprompted. The output instead is, by Workflow:
   on top of his PR head (`gh pr checkout` in a clone of the bot's fork,
   then commit with `--fixup` so he can squash them; never amend or
   autosquash into his commits, see `upstream-pr`), pushed to
-  `cgwalters-bot/REPO`. Link it as a compare against his PR's head branch,
-  so the diff shows only the fixups, e.g.
-  `Fixups for the clippy failure: https://github.com/cgwalters/REPO/compare/<pr-branch>...cgwalters-bot:bot/<short-slug>`.
+  `cgwalters-bot/REPO`. Put a compare against his PR's head branch in
+  Branch, so the diff shows only the fixups
+  (`https://github.com/cgwalters/REPO/compare/<pr-branch>...cgwalters-bot:bot/<short-slug>`),
+  and say what they fix in Why (`Fixups for the clippy failure`).
 - **analysis**: for reviews, bisects or reproductions, a write-up in a
-  secret gist, not posted on the PR.
+  secret gist (its URL in Gist), not posted on the PR.
 
 `pr` never applies to his PRs: the bot doesn't open PRs on his behalf.
 
-Then set In Review with the link in Why. The same privacy rule applies: for
-a non-public repository, push nothing outside that repository, don't put
-its content in a gist, and keep the board text to a URL.
+Then set In Review with the link in Branch or Gist. The same privacy rule
+applies: for a non-public repository, push nothing outside that
+repository, don't put its content in a gist, and keep the board text to a
+URL.
 
 ## Revisiting parked items
 
@@ -270,9 +286,10 @@ Needs human.
 ## Draft issues
 
 Draft issues have no repository, so they cannot be assigned or commented on.
-Track them by status alone, and record progress, questions, and result links
-in Why or by editing the draft body. Editing the body takes the draft's
-content ID (`DI_...`, the "draft id" in `bot-board show`), not the item ID:
+Track them by status alone, record result links in Branch or Gist, and
+progress and questions in Why or by editing the draft body. Editing the
+body takes the draft's content ID (`DI_...`, the "draft id" in
+`bot-board show`), not the item ID:
 
 ```bash
 gh project item-edit --id "$DRAFT_CONTENT_ID" --body "$(cat updated-body.md)"
