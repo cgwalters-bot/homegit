@@ -326,16 +326,28 @@ cmd_provision() {
     ssh -F "$(state_dir "${name}")/ssh_config" "${ALIAS_PREFIX}${name}" \
         bash -s -- "${PROVISION_PACKAGES[@]}" <<'EOF' || fatal "provisioning ${name} failed"
 set -euo pipefail
+# The runner image is built with umask 000, which leaves files such as
+# the crypto-policies OpenSSH config group/world-writable; ssh then refuses to
+# run (breaking e.g. `bcvk libvirt ssh`). Tighten config trees.
+sudo find /etc /usr/share/crypto-policies -xdev -type f -perm /022 \
+    -exec chmod go-w {} + 2>/dev/null || true
 missing=()
 for pkg in "$@"; do
     rpm -q --whatprovides "${pkg}" >/dev/null 2>&1 || missing+=("${pkg}")
 done
 if test "${#missing[@]}" -eq 0; then
     echo "All packages already installed"
-    exit 0
+else
+    sudo dnf install -y -q "${missing[@]}" >/dev/null
+    echo "Installed: ${missing[*]}"
 fi
-sudo dnf install -y -q "${missing[@]}" >/dev/null
-echo "Installed: ${missing[*]}"
+# Let later libvirt/KVM use work without sudo (takes effect for new
+# SSH sessions); the libvirt group only exists once libvirt is installed.
+for group in kvm libvirt; do
+    if getent group "${group}" >/dev/null && ! id -nG | tr ' ' '\n' | grep -qx "${group}"; then
+        sudo usermod -aG "${group}" "$(id -un)"
+    fi
+done
 EOF
 }
 
