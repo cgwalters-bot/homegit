@@ -59,8 +59,14 @@ else
 fi
 export EDITOR
 
-bold=$(tput bold)
-normal=$(tput sgr0)
+# Non-interactive shells (e.g. `ssh host cmd`) have no usable $TERM, and
+# tput would complain on every command.
+bold=
+normal=
+if [[ $- == *i* ]] && test -n "${TERM:-}"; then
+    bold=$(tput bold 2>/dev/null)
+    normal=$(tput sgr0 2>/dev/null)
+fi
 
 # Last command status
 _format_last_err ()
