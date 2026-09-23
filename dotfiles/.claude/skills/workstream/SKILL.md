@@ -131,6 +131,15 @@ after someone else changed the board. If it reports that the GraphQL quota
 is exhausted (exit status 75), stop touching the board until the reset
 time it prints.
 
+GitHub's item listing lags behind writes: a newly added or drafted item can
+be missing from `list` (and so from `show`, and URL/title lookups) for
+several minutes, even with `--refresh`, while `set` with its `PVTI_...` id
+works immediately. So keep the id that `add`/`draft` printed, or that you
+were given, and use it directly. If an item you were told exists isn't in
+the listing, never create a replacement: set it by id if you have one, and
+otherwise report the update you would have made. Duplicate items split the
+history and confuse the human.
+
 Underneath, it uses `gh project field-list`/`item-list` (the item JSON has
 `id`, `content` with `type`, `url` and, for drafts, `id` and `body`, plus one
 key per field with only the first letter lowercased: `status`, `priority`,
