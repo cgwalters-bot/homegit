@@ -267,18 +267,28 @@ excerpt_jq="def excerpt: (. // \"\") | [splits(\"\\r?\\n\") | select(test(\"\\\\
 # check runs and commit statuses of SHA, plus the failing names:
 # {checks, failing}.
 checks_state() {
-    local runs status
-    runs=$(rest_get "repos/$1/commits/$2/check-runs?per_page=${CHECKS_PER_PAGE}") || return
-    status=$(rest_get "repos/$1/commits/$2/status") || return
+    local runs='' page=1 body total status
+    while :; do
+        body=$(rest_get "repos/$1/commits/$2/check-runs?per_page=${CHECKS_PER_PAGE}&page=${page}") || return
+        runs+=$(jq -c '.check_runs[]' <<<"${body}")$'\n'
+        total=$(jq .total_count <<<"${body}")
+        test $((page * CHECKS_PER_PAGE)) -lt "${total}" || break
+        page=$((page + 1))
+    done
+    status=$(rest_get "repos/$1/commits/$2/status?per_page=${CHECKS_PER_PAGE}") || return
+    # Its state covers every status; only the names can be cut short.
+    if test "$(jq .total_count <<<"${status}")" -gt "${CHECKS_PER_PAGE}"; then
+        warn "$1@$2 has over ${CHECKS_PER_PAGE} commit statuses; only the first ${CHECKS_PER_PAGE} are named"
+    fi
     # Too big for jq's argument list.
-    printf '%s\n%s\n' "${runs}" "${status}" | jq -sc '.[0] as $runs | .[1] as $status
-        | ([$runs.check_runs[] | select(.conclusion | IN("failure", "timed_out", "startup_failure")) | .name]
+    printf '%s\n%s\n' "$(jq -sc . <<<"${runs}")" "${status}" | jq -sc '.[0] as $runs | .[1] as $status
+        | ([$runs[] | select(.conclusion | IN("failure", "timed_out", "startup_failure")) | .name]
          + [$status.statuses[] | select(.state | IN("failure", "error")) | .context]) as $failing
         | {failing: $failing,
-           checks: (if ($failing | length) > 0 then "failure"
-                    elif any($runs.check_runs[]; .status != "completed")
+           checks: (if ($failing | length) > 0 or ($status.total_count > 0 and $status.state == "failure") then "failure"
+                    elif any($runs[]; .status != "completed")
                          or ($status.total_count > 0 and $status.state == "pending") then "pending"
-                    elif ($runs.total_count + $status.total_count) > 0 then "success"
+                    elif ($runs | length) + $status.total_count > 0 then "success"
                     else "none" end)}'
 }
 
