@@ -19,12 +19,45 @@ board. Each has a **Status** single-select field:
 | Todo          | Approved and ready to be picked up.                            |
 | In Progress   | Claimed by the bot, being worked on.                           |
 | Needs human   | Blocked on a specific human decision or action.                |
-| In Review     | A PR is open and waiting on review.                            |
+| In Review     | Ready for a human: a tested branch, a write-up, or a PR.       |
 | Done          | Accepted: its PR was merged, or a human moved it here.         |
 
 Items also carry a **Why** text field. It holds the rationale for adding the
-item, and is where you put questions and status notes for cgwalters (see
-below). Read it before starting.
+item, and is where you put questions, status notes and result links for
+cgwalters (see below). Read it before starting. **Priority** ranks the work
+(below), and **Workflow** says what kind of output the item wants.
+
+## Workflow
+
+The **Workflow** single-select decides what "finished" means for an item:
+
+- **branch** (the default when unset): implement the change, test it (in a
+  devspace for anything non-trivial; see the `devspace-work` skill) and
+  push the tested branch as `bot/<short-slug>` to the cgwalters-bot fork
+  of the target repository. **Do not open a PR.** Put the compare URL
+  against upstream and a one-line test summary in Why, e.g.
+  `https://github.com/bootc-dev/bootc/compare/main...cgwalters-bot:bot/fix-foo — cargo test + just test-integration passed on a 16-core devspace`,
+  then set In Review. Pushing updates to the bot's own existing PR
+  branches (for example a rebase cgwalters asked for) is fine under
+  branch.
+- **analysis**: the output is a write-up, such as a pre-review, a
+  reproduction, a bisect or an explainer. Publish it as a secret gist
+  (`gh gist create --desc "..." writeup.md`; gists are secret unless
+  `--public` is given, which you never pass), put its URL and a one-line
+  summary in Why, and set In Review. Nothing is posted upstream.
+- **pr**: like branch, but also open a draft PR following `upstream-pr`,
+  and link it in Why. Only open a PR when a human set this value; never
+  set it yourself.
+- **manual**: a human handles this item. Never touch it: don't claim it,
+  change its fields or work on it.
+
+Why also holds the reason the item exists, so don't discard it when
+recording a result or a question: put the new text first and keep the old
+after it, e.g. `<result> | was: <previous Why>`.
+
+Only a human changes an item's Workflow once it is set. If an item looks
+like it needs a different workflow (e.g. a branch item that turns out to
+be a question for maintainers), say so in Why and set Needs human.
 
 ## Rules
 
@@ -40,103 +73,91 @@ below). Read it before starting.
 - **One item at a time.** Finish or park (In Review / Needs human) the current
   item before claiming another.
 - **Never mark an item Done** unless the PR resolving it was merged (see
-  "Done" below). An open PR is In Review, not Done.
+  "Done" below). An open PR or a pushed branch is In Review, not Done.
 - Skip items assigned to anyone other than `cgwalters` or `cgwalters-bot`.
 - Never take items that have no status; those are awaiting human triage.
-- Resolve IDs at runtime (below); never hardcode project, field, or option IDs.
+- Never touch items whose Workflow is `manual`.
+- Never hardcode project, field, or option IDs; `bot-board` resolves them at runtime.
 - **Keep private repositories off the board.** The board may be visible to
   others, so never copy details (titles, code, discussion, error output) of an
   item in a non-public repository into board text: Why, draft titles or
   bodies. Check with
   `gh repo view OWNER/REPO --json visibility --jq .visibility`; if it is not
   `PUBLIC`, refer to it only by URL.
+- **Board calls are rate limited.** All `gh project` commands spend the
+  bot's GraphQL quota (5000 points per hour), shared by every agent
+  running as the bot. Use `bot-board`, which caches, rather than raw
+  `gh project` calls, and update the board only at meaningful
+  transitions (claimed, blocked, result ready, done), never while polling
+  a build.
 - **Keep upstream noise down.** Status changes live on the board; do not
   comment upstream just to report them. Comment on an upstream issue only when
   it helps its maintainers, for example claiming a long-open issue that
   someone might otherwise duplicate work on. Questions for cgwalters go on the
   board, not upstream.
 
-## Setup and ID lookup
+## Using the board
 
-The `project` scope is required (`gh auth status` shows scopes; for an OAuth
-login use `gh auth refresh -s project`). All commands below use gh's built-in
-`--jq`, so a separate `jq` binary is not needed.
+`bot-board` (in this repository's `bin/`) wraps `gh project` for this board
+and resolves field and option IDs at runtime. Run `bot-board --help`.
 
 ```bash
-OWNER=cgwalters-bot
-NUM=1
-PROJECT_ID=$(gh project view "$NUM" --owner "$OWNER" --format json --jq .id)
-field_id() { # field_id <field name>
-  gh project field-list "$NUM" --owner "$OWNER" --format json \
-    --jq ".fields[] | select(.name == \"$1\") | .id"
-}
-STATUS_FIELD_ID=$(field_id Status)
-WHY_FIELD_ID=$(field_id Why)
-PRIORITY_FIELD_ID=$(field_id Priority)
-# Look up a single-select option ID by field and option name,
-# e.g. field_option Status "In Progress"
-field_option() {
-  gh project field-list "$NUM" --owner "$OWNER" --format json \
-    --jq ".fields[] | select(.name == \"$1\") | .options[] | select(.name == \"$2\") | .id"
-}
-set_status() { # set_status <item-id> <status name>
-  gh project item-edit --project-id "$PROJECT_ID" --id "$1" \
-    --field-id "$STATUS_FIELD_ID" --single-select-option-id "$(field_option Status "$2")"
-}
-set_priority() { # set_priority <item-id> <P0|P1|P2>
-  gh project item-edit --project-id "$PROJECT_ID" --id "$1" \
-    --field-id "$PRIORITY_FIELD_ID" --single-select-option-id "$(field_option Priority "$2")"
-}
-set_why() { # set_why <item-id> <text>
-  gh project item-edit --project-id "$PROJECT_ID" --id "$1" \
-    --field-id "$WHY_FIELD_ID" --text "$2"
-}
+bot-board list                        # all items, P0 first
+bot-board list --status "In Progress" # already-claimed work: resume it first
+bot-board list --status Todo --json   # full item JSON, for jq
+bot-board show ITEM                   # every field, plus a draft's body
+bot-board set ITEM --status "In Review" --why "..."   # also --priority, --workflow
+bot-board add URL                     # prints the new item id
+bot-board draft TITLE BODY            # prints the new item id
 ```
 
-If a lookup returns an empty string, stop and report it; the board layout has
-changed and guessing will corrupt it.
+ITEM is a project item id (`PVTI_...`), an issue or PR URL, or
+`OWNER/REPO#N`. Invalid field values are rejected with the list of valid
+ones. Reads are cached briefly; pass `--refresh` (before the command) right
+after someone else changed the board. If it reports that the GraphQL quota
+is exhausted (exit status 75), stop touching the board until the reset
+time it prints.
 
-## Listing items
+Underneath, it uses `gh project field-list`/`item-list` (the item JSON has
+`id`, `content` with `type`, `url` and, for drafts, `id` and `body`, plus one
+key per field with only the first letter lowercased: `status`, `priority`,
+`workflow`, `why`, `"linked pull requests"`, ...; unset fields are absent)
+and `gh project item-edit --project-id ... --id ITEM --field-id ...` with
+`--single-select-option-id` or `--text`. The `project` scope is required
+(`gh auth status` shows scopes; for an OAuth login use
+`gh auth refresh -s project`).
 
-`item-list` returns at most 30 items by default, so always pass `--limit`.
-Each item has `id` (the project item ID, `PVTI_...`, used by `item-edit`),
-`content` (`type` is `Issue`, `PullRequest`, or `DraftIssue`, plus `url`,
-`number`, `repository` for real issues and `id` for drafts), and one key per
-field, named after the field with only the first letter lowercased: `status`,
-`priority`, `assignees`, `why`, `"linked pull requests"` (a list of PR URLs; access it as
-`."linked pull requests"`), ... Fields with no value are simply absent.
+## Picking an item
+
+Candidates are Todo items that are not `manual` and not assigned to anyone
+other than `cgwalters` or `cgwalters-bot`:
 
 ```bash
-# Everything, in board order
-gh project item-list "$NUM" --owner "$OWNER" --format json --limit 500 \
-  --jq '.items[] | {id, status, priority, title, type: .content.type, url: .content.url, assignees}'
-
-# Already-claimed work: resume this before taking anything new
-gh project item-list "$NUM" --owner "$OWNER" --format json --limit 500 \
-  --jq '.items[] | select(.status == "In Progress")'
-
-# Candidate Todo items not assigned to someone else, highest priority first
-# (P0 < P1 < P2 sorts correctly as strings; unset priority sorts last)
-gh project item-list "$NUM" --owner "$OWNER" --format json --limit 500 \
-  --jq '[.items[] | select(.status == "Todo")
-        | select((.assignees // []) - ["cgwalters", "cgwalters-bot"] | length == 0)]
-        | sort_by(.priority // "P9") | .[]'
+bot-board list --status Todo --json | jq -r '.[]
+  | select(.workflow != "manual")
+  | select((.assignees // []) - ["cgwalters", "cgwalters-bot"] | length == 0)
+  | "\(.id) \(.priority // "-") \(.workflow // "branch") \(.title)"'
 ```
 
 The **Priority** field ranks work: **P0** is urgent or blocking cgwalters
 right now (a request he made directly, his own PR stuck on CI or conflicts),
-**P1** should happen soon, **P2** is nice to have. Take the first candidate
-by priority, then board order within the same priority. A human may change
-priorities at any time; never lower one that a human set. Read the issue itself (`gh issue view <url> --comments`) before
+**P1** should happen soon, **P2** is nice to have. `bot-board list` sorts by
+priority and keeps board order within the same priority; take the first
+candidate. A human may change priorities at any time; never lower one that
+a human set. Read the issue itself (`gh issue view <url> --comments`) before
 claiming, and if it turns out to be already fixed or not actionable, record
 that in the Why field and set Needs human rather than silently skipping it.
 
 ## Lifecycle
 
-**1. Claim.** Set In Progress and assign yourself:
+**1. Claim.** Listings are cached for a minute and other agents may be
+working the board, so re-read the item first and skip it if it is no
+longer Todo or someone else took it. Then set In Progress and assign
+yourself:
 
 ```bash
-set_status "$ITEM_ID" "In Progress"
+bot-board --refresh show "$ITEM"
+bot-board set "$ITEM" --status "In Progress"
 gh issue edit "$ISSUE_URL" --add-assignee cgwalters-bot
 ```
 
@@ -145,21 +166,30 @@ the board status is enough. Only if the issue has been open a long time or
 others have shown interest in fixing it, leave a one-line comment saying you
 are working on it, so nobody duplicates the work.
 
-**2. Work.** Do the change following the `upstream-pr` skill (fork, topic
-branch, tests, commit-review). For items that are cgwalters' own PRs or
-review requests, see "PR items" below instead.
+**2. Work.** Do what the item's Workflow asks (see "Workflow" above).
+For code changes follow the `upstream-pr` skill (fork, topic branch,
+commits, commit-review) and test in a devspace per `devspace-work`. For
+items that are cgwalters' own PRs or review requests, see "PR items"
+below.
 
-**3. PR opened → In Review.** Reference the issue in the PR body
-(`Fixes owner/repo#N`, or `Related: <url>` if it does not fully resolve it).
-GitHub then shows the link on the issue, so do not also comment "Opened PR"
-there. Add the PR to the board too, so it can be tracked on its own, and
-set both items to In Review:
+**3. Result ready → In Review.**
 
-```bash
-PR_ITEM_ID=$(gh project item-add "$NUM" --owner "$OWNER" --url "$PR_URL" --format json --jq .id)
-set_status "$PR_ITEM_ID" "In Review"
-set_status "$ITEM_ID" "In Review"
-```
+- **branch**: push the tested branch to the bot's fork, record the compare
+  URL and test summary, and set In Review:
+
+  ```bash
+  git push -u origin HEAD:bot/<short-slug>
+  bot-board set "$ITEM" --status "In Review" \
+    --why "https://github.com/OWNER/REPO/compare/<default-branch>...cgwalters-bot:bot/<short-slug> — <one-line test summary> | was: <previous Why>"
+  ```
+
+- **analysis**: `gh gist create --desc "..." writeup.md` (secret by
+  default), then set In Review with the gist URL and a one-line summary in
+  Why.
+- **pr**: open the draft PR per `upstream-pr`, referencing the issue in the
+  PR body (`Fixes owner/repo#N`, or `Related: <url>` if it does not fully
+  resolve it). GitHub then shows the link on the issue, so do not also
+  comment "Opened PR" there. Put the PR URL in Why and set In Review.
 
 **4. Blocked → Needs human.** When progress depends on a decision you cannot
 make (design choice, ambiguous requirement, missing access, conflicting
@@ -169,8 +199,8 @@ below). Give the options you see and your recommendation, so the human can
 answer in one line. "What should I do?" is not a good question.
 
 ```bash
-set_why "$ITEM_ID" "Q: <question>. Options: A) ... B) ... Recommend A because ..."
-set_status "$ITEM_ID" "Needs human"
+bot-board set "$ITEM" --status "Needs human" \
+  --why "Q: <question>. Options: A) ... B) ... Recommend A because ..."
 ```
 
 Ask upstream (an issue or PR comment) only when the question is genuinely for
@@ -178,12 +208,13 @@ that project's maintainers, such as which of two approaches they would
 accept.
 
 **5. Done.** Done means the PR resolving the item was merged; that is the one
-acceptance signal you can check. Check it with:
+acceptance signal you can check. For branch and analysis items there may be
+no PR at all; those are moved to Done by a human. Check with:
 
 ```bash
-# For an issue item, its linked PRs; for a PR item, its own URL
-gh project item-list "$NUM" --owner "$OWNER" --format json --limit 500 \
-  --jq ".items[] | select(.id == \"$ITEM_ID\") | .\"linked pull requests\" // []"
+# For an issue item, its linked PRs ("linked PRs" in the output); for a PR
+# item, its own URL
+bot-board show "$ITEM"
 gh pr view "$PR_URL" --json state,mergedAt,mergedBy --jq '{state, mergedAt, by: .mergedBy.login}'
 ```
 
@@ -197,28 +228,31 @@ it in the Why field and set Needs human, and the human decides.
 Some items are PRs by cgwalters that need mechanical follow-up (failing CI,
 merge conflicts, review nits), or PRs where his review was requested. The bot
 cannot push to his branch, and must not post public reviews or PR comments
-unprompted. The output instead is one of:
+unprompted. The output instead is, by Workflow:
 
-- A branch on the bot's fork with the proposed fixup commits on top of his
-  PR head (`gh pr checkout` in a clone of the bot's fork, then commit with
-  `--fixup` so he can squash them), pushed to `cgwalters-bot/REPO`.
-- For reviews, bisects or reproductions: a write-up kept on the board, not
-  posted on the PR. Use the Why field for a short note; for anything longer,
-  create a draft item on the board whose body links the PR and holds the
-  write-up.
+- **branch**: a branch on the bot's fork with the proposed fixup commits
+  on top of his PR head (`gh pr checkout` in a clone of the bot's fork,
+  then commit with `--fixup` so he can squash them), pushed to
+  `cgwalters-bot/REPO`. Link it as a compare against his PR's head branch,
+  so the diff shows only the fixups, e.g.
+  `Fixups for the clippy failure: https://github.com/cgwalters/REPO/compare/<pr-branch>...cgwalters-bot:bot/<short-slug>`.
+- **analysis**: for reviews, bisects or reproductions, a write-up in a
+  secret gist, not posted on the PR.
 
-Then set Needs human, with the Why field saying what is ready and where, e.g.
-`Fixups for the clippy failure ready: https://github.com/cgwalters-bot/REPO/compare/BRANCH`.
-The same privacy rule applies: for a non-public repository, push nothing
-outside that repository and keep the board text to a URL.
+`pr` never applies to his PRs: the bot doesn't open PRs on his behalf.
+
+Then set In Review with the link in Why. The same privacy rule applies: for
+a non-public repository, push nothing outside that repository, don't put
+its content in a gist, and keep the board text to a URL.
 
 ## Revisiting parked items
 
 When there is no In Progress item, check In Review and Needs human items before
 taking new Todo work: a reviewer may have left comments to address on the
 bot's own PR (handle them with fixup commits per `upstream-pr`, and keep the
-status In Review), cgwalters may have answered your question (move back to In
-Progress), or the PR may have merged (move to Done).
+status In Review), cgwalters may have answered your question or asked for
+changes to a pushed branch (move back to In Progress), or the PR may have
+merged (move to Done).
 
 Only an answer from cgwalters unblocks a Needs human item: an edit to the
 board item itself (its Why field or draft body), or a comment whose author is
@@ -235,9 +269,9 @@ Needs human.
 ## Draft issues
 
 Draft issues have no repository, so they cannot be assigned or commented on.
-Track them by status alone, and record progress, questions, and PR links by
-editing the draft body. `item-edit` for drafts takes the draft's content ID
-(`DI_...`, from `.content.id`), not the item ID:
+Track them by status alone, and record progress, questions, and result links
+in Why or by editing the draft body. Editing the body takes the draft's
+content ID (`DI_...`, the "draft id" in `bot-board show`), not the item ID:
 
 ```bash
 gh project item-edit --id "$DRAFT_CONTENT_ID" --body "$(cat updated-body.md)"

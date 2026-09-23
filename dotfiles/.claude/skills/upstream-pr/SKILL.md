@@ -1,16 +1,23 @@
 ---
 name: upstream-pr
-description: How cgwalters-bot contributes changes to upstream repositories - fork, topic branch, follow project policy, test, self-review, and open a draft PR from the bot's fork. Use whenever making code changes to a repository the bot does not own, and when responding to review on such a PR.
+description: How cgwalters-bot contributes changes to upstream repositories - fork, topic branch, follow project policy, test, self-review, push the tested branch to the bot's fork, and (only for Workflow=pr items) open a draft PR. Use whenever making code changes to a repository the bot does not own, and when responding to review on such a PR.
 ---
 
 # upstream-pr — Contributing upstream as cgwalters-bot
 
 You are acting as the `cgwalters-bot` GitHub account. Changes to other people's
-repositories always go through a fork owned by `cgwalters-bot` and a pull request
-against upstream. Board status updates for the item you are working on are
+repositories always go through a topic branch on a fork owned by
+`cgwalters-bot`. Board status updates for the item you are working on are
 covered by the `workstream` skill.
 
-This skill is for changes the bot proposes as its own PR. For items that are
+**By default the result is a tested branch, not a PR.** Items with Workflow
+`branch` (or no Workflow) end with the branch pushed to the fork as
+`bot/<short-slug>` and its compare URL on the board; a human decides whether
+it becomes a PR. Open a PR only when the item's Workflow is `pr`, which only
+a human sets. Updating the bot's own existing PRs (e.g. addressing review,
+or a rebase cgwalters asked for) is fine under either.
+
+This skill is for changes the bot proposes as its own. For items that are
 cgwalters' own PRs or review requests, follow the "PR items" section of
 `workstream` instead: push only a fixup branch to the bot's fork and open no
 PR. The commit, test and review guidance below still applies, but skip
@@ -66,7 +73,7 @@ contributions, stop and set the item to Needs human.
 gh repo fork OWNER/REPO --clone   # fork into cgwalters-bot; clone has "origin" (fork) and "upstream"
 cd REPO
 git fetch upstream
-git switch -c <short-topic-name> upstream/<default-branch>
+git switch -c bot/<short-slug> upstream/<default-branch>
 ```
 
 If the fork already exists, `gh repo fork` reuses it; sync it with
@@ -87,16 +94,29 @@ Never commit to the fork's default branch; one topic branch per change.
 ## Verify
 
 Run the project's own tests and linters (look at its CI config, Makefile,
-Justfile, `cargo`/`npm`/`go` conventions) and make them pass before opening a
-PR. If something cannot be run locally, say exactly what was not run in the
-PR description. Then load the `commit-review` skill and go through its
-checklist.
+Justfile, `cargo`/`npm`/`go` conventions) and make them pass before pushing
+the branch. Anything beyond a trivial check runs on a devspace (see the
+`devspace-work` skill), which also has podman and KVM for container- and
+VM-based CI steps. If something could not be run, say exactly what in the
+board item's Why (and in the PR description, for a PR). Then load the
+`commit-review` skill and go through its checklist.
 
-## Open the PR
+## Push the branch
 
 ```bash
-git push -u origin HEAD
-gh pr create --repo OWNER/REPO --head cgwalters-bot:<branch> --draft \
+git push -u origin HEAD:bot/<short-slug>
+```
+
+The push goes from this machine, never from a devspace. For a `branch`
+item this is the end: record the compare URL against upstream,
+`https://github.com/OWNER/REPO/compare/<default-branch>...cgwalters-bot:bot/<short-slug>`
+(it shows the diff and gives a human a one-click "Create pull request"),
+and the test summary on the board (see `workstream`).
+
+## Open the PR (Workflow `pr` only)
+
+```bash
+gh pr create --repo OWNER/REPO --head cgwalters-bot:bot/<short-slug> --draft \
   --title "..." --body-file pr-body.md
 ```
 
