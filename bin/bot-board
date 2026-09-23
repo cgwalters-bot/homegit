@@ -25,12 +25,15 @@ readonly EX_RATELIMIT=75
 # Scripts keep state shared across machines in archived draft items titled
 # STATE_PREFIX + NAME, holding a fenced JSON block. GitHub's API doesn't
 # list archived items (it ignores archivedStates), so they can't be found
-# by title: their ids are recorded here once state-put has created them.
+# by title: their ids are recorded here once state-put has created them,
+# as "ITEM_ID DRAFT_ID" so that state-put can write the draft directly.
 readonly STATE_PREFIX='bot-state: '
 readonly -A STATE_ITEMS=(
-    [notifications]=PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk
-    [watch]=PVTI_lAHOAQ_SPs4Bj2Gizg8bu2Q
+    [notifications]='PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk DI_lAHOAQ_SPs4Bj2GizgLL1Nk'
+    [watch]='PVTI_lAHOAQ_SPs4Bj2Gizg8bu2Q DI_lAHOAQ_SPs4Bj2GizgLL6AY'
 )
+# GitHub's limit on the body of a draft item, in characters.
+readonly STATE_BODY_MAX=65536
 
 usage() {
     cat <<EOF
@@ -56,7 +59,8 @@ Commands:
                               draft item '${STATE_PREFIX}NAME' ({} if it
                               doesn't exist yet)
   state-put NAME JSON         Replace that state, creating (and archiving)
-                              the item if needed
+                              the item if needed; the compact JSON must
+                              stay under ~64KB (a draft body's limit)
   -h, --help                  Show this help
 
 Options:
@@ -68,7 +72,8 @@ Valid values for Status, Priority and Workflow are read from the board.
 Board calls use the bot's GraphQL quota, shared by all agents, so field
 definitions are cached for ${FIELDS_TTL}s and the item list for ${ITEMS_TTL}s in
 ${CACHE_DIR}; changes made through this tool invalidate the item cache.
-state-get and state-put are one GraphQL call each.
+state-get is one GraphQL call, and so is state-put on an existing item
+(creating one takes a few).
 EOF
 }
 
@@ -393,33 +398,35 @@ parse_state() {
 readonly STATE_NODE_QUERY='query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
     id isArchived content { ... on DraftIssue { id title body } } } } }'
 
-# Set by find_state.
+# Set by state_ids and find_state.
 STATE_ITEM=
 STATE_DRAFT=
 STATE_BODY=
 
-# state_id NAME: prints the id of the state item NAME, from STATE_ITEMS or,
-# for one created since, the cache; nothing if it doesn't exist yet.
-state_id() {
-    local id=${STATE_ITEMS[$1]:-}
-    test -n "${id}" || read -r id 2>/dev/null <"${CACHE_DIR}/state-$1" || true
-    echo "${id}"
+# state_ids NAME: sets STATE_ITEM and STATE_DRAFT to the ids of the state
+# item NAME, from STATE_ITEMS or, for one created since, the cache, or
+# returns 1 if it doesn't exist yet.
+state_ids() {
+    local ids=${STATE_ITEMS[$1]:-}
+    test -n "${ids}" || read -r ids 2>/dev/null <"${CACHE_DIR}/state-$1" || true
+    test -n "${ids}" || return 1
+    read -r STATE_ITEM STATE_DRAFT <<<"${ids}"
+    [[ "${STATE_ITEM}" == PVTI_* && "${STATE_DRAFT}" == DI_* ]] ||
+        fatal "the ids of the state item '$1' are not 'PVTI_... DI_...': '${ids}'; fix STATE_ITEMS in $(basename "$0") or ${CACHE_DIR}/state-$1"
 }
 
 # find_state NAME: sets STATE_ITEM, STATE_DRAFT and STATE_BODY to the
 # state item, or returns 1 if there is none yet.
 find_state() {
-    local id data
-    id=$(state_id "$1")
-    test -n "${id}" || return 1
-    data=$(gqlq "${STATE_NODE_QUERY}" -f id="${id}") || fail_after $? "reading the state item ${id} failed"
-    jq -e --arg t "${STATE_PREFIX}$1" '.node.content.title == $t' <<<"${data}" >/dev/null ||
-        fatal "${id} is not the '${STATE_PREFIX}$1' draft item (deleted?); fix STATE_ITEMS in $(basename "$0"), or remove ${CACHE_DIR}/state-$1 to create a new one"
-    STATE_ITEM=${id}
-    STATE_DRAFT=$(jq -r .node.content.id <<<"${data}")
+    local data
+    state_ids "$1" || return 1
+    data=$(gqlq "${STATE_NODE_QUERY}" -f id="${STATE_ITEM}") || fail_after $? "reading the state item ${STATE_ITEM} failed"
+    jq -e --arg t "${STATE_PREFIX}$1" --arg draft "${STATE_DRAFT}" \
+        '.node.content.title == $t and .node.content.id == $draft' <<<"${data}" >/dev/null ||
+        fatal "${STATE_ITEM} is not the '${STATE_PREFIX}$1' draft item ${STATE_DRAFT} (deleted?); fix STATE_ITEMS in $(basename "$0"), or remove ${CACHE_DIR}/state-$1 to create a new one"
     STATE_BODY=$(jq -r .node.content.body <<<"${data}")
     jq -e .node.isArchived <<<"${data}" >/dev/null ||
-        echo "warning: the state item ${id} is not archived; it shows on the board" 1>&2
+        echo "warning: the state item ${STATE_ITEM} is not archived; it shows on the board" 1>&2
 }
 
 cmd_state_get() {
@@ -434,7 +441,7 @@ cmd_state_get() {
 }
 
 readonly DRAFT_UPDATE_MUTATION='mutation($id: ID!, $body: String!) {
-    updateProjectV2DraftIssue(input: {draftIssueId: $id, body: $body}) { draftIssue { id } } }'
+    updateProjectV2DraftIssue(input: {draftIssueId: $id, body: $body}) { draftIssue { id title } } }'
 
 cmd_state_put() {
     test $# -eq 2 || fatal "usage: $(basename "$0") state-put NAME JSON"
@@ -443,9 +450,17 @@ cmd_state_put() {
     json=$(jq -ce 'if type == "object" then . else error("not an object") end' <<<"$2" 2>/dev/null) ||
         fatal "state-put expects a JSON object"
     body=$(state_body "${json}")
-    if find_state "${name}"; then
-        gqlq "${DRAFT_UPDATE_MUTATION}" -f id="${STATE_DRAFT}" -f body="${body}" >/dev/null ||
-            fail_after $? "writing the state item ${STATE_ITEM} failed"
+    test "${#body}" -le "${STATE_BODY_MAX}" ||
+        fatal "the state '${name}' is ${#body} characters, over the ${STATE_BODY_MAX} a draft body holds; keep less in it"
+    # The known draft is written directly, without reading it first; the
+    # scripts all state-get (which checks the item) before they state-put.
+    if state_ids "${name}"; then
+        local data title
+        data=$(gqlq "${DRAFT_UPDATE_MUTATION}" -f id="${STATE_DRAFT}" -f body="${body}") ||
+            fail_after $? "writing the state item ${STATE_ITEM} (${STATE_DRAFT}) failed"
+        title=$(jq -r .updateProjectV2DraftIssue.draftIssue.title <<<"${data}")
+        test "${title}" = "${STATE_PREFIX}${name}" ||
+            fatal "wrote the state '${name}' into the draft ${STATE_DRAFT} titled '${title}'; fix STATE_ITEMS in $(basename "$0") and restore that draft"
         return 0
     fi
     # Workflow manual, so that nothing ever claims it, even unarchived.
@@ -462,9 +477,13 @@ cmd_state_put() {
     gqlq 'mutation($project: ID!, $item: ID!) { archiveProjectV2Item(input: {projectId: $project, itemId: $item}) { item { id } } }' \
         -f project="${project}" -f item="${id}" >/dev/null ||
         fail_after $? "archiving the state item ${id} failed; archive it by hand"
+    local draft
+    draft=$(gqlq "${STATE_NODE_QUERY}" -f id="${id}") ||
+        fail_after $? "looking up the draft of the new state item ${id} failed; add it to STATE_ITEMS by hand"
+    draft=$(jq -r .node.content.id <<<"${draft}")
     mkdir -p "${CACHE_DIR}"
-    echo "${id}" >"${CACHE_DIR}/state-${name}"
-    echo "Created and archived the state item ${id} ('${STATE_PREFIX}${name}'); add it to STATE_ITEMS in $(basename "$0")" 1>&2
+    echo "${id} ${draft}" >"${CACHE_DIR}/state-${name}"
+    echo "Created and archived the state item ${id} ('${STATE_PREFIX}${name}'); add [${name}]='${id} ${draft}' to STATE_ITEMS in $(basename "$0")" 1>&2
 }
 
 while test $# -gt 0; do
