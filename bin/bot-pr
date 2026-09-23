@@ -1,0 +1,740 @@
+#!/usr/bin/env bash
+# Propose the bot's changes as draft PRs on its own forks, where cgwalters
+# reviews them, and open the upstream PR only once he approves.
+set -euo pipefail
+shopt -s inherit_errexit
+
+readonly BOT_LOGIN=cgwalters-bot
+# The only login whose reviews and comments on a fork PR are acted on.
+readonly REVIEWER=cgwalters
+readonly BRANCH_PREFIX=bot/
+# Where a fork mirrors an upstream base branch whose fork copy has diverged.
+readonly MIRROR_PREFIX=bot-base
+readonly META_START='<!-- bot-meta -->'
+readonly META_END='<!-- /bot-meta -->'
+readonly LLMS_TRAILER='Generated-by: https://github.com/cgwalters/#llms'
+# A line consisting of this, in a comment or review by REVIEWER, asks for
+# the upstream PR to be opened as a draft.
+readonly DRAFT_COMMAND=/draft
+# ... and this, later, takes that back.
+readonly READY_COMMAND=/ready
+readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-pr
+readonly STATE_FILE=${STATE_DIR}/inbox.json
+readonly STATE_VERSION=2
+readonly CLONE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-pr/clones
+readonly DEFAULT_LOOKBACK_DAYS=7
+# How far back each inbox run re-searches closed PRs, for search index lag.
+readonly SEARCH_OVERLAP="1 hour"
+readonly SEARCH_PER_PAGE=100
+readonly EXCERPT_LEN=120
+readonly BOT_GIT_NAME=cgwalters-bot
+readonly BOT_GIT_EMAIL=walters+llm@verbum.org
+# Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
+readonly EX_RATELIMIT=75
+# Returned by ghapi() when GitHub says the resource does not exist.
+readonly EX_NOTFOUND=4
+# Returned by rebase_onto_upstream() when the rebase conflicts.
+readonly EX_CONFLICT=10
+BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
+readonly BOT_BOARD
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") COMMAND [ARGS...]
+
+Review loop for the bot's changes: a tested branch is first proposed as a
+draft PR on the bot's own fork, where ${REVIEWER} reviews it, and only his
+approval opens the upstream PR.
+
+Commands:
+  fork-pr --repo OWNER/REPO --base BRANCH --branch ${BRANCH_PREFIX}SLUG --item PVTI_...
+          --title TITLE --body-file FILE
+        Sync BRANCH of ${BOT_LOGIN}/REPO with upstream OWNER/REPO, then
+        open a draft PR from ${BRANCH_PREFIX}SLUG into it and print its URL. A
+        non-default BRANCH (e.g. a Renovate branch) is mirrored under the
+        same name; if the fork's default branch has commits of its own,
+        upstream is mirrored to ${MIRROR_PREFIX}/BRANCH instead. TITLE and FILE
+        are the future upstream PR: why, what was tested, caveats, ending
+        with '${LLMS_TRAILER}'.
+        A trailing ${META_START} section records the upstream target
+        and board item, with instructions for ${REVIEWER}.
+  promote FORK_PR_URL [--draft] [--why TEXT] [--dry-run]
+        Open the upstream PR for a fork PR whose current head ${REVIEWER}
+        approved (commits pushed after his approval need a new one):
+        rebase onto the upstream base if it moved (on conflicts, dismiss
+        the approval and stop), open the PR from ${BOT_LOGIN}:${BRANCH_PREFIX}SLUG
+        with the fork PR's current title and body minus the bot-meta
+        section, link and close the fork PR, and set the board item In
+        Review with Branch = the upstream PR (and Why = TEXT, if given).
+        The upstream PR is a draft with --draft, or when ${REVIEWER}'s latest
+        '${DRAFT_COMMAND}' or '${READY_COMMAND}' comment line is '${DRAFT_COMMAND}'. --dry-run checks
+        everything and prints what would happen without changing anything.
+  inbox [--since DATE] [--dry-run]
+        List the bot's fork PRs with activity by ${REVIEWER} since the last
+        check (or DATE): reviews, review and issue comments, title and body
+        edits, and fork PRs he closed. Approved PRs are always listed, since
+        they are waiting for 'promote'. --dry-run doesn't record the check.
+  -h, --help
+        Show this help
+
+Only REST calls are made: the GraphQL quota is shared with the board
+tooling. Only activity whose GitHub author is the '${REVIEWER}' login counts.
+inbox state lives in ${STATE_FILE}.
+EOF
+}
+
+# rate_limited() usually runs in a command substitution, so it can't exit
+# the script itself; it leaves this flag, and fatal() passes EX_RATELIMIT on.
+RATE_LIMIT_FLAG=$(mktemp -u "${TMPDIR:-/tmp}/bot-pr-ratelimit.XXXXXX")
+readonly RATE_LIMIT_FLAG
+trap 'rm -f "${RATE_LIMIT_FLAG}"' EXIT
+
+fatal() {
+    test -e "${RATE_LIMIT_FLAG}" && exit "${EX_RATELIMIT}"
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+warn() {
+    echo "warning: $*" 1>&2
+}
+
+info() {
+    echo "$*" 1>&2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
+}
+
+rate_limited() {
+    : >"${RATE_LIMIT_FLAG}"
+    echo "error: GitHub is rate limiting the bot ($1); retry after $(gh api rate_limit --jq ".resources.$2.reset | todate" 2>/dev/null || echo "the reset")" 1>&2
+    exit "${EX_RATELIMIT}"
+}
+
+# ghapi ARGS...: 'gh api', turning rate limiting into a clear exit and a
+# 404 into EX_NOTFOUND (with no output), so callers can tell "absent" from
+# "failed".
+ghapi() {
+    local out err rc=0
+    err=$(mktemp)
+    out=$(gh api "$@" 2>"${err}") || rc=$?
+    if test "${rc}" -ne 0; then
+        if grep -qiE 'rate limit|abuse' "${err}"; then
+            local reason
+            reason=$(grep -iE -m1 'rate limit|abuse' "${err}")
+            rm -f "${err}"
+            local resource=core
+            [[ " $* " == *" search/"* ]] && resource=search
+            rate_limited "${reason}" "${resource}"
+        fi
+        if grep -q 'HTTP 404' "${err}"; then
+            rm -f "${err}"
+            return "${EX_NOTFOUND}"
+        fi
+        cat "${err}" 1>&2
+        rm -f "${err}"
+        return "${rc}"
+    fi
+    rm -f "${err}"
+    test -z "${out}" || printf '%s\n' "${out}"
+}
+
+check_login() {
+    local login
+    login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
+    test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}"
+}
+
+valid_repo() {
+    [[ "$1" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
+}
+
+# The bot's fork of an upstream repository.
+fork_of() {
+    echo "${BOT_LOGIN}/${1#*/}"
+}
+
+# ref_sha REPO BRANCH: prints the branch's commit, or nothing if it doesn't
+# exist.
+ref_sha() {
+    local rc=0 sha
+    sha=$(ghapi "repos/$1/git/ref/heads/$2" --jq .object.sha) || rc=$?
+    test "${rc}" -eq "${EX_NOTFOUND}" && return 0
+    test "${rc}" -eq 0 || fatal "cannot read branch $2 of $1"
+    echo "${sha}"
+}
+
+# sync_base UPSTREAM FORK BRANCH: make the fork's copy of BRANCH match
+# upstream's, and print the name of that copy. It is BRANCH itself unless
+# BRANCH is the fork's default branch and carries commits of its own (as
+# cgwalters-bot/bootc's main does), which are left alone; upstream is then
+# mirrored to MIRROR_PREFIX/BRANCH instead. Any other BRANCH is a mirror
+# (upstream may force-push it, as Renovate does), so it is reset. merge-upstream syncs from the fork's
+# *parent*, which is not always the upstream (cgwalters-bot/bootc is a fork
+# of cgwalters/bootc), so it is only used for the upstream default branch
+# of a direct fork; otherwise the ref is set to the upstream commit, which
+# the fork network already has.
+sync_base() {
+    local upstream=$1 fork=$2 base=$3 target=$3 up_sha fork_sha own parent default fork_default
+    up_sha=$(ref_sha "${upstream}" "${base}")
+    test -n "${up_sha}" || fatal "${upstream} has no branch '${base}'"
+    fork_sha=$(ref_sha "${fork}" "${base}")
+    fork_default=$(ghapi "repos/${fork}" --jq .default_branch) || fatal "cannot read ${fork}"
+    if test -n "${fork_sha}" && test "${fork_sha}" != "${up_sha}" && test "${base}" = "${fork_default}"; then
+        own=$(ghapi "repos/${fork}/compare/${up_sha}...${fork_sha}" --jq .ahead_by) ||
+            fatal "cannot compare ${fork}:${base} with ${upstream}:${base}"
+        if test "${own}" -gt 0; then
+            target=${MIRROR_PREFIX}/${base}
+            info "${fork}:${base} has ${own} commit(s) of its own; leaving it alone and mirroring ${upstream}:${base} to ${target}"
+            fork_sha=$(ref_sha "${fork}" "${target}")
+        fi
+    fi
+    if test "${fork_sha}" = "${up_sha}"; then
+        info "${fork}:${target} is up to date with ${upstream}:${base}"
+        echo "${target}"
+        return 0
+    fi
+    parent=$(ghapi "repos/${fork}" --jq .parent.full_name) || fatal "cannot read ${fork}"
+    default=$(ghapi "repos/${upstream}" --jq .default_branch) || fatal "cannot read ${upstream}"
+    if test -n "${fork_sha}" && test "${target}" = "${default}" && test "${parent}" = "${upstream}"; then
+        ghapi -X POST "repos/${fork}/merge-upstream" -f branch="${target}" >/dev/null ||
+            fatal "syncing ${fork}:${target} with ${upstream} failed"
+    elif test -z "${fork_sha}"; then
+        ghapi -X POST "repos/${fork}/git/refs" -f ref="refs/heads/${target}" -f sha="${up_sha}" >/dev/null ||
+            fatal "creating ${fork}:${target} at ${upstream}'s ${up_sha} failed"
+    else
+        # Either a fast-forward, or a mirror, which upstream (Renovate, say)
+        # may have force-pushed.
+        ghapi -X PATCH "repos/${fork}/git/refs/heads/${target}" -f sha="${up_sha}" -F force=true >/dev/null ||
+            fatal "updating ${fork}:${target} to ${upstream}'s ${up_sha} failed"
+    fi
+    fork_sha=$(ref_sha "${fork}" "${target}")
+    test "${fork_sha}" = "${up_sha}" ||
+        warn "${fork}:${target} is at ${fork_sha}, not upstream's ${up_sha}; the fork PR's diff may include extra commits"
+    info "Synced ${fork}:${target} with ${upstream}:${base} (${up_sha:0:12})"
+    echo "${target}"
+}
+
+# The bot-meta section appended to fork PR bodies. Its "Upstream:" and
+# "Board item:" lines are parsed back by promote.
+meta_section() {
+    local upstream=$1 base=$2 item=$3
+    cat <<EOF
+${META_START}
+---
+
+**Review draft on the bot's fork, not upstream yet.** This section is removed when the PR is opened upstream.
+
+- Upstream: \`${upstream}\`, base \`${base}\`
+- Board item: \`${item}\`
+
+@${REVIEWER}:
+- **Approve** to open it upstream, ready for review.
+- Comment \`${DRAFT_COMMAND}\`, then approve, to open it upstream as a draft (\`${READY_COMMAND}\` undoes that).
+- **Close** to drop it.
+- Edit the title and description freely: they become the upstream PR's. Review comments are addressed with fixup commits and a reply here.
+${META_END}
+EOF
+}
+
+# jq definitions for fork PR bodies. Bodies edited in the web UI use CRLF.
+# shellcheck disable=SC2016 # jq, not shell
+readonly BODY_JQ='
+def normalize: (. // "") | gsub("\r\n"; "\n");
+def meta: normalize | [match("<!-- bot-meta -->[\\s\\S]*?<!-- /bot-meta -->").string] | first // "";
+def strip_meta: normalize | gsub("\\s*<!-- bot-meta -->[\\s\\S]*?<!-- /bot-meta -->"; "") | sub("\\s+$"; "");
+def excerpt($n): normalize | gsub("\\s+"; " ") | if length > $n then .[:$n] + "..." else . end;
+'
+
+# Inbox state: {version, last_check, prs: {URL: {body: sha256, seen}},
+# closed: {URL: true}}. Body edits have no REST event, so they show up as
+# a changed hash; 'seen' is when a PR's activity was last reported.
+lock_state() {
+    require_cmd flock "install util-linux"
+    mkdir -p "${STATE_DIR}" || fatal "cannot create ${STATE_DIR}"
+    exec {STATE_LOCK_FD}>"${STATE_DIR}/lock" || fatal "cannot open ${STATE_DIR}/lock"
+    flock -w 60 "${STATE_LOCK_FD}" || fatal "another $(basename "$0") run holds ${STATE_DIR}/lock"
+}
+
+load_state() {
+    if test -s "${STATE_FILE}"; then
+        jq -c --argjson v "${STATE_VERSION}" 'if .version == $v then . else error("unsupported state version \(.version)") end' "${STATE_FILE}" ||
+            fatal "cannot parse ${STATE_FILE}; move it away to start over"
+    else
+        jq -nc --argjson v "${STATE_VERSION}" '{version: $v, prs: {}, closed: {}}'
+    fi
+}
+
+save_state() {
+    printf '%s\n' "$1" >"${STATE_FILE}.tmp.$$" || fatal "cannot write ${STATE_FILE}.tmp.$$"
+    mv -f "${STATE_FILE}.tmp.$$" "${STATE_FILE}" || fatal "cannot replace ${STATE_FILE}"
+}
+
+# body_hash < PR_JSON
+body_hash() {
+    jq -r "${BODY_JQ} .body | normalize" | sha256sum | cut -d' ' -f1
+}
+
+cmd_fork_pr() {
+    local upstream="" base="" branch="" item="" title="" body_file=""
+    while test $# -gt 0; do
+        case "$1" in
+            --repo|--base|--branch|--item|--title|--body-file)
+                test $# -ge 2 || fatal "$1 requires an argument"
+                case "$1" in
+                    --repo) upstream=$2 ;;
+                    --base) base=$2 ;;
+                    --branch) branch=$2 ;;
+                    --item) item=$2 ;;
+                    --title) title=$2 ;;
+                    --body-file) body_file=$2 ;;
+                esac
+                shift 2
+                ;;
+            *) fatal "unknown argument for fork-pr: $1 (see --help)" ;;
+        esac
+    done
+    local opt var
+    for opt in upstream:--repo base:--base branch:--branch item:--item title:--title body_file:--body-file; do
+        var=${opt%%:*}
+        test -n "${!var}" || fatal "fork-pr requires ${opt#*:}"
+    done
+    valid_repo "${upstream}" || fatal "--repo must be OWNER/REPO, not '${upstream}'"
+    test "${upstream%%/*}" != "${BOT_LOGIN}" || fatal "--repo is the upstream repository, not the bot's fork"
+    [[ "${branch}" == "${BRANCH_PREFIX}"?* ]] || fatal "--branch must be ${BRANCH_PREFIX}<slug>, not '${branch}'"
+    [[ "${item}" =~ ^PVTI_[A-Za-z0-9_-]+$ ]] || fatal "--item must be a board item id (PVTI_...), not '${item}'"
+    test -s "${body_file}" || fatal "--body-file '${body_file}' is missing or empty"
+    local body
+    body=$(<"${body_file}")
+    ! grep -qF "${META_START}" <<<"${body}" || fatal "${body_file} already has a bot-meta section; fork-pr adds it"
+    grep -qxF "${LLMS_TRAILER}" <<<"${body}" ||
+        warn "${body_file} has no '${LLMS_TRAILER}' line; add one unless the project's policy says otherwise"
+    check_login
+
+    local fork source parent
+    fork=$(fork_of "${upstream}")
+    read -r parent source < <(ghapi "repos/${fork}" --jq '"\(.parent.full_name) \(.source.full_name)"') ||
+        fatal "${fork} does not exist; fork ${upstream} first (gh api -X POST repos/${upstream}/forks)"
+    test "${upstream}" = "${parent}" || test "${upstream}" = "${source}" ||
+        fatal "${fork} is a fork of ${parent} (network root ${source}), not of ${upstream}"
+
+    local head_sha compare ahead behind
+    head_sha=$(ref_sha "${fork}" "${branch}")
+    test -n "${head_sha}" || fatal "${fork} has no branch ${branch}; push the tested branch first"
+    compare=$(ghapi "repos/${upstream}/compare/${base}...${BOT_LOGIN}:${branch}" --jq '"\(.ahead_by) \(.behind_by)"') ||
+        fatal "cannot compare ${branch} with ${upstream}:${base}"
+    read -r ahead behind <<<"${compare}"
+    test "${ahead}" -gt 0 || fatal "${branch} has no commits on top of ${upstream}:${base}"
+    test "${behind}" -eq 0 || info "note: ${branch} is ${behind} commit(s) behind ${upstream}:${base}; promote rebases it"
+
+    local existing
+    existing=$(ghapi -X GET "repos/${upstream}/pulls" -f head="${BOT_LOGIN}:${branch}" -f state=open --jq '.[0].html_url // empty') ||
+        fatal "cannot list the PRs of ${upstream}"
+    test -z "${existing}" || fatal "${branch} is already open upstream as ${existing}"
+    existing=$(ghapi -X GET "repos/${fork}/pulls" -f head="${BOT_LOGIN}:${branch}" -f state=open --jq '.[0].html_url // empty') ||
+        fatal "cannot list the PRs of ${fork}"
+    if test -n "${existing}"; then
+        info "A fork PR for ${branch} is already open; not opening another"
+        echo "${existing}"
+        return 0
+    fi
+
+    local fork_base
+    fork_base=$(sync_base "${upstream}" "${fork}" "${base}")
+
+    local full_body url
+    full_body="${body}"$'\n\n'"$(meta_section "${upstream}" "${base}" "${item}")"
+    local created
+    created=$(jq -n --arg title "${title}" --arg head "${branch}" --arg base "${fork_base}" --arg body "${full_body}" \
+        '{title: $title, head: $head, base: $base, body: $body, draft: true}' |
+        ghapi -X POST "repos/${fork}/pulls" --input -) ||
+        fatal "opening the draft PR in ${fork} failed"
+    url=$(jq -r .html_url <<<"${created}")
+    # So that inbox reports even edits made before its next run. In a
+    # subshell: the PR exists now, so a failure here is only a warning.
+    (
+        lock_state
+        state=$(load_state)
+        hash=$(body_hash <<<"${created}")
+        save_state "$(jq -c --arg u "${url}" --arg h "${hash}" --arg now "$(date -u +%FT%TZ)" \
+            '.prs[$u] = {body: $h, seen: $now}' <<<"${state}")"
+    ) || warn "recording ${url} in ${STATE_FILE} failed; inbox will pick it up without its original body"
+
+    local perm
+    perm=$(ghapi "repos/${fork}/collaborators/${REVIEWER}/permission" --jq .permission 2>/dev/null) || perm=unknown
+    case "${perm}" in
+        admin|maintain|write) ;;
+        *) warn "${REVIEWER} has '${perm}' access to ${fork}, so he can review and comment but not edit the title and body" ;;
+    esac
+    echo "${url}"
+}
+
+# The reviewer's comments, reviews and inline review comments on a fork
+# PR, as a JSON array of {kind, at, url, state, body, path}.
+reviewer_activity() {
+    local fork=$1 number=$2
+    {
+        ghapi --paginate "repos/${fork}/pulls/${number}/reviews?per_page=100" \
+            --jq ".[] | select(.user.login == \"${REVIEWER}\")
+                  | {kind: \"review\", at: .submitted_at, url: .html_url, state, body, id, commit_id}" ||
+            fatal "cannot list the reviews of ${fork}#${number}"
+        ghapi --paginate "repos/${fork}/pulls/${number}/comments?per_page=100" \
+            --jq ".[] | select(.user.login == \"${REVIEWER}\")
+                  | {kind: \"review comment\", at: .updated_at, url: .html_url, body, path}" ||
+            fatal "cannot list the review comments of ${fork}#${number}"
+        ghapi --paginate "repos/${fork}/issues/${number}/comments?per_page=100" \
+            --jq ".[] | select(.user.login == \"${REVIEWER}\")
+                  | {kind: \"comment\", at: .updated_at, url: .html_url, body}" ||
+            fatal "cannot list the comments of ${fork}#${number}"
+    } | jq -sc .
+}
+
+# jq over reviewer_activity output, with \$head the PR's head commit:
+# whether the latest review that decides anything approves (a later
+# dismissal or change request cancels it) and approved the current head,
+# since commits pushed after it are unreviewed; and whether the latest
+# '/draft' or '/ready' line in a comment or review body asks for a draft.
+readonly VERDICT_JQ="
+def approval: [.[] | select(.kind == \"review\" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\")))]
+    | sort_by(.at) | last;
+def approved_any: approval.state == \"APPROVED\";
+def approved: approved_any and approval.commit_id == \$head;
+def wants_draft: [.[] | {at, cmd: ((.body // \"\") | gsub(\"\\r\"; \"\")
+        | [scan(\"(?:^|\\n)[ \\t]*(${DRAFT_COMMAND}|${READY_COMMAND})[ \\t]*(?=\\n|\$)\")[0]] | last)}
+    | select(.cmd != null)] | sort_by(.at) | last | .cmd == \"${DRAFT_COMMAND}\";
+"
+
+# parse_fork_pr_url URL: sets FORK and NUMBER.
+parse_fork_pr_url() {
+    [[ "$1" =~ ^https://github\.com/(${BOT_LOGIN}/[A-Za-z0-9_.-]+)/pull/([0-9]+)/?$ ]] ||
+        fatal "expected a PR URL in one of ${BOT_LOGIN}'s forks (https://github.com/${BOT_LOGIN}/REPO/pull/N), got '$1'"
+    FORK=${BASH_REMATCH[1]}
+    NUMBER=${BASH_REMATCH[2]}
+}
+
+# rebase_onto_upstream FORK BRANCH OLD_SHA UPSTREAM BASE: rebases the
+# branch in a cached clone, force-pushes it and prints the new head. On
+# conflicts, prints the conflicting paths and returns EX_CONFLICT. Any
+# other failure exits. It runs in a '||' list, where errexit is off, so
+# every step checks for itself.
+rebase_onto_upstream() {
+    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 dir conflicts new_sha clone_lock
+    require_cmd git "install git"
+    require_cmd flock "install util-linux"
+    dir=${CLONE_DIR}/${fork//\//_}
+    mkdir -p "${CLONE_DIR}" || fatal "cannot create ${CLONE_DIR}"
+    exec {clone_lock}>"${dir}.lock" || fatal "cannot open ${dir}.lock"
+    flock "${clone_lock}" || fatal "cannot lock ${dir}.lock"
+    if ! test -d "${dir}/.git"; then
+        rm -rf "${dir}"
+        git clone -q --filter=blob:none --no-checkout "https://github.com/${fork}" "${dir}" 1>&2 ||
+            fatal "cloning ${fork} into ${dir} failed"
+    fi
+    git -C "${dir}" fetch -q --filter=blob:none "https://github.com/${fork}" "+refs/heads/${branch}:refs/bot-pr/head" 1>&2 ||
+        fatal "fetching ${fork}:${branch} into ${dir} failed"
+    git -C "${dir}" fetch -q --filter=blob:none "https://github.com/${upstream}" "+refs/heads/${base}:refs/bot-pr/base" 1>&2 ||
+        fatal "fetching ${upstream}:${base} into ${dir} failed"
+    test "$(git -C "${dir}" rev-parse refs/bot-pr/head)" = "${old_sha}" ||
+        fatal "${fork}:${branch} moved while promoting; rerun promote"
+    git -C "${dir}" rebase --abort >/dev/null 2>&1 || true
+    git -C "${dir}" checkout -q --force --detach refs/bot-pr/head 1>&2 ||
+        fatal "checking out ${branch} in ${dir} failed"
+    test "$(git -C "${dir}" rev-parse HEAD)" = "${old_sha}" || fatal "${dir} is not at ${branch} after checkout"
+    if ! GIT_COMMITTER_NAME=${BOT_GIT_NAME} GIT_COMMITTER_EMAIL=${BOT_GIT_EMAIL} \
+        git -C "${dir}" rebase -q refs/bot-pr/base >/dev/null 2>&1; then
+        conflicts=$(git -C "${dir}" diff --name-only --diff-filter=U | paste -sd, -)
+        git -C "${dir}" rebase --abort >/dev/null 2>&1 || true
+        test -n "${conflicts}" || fatal "rebasing ${branch} onto ${upstream}:${base} in ${dir} failed without conflicts; nothing was changed"
+        echo "${conflicts}"
+        return "${EX_CONFLICT}"
+    fi
+    new_sha=$(git -C "${dir}" rev-parse HEAD) || fatal "cannot read the rebased head in ${dir}"
+    git -C "${dir}" merge-base --is-ancestor refs/bot-pr/base "${new_sha}" ||
+        fatal "the rebased ${branch} in ${dir} doesn't contain ${upstream}:${base}; not pushing it"
+    git -C "${dir}" push -q --force-with-lease="refs/heads/${branch}:${old_sha}" \
+        "https://github.com/${fork}" "${new_sha}:refs/heads/${branch}" 1>&2 ||
+        fatal "pushing the rebased ${branch} to ${fork} failed"
+    echo "${new_sha}"
+}
+
+cmd_promote() {
+    local url="" draft=false dry_run=false why="" have_why=false
+    while test $# -gt 0; do
+        case "$1" in
+            --draft) draft=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            --why) test $# -ge 2 || fatal "--why requires an argument"; why=$2; have_why=true; shift 2 ;;
+            -*) fatal "unknown argument for promote: $1 (see --help)" ;;
+            *) test -z "${url}" || fatal "promote takes one fork PR URL"; url=$1; shift ;;
+        esac
+    done
+    test -n "${url}" || fatal "usage: $(basename "$0") promote FORK_PR_URL [--draft] [--why TEXT] [--dry-run]"
+    local FORK NUMBER
+    parse_fork_pr_url "${url}"
+    check_login
+
+    local pr
+    pr=$(ghapi "repos/${FORK}/pulls/${NUMBER}") || fatal "cannot read ${url}"
+    local author state head head_repo head_sha fork_base
+    read -r author state head head_repo head_sha fork_base < <(jq -r \
+        '"\(.user.login) \(.state) \(.head.ref) \(.head.repo.full_name) \(.head.sha) \(.base.ref)"' <<<"${pr}")
+    test "${author}" = "${BOT_LOGIN}" || fatal "${url} was opened by ${author}, not ${BOT_LOGIN}"
+    test "${state}" = open || fatal "${url} is ${state}; only an open fork PR can be promoted"
+    test "${head_repo}" = "${FORK}" || fatal "${url}'s head is in ${head_repo}, not ${FORK}"
+    [[ "${head}" == "${BRANCH_PREFIX}"?* ]] || fatal "${url}'s branch '${head}' is not a ${BRANCH_PREFIX}<slug> branch"
+
+    # The upstream repository comes from the bot-meta section: a fork's
+    # parent is not necessarily the upstream.
+    local meta upstream meta_base item title body
+    meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
+    test -n "${meta}" || fatal "${url} has no complete ${META_START} ... ${META_END} section; was it opened with fork-pr? Restore it in the PR body"
+    # shellcheck disable=SC2016 # literal backticks
+    local upstream_re='Upstream: `([^`]+)`, base `([^`]+)`' item_re='Board item: `(PVTI_[A-Za-z0-9_-]+)`'
+    [[ "${meta}" =~ ${upstream_re} ]] ||
+        fatal "cannot find the 'Upstream: \`OWNER/REPO\`, base \`BRANCH\`' line in ${url}'s bot-meta section"
+    upstream=${BASH_REMATCH[1]}
+    meta_base=${BASH_REMATCH[2]}
+    valid_repo "${upstream}" || fatal "invalid upstream '${upstream}' in ${url}'s bot-meta section"
+    local network
+    network=$(ghapi "repos/${FORK}" --jq '"\(.parent.full_name) \(.source.full_name)"') || fatal "cannot read ${FORK}"
+    [[ " ${network} " == *" ${upstream} "* ]] ||
+        fatal "bot-meta names upstream ${upstream}, but ${FORK} is a fork of ${network% *} (network root ${network#* })"
+    item=
+    if [[ "${meta}" =~ ${item_re} ]]; then
+        item=${BASH_REMATCH[1]}
+    else
+        warn "no board item in ${url}'s bot-meta section; the board won't be updated"
+    fi
+    local base=${meta_base}
+    test "${fork_base}" = "${base}" || test "${fork_base}" = "${MIRROR_PREFIX}/${base}" ||
+        warn "the fork PR targets '${fork_base}', but bot-meta says upstream base '${base}'; using '${base}'"
+    title=$(jq -r .title <<<"${pr}")
+    body=$(jq -r "${BODY_JQ} .body | strip_meta" <<<"${pr}")
+    ! grep -qF 'bot-meta' <<<"${body}" || fatal "${url}'s body still mentions bot-meta after stripping the section; fix its markers"
+    test -n "${body}" || fatal "${url}'s body is empty without the bot-meta section"
+    grep -qxF "${LLMS_TRAILER}" <<<"${body}" || warn "${url}'s body has no '${LLMS_TRAILER}' line"
+
+    local activity approved wants_draft
+    activity=$(reviewer_activity "${FORK}" "${NUMBER}")
+    approved=$(jq -r --arg head "${head_sha}" "${VERDICT_JQ} approved" <<<"${activity}")
+    wants_draft=$(jq -r --arg head "${head_sha}" "${VERDICT_JQ} wants_draft" <<<"${activity}")
+    if test "${approved}" != true; then
+        local why_not="is not approved by ${REVIEWER}; only his approval promotes a fork PR"
+        if test "$(jq -r --arg head "${head_sha}" "${VERDICT_JQ} approved_any" <<<"${activity}")" = true; then
+            why_not="has commits pushed after ${REVIEWER} approved it; he needs to approve the current head"
+        fi
+        ${dry_run} || fatal "${url} ${why_not}"
+        warn "${url} ${why_not}; a real promote would stop here"
+    fi
+    if test "${wants_draft}" = true && ! ${draft}; then
+        info "${REVIEWER} asked for '${DRAFT_COMMAND}'; opening the upstream PR as a draft"
+        draft=true
+    fi
+
+    local existing ahead behind compare
+    existing=$(ghapi -X GET "repos/${upstream}/pulls" -f head="${BOT_LOGIN}:${head}" -f state=open --jq '.[0].html_url // empty') ||
+        fatal "cannot list the PRs of ${upstream}"
+    compare=$(ghapi "repos/${upstream}/compare/${base}...${BOT_LOGIN}:${head}" --jq '"\(.ahead_by) \(.behind_by)"') ||
+        fatal "cannot compare ${head} with ${upstream}:${base}"
+    read -r ahead behind <<<"${compare}"
+    test "${ahead}" -gt 0 || fatal "${head} has no commits on top of ${upstream}:${base}; was it merged already?"
+
+    if ${dry_run}; then
+        cat <<EOF
+Fork PR:   ${url} (${REVIEWER}: $(jq -r --arg head "${head_sha}" "${VERDICT_JQ} approval.state // \"no verdict\"" <<<"${activity}"))
+Upstream:  ${upstream}, base ${base}, from ${BOT_LOGIN}:${head} (${ahead} ahead, ${behind} behind)
+Board:     ${item:-(none)}
+
+Would:
+EOF
+        test "${behind}" -eq 0 || echo "- rebase ${head} onto ${upstream}:${base} and force-push it (on conflicts: dismiss the approval, comment, stop)"
+        if test -n "${existing}"; then
+            echo "- reuse the already open ${existing}"
+        else
+            echo "- open $(if ${draft}; then echo "a draft"; else echo "a ready-for-review"; fi) PR in ${upstream}"
+        fi
+        echo "- comment the upstream PR link on ${url} and close it"
+        test -z "${item}" || echo "- bot-board set ${item} --status \"In Review\" --branch <upstream PR URL>$(${have_why} && echo " --why ...")"
+        printf '\nTitle: %s\n\n%s\n' "${title}" "${body}"
+        return 0
+    fi
+
+    # The head that goes upstream: the approved one, or its clean rebase.
+    local expected_head=${head_sha}
+    if test "${behind}" -gt 0 && test -z "${existing}"; then
+        info "${head} is ${behind} commit(s) behind ${upstream}:${base}; rebasing"
+        # The new head on success, the conflicting paths otherwise.
+        local out rc=0
+        out=$(rebase_onto_upstream "${FORK}" "${head}" "${head_sha}" "${upstream}" "${base}") || rc=$?
+        test "${rc}" -eq 0 || test "${rc}" -eq "${EX_CONFLICT}" || exit "${rc}"
+        if test "${rc}" -eq "${EX_CONFLICT}"; then
+            local review_id
+            review_id=$(jq -r --arg head "${head_sha}" "${VERDICT_JQ} approval.id" <<<"${activity}")
+            ghapi -X PUT "repos/${FORK}/pulls/${NUMBER}/reviews/${review_id}/dismissals" \
+                -f message="Upstream ${base} moved and this no longer rebases cleanly; needs another look after the conflicts are resolved." >/dev/null ||
+                warn "dismissing the approval on ${url} failed; the next inbox will still show it as approved"
+            ghapi -X POST "repos/${FORK}/issues/${NUMBER}/comments" -f body="Not promoted: \`${upstream}:${base}\` moved and \`${head}\` no longer rebases cleanly (conflicts in: ${out}). Back to Draft; I'll resolve the conflicts here and ask for another review." >/dev/null ||
+                warn "commenting on ${url} failed"
+            if test -n "${item}"; then
+                "${BOT_BOARD}" set "${item}" --status Draft >/dev/null ||
+                    warn "setting ${item} back to Draft failed; do it by hand"
+            fi
+            fatal "${head} conflicts with ${upstream}:${base} in ${out}; resolve that on the branch, push, and wait for ${REVIEWER} to approve again"
+        fi
+        expected_head=${out}
+        info "Rebased and pushed ${head} (${expected_head:0:12})"
+    fi
+    # Nothing unreviewed may go upstream: fail if anything was pushed since.
+    test "$(ref_sha "${FORK}" "${head}")" = "${expected_head}" ||
+        fatal "${FORK}:${head} moved while promoting; not opening the upstream PR"
+
+    local upstream_url
+    if test -n "${existing}"; then
+        info "Reusing the already open ${existing}"
+        upstream_url=${existing}
+    else
+        upstream_url=$(jq -n --arg title "${title}" --arg head "${BOT_LOGIN}:${head}" --arg base "${base}" \
+            --arg body "${body}" --argjson draft "${draft}" \
+            '{title: $title, head: $head, base: $base, body: $body, draft: $draft, maintainer_can_modify: true}' |
+            ghapi -X POST "repos/${upstream}/pulls" --input - --jq .html_url) ||
+            fatal "opening the PR in ${upstream} failed; nothing else was changed"
+        info "Opened ${upstream_url}"
+    fi
+    ghapi -X POST "repos/${FORK}/issues/${NUMBER}/comments" \
+        -f body="Opened upstream as ${upstream_url}$(${draft} && echo " (draft)"). Closing this review draft." >/dev/null ||
+        warn "commenting on ${url} failed"
+    ghapi -X PATCH "repos/${FORK}/pulls/${NUMBER}" -f state=closed >/dev/null ||
+        warn "closing ${url} failed; close it by hand"
+    if test -n "${item}"; then
+        local board_args=(set "${item}" --status "In Review" --branch "${upstream_url}")
+        ${have_why} && board_args+=(--why "${why}")
+        "${BOT_BOARD}" "${board_args[@]}" >/dev/null ||
+            fatal "the upstream PR is open, but updating the board failed; retry: bot-board$(printf ' %q' "${board_args[@]}")"
+    fi
+    echo "${upstream_url}"
+}
+
+cmd_inbox() {
+    local since="" dry_run=false
+    while test $# -gt 0; do
+        case "$1" in
+            --since) test $# -ge 2 || fatal "--since requires a date"; since=$2; shift 2 ;;
+            --since=*) since=${1#--since=}; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            *) fatal "unknown argument for inbox: $1 (see --help)" ;;
+        esac
+    done
+    if test -n "${since}"; then
+        local parsed
+        parsed=$(date -u -d "${since}" +%FT%TZ 2>/dev/null) || fatal "invalid --since date '${since}'"
+        since=${parsed}
+    fi
+    check_login
+    # A dry run records nothing, so it needn't wait for a real run.
+    ${dry_run} || lock_state
+    local state
+    state=$(load_state)
+    local default_since now closed_since
+    default_since=${since:-$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%FT%TZ)}
+    now=$(date -u +%FT%TZ)
+    # Search lags behind by minutes, so closed PRs are searched with an
+    # overlap and deduplicated through the state.
+    closed_since=${since:-$(jq -r '.last_check // empty' <<<"${state}")}
+    closed_since=$(date -u -d "${closed_since:-${default_since}} - ${SEARCH_OVERLAP}" +%FT%TZ)
+
+    local open closed
+    open=$(ghapi -X GET search/issues --paginate -f per_page="${SEARCH_PER_PAGE}" \
+        -f q="is:pr is:open author:${BOT_LOGIN} user:${BOT_LOGIN}" \
+        --jq '.items[] | {url: .html_url, number, body, repo: (.repository_url | sub("^.*/repos/"; ""))}' | jq -sc .) ||
+        fatal "searching for the bot's open fork PRs failed"
+    closed=$(ghapi -X GET search/issues --paginate -f per_page="${SEARCH_PER_PAGE}" \
+        -f q="is:pr is:closed is:unmerged author:${BOT_LOGIN} user:${BOT_LOGIN} closed:>=${closed_since}" \
+        --jq '.items[] | {url: .html_url, number, title, body, repo: (.repository_url | sub("^.*/repos/"; ""))}' | jq -sc .) ||
+        fatal "searching for the bot's closed fork PRs failed"
+    # Only PRs opened by fork-pr are in the review loop.
+    open=$(jq -c --arg m "${META_START}" '[.[] | select((.body // "") | contains($m))]' <<<"${open}")
+    closed=$(jq -c --arg m "${META_START}" '[.[] | select((.body // "") | contains($m))]' <<<"${closed}")
+
+    local nreported=0 found url repo number pr head_sha pr_since activity events lines verdict hash old_hash
+    while IFS= read -r found; do
+        test -n "${found}" || continue
+        url=$(jq -r .url <<<"${found}")
+        repo=$(jq -r .repo <<<"${found}")
+        number=$(jq -r .number <<<"${found}")
+        # Search results can be stale; the PR itself is not.
+        pr=$(ghapi "repos/${repo}/pulls/${number}") || fatal "cannot read ${url}"
+        test "$(jq -r .state <<<"${pr}")" = open || continue
+        head_sha=$(jq -r .head.sha <<<"${pr}")
+        # Per PR, so a PR that search only found late still gets its
+        # activity from before that.
+        pr_since=${since:-$(jq -r --arg u "${url}" '.prs[$u].seen // empty' <<<"${state}")}
+        pr_since=${pr_since:-${default_since}}
+        activity=$(reviewer_activity "${repo}" "${number}")
+        events=$(ghapi --paginate "repos/${repo}/issues/${number}/timeline?per_page=100" \
+            --jq ".[] | select(.event == \"renamed\" and .actor.login == \"${REVIEWER}\")
+                  | {kind: \"renamed\", at: .created_at, from: .rename.from, to: .rename.to}" | jq -sc .) ||
+            fatal "cannot read the timeline of ${url}"
+        hash=$(body_hash <<<"${pr}")
+        old_hash=$(jq -r --arg u "${url}" '.prs[$u].body // empty' <<<"${state}")
+        state=$(jq -c --arg u "${url}" --arg h "${hash}" --arg now "${now}" '.prs[$u] = {body: $h, seen: $now}' <<<"${state}")
+        lines=$(jq -r --arg since "${pr_since}" --argjson n "${EXCERPT_LEN}" --argjson events "${events}" "${BODY_JQ}"'
+            [(.[] | select(.at >= $since)
+                  # the container of inline comments, which are listed anyway
+                  | select(.kind != "review" or .state != "COMMENTED" or (.body // "") != "")),
+             ($events[] | select(.at >= $since))] | sort_by(.at) | .[]
+            | if .kind == "renamed" then "  \(.at) title edited: \(.from | tojson) -> \(.to | tojson)"
+              elif .kind == "review" then "  \(.at) review \(.state): \(.url)\(if (.body // "") != "" then "\n    > " + (.body | excerpt($n)) else "" end)"
+              elif .kind == "review comment" then "  \(.at) review comment on \(.path): \(.url)\n    > \(.body | excerpt($n))"
+              else "  \(.at) comment: \(.url)\n    > \(.body | excerpt($n))" end' <<<"${activity}")
+        if test -n "${old_hash}" && test "${old_hash}" != "${hash}"; then
+            lines+=${lines:+$'\n'}"  body edited (since the last check; by ${REVIEWER} or the bot)"
+        fi
+        verdict=$(jq -r --arg head "${head_sha}" "${VERDICT_JQ}"'
+            [if approved then "APPROVED" elif approved_any then "APPROVED earlier; new commits since" else empty end,
+             if wants_draft then "'"${DRAFT_COMMAND}"'" else empty end] | join(", ")' <<<"${activity}")
+        test -n "${lines}" || test -n "${verdict}" || continue
+        echo "${url}${verdict:+  [${verdict}]}  $(jq -r .title <<<"${pr}")"
+        test -z "${lines}" || echo "${lines}"
+        if [[ "${verdict}" == APPROVED ]] || [[ "${verdict}" == "APPROVED, "* ]]; then
+            echo "  -> approved: $(basename "$0") promote ${url}$([[ "${verdict}" == *"${DRAFT_COMMAND}"* ]] && echo " --draft")"
+        elif [[ "${verdict}" == *"new commits since"* ]]; then
+            echo "  -> needs ${REVIEWER} to approve the current head before promote"
+        fi
+        nreported=$((nreported + 1))
+    done < <(jq -c '.[]' <<<"${open}")
+
+    local closed_by
+    while IFS= read -r found; do
+        test -n "${found}" || continue
+        url=$(jq -r .url <<<"${found}")
+        jq -e --arg u "${url}" '.closed[$u]' <<<"${state}" >/dev/null && continue
+        closed_by=$(ghapi "repos/$(jq -r .repo <<<"${found}")/issues/$(jq -r .number <<<"${found}")" --jq '.closed_by.login // ""') ||
+            fatal "cannot read ${url}"
+        state=$(jq -c --arg u "${url}" '.closed[$u] = true | del(.prs[$u])' <<<"${state}")
+        # promote closes the fork PRs it took upstream.
+        test "${closed_by}" = "${REVIEWER}" || continue
+        echo "${url}  [CLOSED]  $(jq -r .title <<<"${found}")"
+        echo "  -> closed by ${REVIEWER}: drop it (board item Done, Why \"dropped: ...\")"
+        nreported=$((nreported + 1))
+    done < <(jq -c '.[]' <<<"${closed}")
+
+    if ! ${dry_run}; then
+        save_state "$(jq -c --arg now "${now}" '.last_check = $now' <<<"${state}")"
+    fi
+    info "$(jq length <<<"${open}") open fork PR(s); ${nreported} with activity by ${REVIEWER} or awaiting promote"
+}
+
+test $# -gt 0 || { usage 1>&2; exit 1; }
+command=$1
+shift
+case "${command}" in
+    -h|--help|help) usage; exit 0 ;;
+    fork-pr) command=fork_pr ;;
+    promote|inbox) ;;
+    *) fatal "unknown command '${command}' (see --help)" ;;
+esac
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${BOT_LOGIN}"
+require_cmd jq "install jq"
+"cmd_${command}" "$@"
