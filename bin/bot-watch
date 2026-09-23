@@ -34,6 +34,7 @@ readonly PER_PAGE=100
 # Conditional requests answered 304 are free; the cache is local and only
 # an HTTP cache, so it is written even in a dry run.
 readonly ETAG_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-watch/etags
+readonly ETAG_KEEP_DAYS=14
 readonly LOCK_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-watch
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
@@ -53,7 +54,8 @@ the PR URLs in its Branch field. For each, compare with what the last
 sweep saw and report:
 
   - new comments and reviews by anyone but ${BOT_LOGIN}, with their
-    author and first line (those by ${REQUESTER} flagged);
+    author and first line that isn't quoted (those by ${REQUESTER}
+    flagged; for a review of line comments only, its first comment);
   - state changes: merged, closed, reopened;
   - pushes to a PR's head: force pushes by anyone but ${BOT_LOGIN}, with
     who made them; other new commits with their committer (GitHub
@@ -79,11 +81,12 @@ Options:
   --json      Print one JSON object for agents instead of the report
   -h, --help  Show this help
 
-The last-seen state (url -> updated_at, state, head_sha, checks) lives in
-the archived 'bot-state: ${STATE_NAME}' draft item on the board, read and
-written with 'bot-board state-get/state-put' (one GraphQL call each; the
-write only when something changed), and must stay under the ~64KB a
-draft body holds (a few hundred URLs). It advances per URL: one that could
+The last-seen state (url -> updated_at, state, head_sha, checks, and
+edge_ids: the comments seen at updated_at) lives in the archived
+'bot-state: ${STATE_NAME}' draft item on the board, read and written
+with 'bot-board state-get/state-put' (one GraphQL call each; the write
+only when something changed), and must stay under the ~64KB a draft
+body holds (a few hundred URLs). It advances per URL: one that could
 not be read keeps its last-seen state, so a later sweep reports its
 changes, and the sweep exits nonzero. The board listing comes from
 bot-board's cache (refreshed for --apply); everything else is REST, with
@@ -179,7 +182,11 @@ rest_get() {
     tr -d '\r' <"${scratch}/raw" | sed '/^$/q' >"${scratch}/headers"
     status=$(awk 'NR == 1 { print $2 }' "${scratch}/headers")
     case "${status}" in
-        304) cat "${body_file}" ;;
+        304)
+            # Still in use: see the pruning below.
+            touch "${body_file}" "${etag_file}"
+            cat "${body_file}"
+            ;;
         200)
             tr -d '\r' <"${scratch}/raw" | sed '1,/^$/d' >"${scratch}/body"
             etag=$(awk 'tolower($0) ~ /^etag:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "${scratch}/headers")
@@ -214,6 +221,12 @@ rest_pages() {
         page=$((page + 1))
     done
 }
+
+# Copies of resources not read for a while (such as the comments since
+# an old updated_at) are dropped.
+if test -d "${ETAG_DIR}"; then
+    find "${ETAG_DIR}" -type f -mtime "+${ETAG_KEEP_DAYS}" -delete || warn "pruning ${ETAG_DIR} failed"
+fi
 
 login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
 test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}"
@@ -260,8 +273,14 @@ nitems=$(jq '[.[].items[].id] | unique | length' <<<"${watch}")
 
 # --- Sweep -----------------------------------------------------------------
 
-excerpt_jq="def excerpt: (. // \"\") | [splits(\"\\r?\\n\") | select(test(\"\\\\S\"))] | (first // \"\")
-    | gsub(\"\\\\s+\"; \" \") | if length > ${EXCERPT_LEN} then .[:${EXCERPT_LEN}] + \"...\" else . end;"
+# The first line of a text that isn't blank or quoted (a reply starts by
+# quoting what it answers), without control or bidi characters that a
+# terminal would act on; $len is its maximum length.
+readonly EXCERPT_JQ='def excerpt:
+    [(. // "") | splits("\n") | gsub("[[:cntrl:]\u200e\u200f\u202a-\u202e\u2066-\u2069]"; " ")
+     | select(test("\\S") and (test("^\\s*>") | not))]
+    | (first // "") | gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ")
+    | if length > $len then .[:$len] + "..." else . end;'
 
 # checks_state REPO SHA: prints failure, pending, success or none for the
 # check runs and commit statuses of SHA, plus the failing names:
@@ -326,23 +345,52 @@ probe() {
     prev_state=$(jq -r '.state // empty' <<<"${prev}")
     state=$(jq -r .state <<<"${cur}")
 
-    # New comments and reviews, if anything moved; on fork PRs they're
-    # 'bot-pr inbox' business.
-    if test -n "${prev_updated}" && ! ${fork} &&
-        [[ "$(jq -r .updated_at <<<"${cur}")" > "${prev_updated}" ]]; then
-        local found
-        found=$({
-            ghapi --paginate "repos/${repo}/issues/${number}/comments?per_page=100&since=${prev_updated}" \
-                --jq '.[] | {type: "comment", author: .user.login, at: .created_at, link: .html_url, body}' || exit
+    # New comments and reviews; on fork PRs they're 'bot-pr inbox'
+    # business. Timestamps have whole seconds, so those at the last
+    # sweep's updated_at are new too, except the ones it had seen then:
+    # their keys are kept as edge_ids. For the same reason they are read
+    # even if updated_at didn't move (unchanged, that costs a free 304),
+    # and the first time a URL is seen, only to record those.
+    local updated
+    updated=$(jq -r .updated_at <<<"${cur}")
+    if ! ${fork}; then
+        local edge
+        edge=$(jq -c '.edge_ids // []' <<<"${prev}")
+        if test -z "${prev_updated}" || [[ ! "${updated}" < "${prev_updated}" ]]; then
+            local since=${prev_updated:-${updated}} notes reviews='' found
+            notes=$(rest_pages "repos/${repo}/issues/${number}/comments?since=${since}") || return "$(sub_status $?)"
             if test "${kind}" = pull; then
-                ghapi --paginate "repos/${repo}/pulls/${number}/reviews?per_page=100" \
-                    --jq '.[] | {type: "review", author: .user.login, at: .submitted_at, link: .html_url, body, review_state: .state}' || exit
+                reviews=$(rest_pages "repos/${repo}/pulls/${number}/reviews") || return "$(sub_status $?)"
             fi
-        } | jq -sc --arg since "${prev_updated}" --arg bot "${BOT_LOGIN}" --arg req "${REQUESTER}" "${excerpt_jq}"'
-            [.[] | select(.author != $bot and (.at // "") > $since)
-                 | .excerpt = (.body | excerpt) | del(.body)
-                 | .from_requester = (.author == $req)] | sort_by(.at)') || return "$(sub_status $?)"
-        changes=$(jq -c --argjson f "${found}" '. + $f' <<<"${changes}")
+            printf '%s\n' "${notes}" | jq -c '{type: "comment", key: "c\(.id)", author: .user.login,
+                at: .created_at, link: .html_url, body}' >"${scratch}/notes"
+            printf '%s\n' "${reviews}" | jq -c 'select(.submitted_at != null) | {type: "review", key: "r\(.id)", id,
+                author: .user.login, at: .submitted_at, link: .html_url, body, review_state: .state}' >>"${scratch}/notes"
+            if test -n "${prev_updated}"; then
+                found=$(jq -sc --arg since "${prev_updated}" --argjson edge "${edge}" --arg bot "${BOT_LOGIN}" \
+                    --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
+                    [.[] | select(.author != $bot and .at >= $since and (.key | IN($edge[]) | not))
+                         | .excerpt = (.body | excerpt) | del(.body, .key)
+                         | .from_requester = (.author == $req)] | sort_by(.at)' "${scratch}/notes")
+                # A review of line comments only has an empty body: show
+                # its first comment instead.
+                if jq -e 'any(.[]; .type == "review" and .excerpt == "")' <<<"${found}" >/dev/null; then
+                    local line_comments
+                    line_comments=$(rest_pages "repos/${repo}/pulls/${number}/comments?since=${prev_updated}") ||
+                        return "$(sub_status $?)"
+                    found=$(printf '%s\n' "${line_comments}" | jq -sc --argjson found "${found}" \
+                        --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
+                        sort_by(.id) as $lc
+                        | $found | map(if .type == "review" and .excerpt == "" then
+                              .id as $id | .excerpt = ([$lc[] | select(.pull_request_review_id == $id) | .body | excerpt
+                                                        | select(. != "")] | first // "")
+                          else . end)')
+                fi
+                changes=$(jq -c --argjson f "${found}" '. + ($f | map(del(.id)))' <<<"${changes}")
+            fi
+            edge=$(jq -sc --arg updated "${updated}" '[.[] | select(.at >= $updated) | .key]' "${scratch}/notes")
+        fi
+        cur=$(jq -c --argjson edge "${edge}" '.edge_ids = $edge' <<<"${cur}")
     fi
 
     if test -n "${prev_state}" && test "${prev_state}" != "${state}" && ! ${fork}; then
