@@ -1,0 +1,12 @@
+# Not enabled by 'make install'; enable with
+#   systemctl --user enable --now bot-feedback.timer
+[Unit]
+Description=Surface reactions on cgwalters-bot content every 2 hours
+
+[Timer]
+OnCalendar=00/2:00
+RandomizedDelaySec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

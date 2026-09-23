@@ -16,6 +16,7 @@ Install with `make install` as usual. The shared agent prompt is still
 [AGENTS.md](AGENTS.md), and the skills in `dotfiles/.claude/skills` are
 picked up by both agent CLIs: `workstream` (using the board),
 `backlog-planning` (refilling the board from recent GitHub activity),
+`bot-feedback` (surfacing reactions on the bot's work),
 `upstream-pr` (how to contribute as the bot), `devspace-work` (building
 and testing on a remote runner), plus the upstream ones like
 `commit-review`.
@@ -35,6 +36,15 @@ claude` uses Claude Code instead, and any extra arguments are passed along
 as additional instructions. `bot-work --plan` instead reviews recent GitHub
 activity (the last week, or `--since YYYY-MM-DD`) and adds candidate items
 to the board for triage.
+
+People often react to the bot with an emoji rather than a comment, so
+`bot-feedback` reports new reactions on everything cgwalters-bot wrote
+(its comments and the issues and PRs it opened), and with `--board` files
+each new 👎 or 😕 as a P0 Needs human item. It is a plain script, not an
+agent session; `backlog-planning` runs it first, and
+`dotfiles/.config/systemd/user/bot-feedback.timer` runs it every two
+hours. `make install` puts the units in place but doesn't enable them:
+`systemctl --user enable --now bot-feedback.timer`.
 
 ### Overnight working model
 
