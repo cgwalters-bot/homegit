@@ -259,8 +259,8 @@ below.
   DCO sign-off), `Fixes OWNER/REPO#N` or `Related: <url>`, and the
   `Generated-by: https://github.com/cgwalters/#llms` line last. `fork-pr`
   appends the bot-meta section (upstream target, board item, and how to
-  approve) and prints the fork PR URL. It creates the fork (with Actions
-  enabled) the first time, and syncs its base with upstream:
+  approve) and prints the fork PR URL. It creates the fork the first time
+  (with Actions enabled, minus scheduled workflows), and syncs its base with upstream:
 
   ```bash
   FORK_PR=$(bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \

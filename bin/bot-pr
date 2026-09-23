@@ -57,8 +57,8 @@ reviews it, and only his approval opens the upstream PR.
 Commands:
   fork-pr --repo OWNER/REPO --base BRANCH --branch ${BRANCH_PREFIX}SLUG --item PVTI_...
           --title TITLE --body-file FILE [--from DIR]
-        Fork OWNER/REPO into ${FORGE_ORG} if needed (enabling Actions on
-        the new fork), sync the fork's BRANCH with upstream, push
+        Fork OWNER/REPO into ${FORGE_ORG} if needed, sync the fork's
+        BRANCH with upstream, set up its Actions (see fork-setup), push
         ${BRANCH_PREFIX}SLUG to the fork from the git repository DIR (default:
         the current one) if it has that branch, and open a draft PR from
         ${BRANCH_PREFIX}SLUG into BRANCH; print its URL. A non-default BRANCH
@@ -67,6 +67,13 @@ Commands:
         tested, caveats, ending with '${LLMS_TRAILER}'.
         A trailing ${META_START} section records the upstream target
         and board item, with instructions for the reviewer.
+  fork-setup REPO
+        Enable Actions on the fork ${FORGE_ORG}/REPO and the workflows
+        GitHub disabled when forking, but disable those that run on a
+        schedule and not for PRs or pushes: without upstream's secrets
+        they just fail. Scheduled workflows that also run for PRs, pushes
+        or the merge queue stay enabled, with a warning. fork-pr does this
+        on every run; safe to repeat.
   promote FORK_PR_URL [--draft] [--why TEXT] [--dry-run]
         Open the upstream PR for a fork PR whose current head ${REVIEWER}
         approved (commits pushed after his approval need a new one):
@@ -173,7 +180,7 @@ ref_sha() {
 }
 
 # ensure_fork UPSTREAM: prints the forge's fork of UPSTREAM, creating it
-# (and enabling its workflows) if needed, and waits until it is usable.
+# if needed, and waits until it is usable.
 # GitHub names the fork after UPSTREAM's repository, with a suffix if the
 # forge already has an unrelated repository of that name.
 ensure_fork() {
@@ -198,25 +205,145 @@ ensure_fork() {
         sleep "${FORK_READY_POLL}"
         waited=$((waited + FORK_READY_POLL))
     done
-    enable_actions "${fork}"
     echo "${fork}"
 }
 
-# enable_actions FORK: turns on Actions for a new fork, whose workflows
-# GitHub disables until someone enables them, so that fork PRs get the
-# project's CI. Failures are only warnings: the fork PR is still useful.
-enable_actions() {
-    local fork=$1 ids id
+# Triggers that make a scheduled workflow part of fork PRs' CI, so that
+# fork_setup leaves it enabled. Not workflow_dispatch: many upstream
+# scheduled jobs (releases, dependency bumps) also allow manual runs,
+# which nobody does on a fork.
+readonly CI_TRIGGERS='["pull_request", "pull_request_target", "push", "merge_group"]'
+
+# jq over a workflow file as JSON: prints "CLASS<TAB>TRIGGERS", where
+# CLASS is "scheduled" (schedule and no CI_TRIGGERS), "mixed" (schedule and
+# some), "unscheduled", or "unknown" (no readable 'on:'). 'on' is
+# YAML 1.1's boolean true, which PyYAML turns into the key "true".
+# shellcheck disable=SC2016 # jq, not shell
+readonly TRIGGERS_JQ='
+(if type == "object" then [.on, .true, .True] | map(select(. != null)) | first else null end) as $on
+| ($on | if type == "string" then [.]
+         elif type == "array" then map(tostring)
+         elif type == "object" then keys
+         else null end) as $t
+| if $t == null or $t == [] then "unknown"
+  elif ($t | index("schedule")) == null then "unscheduled"
+  elif any($t[]; IN($ci[])) then "mixed"
+  else "scheduled" end
+| "\(.)\t\($t // [] | join(","))"
+'
+
+# How yaml_to_json converts; set by require_yaml_parser.
+YAML_PARSER=""
+
+require_yaml_parser() {
+    if python3 -c 'import yaml' >/dev/null 2>&1; then
+        YAML_PARSER=pyyaml
+    elif command -v yq >/dev/null 2>&1; then
+        if yq --version 2>&1 | grep -q mikefarah; then
+            YAML_PARSER=yq-go
+        else
+            YAML_PARSER=yq-py
+        fi
+    else
+        fatal "parsing workflow files needs python3 with PyYAML (e.g. dnf install python3-pyyaml) or yq"
+    fi
+}
+
+# yaml_to_json < YAML: prints the (first) document as JSON.
+yaml_to_json() {
+    case "${YAML_PARSER}" in
+        pyyaml) python3 -c '
+import json, sys, yaml
+try:
+    doc = yaml.safe_load(sys.stdin)
+except yaml.YAMLError as e:
+    sys.exit(" ".join(str(e).split()))
+print(json.dumps(doc, default=str))' ;;
+        yq-go) yq -p yaml -o json '.' ;;
+        yq-py) yq -c '.' ;;
+        *) fatal "internal error: require_yaml_parser was not called" ;;
+    esac
+}
+
+# classify_workflow < YAML: prints "CLASS<TAB>TRIGGERS" (see TRIGGERS_JQ).
+classify_workflow() {
+    yaml_to_json | jq -r --argjson ci "${CI_TRIGGERS}" "${TRIGGERS_JQ}"
+}
+
+# Set by fork_setup: the workflows it left running with a schedule trigger,
+# because they also run for PRs or pushes.
+SCHEDULED_ACTIVE=()
+
+# fork_setup FORK: turn on Actions for a fork in the forge, so that fork
+# PRs get the project's CI, but disable scheduled workflows that aren't
+# also CI (see CI_TRIGGERS): they run without upstream's secrets and fail
+# every time, or worse, act (e.g. release) on the fork. Other workflows
+# GitHub disabled on forking are enabled; ones someone disabled by hand
+# are left alone. Idempotent; failures are warnings, since the fork PR is
+# still useful without CI.
+fork_setup() {
+    local fork=$1 default workflows id state path yaml cls triggers rc name
+    local changed=0
+    SCHEDULED_ACTIVE=()
     ghapi -X PUT "repos/${fork}/actions/permissions" -F enabled=true -f allowed_actions=all >/dev/null ||
         { warn "enabling Actions on ${fork} failed; fork PRs there won't run CI until someone does"; return 0; }
-    ids=$(ghapi --paginate "repos/${fork}/actions/workflows?per_page=100" \
-        --jq '.workflows[] | select(.state == "disabled_fork") | .id') ||
-        { warn "cannot list the workflows of ${fork}; check that they are enabled"; return 0; }
-    for id in ${ids}; do
-        ghapi -X PUT "repos/${fork}/actions/workflows/${id}/enable" >/dev/null ||
-            warn "enabling workflow ${id} on ${fork} failed"
-    done
-    info "Enabled Actions on ${fork}"
+    default=$(ghapi "repos/${fork}" --jq .default_branch) ||
+        { warn "cannot read ${fork}; check its workflows by hand"; return 0; }
+    workflows=$(ghapi --paginate "repos/${fork}/actions/workflows?per_page=100" \
+        --jq '.workflows[] | [.id, .state, .path] | @tsv') ||
+        { warn "cannot list the workflows of ${fork}; check them by hand"; return 0; }
+    while IFS=$'\t' read -r id state path; do
+        test -n "${id}" || continue
+        # GitHub's own dynamic workflows (CodeQL setup, Dependabot) have
+        # no file and are configured elsewhere.
+        [[ "${path}" == .github/workflows/* ]] || continue
+        name=${path#.github/workflows/}
+        rc=0
+        yaml=$(ghapi -H "Accept: application/vnd.github.raw+json" \
+            "repos/${fork}/contents/${path}?ref=$(jq -rn --arg b "${default}" '$b | @uri')") || rc=$?
+        if test "${rc}" -eq "${EX_NOTFOUND}"; then
+            # Deleted since; GitHub lists workflows that ever ran.
+            continue
+        elif test "${rc}" -ne 0; then
+            warn "cannot read ${fork}:${default}/${path}; leaving it ${state}"
+            continue
+        fi
+        if ! cls=$(classify_workflow <<<"${yaml}") || test -z "${cls}"; then
+            warn "cannot parse ${fork}:${default}/${path}; leaving it ${state}"
+            continue
+        fi
+        IFS=$'\t' read -r cls triggers <<<"${cls}"
+        case "${cls}" in
+            scheduled)
+                test "${state}" = active || continue
+                if ghapi -X PUT "repos/${fork}/actions/workflows/${id}/disable" >/dev/null; then
+                    info "Disabled ${name} on ${fork} (on: ${triggers})"
+                    changed=$((changed + 1))
+                else
+                    warn "disabling ${name} on ${fork} failed; it will run on its schedule"
+                fi
+                ;;
+            mixed|unscheduled)
+                if test "${state}" = disabled_fork; then
+                    if ghapi -X PUT "repos/${fork}/actions/workflows/${id}/enable" >/dev/null; then
+                        info "Enabled ${name} on ${fork}"
+                        changed=$((changed + 1))
+                        state=active
+                    else
+                        warn "enabling ${name} on ${fork} failed"
+                    fi
+                fi
+                if test "${cls}" = mixed && test "${state}" = active; then
+                    SCHEDULED_ACTIVE+=("${name}")
+                fi
+                ;;
+            *) warn "${fork}:${default}/${path} has no readable 'on:' triggers; leaving it ${state}" ;;
+        esac
+    done <<<"${workflows}"
+    if test "${#SCHEDULED_ACTIVE[@]}" -gt 0; then
+        warn "left active on ${fork} despite schedule triggers, since they also run for PRs or pushes: ${SCHEDULED_ACTIVE[*]}"
+    fi
+    info "Set up Actions on ${fork}: ${changed} workflow(s) changed"
 }
 
 # sync_base UPSTREAM FORK BRANCH: make the fork's copy of BRANCH match
@@ -268,7 +395,11 @@ push_branch() {
 # The bot-meta section appended to fork PR bodies. Its "Upstream:" and
 # "Board item:" lines are parsed back by promote.
 meta_section() {
-    local upstream=$1 base=$2 item=$3
+    local upstream=$1 base=$2 item=$3 scheduled=""
+    if test "${#SCHEDULED_ACTIVE[@]}" -gt 0; then
+        scheduled=$(printf "\`%s\`, " "${SCHEDULED_ACTIVE[@]}")
+        scheduled=$'\n'"- Scheduled triggers left active: ${scheduled%, } (they also run for PRs or pushes, so fork setup didn't disable them)"
+    fi
     cat <<EOF
 ${META_START}
 ---
@@ -276,7 +407,7 @@ ${META_START}
 **Review draft in ${FORGE_ORG}, not upstream yet.** This section is removed when the PR is opened upstream.
 
 - Upstream: \`${upstream}\`, base \`${base}\`
-- Board item: \`${item}\`
+- Board item: \`${item}\`${scheduled}
 
 To review:
 - **Approve** to open it upstream, ready for review.
@@ -362,12 +493,14 @@ cmd_fork_pr() {
     ! grep -qF "${META_START}" <<<"${body}" || fatal "${body_file} already has a bot-meta section; fork-pr adds it"
     grep -qxF "${LLMS_TRAILER}" <<<"${body}" ||
         warn "${body_file} has no '${LLMS_TRAILER}' line; add one unless the project's policy says otherwise"
+    require_yaml_parser
     check_login
 
     local fork owner
     fork=$(ensure_fork "${upstream}")
     owner=${fork%%/*}
     sync_base "${upstream}" "${fork}" "${base}"
+    fork_setup "${fork}"
     push_branch "${from}" "${fork}" "${branch}"
 
     local head_sha compare ahead behind
@@ -416,6 +549,29 @@ cmd_fork_pr() {
         *) warn "${REVIEWER} has '${perm}' access to ${fork}, so he can review and comment but not edit the title and body" ;;
     esac
     echo "${url}"
+}
+
+cmd_fork_setup() {
+    test $# -gt 0 || fatal "fork-setup requires REPO (see --help)"
+    require_yaml_parser
+    # Hidden, for tests: classify one workflow file offline.
+    if test "$1" = --classify-file; then
+        test $# -eq 2 || fatal "--classify-file requires exactly one FILE"
+        classify_workflow <"$2" || fatal "cannot parse $2"
+        return 0
+    fi
+    test $# -eq 1 || fatal "fork-setup takes a single REPO"
+    local fork=$1
+    [[ "${fork}" == */* ]] || fork=${FORGE_ORG}/${fork}
+    if ! valid_repo "${fork}" || test "${fork%%/*}" != "${FORGE_ORG}"; then
+        fatal "fork-setup takes a fork in ${FORGE_ORG} (REPO or ${FORGE_ORG}/REPO), not '$1'"
+    fi
+    check_login
+    local rc=0
+    ghapi "repos/${fork}" --jq .fork >/dev/null || rc=$?
+    test "${rc}" -ne "${EX_NOTFOUND}" || fatal "${fork} does not exist"
+    test "${rc}" -eq 0 || fatal "cannot read ${fork}"
+    fork_setup "${fork}"
 }
 
 # The reviewer's comments, reviews and inline review comments on a fork
@@ -784,6 +940,7 @@ shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
     fork-pr) command=fork_pr ;;
+    fork-setup) command=fork_setup ;;
     promote|inbox) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac

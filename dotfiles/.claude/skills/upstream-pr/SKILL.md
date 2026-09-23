@@ -142,8 +142,9 @@ bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
 ```
 
 Run it in the clone that has the branch. It creates `cgwalters-forge/REPO`
-if needed (enabling Actions), syncs the fork's copy of the base with
-upstream, pushes the branch there, opens the PR inside the fork, and
+if needed, syncs the fork's copy of the base with upstream, enables
+Actions except for scheduled workflows (`bot-pr fork-setup REPO` redoes
+just that), pushes the branch there, opens the PR inside the fork, and
 appends a bot-meta section with the upstream target, the board item and
 review instructions. Write the title
 and body as the upstream PR (the PR description rules below apply): once
