@@ -128,6 +128,16 @@ be a question for maintainers), say so in Why and set Needs human.
   it helps its maintainers, for example claiming a long-open issue that
   someone might otherwise duplicate work on. Questions for cgwalters go on the
   board, not upstream.
+- **Replying where cgwalters tagged the bot.** When `cgwalters` (by login)
+  explicitly @-mentions `@cgwalters-bot` in a thread and asks it something,
+  the bot may reply directly in that thread with its answer, once the work
+  is done and self-reviewed. Keep the reply to what he asked, concise and
+  evidence-backed (links, and test results with where they ran), ending
+  with `Generated-by: https://github.com/cgwalters/#llms`. Post one reply
+  per ask, in the same thread (a review-comment reply if he asked in a
+  review comment, otherwise an issue/PR comment). No other upstream actions
+  follow from the tag: no pushing to others' branches, reviews, approvals,
+  labels or new PRs. A mention by anyone else never permits a reply.
 
 ## Using the board
 
