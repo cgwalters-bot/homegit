@@ -22,8 +22,13 @@ readonly LLMS_TRAILER='Generated-by: https://github.com/cgwalters/#llms'
 readonly DRAFT_COMMAND=/draft
 # ... and this, later, takes that back.
 readonly READY_COMMAND=/ready
+# The inbox state lives on the Workstream board, in the archived draft
+# item 'bot-state: pr-inbox' (see 'bot-board state-get'), so that every
+# machine the bot runs on shares it; STATE_DIR only holds the local lock.
+readonly STATE_NAME=pr-inbox
 readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-pr
-readonly STATE_FILE=${STATE_DIR}/inbox.json
+# Where the state was kept before; merged into the board's on first use.
+readonly LEGACY_STATE_FILE=${STATE_DIR}/inbox.json
 readonly STATE_VERSION=2
 readonly CLONE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-pr/clones
 readonly DEFAULT_LOOKBACK_DAYS=7
@@ -136,8 +141,11 @@ GraphQL says: one call when set-body finds a body that isn't the bot's
 last write, and in inbox per fork PR whose body changed other than
 through set-body. The GraphQL quota is shared with the board tooling.
 Only activity whose GitHub author is the '${REVIEWER}' login counts.
-inbox state lives in ${STATE_FILE}. BOT_PR_FORGE overrides the
-organization (${FORGE_ORG}).
+The inbox state lives in the archived 'bot-state: ${STATE_NAME}' draft
+item on the board, shared by every machine: each command that uses it
+reads it once (one GraphQL call) and writes it at most once (two: a
+checked write, merging with whatever another machine wrote meanwhile).
+BOT_PR_FORGE overrides the organization (${FORGE_ORG}).
 EOF
 }
 
@@ -540,7 +548,7 @@ def excerpt($n): normalize | gsub("\\s+"; " ") | if length > $n then .[:$n] + ".
 '
 
 # Inbox state: {version, last_check, prs: {URL: {body, seen, edits_seen,
-# bot_body, base_body, reviewer_edit}}, closed: {URL: true}}. Body edits
+# bot_body, base_body, reviewer_edit}}, closed: {URL: closed_at}}. Body edits
 # have no REST event, so they show up as a change of 'body', the sha256 of
 # the body inbox last saw; 'seen' is when a PR's activity was last
 # reported, and 'edits_seen' how many body edits GitHub listed when inbox
@@ -549,7 +557,9 @@ def excerpt($n): normalize | gsub("\\s+"; " ") | if length > $n then .[:$n] + ".
 # GraphQL call to know it isn't the reviewer's. 'base_body' is the hash
 # get-body printed, which set-body compares with. 'reviewer_edit' is
 # {at, note}: an edit by the reviewer (or, with GraphQL down, possibly by
-# him) that set-body replaced before inbox saw it.
+# him) that set-body replaced before inbox saw it. 'closed' holds when
+# the closed fork PRs that inbox already reported were closed, for as long
+# as its search can still find them.
 lock_state() {
     require_cmd flock "install util-linux"
     mkdir -p "${STATE_DIR}" || fatal "cannot create ${STATE_DIR}"
@@ -557,18 +567,47 @@ lock_state() {
     flock -w 60 "${STATE_LOCK_FD}" || fatal "another $(basename "$0") run holds ${STATE_DIR}/lock"
 }
 
-load_state() {
-    if test -s "${STATE_FILE}"; then
-        jq -c --argjson v "${STATE_VERSION}" 'if .version == $v then . else error("unsupported state version \(.version)") end' "${STATE_FILE}" ||
-            fatal "cannot parse ${STATE_FILE}; move it away to start over"
-    else
-        jq -nc --argjson v "${STATE_VERSION}" '{version: $v, prs: {}, closed: {}}'
+# board_failed STATUS MESSAGE: after a failed bot-board call, pass a
+# rate-limit exit on (bot-board said why), else fail.
+board_failed() {
+    if test "$1" -eq "${EX_RATELIMIT}"; then
+        : >"${RATE_LIMIT_FLAG}"
+        exit "${EX_RATELIMIT}"
     fi
+    fatal "$2"
 }
 
+# load_state [--untracked]: prints the inbox state, tracked for save_state
+# unless --untracked (for a run that won't save). Needs lock_state, unless
+# --untracked. A state file from before the board kept it is merged in,
+# with the board's entries taking precedence, until save_state succeeds.
+load_state() {
+    local track=(--track) state rc=0
+    test "${1:-}" != --untracked || track=()
+    state=$("${BOT_BOARD}" state-get "${track[@]}" "${STATE_NAME}") || rc=$?
+    test "${rc}" -eq 0 || board_failed "${rc}" "reading the inbox state (bot-state: ${STATE_NAME}) failed"
+    if test -s "${LEGACY_STATE_FILE}"; then
+        state=$(jq -c --slurpfile old "${LEGACY_STATE_FILE}" '$old[0] * .' <<<"${state}") ||
+            fatal "cannot parse ${LEGACY_STATE_FILE}, the old inbox state; move it away"
+    fi
+    jq -c --argjson v "${STATE_VERSION}" '
+        if . == {} then {version: $v, prs: {}, closed: {}}
+        elif .version == $v then . else error("unsupported state version \(.version)") end' <<<"${state}" ||
+        fatal "cannot use the inbox state (bot-state: ${STATE_NAME}); fix it, or empty it to start over"
+}
+
+# save_state JSON: writes the inbox state that load_state read, changed,
+# unless it is unchanged.
 save_state() {
-    printf '%s\n' "$1" >"${STATE_FILE}.tmp.$$" || fatal "cannot write ${STATE_FILE}.tmp.$$"
-    mv -f "${STATE_FILE}.tmp.$$" "${STATE_FILE}" || fatal "cannot replace ${STATE_FILE}"
+    local rc=0
+    "${BOT_BOARD}" state-put --checked "${STATE_NAME}" "$1" || rc=$?
+    test "${rc}" -eq 0 ||
+        board_failed "${rc}" "writing the inbox state (bot-state: ${STATE_NAME}) failed; bot-board keeps the changes locally for the next run"
+    if test -e "${LEGACY_STATE_FILE}"; then
+        mv -f "${LEGACY_STATE_FILE}" "${LEGACY_STATE_FILE}.migrated" ||
+            fatal "cannot move ${LEGACY_STATE_FILE} away; it is on the board now, so remove it"
+        info "Moved the inbox state from ${LEGACY_STATE_FILE} to the board (bot-state: ${STATE_NAME}); the old file is ${LEGACY_STATE_FILE}.migrated"
+    fi
 }
 
 # body_hash < PR_JSON
@@ -722,7 +761,7 @@ cmd_fork_pr() {
         hash=$(body_hash <<<"${created}")
         save_state "$(jq -c --arg u "${url}" --arg h "${hash}" --arg now "$(date -u +%FT%TZ)" \
             '.prs[$u] = {body: $h, seen: $now, bot_body: $h}' <<<"${state}")"
-    ) || warn "recording ${url} in ${STATE_FILE} failed; inbox will pick it up without its original body"
+    ) || warn "recording ${url} in the inbox state failed; inbox will pick it up without its original body"
 
     local perm
     perm=$(ghapi "repos/${fork}/collaborators/${REVIEWER}/permission" --jq .permission 2>/dev/null) || perm=unknown
@@ -1230,9 +1269,13 @@ cmd_inbox() {
     fi
     check_login
     # A dry run records nothing, so it needn't wait for a real run.
-    ${dry_run} || lock_state
     local state
-    state=$(load_state)
+    if ${dry_run}; then
+        state=$(load_state --untracked)
+    else
+        lock_state
+        state=$(load_state)
+    fi
     local default_since now closed_since
     default_since=${since:-$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%FT%TZ)}
     now=$(date -u +%FT%TZ)
@@ -1251,7 +1294,7 @@ cmd_inbox() {
     closed=$(for scope in "${SEARCH_SCOPES[@]}"; do
         ghapi -X GET search/issues --paginate -f per_page="${SEARCH_PER_PAGE}" \
             -f q="is:pr is:closed is:unmerged author:${BOT_LOGIN} ${scope} closed:>=${closed_since}" \
-            --jq '.items[] | {url: .html_url, number, title, body, repo: (.repository_url | sub("^.*/repos/"; ""))}' ||
+            --jq '.items[] | {url: .html_url, number, title, body, closed_at, repo: (.repository_url | sub("^.*/repos/"; ""))}' ||
             fatal "searching for the bot's closed fork PRs (${scope}) failed"
     done | jq -sc 'unique_by(.url)') || fatal "searching for the bot's fork PRs failed"
     # Only PRs opened by fork-pr are in the review loop.
@@ -1340,7 +1383,7 @@ cmd_inbox() {
         jq -e --arg u "${url}" '.closed[$u]' <<<"${state}" >/dev/null && continue
         closed_by=$(ghapi "repos/$(jq -r .repo <<<"${found}")/issues/$(jq -r .number <<<"${found}")" --jq '.closed_by.login // ""') ||
             fatal "cannot read ${url}"
-        state=$(jq -c --arg u "${url}" '.closed[$u] = true | del(.prs[$u])' <<<"${state}")
+        state=$(jq -c --arg u "${url}" --arg at "$(jq -r .closed_at <<<"${found}")" '.closed[$u] = $at | del(.prs[$u])' <<<"${state}")
         # promote closes the fork PRs it took upstream.
         test "${closed_by}" = "${REVIEWER}" || continue
         echo "${url}  [CLOSED]  $(jq -r .title <<<"${found}")"
@@ -1349,7 +1392,17 @@ cmd_inbox() {
     done < <(jq -c '.[]' <<<"${closed}")
 
     if ! ${dry_run}; then
-        save_state "$(jq -c --arg now "${now}" '.last_check = $now' <<<"${state}")"
+        # The state has to fit in a board item, so it forgets closed PRs
+        # the next search can't find, and fork PRs that were neither
+        # open nor recorded lately (merged, say).
+        local forget_closed forget_prs
+        forget_closed=$(date -u -d "${now} - ${SEARCH_OVERLAP}" +%FT%TZ)
+        forget_prs=$(date -u -d "${now} - ${DEFAULT_LOOKBACK_DAYS} days" +%FT%TZ)
+        save_state "$(jq -c --arg now "${now}" --arg fc "${forget_closed}" --arg fp "${forget_prs}" --argjson open "${open}" '
+            ([$open[].url]) as $urls
+            | .last_check = $now
+            | .closed |= with_entries(select(.value | type == "string" and . >= $fc))
+            | .prs |= with_entries(select(.key as $u | ($urls | index($u)) or (.value.seen // "") >= $fp))' <<<"${state}")"
     fi
     info "$(jq length <<<"${open}") open fork PR(s); ${nreported} with activity by ${REVIEWER} or awaiting promote"
 }

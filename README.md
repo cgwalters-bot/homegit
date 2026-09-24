@@ -122,7 +122,9 @@ your activity on them since its last run (only the `cgwalters` login
 counts, so the bot's own edits, pushes and comments are left out), and
 `promote` rebases onto upstream, opens the
 upstream PR, closes the fork PR and moves the item to In Review. Agents
-run `bot-pr inbox` at the start of every session.
+run `bot-pr inbox` at the start of every session. What inbox has already
+reported is kept in the archived `bot-state: pr-inbox` board item, so it
+doesn't matter which machine runs it.
 
 To pick up changes from the upstream repository:
 

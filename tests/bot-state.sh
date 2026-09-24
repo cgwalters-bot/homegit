@@ -96,6 +96,10 @@ case "$1 $2" in
         ;;
     "project item-edit") exit 0 ;;
 esac
+# No fork PRs, open or closed.
+if [[ " $* " == *" search/issues "* ]]; then
+    exit 0
+fi
 if test -n "${FAKE_GH_EXTRA:-}" && test -x "${FAKE_GH_EXTRA}"; then
     exec "${FAKE_GH_EXTRA}" "$@"
 fi
@@ -267,6 +271,40 @@ test_create() {
     "${BIN}/bot-board" state-get --track newthing >/dev/null 2>&1
     "${BIN}/bot-board" state-put --checked newthing '{"a":1}' 2>/dev/null
     expect_json "$(project_state newthing)" '{"a":1}' "created state item"
+}
+
+# --- bot-pr -----------------------------------------------------------------
+
+test_pr_inbox_migration() {
+    local recent old legacy
+    recent=$(date -u -d '1 hour ago' +%FT%TZ)
+    old=$(date -u -d '30 days ago' +%FT%TZ)
+    # Another machine already recorded B; this one still has A in its file,
+    # plus a fork PR gone long ago and a PR closed long ago.
+    set_project_state pr-inbox "$(jq -nc --arg r "${recent}" \
+        '{version: 2, prs: {B: {body: "hb", seen: $r}}, closed: {}}')"
+    legacy=${XDG_STATE_HOME}/bot-pr/inbox.json
+    mkdir -p "$(dirname "${legacy}")"
+    jq -nc --arg r "${recent}" --arg o "${old}" '{version: 2, last_check: $r,
+        prs: {A: {body: "ha", seen: $r, bot_body: "ha"}, Gone: {body: "hg", seen: $o}},
+        closed: {C: true}}' >"${legacy}"
+    # A dry run reads both, and writes neither.
+    reset_calls
+    "${BIN}/bot-pr" inbox --dry-run 2>/dev/null
+    expect_eq "$(graphql_calls)" 1 "GraphQL calls of a dry run"
+    test -e "${legacy}" || fail "a dry run moved the old state file"
+    # A real run moves the file's entries to the board.
+    reset_calls
+    "${BIN}/bot-pr" inbox 2>"${WORK}/err"
+    grep -q 'Moved the inbox state' "${WORK}/err" || fail "no migration note: $(cat "${WORK}/err")"
+    expect_eq "$(graphql_calls)" 3 "GraphQL calls of an inbox run"
+    { test ! -e "${legacy}" && test -e "${legacy}.migrated"; } || fail "the old state file was not moved away"
+    expect_json "$(project_state pr-inbox | jq -c '{prs: (.prs | map_values(.body)), closed}')" \
+        '{"prs":{"A":"ha","B":"hb"},"closed":{}}' "migrated inbox state"
+    # The next run finds the state on the board alone.
+    "${BIN}/bot-pr" inbox 2>"${WORK}/err"
+    ! grep -q 'Moved' "${WORK}/err" || fail "migrated twice"
+    expect_json "$(project_state pr-inbox | jq -c '.prs | keys')" '["A","B"]' "inbox state after the next run"
 }
 
 # --- runner -----------------------------------------------------------------
