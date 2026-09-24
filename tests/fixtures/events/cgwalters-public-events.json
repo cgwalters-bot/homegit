@@ -1,0 +1,350 @@
+[
+  {
+    "id": "15668391635",
+    "type": "PullRequestReviewEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "coreos/rpm-ostree"
+    },
+    "public": true,
+    "created_at": "2026-09-24T12:28:20Z",
+    "payload": {
+      "review": {
+        "id": 5304125248,
+        "html_url": "https://github.com/coreos/rpm-ostree/pull/5635#pullrequestreview-5304125248",
+        "body": "What gives me a bit of uncertainty right now is I don't recall why we made the decision to special case ostree-container.\n\nIt may be entirely vestigal - I believe the rpm-ostree path in container is basically deferring to libdnf anyways and doesn't touch `/ostree` in general.\n\n@cgwalters-bot but this could use a deeper verification",
+        "submitted_at": "2026-09-24T12:28:19Z"
+      },
+      "pull_request": {
+        "url": "https://api.github.com/repos/coreos/rpm-ostree/pulls/5635",
+        "number": 5635
+      },
+      "action": "created"
+    }
+  },
+  {
+    "id": "15668391525",
+    "type": "PullRequestReviewEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "coreos/rpm-ostree"
+    },
+    "public": true,
+    "created_at": "2026-09-24T12:28:20Z",
+    "payload": {
+      "review": {
+        "id": 5304125248,
+        "html_url": "https://github.com/coreos/rpm-ostree/pull/5635#pullrequestreview-5304125248",
+        "body": "What gives me a bit of uncertainty right now is I don't recall why we made the decision to special case ostree-container.\n\nIt may be entirely vestigal - I believe the rpm-ostree path in container is basically deferring to libdnf anyways and doesn't touch `/ostree` in general.\n\n@cgwalters-bot but this could use a deeper verification",
+        "submitted_at": "2026-09-24T12:28:19Z"
+      },
+      "pull_request": {
+        "url": "https://api.github.com/repos/coreos/rpm-ostree/pulls/5635",
+        "number": 5635
+      },
+      "action": "updated"
+    }
+  },
+  {
+    "id": "15666632119",
+    "type": "PullRequestReviewCommentEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "coreos/rpm-ostree"
+    },
+    "public": true,
+    "created_at": "2026-09-24T12:03:02Z",
+    "payload": {
+      "action": "created",
+      "comment": {
+        "url": "https://api.github.com/repos/coreos/rpm-ostree/pulls/comments/4093356801",
+        "html_url": "https://github.com/coreos/rpm-ostree/pull/5635#discussion_r4093356801",
+        "id": 4093356801,
+        "user": {
+          "login": "cgwalters",
+          "type": "User"
+        },
+        "body": "I think this could now actually likely *just* be `running_in_container`?\n\nBut looks fine as is.\n\n"
+      },
+      "pull_request": {
+        "url": "https://api.github.com/repos/coreos/rpm-ostree/pulls/5635",
+        "number": 5635
+      }
+    }
+  },
+  {
+    "id": "15614338658",
+    "type": "IssueCommentEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "bootc-dev/bootc"
+    },
+    "public": true,
+    "created_at": "2026-09-23T19:35:36Z",
+    "payload": {
+      "action": "created",
+      "issue": {
+        "url": "https://api.github.com/repos/bootc-dev/bootc/issues/2490",
+        "html_url": "https://github.com/bootc-dev/bootc/pull/2490",
+        "number": 2490,
+        "title": "composefs: Add support for android boot (both regular and ukiboot)",
+        "pull_request": {
+          "url": "https://api.github.com/repos/bootc-dev/bootc/pulls/2490"
+        },
+        "body": "(trimmed)"
+      },
+      "comment": {
+        "url": "https://api.github.com/repos/bootc-dev/bootc/issues/comments/5801583432",
+        "html_url": "https://github.com/bootc-dev/bootc/pull/2490#issuecomment-5801583432",
+        "id": 5801583432,
+        "user": {
+          "login": "cgwalters",
+          "type": "User"
+        },
+        "body": "Copying over https://github.com/composefs/composefs-rs/pull/399#discussion_r4086098487 - would have been nice to have a rough sketch of a design draft for this linked and gather a bit of consensus on it.\r\n\r\nCould have basically just been https://github.com/bootc-dev/bootc/pull/2490/changes/fe1ea1aba4a75ad2cf196fbcea1e084b0f39c4ae#diff-8df22b9d26bdc5a49b7c7557b59e35583771fb6bd56bb735479048f176cec622 filed as an issue?\r\n\r\nIt may still be worth filing one as the right place to discuss high level things as opposed to implementation code concerns."
+      }
+    }
+  },
+  {
+    "id": "900001",
+    "type": "IssueCommentEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "example/repo"
+    },
+    "public": true,
+    "created_at": "2026-09-24T09:00:00Z",
+    "payload": {
+      "action": "created",
+      "issue": {
+        "url": "https://api.github.com/repos/example/repo/issues/1",
+        "html_url": "https://github.com/example/repo/issues/1",
+        "number": 1,
+        "title": "Synthetic issue 1",
+        "pull_request": null,
+        "body": "(trimmed)"
+      },
+      "comment": {
+        "url": "https://api.github.com/repos/example/repo/issues/comments/100",
+        "html_url": "https://github.com/example/repo/issues/1#issuecomment-100",
+        "id": 100,
+        "user": {
+          "login": "cgwalters",
+          "type": "User"
+        },
+        "body": "@CGWalters-Bot, can you look into this?"
+      }
+    }
+  },
+  {
+    "id": "900002",
+    "type": "IssueCommentEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "example/repo"
+    },
+    "public": true,
+    "created_at": "2026-09-24T09:01:00Z",
+    "payload": {
+      "action": "created",
+      "issue": {
+        "url": "https://api.github.com/repos/example/repo/issues/2",
+        "html_url": "https://github.com/example/repo/issues/2",
+        "number": 2,
+        "title": "Synthetic issue 2",
+        "pull_request": null,
+        "body": "(trimmed)"
+      },
+      "comment": {
+        "url": "https://api.github.com/repos/example/repo/issues/comments/200",
+        "html_url": "https://github.com/example/repo/issues/2#issuecomment-200",
+        "id": 200,
+        "user": {
+          "login": "cgwalters",
+          "type": "User"
+        },
+        "body": "cc @cgwalters-bot-other, not the bot"
+      }
+    }
+  },
+  {
+    "id": "900003",
+    "type": "IssueCommentEvent",
+    "actor": {
+      "login": "someone"
+    },
+    "repo": {
+      "name": "example/repo"
+    },
+    "public": true,
+    "created_at": "2026-09-24T09:02:00Z",
+    "payload": {
+      "action": "created",
+      "issue": {
+        "url": "https://api.github.com/repos/example/repo/issues/3",
+        "html_url": "https://github.com/example/repo/issues/3",
+        "number": 3,
+        "title": "Synthetic issue 3",
+        "pull_request": null,
+        "body": "(trimmed)"
+      },
+      "comment": {
+        "url": "https://api.github.com/repos/example/repo/issues/comments/300",
+        "html_url": "https://github.com/example/repo/issues/3#issuecomment-300",
+        "id": 300,
+        "user": {
+          "login": "cgwalters",
+          "type": "User"
+        },
+        "body": "@cgwalters-bot do this"
+      }
+    }
+  },
+  {
+    "id": "900004",
+    "type": "IssueCommentEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "example/repo"
+    },
+    "public": true,
+    "created_at": "2026-09-23T11:00:00Z",
+    "payload": {
+      "action": "created",
+      "issue": {
+        "url": "https://api.github.com/repos/example/repo/issues/4",
+        "html_url": "https://github.com/example/repo/issues/4",
+        "number": 4,
+        "title": "Synthetic issue 4",
+        "pull_request": null,
+        "body": "(trimmed)"
+      },
+      "comment": {
+        "url": "https://api.github.com/repos/example/repo/issues/comments/400",
+        "html_url": "https://github.com/example/repo/issues/4#issuecomment-400",
+        "id": 400,
+        "user": {
+          "login": "cgwalters",
+          "type": "User"
+        },
+        "body": "@cgwalters-bot too old"
+      }
+    }
+  },
+  {
+    "id": "900005",
+    "type": "IssuesEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "example/repo"
+    },
+    "public": true,
+    "created_at": "2026-09-24T09:03:00Z",
+    "payload": {
+      "action": "assigned",
+      "issue": {
+        "url": "https://api.github.com/repos/example/repo/issues/5",
+        "html_url": "https://github.com/example/repo/issues/5",
+        "number": 5,
+        "title": "Assigned",
+        "body": ""
+      },
+      "assignee": {
+        "login": "cgwalters-bot"
+      }
+    }
+  },
+  {
+    "id": "900006",
+    "type": "IssuesEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "example/repo"
+    },
+    "public": true,
+    "created_at": "2026-09-24T09:04:00Z",
+    "payload": {
+      "action": "assigned",
+      "issue": {
+        "url": "https://api.github.com/repos/example/repo/issues/6",
+        "html_url": "https://github.com/example/repo/issues/6",
+        "number": 6,
+        "title": "Assigned to someone else",
+        "body": ""
+      },
+      "assignee": {
+        "login": "someone"
+      }
+    }
+  },
+  {
+    "id": "900007",
+    "type": "PullRequestEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "example/repo"
+    },
+    "public": true,
+    "created_at": "2026-09-24T09:05:00Z",
+    "payload": {
+      "action": "review_requested",
+      "number": 7,
+      "pull_request": {
+        "url": "https://api.github.com/repos/example/repo/pulls/7",
+        "number": 7
+      },
+      "requested_reviewer": {
+        "login": "cgwalters-bot"
+      }
+    }
+  },
+  {
+    "id": "900008",
+    "type": "PullRequestReviewCommentEvent",
+    "actor": {
+      "login": "cgwalters"
+    },
+    "repo": {
+      "name": "example/private"
+    },
+    "public": false,
+    "created_at": "2026-09-24T09:06:00Z",
+    "payload": {
+      "action": "created",
+      "comment": {
+        "url": "https://api.github.com/repos/example/private/pulls/comments/8",
+        "html_url": "https://github.com/example/private/pull/8#discussion_r8",
+        "id": 8,
+        "user": {
+          "login": "cgwalters",
+          "type": "User"
+        },
+        "body": "@cgwalters-bot: fix this"
+      },
+      "pull_request": {
+        "url": "https://api.github.com/repos/example/private/pulls/8",
+        "number": 8
+      }
+    }
+  }
+]

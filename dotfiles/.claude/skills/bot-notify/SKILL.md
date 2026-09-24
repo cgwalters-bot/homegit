@@ -8,7 +8,18 @@ description: Poll cgwalters-bot's GitHub notifications (mentions, team mentions,
 People mention @cgwalters-bot, request its review or assign it issues.
 cgwalters does this to hand the bot work; anyone else doing it is at most
 a signal for cgwalters. `bot-notify` (in this repository's `bin/`) polls
-the bot's notifications once and routes each new trigger:
+the bot's notifications once and routes each new trigger.
+
+GitHub doesn't reliably notify the bot (its notifications have come back
+empty even for mentions by cgwalters in watched repositories), so every
+run also has a safety net: cgwalters' public events (his review bodies,
+comments, and assignments and review requests of the bot) and a search
+for mentions of @cgwalters-bot, both since the last poll. What they turn
+up is routed exactly like a notification, as a thread whose id is the
+issue or PR URL (`found in events` or `found in search` in the output).
+A warning says when a request was found only that way. Private
+repositories only show up in the search, which doesn't cover review
+bodies. Each trigger is routed as follows:
 
 - **An assignment by `cgwalters`**, as recorded by GitHub (the `actor` of
   the `assigned` event whose `assignee` is cgwalters-bot), in a public
@@ -106,8 +117,10 @@ For each one:
 4. With `located: false`, read the thread first; if it isn't actually an
    ask for the bot, don't add anything and say so in your report.
 5. Once the board item exists (or you decided it needs none and said so
-   in your report), ack it: `bot-notify ack THREAD_ID`. That marks the
-   thread read and stops the record from being printed again.
+   in your report), ack it: `bot-notify ack THREAD_ID`, with the record's
+   `thread_id` (a number, or for a safety-net thread the issue or PR URL).
+   That marks a notification thread read and stops the record from being
+   printed again.
 
 Until acked, a record is kept on the board (see State) and printed by
 every run, even a 304 one, on any machine, so a session that stops
@@ -128,9 +141,12 @@ and writes it at the end of a run that changed it, with a checked
 `bot-board state-put` (a reread and a write): if another machine wrote
 it meanwhile, say by acking a request, both changes are kept. A 304 with
 nothing to ack costs no write. GitHub can't list archived items, so
-bot-board knows the item by its id. Next to the local lock, `filed.json`
-caches the triggers already filed as issues, checked before the lagging
-issue list; losing it is harmless, since the issues carry markers. A
+bot-board knows the item by its id. A 304 still moves `since` up once it
+is an hour old, which bounds the window the safety net looks at. Next to
+the local lock, `filed.json` caches the triggers already filed as issues,
+checked before the lagging issue list, and `events.json` the ETag of
+cgwalters' events and what was found in them; losing either is harmless,
+since the issues carry markers and the events are just fetched again. A
 `pending.json` from before the board held the requests is merged in and
 moved to `pending.json.migrated` by the first run that writes.
 
@@ -147,7 +163,10 @@ issue in cgwalters-bot/cgwalters-bot that the bot created mentioning
 it gets filed; to test the cgwalters paths instead, set
 `BOT_NOTIFY_TRUSTED=cgwalters-bot`, which the script honors only with
 `--from-file`. Marking a fake thread id read gets a 404, which the script
-reports and treats as done. `--repo` pointing at a missing repository
+reports and treats as done. `tests/bot-notify-events.sh` checks offline
+what the safety net makes of a fixture of events (through the hidden
+`--event-threads FILE SINCE`), and `tests/bot-state.sh` the state and ack
+handling. `--repo` pointing at a missing repository
 makes routing fail, to check that the state doesn't advance. Delete the
 test board items (`gh project item-delete`) and issues (`deleteIssue` in
 GraphQL; the bot owns the repository) afterwards, and remove their
@@ -157,5 +176,7 @@ entries from the local files.
 
 Only notifications for issues and PRs are traced to their trigger; others
 (discussions, commits) fall back to the latest comment, and are treated as
-from someone else unless its login is cgwalters. Pending requests are per
-machine. Nothing runs this on a schedule yet.
+from someone else unless its login is cgwalters. The safety net only
+sees public events and what search indexes, both with some lag (it looks
+an hour further back to make up for that), and only the last 300 of
+cgwalters' events. Nothing runs this on a schedule yet.

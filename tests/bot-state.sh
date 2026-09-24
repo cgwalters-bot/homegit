@@ -104,10 +104,15 @@ if test "$1 $2" = "api -i" && [[ "$3" == notifications\?* ]]; then
     echo "gh: HTTP 304" 1>&2
     exit 1
 fi
+# cgwalters' public events (bot-notify's safety net): none.
+if test "$1 $2" = "api -i" && [[ "$3" == users/*/events/public* ]]; then
+    printf 'HTTP/2.0 200 OK\r\nEtag: W/"e"\r\n\r\n[]'
+    exit 0
+fi
 if test "$1 $2 $3" = "api -X PATCH" && [[ "$4" == notifications/threads/* ]]; then
     exit 0
 fi
-# No fork PRs, open or closed.
+# No fork PRs, open or closed, and no mentions.
 if [[ " $* " == *" search/issues "* ]]; then
     exit 0
 fi
@@ -373,6 +378,19 @@ test_notify_ack_retried() {
     ! grep -q '^request ' "${WORK}/out" || fail "the acked request is still printed: $(cat "${WORK}/out")"
     expect_json "$(project_state notifications | jq -c '{p: (.pending | keys), a: (.acked | keys)}')" \
         '{"p":[],"a":["U1"]}' "state after the next run"
+}
+
+test_notify_ack_url() {
+    local pr=https://github.com/o/r/pull/1
+    # A request the safety net found has its PR's URL as its thread id.
+    set_project_state notifications "$(jq -nc --argjson r "$(request U1 "${pr}")" \
+        '{since: "2026-09-20T00:00:00Z", last_modified: "LM", pending: {U1: $r}, acked: {}}')"
+    reset_calls
+    "${BIN}/bot-notify" ack "${pr}" >/dev/null
+    expect_json "$(project_state notifications | jq -c '{p: (.pending | keys), a: (.acked | keys)}')" \
+        '{"p":[],"a":["U1"]}' "state after acking by URL"
+    ! grep -q 'notifications/threads' "${FAKE_GH}/calls" || fail "acking by URL marked a thread read"
+    ! "${BIN}/bot-notify" ack https://example.com/x 2>/dev/null || fail "acked a URL that is no issue or PR"
 }
 
 test_notify_race() {

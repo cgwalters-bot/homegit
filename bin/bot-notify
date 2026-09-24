@@ -24,6 +24,13 @@ readonly EXCERPT_LEN=300
 # A 304 leaves the state alone, but 'since' is rewritten at least this
 # often, so it tracks the last poll rather than the last notification.
 readonly SINCE_REFRESH_SECS=3600
+# The safety net for asks the notifications miss: REQUESTER's public
+# events (ETag-cached here, with the hits found in them) and a search for
+# mentions of the bot. Both lag, so they look this far before 'since'.
+readonly SAFETY_LOOKBACK_SECS=3600
+# The events API serves at most 300 events, 100 per page.
+readonly EVENTS_PER_PAGE=100
+readonly EVENTS_MAX_PAGES=3
 # The poll state and the requests printed but not acked yet (plus
 # recently acked ones, so they aren't printed again) live on the Workstream
 # board, in the archived draft item 'bot-state: notifications' (see
@@ -34,6 +41,7 @@ readonly STATE_NAME=notifications
 # issues (a cache; the issues' markers are what counts).
 readonly LOCAL_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-notify
 readonly FILED_FILE=${LOCAL_DIR}/filed.json
+readonly EVENTS_FILE=${LOCAL_DIR}/events.json
 # Where the requests were kept before; merged into the board's on first
 # use.
 readonly LEGACY_PENDING_FILE=${LOCAL_DIR}/pending.json
@@ -63,14 +71,19 @@ Usage: $(basename "$0") [--dry-run] [--repo OWNER/REPO] [--no-mention]
        $(basename "$0") ack THREAD_ID...
 
 Poll ${BOT_LOGIN}'s GitHub notifications once, and route every new
-mention, team mention, review request and assignment:
+mention, team mention, review request and assignment. GitHub doesn't
+reliably notify the bot, so every run also looks for them in
+${REQUESTER}'s public events (his reviews, comments, assignments and
+review requests that mention or name @${BOT_LOGIN}) and searches for
+mentions of @${BOT_LOGIN} since the last poll; what that finds is routed
+the same way, as threads whose THREAD_ID is the issue or PR URL:
 
   - an assignment by ${REQUESTER} (by GitHub login) in a public repository:
     add the issue or PR to the board as ${ASSIGN_STATUS}, ${ASSIGN_PRIORITY}, unless it is on it already;
   - any other ask by ${REQUESTER}: print a 'request' record, one JSON object
     per line, for the agent to turn into a board item. Every run prints
     them again until 'ack THREAD_ID' says they're on the board, which
-    also marks the thread read;
+    also marks a notification thread read;
   - from anyone else: file an issue in ${DEFAULT_ISSUE_REPO} mentioning
     @${REQUESTER}, once per trigger (deduped locally, then by a hidden
     marker in the issues); the bot never acts on it. For a non-public
@@ -80,12 +93,13 @@ Threads in ${FORGE_ORG} are skipped: 'bot-pr inbox' covers them. Other
 threads are marked read once routed, unless they hold unacked requests.
 The poll state (since, Last-Modified) and the unacked requests are kept
 in the archived 'bot-state: ${STATE_NAME}' draft item on the board,
-shared by every machine. The poll state only advances when every thread
-was routed, so a failed run is retried. It is written once, at the end
-of a run, and only if something changed (a 304 from GitHub means
-nothing new, though 'since' still moves up hourly), with a checked
-write that merges in what another machine wrote meanwhile. Filed
-triggers are cached in ${LOCAL_DIR}.
+shared by every machine. The poll state only advances when every thread,
+safety net included, was routed, so a failed run is retried. It is
+written once, at the end of a run, and only if something changed (a 304
+from GitHub means nothing new, though 'since' still moves up hourly),
+with a checked write that merges in what another machine wrote
+meanwhile. Filed triggers and the events' ETag are cached in
+${LOCAL_DIR}.
 
 Options:
   --dry-run           Report only: file and add nothing, mark nothing read,
@@ -97,7 +111,9 @@ Options:
 This is a one-shot command; it prints GitHub's X-Poll-Interval, the
 minimum time to wait before polling again. The token needs the classic
 'notifications' scope. REST is used for everything but the state (one
-GraphQL read per run, and a reread and a write per run that changed it).
+GraphQL read per run, and a reread and a write per run that changed it);
+the safety net adds a conditional events request (free when it is a
+304) and a search request per run.
 EOF
 }
 
@@ -168,12 +184,65 @@ iso_now() {
     date -u +%FT%TZ
 }
 
+# is_thread_id ID: whether ID is a notification thread's, rather than the
+# issue or PR URL standing for a thread the safety net found.
+is_thread_id() {
+    [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# The safety net's hits in REQUESTER's public events, one JSON object each:
+# {repo, number, pr, reason, url (the trigger, if known), title, at,
+# private, source}. PR event payloads carry neither body nor title.
+readonly EVENT_HITS_JQ='
+def names_bot: (. // "") | test("@" + $bot + "(?![A-Za-z0-9-])"; "i");
+.[] | select(.actor.login == $requester) | .payload as $p
+| {repo: .repo.name, at: .created_at, private: (.public | not), source: "events"} + (
+    if .type == "IssueCommentEvent" and $p.action == "created" and ($p.comment.body | names_bot) then
+        {number: $p.issue.number, pr: ($p.issue.pull_request != null), reason: "mention",
+         url: $p.comment.html_url, title: $p.issue.title}
+    elif .type == "PullRequestReviewCommentEvent" and $p.action == "created" and ($p.comment.body | names_bot) then
+        {number: $p.pull_request.number, pr: true, reason: "mention", url: $p.comment.html_url}
+    elif .type == "PullRequestReviewEvent" and ($p.review.body | names_bot) then
+        {number: $p.pull_request.number, pr: true, reason: "mention", url: $p.review.html_url}
+    elif .type == "IssuesEvent" and $p.action == "opened" and ($p.issue.body | names_bot) then
+        {number: $p.issue.number, pr: false, reason: "mention", url: $p.issue.html_url, title: $p.issue.title}
+    elif .type == "IssuesEvent" and $p.action == "assigned" and $p.assignee.login? == $bot then
+        {number: $p.issue.number, pr: false, reason: "assign", title: $p.issue.title}
+    elif .type == "PullRequestEvent" and $p.action == "opened" and ($p.pull_request.body | names_bot) then
+        {number: $p.number, pr: true, reason: "mention", url: $p.pull_request.html_url, title: $p.pull_request.title}
+    elif .type == "PullRequestEvent" and $p.action == "review_requested" and $p.requested_reviewer.login? == $bot then
+        {number: $p.number, pr: true, reason: "review_requested"}
+    elif .type == "PullRequestEvent" and $p.action == "assigned" and $p.assignee.login? == $bot then
+        {number: $p.number, pr: true, reason: "assign"}
+    else empty end)'
+# The same for a search/issues result.
+readonly SEARCH_HITS_JQ='.items[] | {repo: (.repository_url | sub("^.*/repos/"; "")), number,
+    pr: (.pull_request != null), reason: "mention", title, at: .updated_at, private: null, source: "search"}'
+# An array of hits to threads shaped like the notifications API's, one
+# per issue or PR and reason, with the issue or PR URL as the id, and read
+# at $window, so that only triggers after it count. Hits from before
+# $window, or whose trigger is in $known, are dropped.
+readonly HITS_TO_THREADS_JQ='
+map(select(.at > $window and (.url == null or (.url as $u | $known | index($u) | not))))
+| group_by([.repo, .number, .reason]) | .[]
+| .[0].repo as $repo | (if any(.[]; .pr) then "pull" else "issues" end) as $kind
+| {id: "https://github.com/\($repo)/\($kind)/\(.[0].number)", reason: .[0].reason, unread: true,
+   updated_at: (map(.at) | max), last_read_at: $window, source: (map(.source) | unique | join("+")),
+   subject: {type: (if $kind == "pull" then "PullRequest" else "Issue" end), title: (map(.title // empty) | first),
+             url: "https://api.github.com/repos/\($repo)/issues/\(.[0].number)", latest_comment_url: null},
+   repository: {full_name: $repo, owner: {login: ($repo | split("/")[0])}, private: (map(.private) | first),
+                html_url: "https://github.com/\($repo)"}}'
+
 dry_run=false
 issue_repo=${DEFAULT_ISSUE_REPO}
 mention=true
 # Hidden test hook: a JSON array of notification threads, processed as if
 # the poll had returned them too (the real poll still runs).
 from_file=
+# Hidden test hook: prints the threads the safety net makes of an events
+# JSON array, looking back to a given time, offline, and exits.
+events_file=
+events_window=
 subcmd=poll
 ack_ids=()
 if test "${1:-}" = ack; then
@@ -181,7 +250,8 @@ if test "${1:-}" = ack; then
     shift
     test $# -gt 0 || fatal "usage: $(basename "$0") ack THREAD_ID..."
     for id in "$@"; do
-        [[ "${id}" =~ ^[0-9]+$ ]] || fatal "not a notification thread id: '${id}'"
+        is_thread_id "${id}" || [[ "${id}" =~ ^https://github\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$ ]] ||
+            fatal "not a notification thread id, nor an issue or PR URL: '${id}'"
     done
     ack_ids=("$@")
     set --
@@ -193,6 +263,8 @@ while test $# -gt 0; do
         --repo=*) issue_repo=${1#--repo=}; shift ;;
         --no-mention) mention=false; shift ;;
         --from-file) test $# -ge 2 || fatal "--from-file requires a file"; from_file=$2; shift 2 ;;
+        --event-threads) test $# -ge 3 || fatal "--event-threads requires a file and a time"
+            events_file=$2; events_window=$3; shift 3 ;;
         -h|--help) usage; exit 0 ;;
         *) fatal "unknown argument: $1 (see --help)" ;;
     esac
@@ -200,6 +272,11 @@ done
 [[ "${issue_repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fatal "--repo must be OWNER/REPO, not '${issue_repo}'"
 if test -n "${from_file}"; then
     jq -e 'type == "array"' "${from_file}" >/dev/null 2>&1 || fatal "--from-file ${from_file} is not a JSON array of notification threads"
+fi
+if test -n "${events_file}"; then
+    jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" "${EVENT_HITS_JQ}" "${events_file}" |
+        jq -sc --arg window "${events_window}" --argjson known '[]' "${HITS_TO_THREADS_JQ}"
+    exit 0
 fi
 # Logins whose asks are acted on. Test hook: BOT_NOTIFY_TRUSTED adds one
 # (the bot, say, since only it can assign in a throwaway repository), and
@@ -307,9 +384,12 @@ save_state() {
     fi
 }
 
+# mark_read ID: marks a notification thread read (a no-op for a thread
+# the safety net found, which GitHub knows nothing about).
 mark_read() {
     local rc=0
     ${dry_run} && return 0
+    is_thread_id "$1" || return 0
     ghapi -X PATCH "notifications/threads/$1" >/dev/null || rc=$?
     case "${rc}" in
         0) ;;
@@ -339,7 +419,11 @@ if test "${subcmd}" = ack; then
             ([.pending | to_entries[] | select(.value.thread_id == $id) | .key]) as $urls
             | .acked += ($urls | map({(.): $now}) | add // {})
             | .pending |= with_entries(select(.value.thread_id != $id))' <<<"${PENDING_JSON}")
-        echo "Acked thread ${id} (${n} requests); marked it read."
+        if is_thread_id "${id}"; then
+            echo "Acked thread ${id} (${n} requests); marked it read."
+        else
+            echo "Acked ${id} (${n} requests)."
+        fi
     done
     save_state >/dev/null
     exit "${rc}"
@@ -359,11 +443,12 @@ test -n "${since}" || since=$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%F
 scratch=$(mktemp -d)
 trap 'rm -rf "${scratch}"' EXIT
 
-# fetch_page PATH [IF_MODIFIED_SINCE]: GETs PATH with headers into
-# ${scratch}/headers and the body into ${scratch}/body; prints the status.
+# fetch_page PATH [HEADER]: GETs PATH, with a request HEADER such as
+# If-Modified-Since if given, with headers into ${scratch}/headers and
+# the body into ${scratch}/body; prints the status.
 fetch_page() {
     local args=(-i "$1") rc=0 status
-    test -z "${2:-}" || args+=(-H "If-Modified-Since: $2")
+    test -z "${2:-}" || args+=(-H "$2")
     gh api "${args[@]}" >"${scratch}/raw" 2>"${scratch}/err" || rc=$?
     tr -d '\r' <"${scratch}/raw" | sed '/^$/q' >"${scratch}/headers"
     tr -d '\r' <"${scratch}/raw" | sed '1,/^$/d' >"${scratch}/body"
@@ -383,7 +468,8 @@ header() {
 }
 
 poll_start=$(iso_now)
-status=$(fetch_page "notifications?all=true&since=${since}&per_page=${PER_PAGE}" "${last_modified}") ||
+status=$(fetch_page "notifications?all=true&since=${since}&per_page=${PER_PAGE}" \
+    "${last_modified:+If-Modified-Since: ${last_modified}}") ||
     fatal "polling the notifications failed"
 poll_interval=$(header X-Poll-Interval)
 if server_date=$(header Date) && test -n "${server_date}"; then
@@ -418,7 +504,95 @@ if test -n "${from_file}"; then
     echo "Added $(jq -c --slurpfile extra "${from_file}" -n '$extra[0] | length') threads from ${from_file}."
 fi
 
+# --- Safety net -----------------------------------------------------------
+
+# GitHub doesn't reliably notify the bot: for a long while the bot's
+# notifications were empty (even with all=true) although it watches busy
+# repositories and cgwalters mentioned it. So REQUESTER's public events,
+# which include his review bodies, and a search for mentions (which
+# doesn't cover review bodies, but covers everyone else) are checked on
+# every run too. Private repositories only show up in the search.
+
+# event_hits WINDOW: prints the hits in REQUESTER's recent public events,
+# using and updating the ETag cache in EVENTS_FILE.
+event_hits() {
+    local window=$1 cache etag status hits next pages=1 oldest
+    cache='{}'
+    if test -s "${EVENTS_FILE}"; then
+        cache=$(jq -ce --argjson v "${LOCAL_VERSION}" 'select(.version == $v)' "${EVENTS_FILE}") ||
+            { warn "ignoring ${EVENTS_FILE}, which can't be parsed"; cache='{}'; }
+    fi
+    etag=$(jq -r '.etag // empty' <<<"${cache}")
+    status=$(fetch_page "users/${REQUESTER}/events/public?per_page=${EVENTS_PER_PAGE}" \
+        "${etag:+If-None-Match: ${etag}}") || return 1
+    case "${status}" in
+        304)
+            jq -c '.hits[]' <<<"${cache}"
+            return 0
+            ;;
+        200) ;;
+        *) warn "unexpected HTTP status '${status}' reading ${REQUESTER}'s events"; return 1 ;;
+    esac
+    etag=$(header ETag)
+    hits=$(jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" "${EVENT_HITS_JQ}" "${scratch}/body")
+    oldest=$(jq -r '.[-1].created_at // empty' "${scratch}/body")
+    next=$(header Link | grep -oP '<\K[^>]+(?=>; rel="next")' || true)
+    while test -n "${next}" && test -n "${oldest}" && [[ "${oldest}" > "${window}" ]] && test "${pages}" -lt "${EVENTS_MAX_PAGES}"; do
+        status=$(fetch_page "${next#"${API}"/}") || return 1
+        hits+=$'\n'$(jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" "${EVENT_HITS_JQ}" "${scratch}/body")
+        oldest=$(jq -r '.[-1].created_at // empty' "${scratch}/body")
+        next=$(header Link | grep -oP '<\K[^>]+(?=>; rel="next")' || true)
+        pages=$((pages + 1))
+    done
+    if test -n "${oldest}" && [[ "${oldest}" > "${window}" ]]; then
+        warn "${REQUESTER}'s public events only go back to ${oldest}; asks there before it may be missed"
+    fi
+    save_local "${EVENTS_FILE}" "$(jq -sc --arg etag "${etag}" --argjson v "${LOCAL_VERSION}" \
+        '{version: $v, etag: $etag, hits: .}' <<<"${hits}")"
+    printf '%s\n' "${hits}"
+}
+
+# safety_threads: prints a JSON array of threads for what the safety net
+# found that isn't in THREADS already.
+safety_threads() {
+    local window hits known
+    window=$(date -u -d "@$(($(date -u -d "${since}" +%s) - SAFETY_LOOKBACK_SECS))" +%FT%TZ)
+    hits=$(event_hits "${window}") || return 1
+    hits+=$'\n'$(ghapi -X GET search/issues -f q="mentions:${BOT_LOGIN} updated:>${window} -user:${FORGE_ORG}" \
+        -f sort=updated -f per_page=100 --jq "${SEARCH_HITS_JQ}") || return 1
+    known=$(jq -c '[.pending, .acked | keys[]]' <<<"${PENDING_JSON}")
+    jq -sc --arg window "${window}" --argjson known "${known}" "${HITS_TO_THREADS_JQ}" <<<"${hits}" |
+        jq -sc --argjson threads "${threads}" '
+            ($threads | map("\(.repository.full_name)#\(.subject.url // "" | capture("/(?<n>[0-9]+)$").n // "")")) as $seen
+            | map(select("\(.repository.full_name)#\(.subject.url | capture("/(?<n>[0-9]+)$").n)" as $k | $seen | index($k) | not))'
+}
+
+safety_failed=false
+if extra=$(safety_threads); then
+    if test "$(jq length <<<"${extra}")" -gt 0; then
+        echo "The safety net found $(jq length <<<"${extra}") issues and PRs that may hold asks the notifications lack."
+        threads_all=$(jq -c --argjson extra "${extra}" '. + $extra' <<<"${threads}")
+    else
+        threads_all=${threads}
+    fi
+else
+    warn "the safety net (${REQUESTER}'s events, the mention search) failed"
+    safety_failed=true
+    threads_all=${threads}
+fi
+
 # --- Find what triggered each thread -------------------------------------
+
+# is_trusted AUTHOR AUTHOR_TYPE: whether GitHub recorded one of the
+# trusted logins (a user, not a bot or an organization).
+is_trusted() {
+    local login
+    test "$2" = User || return 1
+    for login in "${trusted[@]}"; do
+        test "$1" = "${login}" && return 0
+    done
+    return 1
+}
 
 excerpt_jq="(. // \"\" | gsub(\"\\\\s+\"; \" \") | if length > ${EXCERPT_LEN} then .[:${EXCERPT_LEN}] + \"...\" else . end)"
 
@@ -426,8 +600,13 @@ excerpt_jq="(. // \"\" | gsub(\"\\\\s+\"; \" \") | if length > ${EXCERPT_LEN} th
 # {author, author_type, url, body, located}. Nothing if the thread has no
 # trigger newer than its last read; fails if GitHub can't be read.
 triggers() {
-    local thread=$1 reason type subject_url latest last_read repo number
+    local thread=$1 reason type subject_url latest last_read repo number self=true
     reason=$(jq -r .reason <<<"${thread}")
+    # GitHub never notifies anyone of their own mentions, but the safety
+    # net would find the bot's, unless the bot is trusted for testing.
+    if jq -e .source <<<"${thread}" >/dev/null && ! is_trusted "${BOT_LOGIN}" User; then
+        self=false
+    fi
     type=$(jq -r .subject.type <<<"${thread}")
     subject_url=$(jq -r '.subject.url // empty' <<<"${thread}")
     latest=$(jq -r '.subject.latest_comment_url // empty' <<<"${thread}")
@@ -459,8 +638,8 @@ triggers() {
                             --jq '.[] | {author: .user.login, author_type: .user.type, url: .html_url, body, at: .submitted_at}' || exit 1
                     fi
                 ) || return 1
-                found=$(jq -c --arg lr "${last_read}" --arg re "${pattern}" \
-                    'select(($lr == "" or .at > $lr) and (.body // "" | test($re; "i")))
+                found=$(jq -c --arg lr "${last_read}" --arg re "${pattern}" --argjson self "${self}" --arg bot "${BOT_LOGIN}" \
+                    'select(($lr == "" or .at > $lr) and (.body // "" | test($re; "i")) and ($self or .author != $bot))
                      | del(.at) + {located: true}' <<<"${candidates}")
                 ;;
             review_requested|assign)
@@ -483,6 +662,9 @@ triggers() {
         if test -z "${found}" && test -n "${last_read}"; then
             # Read before, and nothing new that concerns the bot.
             return 0
+        fi
+        if test -n "${found}"; then
+            found=$(jq -c --arg title "$(jq -r .title <<<"${issue}")" '. + {issue_title: $title}' <<<"${found}")
         fi
     fi
     if test -z "${found}"; then
@@ -578,17 +760,6 @@ file_issue() {
     nfiled=$((nfiled + 1))
 }
 
-# is_trusted AUTHOR AUTHOR_TYPE: whether GitHub recorded one of the
-# trusted logins (a user, not a bot or an organization).
-is_trusted() {
-    local login
-    test "$2" = User || return 1
-    for login in "${trusted[@]}"; do
-        test "$1" = "${login}" && return 0
-    done
-    return 1
-}
-
 readonly ITEM_STATUS_QUERY='query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
     fieldValueByName(name: "Status") { ... on ProjectV2ItemFieldSingleSelectValue { name } } } } }'
 
@@ -638,10 +809,12 @@ nassigned=0
 nfiled=0
 nfailed=0
 nskipped=0
+# New requests only the safety net found.
+nunnotified=0
 while IFS= read -r thread; do
     test -n "${thread}" || continue
     id=$(jq -r .id <<<"${thread}")
-    desc=$(jq -r '"\(.reason) in \(.repository.full_name): \(.subject.title) [thread \(.id)]"' <<<"${thread}")
+    desc=$(jq -r '"\(.reason) in \(.repository.full_name): \(.subject.title // .id) [\(if .source then "found in \(.source)" else "thread \(.id)" end)]"' <<<"${thread}")
     # Already routed (only this script reads the bot's notifications), and
     # not updated since.
     if jq -e '.unread == false and .last_read_at != null and .last_read_at >= .updated_at' <<<"${thread}" >/dev/null; then
@@ -670,8 +843,13 @@ while IFS= read -r thread; do
         t=$(jq -c --argjson th "${thread}" "(.body | ${excerpt_jq}) as \$ex
             | {reason: \$th.reason, repo: \$th.repository.full_name, private: \$th.repository.private,
                number: ((\$th.subject.url // \"\" | capture(\"/(?<n>[0-9]+)\$\") | .n) // null),
-               title: \$th.subject.title, thread_url: (.url | sub(\"#.*\"; \"\")),
+               title: (\$th.subject.title // .issue_title), thread_url: (.url | sub(\"#.*\"; \"\")),
                thread_id: \$th.id, author, url, excerpt: \$ex, located}" <<<"${trig}")
+        if jq -e '.private == null' <<<"${t}" >/dev/null; then
+            priv=false
+            ! is_private "$(jq -r .repo <<<"${t}")" || priv=true
+            t=$(jq -c --argjson p "${priv}" '.private = $p' <<<"${t}")
+        fi
         url=$(jq -r .url <<<"${t}")
         author=$(jq -r '.author // "unknown"' <<<"${trig}")
         # Only the login GitHub recorded counts, never what the text says.
@@ -695,23 +873,31 @@ while IFS= read -r thread; do
             # A private source never goes on the board; the agent reports it.
             add_pending "${t}"
             nrequests=$((nrequests + 1))
+            ! jq -e .source <<<"${thread}" >/dev/null || nunnotified=$((nunnotified + 1))
             echo "  request from @${author}, pending until acked"
         fi
     done <<<"${found}"
     if ! ${ok}; then
         nfailed=$((nfailed + 1))
     elif jq -e --arg id "${id}" 'any(.pending[]; .thread_id == $id)' <<<"${PENDING_JSON}" >/dev/null; then
-        echo "  left unread until 'bot-notify ack ${id}'"
+        if is_thread_id "${id}"; then
+            echo "  left unread until 'bot-notify ack ${id}'"
+        else
+            echo "  kept until 'bot-notify ack ${id}'"
+        fi
     else
         mark_read "${id}" || nfailed=$((nfailed + 1))
     fi
-done < <(jq -c --argjson reasons "${SELECT_REASONS}" '.[] | select(.reason as $r | $reasons | index($r))' <<<"${threads}")
+done < <(jq -c --argjson reasons "${SELECT_REASONS}" '.[] | select(.reason as $r | $reasons | index($r))' <<<"${threads_all}")
+! ${safety_failed} || nfailed=$((nfailed + 1))
 
 filed_verb=filed
 ! ${dry_run} || filed_verb="to file"
 echo "Routed ${nselected} threads: ${nrequests} new requests and ${nassigned} assignments from ${REQUESTER}, ${nfiled} triggers by others ${filed_verb}, ${nskipped} skipped."
 print_pending
-
+if test "${nunnotified}" -gt 0; then
+    warn "${nunnotified} new requests were only found by the safety net, not in ${BOT_LOGIN}'s notifications; check that its notification settings deliver 'On GitHub' for participating and watched activity"
+fi
 
 # --- Advance the state ---------------------------------------------------
 

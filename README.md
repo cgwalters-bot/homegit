@@ -52,9 +52,10 @@ run it is planned.
 Likewise `bot-notify` polls the bot's notifications: a mention, review
 request or assignment by cgwalters becomes a Todo item on the board,
 while one by anyone else is filed as an issue for cgwalters and never
-acted on. Its poll state lives on the board itself, in an archived draft
-item (`bot-state: notifications`), so any machine can pick up where the
-last run stopped. Agents run it at the start of each session and planning
+acted on. GitHub doesn't reliably notify the bot, so it also checks
+cgwalters' public events and searches for mentions. Its poll state lives
+on the board itself, in an archived draft item (`bot-state:
+notifications`), so any machine can pick up where the last run stopped. Agents run it at the start of each session and planning
 pass for now; running it on a schedule comes later.
 
 Pings are only part of it: `bot-watch` sweeps the issues and PRs of the
