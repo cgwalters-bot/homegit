@@ -80,7 +80,11 @@ stop` cancels the runner, since they're billed while they run.
 `bot-board` is a small CLI over `gh project` for the Workstream board
 (`list`, `show`, `add`, `draft`, `set`, and `state-get`/`state-put` for
 the scripts' state items), which caches reads because the
-bot's GraphQL quota is shared by every agent. Each item's Workflow field
+bot's GraphQL quota is shared by every agent. The state items are what
+lets any machine run a session: nothing a script needs to remember lives
+only on one machine, and `state-put --checked` merges the changes of two
+machines writing the same item at once. `tests/bot-state.sh` tests that
+state handling offline, against a fake `gh`. Each item's Workflow field
 says what the bot delivers: a tested branch proposed as a draft PR on a
 forge fork (`branch`, the default), a write-up in a secret gist (`analysis`), a
 draft PR straight upstream (`pr`, set only by a human), or nothing

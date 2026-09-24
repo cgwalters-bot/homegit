@@ -52,6 +52,33 @@ readonly -A STATE_ITEMS=(
 )
 # GitHub's limit on the body of a draft item, in characters.
 readonly STATE_BODY_MAX=65536
+# Per state item, the last state this machine read from or wrote to the
+# project ('base') and the state it last meant to write ('state'), for
+# 'state-put --checked'. They differ only after a checked write failed,
+# and then state-get merges the unwritten changes back in. A strict write
+# (a lease, say) never leaves changes behind: its caller decides anew.
+readonly STATE_MIRROR_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-board
+# Exit status of 'state-put --checked --strict' when the state changed
+# since state-get.
+readonly EX_CONFLICT=3
+# merge3(BASE; OURS; THEIRS): THEIRS with the changes from BASE to OURS
+# applied, recursively through objects: a key OURS left as it was in BASE
+# takes THEIRS' value (or absence), one OURS changed or added takes OURS'
+# (THEIRS changing or removing it too loses, so an entry one machine
+# removed comes back if another changed it meanwhile), and one OURS
+# removed is removed.
+readonly MERGE3_JQ='
+def merge3($b; $o; $t):
+  if [$b, $o, $t] | all(type == "object") then
+    reduce ([$b, $o, $t] | map(keys[]) | unique[]) as $k ({};
+      if ($o | has($k)) == ($b | has($k)) and $o[$k] == $b[$k] then
+        if $t | has($k) then .[$k] = $t[$k] else . end
+      elif $o | has($k) | not then .
+      elif ($b | has($k)) and ($t | has($k)) then .[$k] = merge3($b[$k]; $o[$k]; $t[$k])
+      else .[$k] = $o[$k] end)
+  elif $o == $b then $t
+  else $o end;
+'
 
 usage() {
     cat <<EOF
@@ -82,12 +109,20 @@ Commands:
                               every item), from the content URL, else the
                               first Branch URL, else the title's first
                               word; '${ORG_OTHER}' when nothing matches
-  state-get NAME              Print the JSON state kept in the archived
+  state-get [--track] NAME    Print the JSON state kept in the archived
                               draft item '${STATE_PREFIX}NAME' ({} if it
-                              doesn't exist yet)
-  state-put NAME JSON         Replace that state, creating (and archiving)
+                              doesn't exist yet). --track records it as
+                              the base for 'state-put --checked'
+  state-put [--checked [--strict]] NAME JSON
+                              Replace that state, creating (and archiving)
                               the item if needed; the compact JSON must
-                              stay under ~64KB (a draft body's limit)
+                              stay under ~64KB (a draft body's limit).
+                              --checked writes nothing if JSON is the
+                              tracked base, and otherwise rereads the
+                              item first: if another machine changed it
+                              since, applies the changes from the base
+                              to JSON on top of theirs (--strict: fails
+                              with status ${EX_CONFLICT} instead)
   -h, --help                  Show this help
 
 Options:
@@ -100,7 +135,16 @@ Board calls use the bot's GraphQL quota, shared by all agents, so field
 definitions are cached for ${FIELDS_TTL}s and the item list for ${ITEMS_TTL}s in
 ${CACHE_DIR}; changes made through this tool invalidate the item cache.
 state-get is one GraphQL call, and so is state-put on an existing item
-(creating one takes a few).
+(creating one takes a few); --checked adds a read, unless there is
+nothing to write.
+
+State writes are last-writer-wins unless checked. A checked write is an
+optimistic one: GitHub can't make the write conditional, so a write by
+another machine in the moment between the reread and the write is still
+lost. A tracked state is mirrored in ${STATE_MIRROR_DIR}; when a
+checked write fails (say, rate limited or over the size limit), the
+mirror keeps the changes and the next state-get merges them back in.
+Runs on one machine must not state-get --track the same NAME at once.
 EOF
 }
 
@@ -581,29 +625,89 @@ find_state() {
         echo "warning: the state item ${STATE_ITEM} is not archived; it shows on the board" 1>&2
 }
 
-cmd_state_get() {
-    test $# -eq 1 || fatal "usage: $(basename "$0") state-get NAME"
-    state_name_ok "$1"
+# read_state NAME: prints the state on the project, {} if its item
+# doesn't exist yet. One GraphQL call.
+read_state() {
     if find_state "$1"; then
         parse_state "${STATE_ITEM}" "${STATE_BODY}"
     else
-        echo "warning: no '${STATE_PREFIX}$1' state item yet; state-put creates it" 1>&2
         echo '{}'
     fi
+}
+
+mirror_file() {
+    echo "${STATE_MIRROR_DIR}/state-$1.json"
+}
+
+# read_mirror NAME: prints the mirror {base, state} of NAME, or nothing.
+read_mirror() {
+    local file
+    file=$(mirror_file "$1")
+    test -s "${file}" || return 0
+    jq -ce 'if type == "object" and has("base") and has("state") then . else error("not {base, state}") end' "${file}" ||
+        fatal "cannot parse ${file}; if it holds changes to the state '$1' that are still wanted, write them with state-put, then remove it"
+}
+
+# write_mirror NAME BASE STATE
+write_mirror() {
+    local file
+    file=$(mirror_file "$1")
+    mkdir -p "${STATE_MIRROR_DIR}" || fatal "cannot create ${STATE_MIRROR_DIR}"
+    jq -nc --argjson b "$2" --argjson s "$3" '{base: $b, state: $s}' >"${file}.tmp.$$" ||
+        fatal "cannot write ${file}.tmp.$$"
+    mv -f "${file}.tmp.$$" "${file}" || fatal "cannot replace ${file}"
+}
+
+# merge3 BASE OURS THEIRS: prints the three-way merge (see MERGE3_JQ).
+merge3() {
+    jq -nc --argjson b "$1" --argjson o "$2" --argjson t "$3" "${MERGE3_JQ} merge3(\$b; \$o; \$t)"
+}
+
+same_json() {
+    jq -ne --argjson a "$1" --argjson b "$2" '$a == $b' >/dev/null
+}
+
+cmd_state_get() {
+    local name="" track=false
+    while test $# -gt 0; do
+        case "$1" in
+            --track) track=true; shift ;;
+            -*) fatal "unknown argument for state-get: $1 (see --help)" ;;
+            *) test -z "${name}" || fatal "usage: $(basename "$0") state-get [--track] NAME"; name=$1; shift ;;
+        esac
+    done
+    test -n "${name}" || fatal "usage: $(basename "$0") state-get [--track] NAME"
+    state_name_ok "${name}"
+    local theirs mirror result
+    theirs=$(read_state "${name}")
+    test "${theirs}" != '{}' || state_ids "${name}" ||
+        echo "warning: no '${STATE_PREFIX}${name}' state item yet; state-put creates it" 1>&2
+    result=${theirs}
+    mirror=$(read_mirror "${name}")
+    if test -n "${mirror}" && ! jq -e '.base == .state' <<<"${mirror}" >/dev/null; then
+        echo "note: merging in the changes to the state '${name}' that a previous run on this machine could not write" 1>&2
+        result=$(merge3 "$(jq -c .base <<<"${mirror}")" "$(jq -c .state <<<"${mirror}")" "${theirs}")
+    fi
+    ! ${track} || write_mirror "${name}" "${theirs}" "${result}"
+    printf '%s\n' "${result}"
 }
 
 readonly DRAFT_UPDATE_MUTATION='mutation($id: ID!, $body: String!) {
     updateProjectV2DraftIssue(input: {draftIssueId: $id, body: $body}) { draftIssue { id title } } }'
 
-cmd_state_put() {
-    test $# -eq 2 || fatal "usage: $(basename "$0") state-put NAME JSON"
-    local name=$1 json body id project
-    state_name_ok "${name}"
-    json=$(jq -ce 'if type == "object" then . else error("not an object") end' <<<"$2" 2>/dev/null) ||
-        fatal "state-put expects a JSON object"
-    body=$(state_body "${json}")
+# check_state_size NAME JSON: fails unless JSON fits in a draft body.
+check_state_size() {
+    local body
+    body=$(state_body "$2")
     test "${#body}" -le "${STATE_BODY_MAX}" ||
-        fatal "the state '${name}' is ${#body} characters, over the ${STATE_BODY_MAX} a draft body holds; keep less in it"
+        fatal "the state '$1' is ${#body} characters, over the ${STATE_BODY_MAX} a draft body holds; keep less in it"
+}
+
+# write_state NAME JSON: replaces the state on the project, creating (and
+# archiving) its item if needed.
+write_state() {
+    local name=$1 json=$2 body id project
+    body=$(state_body "${json}")
     # The known draft is written directly, without reading it first; the
     # scripts all state-get (which checks the item) before they state-put.
     if state_ids "${name}"; then
@@ -636,6 +740,73 @@ cmd_state_put() {
     mkdir -p "${CACHE_DIR}"
     echo "${id} ${draft}" >"${CACHE_DIR}/state-${name}"
     echo "Created and archived the state item ${id} ('${STATE_PREFIX}${name}'); add [${name}]='${id} ${draft}' to STATE_ITEMS in $(basename "$0")" 1>&2
+}
+
+# checked_put NAME JSON STRICT: state-put --checked (see usage).
+checked_put() {
+    local name=$1 json=$2 strict=$3 mirror base current
+    mirror=$(read_mirror "${name}")
+    test -n "${mirror}" || fatal "state-put --checked needs a 'state-get --track ${name}' first"
+    base=$(jq -c .base <<<"${mirror}")
+    if same_json "${json}" "${base}"; then
+        write_mirror "${name}" "${base}" "${base}"
+        return 0
+    fi
+    # Until the write succeeds, the mirror holds the changes, so that the
+    # next state-get merges them in.
+    ${strict} || write_mirror "${name}" "${base}" "${json}"
+    current=$(read_state "${name}")
+    # Already written, by a write that gh reported as failed (a timeout).
+    if same_json "${current}" "${json}"; then
+        write_mirror "${name}" "${current}" "${current}"
+        return 0
+    fi
+    if ! same_json "${current}" "${base}"; then
+        if ${strict}; then
+            # The caller decides again from the new state; nothing to merge.
+            write_mirror "${name}" "${current}" "${current}"
+            echo "error: the state '${name}' changed since it was read (another machine wrote it); not writing" 1>&2
+            exit "${EX_CONFLICT}"
+        fi
+        echo "note: the state '${name}' changed since it was read (another machine wrote it); merging" 1>&2
+        json=$(merge3 "${base}" "${json}" "${current}")
+        if same_json "${json}" "${current}"; then
+            write_mirror "${name}" "${current}" "${current}"
+            return 0
+        fi
+    fi
+    if ${strict}; then
+        write_mirror "${name}" "${current}" "${current}"
+    else
+        write_mirror "${name}" "${current}" "${json}"
+    fi
+    check_state_size "${name}" "${json}"
+    write_state "${name}" "${json}"
+    write_mirror "${name}" "${json}" "${json}"
+}
+
+cmd_state_put() {
+    local args=() checked=false strict=false
+    while test $# -gt 0; do
+        case "$1" in
+            --checked) checked=true; shift ;;
+            --strict) strict=true; shift ;;
+            -*) fatal "unknown argument for state-put: $1 (see --help)" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    test "${#args[@]}" -eq 2 || fatal "usage: $(basename "$0") state-put [--checked [--strict]] NAME JSON"
+    ! ${strict} || ${checked} || fatal "--strict needs --checked"
+    local name=${args[0]} json
+    state_name_ok "${name}"
+    json=$(jq -ce 'if type == "object" then . else error("not an object") end' <<<"${args[1]}" 2>/dev/null) ||
+        fatal "state-put expects a JSON object"
+    if ${checked}; then
+        checked_put "${name}" "${json}" "${strict}"
+    else
+        check_state_size "${name}" "${json}"
+        write_state "${name}" "${json}"
+    fi
 }
 
 while test $# -gt 0; do

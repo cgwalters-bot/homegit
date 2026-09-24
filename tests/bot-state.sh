@@ -1,0 +1,310 @@
+#!/usr/bin/env bash
+# Offline tests of the state the bot scripts keep on the Workstream board
+# ('bot-board state-get/state-put'), against a fake 'gh' that keeps the
+# project's state items in a temporary directory. No network, no quota.
+#   tests/bot-state.sh [TEST...]
+# State bodies hold literal backquotes (a fenced JSON block).
+# shellcheck disable=SC2016
+set -euo pipefail
+
+BIN=$(cd "$(dirname "$0")/../bin" && pwd)
+readonly BIN
+
+fail() {
+    echo "FAIL: $*" 1>&2
+    exit 1
+}
+
+# The fake gh. Draft items live in $FAKE_GH/items/DRAFT_ID.{item,title,body};
+# every call is appended to $FAKE_GH/calls. With $FAKE_GH/fail-graphql,
+# every GraphQL call is rate limited; with $FAKE_GH/fail-write, draft
+# writes fail.
+write_fake_gh() {
+    cat >"$1/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+store=${FAKE_GH:?}
+printf '%s\n' "$*" >>"${store}/calls"
+arg() { # arg NAME ARGS...: the value of '-f NAME=...'
+    local name=$1
+    shift
+    while test $# -gt 0; do
+        if test "$1" = -f && [[ "$2" == "${name}="* ]]; then
+            printf '%s' "${2#"${name}"=}"
+            return 0
+        fi
+        shift
+    done
+}
+draft_of() { # draft_of ITEM_ID
+    grep -lx "$1" "${store}"/items/*.item 2>/dev/null | head -n1 | xargs -r basename -s .item
+}
+case "$1 $2" in
+    "api user") echo "${FAKE_GH_LOGIN:-cgwalters-bot}"; exit 0 ;;
+    "api rate_limit") echo 5000; exit 0 ;;
+    "api graphql")
+        query=$(arg query "$@")
+        if test -e "${store}/fail-graphql"; then
+            echo "gh: API rate limit exceeded" 1>&2
+            exit 1
+        fi
+        case "${query}" in
+            *updateProjectV2DraftIssue*)
+                if test -e "${store}/fail-write"; then
+                    echo "gh: HTTP 502: Bad Gateway" 1>&2
+                    exit 1
+                fi
+                draft=$(arg id "$@")
+                test -e "${store}/items/${draft}.title" || { echo "gh: Could not resolve to a node with the global id of '${draft}'" 1>&2; exit 1; }
+                arg body "$@" >"${store}/items/${draft}.body"
+                jq -nc --arg id "${draft}" --rawfile t "${store}/items/${draft}.title" \
+                    '{updateProjectV2DraftIssue: {draftIssue: {id: $id, title: ($t | rtrimstr("\n"))}}}'
+                ;;
+            *archiveProjectV2Item*) echo '{}' ;;
+            *"node(id:"*)
+                item=$(arg id "$@")
+                draft=$(draft_of "${item}")
+                test -n "${draft}" || { echo '{"node": null}'; exit 0; }
+                jq -nc --arg item "${item}" --arg d "${draft}" \
+                    --rawfile t "${store}/items/${draft}.title" --rawfile b "${store}/items/${draft}.body" \
+                    '{node: {id: $item, isArchived: true, content: {id: $d, title: ($t | rtrimstr("\n")), body: $b}}}'
+                ;;
+            *) echo "fake gh: unexpected query: ${query}" 1>&2; exit 1 ;;
+        esac
+        exit 0
+        ;;
+    "project item-create")
+        n=$(find "${store}/items" -name '*.item' | wc -l)
+        shift 2
+        while test $# -gt 0; do
+            case "$1" in
+                --title) title=$2; shift 2 ;;
+                --body) body=$2; shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        printf '%s\n' "PVTI_fake${n}" >"${store}/items/DI_fake${n}.item"
+        printf '%s\n' "${title}" >"${store}/items/DI_fake${n}.title"
+        printf '%s' "${body}" >"${store}/items/DI_fake${n}.body"
+        echo "PVTI_fake${n}"
+        exit 0
+        ;;
+    "project view") echo PVT_fake; exit 0 ;;
+    "project field-list")
+        echo '{"fields": [{"id": "F_workflow", "name": "Workflow", "options": [{"id": "O_manual", "name": "manual"}]}]}'
+        exit 0
+        ;;
+    "project item-edit") exit 0 ;;
+esac
+if test -n "${FAKE_GH_EXTRA:-}" && test -x "${FAKE_GH_EXTRA}"; then
+    exec "${FAKE_GH_EXTRA}" "$@"
+fi
+echo "fake gh: unexpected call: $*" 1>&2
+exit 1
+EOF
+    chmod +x "$1/gh"
+}
+
+# state_ids NAME: prints "ITEM_ID DRAFT_ID" of the state item NAME: the
+# ones in bot-board's STATE_ITEMS, else the fake project's.
+state_ids() {
+    local ids draft
+    ids=$(sed -n "s/^ *\[$1\]='\(PVTI_[^ ]*\) \(DI_[^']*\)'.*/\1 \2/p" "${BIN}/bot-board")
+    if test -z "${ids}"; then
+        draft=$(grep -lx "bot-state: $1" "${FAKE_GH}"/items/*.title | head -n1 | xargs basename -s .title)
+        ids="$(cat "${FAKE_GH}/items/${draft}.item") ${draft}"
+    fi
+    echo "${ids}"
+}
+
+# set_project_state NAME JSON: writes the state on the fake project, as
+# another machine would, creating the draft that bot-board's STATE_ITEMS
+# names for NAME if needed.
+set_project_state() {
+    local item draft
+    read -r item draft <<<"$(state_ids "$1")"
+    echo "${item}" >"${FAKE_GH}/items/${draft}.item"
+    echo "bot-state: $1" >"${FAKE_GH}/items/${draft}.title"
+    printf 'x\n\n```json\n%s\n```\n' "$(jq -c . <<<"$2")" >"${FAKE_GH}/items/${draft}.body"
+}
+
+# project_state NAME: the JSON on the fake project.
+project_state() {
+    local draft
+    read -r _ draft <<<"$(state_ids "$1")"
+    awk '/^```json/ { f = 1; next } f && /^```/ { exit } f' "${FAKE_GH}/items/${draft}.body"
+}
+
+graphql_calls() {
+    grep -c '^api graphql' "${FAKE_GH}/calls" 2>/dev/null || true
+}
+
+reset_calls() {
+    : >"${FAKE_GH}/calls"
+}
+
+# expect_json ACTUAL EXPECTED [WHAT]
+expect_json() {
+    jq -ne --argjson a "$1" --argjson b "$2" '$a == $b' >/dev/null ||
+        fail "${3:-JSON}: expected $(jq -c . <<<"$2"), got $(jq -c . <<<"$1")"
+}
+
+expect_eq() {
+    test "$1" = "$2" || fail "${3:-value}: expected '$2', got '$1'"
+}
+
+# --- bot-board --------------------------------------------------------------
+
+test_merge3() {
+    # Data driven: base, ours, theirs, expected.
+    local cases=(
+        '{"a":1} {"a":2} {"a":1} {"a":2}'
+        '{"a":1} {"a":1} {"a":3} {"a":3}'
+        '{"a":1} {"a":2} {"a":3} {"a":2}'
+        '{"p":{"x":1}} {"p":{"x":1,"y":2}} {"p":{"x":1,"z":3}} {"p":{"x":1,"y":2,"z":3}}'
+        '{"p":{"x":1,"y":2}} {"p":{"x":1}} {"p":{"x":1,"y":2,"z":3}} {"p":{"x":1,"z":3}}'
+        '{"p":{"x":{"s":1,"t":1}}} {"p":{"x":{"s":2,"t":1}}} {"p":{"x":{"s":1,"t":5}}} {"p":{"x":{"s":2,"t":5}}}'
+        '{} {"a":1} {"b":2} {"a":1,"b":2}'
+        '{"a":1} {} {"a":1,"b":2} {"b":2}'
+        '{"a":1} {"a":1} {} {}'
+    )
+    local c b o t want got
+    for c in "${cases[@]}"; do
+        read -r b o t want <<<"${c}"
+        got=$(jq -nc --argjson b "${b}" --argjson o "${o}" --argjson t "${t}" \
+            "$(sed -n "/^readonly MERGE3_JQ='/,/^'/p" "${BIN}/bot-board" | sed '1d;$d') merge3(\$b; \$o; \$t)")
+        expect_json "${got}" "${want}" "merge3 ${b} ${o} ${t}"
+    done
+}
+
+test_checked_put() {
+    set_project_state notifications '{"since":"a","pending":{}}'
+    reset_calls
+    local got
+    got=$("${BIN}/bot-board" state-get --track notifications)
+    expect_json "${got}" '{"since":"a","pending":{}}' "state-get"
+    expect_eq "$(graphql_calls)" 1 "GraphQL calls of state-get"
+    # Nothing changed: no call at all.
+    reset_calls
+    "${BIN}/bot-board" state-put --checked notifications "${got}"
+    expect_eq "$(graphql_calls)" 0 "GraphQL calls of an unchanged checked put"
+    # A change: one reread, one write.
+    reset_calls
+    "${BIN}/bot-board" state-put --checked notifications '{"since":"b","pending":{}}'
+    expect_eq "$(graphql_calls)" 2 "GraphQL calls of a checked put"
+    expect_json "$(project_state notifications)" '{"since":"b","pending":{}}' "after a checked put"
+}
+
+test_race_merge() {
+    set_project_state notifications '{"since":"a","pending":{"u1":{"n":1}},"acked":{}}'
+    "${BIN}/bot-board" state-get --track notifications >/dev/null
+    # Another machine acks u1 and advances since, between our read and write.
+    set_project_state notifications '{"since":"c","pending":{},"acked":{"u1":"t"}}'
+    "${BIN}/bot-board" state-put --checked notifications '{"since":"b","pending":{"u1":{"n":1},"u2":{"n":2}},"acked":{}}' 2>"${WORK}/err"
+    grep -q 'changed since it was read' "${WORK}/err" || fail "no note about the concurrent write"
+    expect_json "$(project_state notifications)" '{"since":"b","pending":{"u2":{"n":2}},"acked":{"u1":"t"}}' "merged state"
+    # The mirror now tracks what was written, so the next put is clean.
+    reset_calls
+    "${BIN}/bot-board" state-put --checked notifications "$(project_state notifications)"
+    expect_eq "$(graphql_calls)" 0 "GraphQL calls after the merge"
+}
+
+test_race_strict() {
+    set_project_state notifications '{"holder":null}'
+    "${BIN}/bot-board" state-get --track notifications >/dev/null
+    set_project_state notifications '{"holder":"other"}'
+    local rc=0
+    "${BIN}/bot-board" state-put --checked --strict notifications '{"holder":"me"}' 2>/dev/null || rc=$?
+    expect_eq "${rc}" 3 "exit status of a strict conflict"
+    expect_json "$(project_state notifications)" '{"holder":"other"}' "state after a strict conflict"
+    expect_json "$("${BIN}/bot-board" state-get notifications)" '{"holder":"other"}' "state-get after a strict conflict"
+    # A failed strict write isn't merged back in later either: another
+    # machine's lease must never turn into ours.
+    "${BIN}/bot-board" state-get --track notifications >/dev/null
+    touch "${FAKE_GH}/fail-write"
+    ! "${BIN}/bot-board" state-put --checked --strict notifications '{"holder":"me"}' 2>/dev/null ||
+        fail "a failing strict write succeeded"
+    rm "${FAKE_GH}/fail-write"
+    set_project_state notifications '{"holder":"third"}'
+    expect_json "$("${BIN}/bot-board" state-get notifications)" '{"holder":"third"}' "state-get after a failed strict write"
+}
+
+test_size_cap() {
+    set_project_state notifications '{"a":1}'
+    "${BIN}/bot-board" state-get --track notifications >/dev/null
+    local big rc=0
+    big=$(jq -nc '{a: 1, big: ("x" * 70000)}')
+    reset_calls
+    "${BIN}/bot-board" state-put --checked notifications "${big}" 2>"${WORK}/err" || rc=$?
+    test "${rc}" -ne 0 || fail "an oversized state was accepted"
+    grep -q 'over the 65536' "${WORK}/err" || fail "no size error: $(cat "${WORK}/err")"
+    expect_json "$(project_state notifications)" '{"a":1}' "state after an oversized put"
+    # The unwritten change is kept locally and merged into the next read.
+    local got
+    got=$("${BIN}/bot-board" state-get notifications 2>"${WORK}/err")
+    grep -q 'could not write' "${WORK}/err" || fail "no note about the unwritten change"
+    expect_eq "$(jq -r '.big | length' <<<"${got}")" 70000 "unwritten change merged back"
+}
+
+test_failed_write_kept() {
+    set_project_state notifications '{"n":1}'
+    "${BIN}/bot-board" state-get --track notifications >/dev/null
+    touch "${FAKE_GH}/fail-graphql"
+    local rc=0
+    "${BIN}/bot-board" state-put --checked notifications '{"n":2,"new":true}' 2>/dev/null || rc=$?
+    expect_eq "${rc}" 75 "exit status when rate limited"
+    rm "${FAKE_GH}/fail-graphql"
+    # Meanwhile another machine changed n; ours is kept and merged.
+    set_project_state notifications '{"n":5}'
+    local got
+    got=$("${BIN}/bot-board" state-get --track notifications 2>/dev/null)
+    expect_json "${got}" '{"n":2,"new":true}' "state-get after a failed write"
+    "${BIN}/bot-board" state-put --checked notifications "${got}"
+    expect_json "$(project_state notifications)" '{"n":2,"new":true}' "state after the retry"
+}
+
+test_create() {
+    "${BIN}/bot-board" state-get --track newthing >/dev/null 2>&1
+    "${BIN}/bot-board" state-put --checked newthing '{"a":1}' 2>/dev/null
+    expect_json "$(project_state newthing)" '{"a":1}' "created state item"
+}
+
+# --- runner -----------------------------------------------------------------
+
+all_tests() {
+    declare -F | awk '$3 ~ /^test_/ { sub(/^test_/, "", $3); print $3 }'
+}
+
+# run_test NAME: runs test_NAME in a fresh fake world. Called in a
+# separate process per test, so that set -e holds inside it.
+run_test() {
+    WORK=$(mktemp -d)
+    trap 'rm -rf "${WORK}"' EXIT
+    FAKE_GH=${WORK}/gh-store
+    mkdir -p "${FAKE_GH}/items" "${WORK}/bin" "${WORK}/home/run"
+    write_fake_gh "${WORK}/bin"
+    export FAKE_GH WORK
+    export PATH=${WORK}/bin:${PATH}
+    export HOME=${WORK}/home XDG_STATE_HOME=${WORK}/home/state XDG_CACHE_HOME=${WORK}/home/cache
+    export XDG_RUNTIME_DIR=${WORK}/home/run
+    unset GH_TOKEN GITHUB_TOKEN
+    "test_$1"
+}
+
+if test "${1:-}" = --one; then
+    run_test "$2"
+    exit 0
+fi
+tests=("$@")
+test "${#tests[@]}" -gt 0 || mapfile -t tests < <(all_tests)
+failed=0
+for t in "${tests[@]}"; do
+    if "$0" --one "${t}"; then
+        echo "ok ${t}"
+    else
+        echo "not ok ${t}"
+        failed=$((failed + 1))
+    fi
+done
+test "${failed}" -eq 0 || { echo "${failed} test(s) failed" 1>&2; exit 1; }
+echo "all ${#tests[@]} tests passed"
