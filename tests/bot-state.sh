@@ -42,7 +42,8 @@ draft_of() { # draft_of ITEM_ID
     grep -lx "$1" "${store}"/items/*.item 2>/dev/null | head -n1 | xargs -r basename -s .item
 }
 # REST fixtures: a GET of PATH (query string ignored) answers with
-# $FAKE_GH/rest/PATH.json, if it exists, filtered by --jq like gh does.
+# $FAKE_GH/rest/PATH.json, if it exists, filtered by --jq like gh does,
+# or with a 404 if $FAKE_GH/rest/PATH.404 exists.
 if test "$1" = api && test -d "${store}/rest"; then
     method=GET path="" filter="" args=("${@:2}")
     while test "${#args[@]}" -gt 0; do
@@ -58,6 +59,10 @@ if test "$1" = api && test -d "${store}/rest"; then
     if test "${method}" = GET && test -e "${fixture}"; then
         jq -rc "${filter:-.}" "${fixture}"
         exit 0
+    fi
+    if test "${method}" = GET && test -e "${store}/rest/${path}.404"; then
+        echo "gh: Not Found (HTTP 404)" 1>&2
+        exit 1
     fi
 fi
 case "$1 $2" in
@@ -374,6 +379,7 @@ promote_world() {
     rest "repos/${PR_FORK}/issues/1/timeline" "$4"
     rest "repos/up/demo/pulls" '[]'
     rest "repos/up/demo/compare/main...cgwalters-forge:${PR_BRANCH}" '{"ahead_by": 1, "behind_by": 0}'
+    rest "repos/up/demo/rules/branches/main" '[]'
 }
 
 # The head was pushed at 10:00, from a commit made at 09:50.
@@ -441,6 +447,32 @@ test_pr_promote_go_ahead_hint() {
     local out
     out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
     ! grep -q 'go-ahead' <<<"${out}" || fail "a go-ahead from before the last push was pointed out: ${out}"
+}
+
+test_pr_promote_dco() {
+    local cmd='[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "/promote"}]'
+    local dco_rules='[{"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "DCO"}]}}]'
+    local out
+    promote_world "${cmd}" '[]' "${PUSHED_10}" "${COMMITTED_0950}"
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1) || fail "promote failed: ${out}"
+    ! grep -q 'DCO' <<<"${out}" || fail "a DCO note without a DCO rule: ${out}"
+
+    rest "repos/up/demo/rules/branches/main" "${dco_rules}"
+    local workflow=${FAKE_GH}/rest/repos/up/demo/contents/.github/workflows/signoff.yml
+    mkdir -p "$(dirname "${workflow}")"
+    touch "${workflow}.404"
+    expect_promote "DCO required, no /signoff workflow" yes \
+        $'requires DCO, and these commits have no `Signed-off-by`.*git rebase --signoff <upstream>/main'
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
+    # The note goes before the trailer, which stays last.
+    grep -A2 'requires DCO' <<<"${out}" | tail -n1 | grep -qxF 'Generated-by: https://github.com/cgwalters/#llms' ||
+        fail "the DCO note isn't right before the trailer: ${out}"
+
+    rm "${workflow}.404"
+    rest "repos/up/demo/contents/.github/workflows/signoff.yml" '{"path": ".github/workflows/signoff.yml"}'
+    expect_promote "DCO required, with the /signoff workflow" yes 'requires DCO; comment `/signoff`'
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
+    test "$(grep -c 'requires DCO' <<<"${out}")" -eq 1 || fail "expected one DCO note: ${out}"
 }
 
 # --- bot-notify -------------------------------------------------------------

@@ -58,6 +58,12 @@ readonly EX_RATELIMIT=75
 readonly EX_NOTFOUND=4
 # Returned by rebase_onto_upstream() when the rebase conflicts.
 readonly EX_CONFLICT=10
+# Part of the name of the required status check the DCO app (dco-2)
+# reports, which makes a repository require a Signed-off-by on every commit.
+readonly DCO_CHECK=DCO
+# Where a repository installs the /signoff command (bootc-dev/actions'
+# pr-signoff workflow; bootc-dev/infra syncs this stub to its org).
+readonly SIGNOFF_WORKFLOW=.github/workflows/signoff.yml
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
 
@@ -109,7 +115,10 @@ Commands:
         rebase onto the upstream base if it moved (on conflicts, dismiss
         the approval and stop), open the PR from ${FORGE_ORG}:${BRANCH_PREFIX}SLUG
         with the fork PR's current title and body minus the bot-meta
-        section, link and close the fork PR, and set the board item In
+        section (plus, if the base branch's rules require the DCO check,
+        a line telling maintainers to comment '/signoff', or how to sign
+        off by hand where ${SIGNOFF_WORKFLOW} doesn't exist), link and
+        close the fork PR, and set the board item In
         Review with Branch = the upstream PR (and Why = TEXT, if given).
         The upstream PR is a draft with --draft, or when ${REVIEWER}'s latest
         '${DRAFT_COMMAND}' or '${READY_COMMAND}' comment line is '${DRAFT_COMMAND}'. --dry-run checks
@@ -1162,6 +1171,42 @@ verdict() {
         "${VERDICT_JQ} $1" <<<"${activity}"
 }
 
+# dco_note REPO BASE: prints a line for an upstream PR body telling the
+# maintainers how to sign off its commits, if pushes to BASE in REPO
+# need the DCO check; nothing otherwise. Only the branch rules count, not
+# what CONTRIBUTING says. The bot never signs off itself.
+dco_note() {
+    local repo=$1 base=$2 checks rc=0
+    checks=$(ghapi -X GET "repos/${repo}/rules/branches/${base}" \
+        --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context') || {
+        warn "cannot read the branch rules of ${repo}:${base}; add a DCO note to the PR by hand if it needs one"
+        return 0
+    }
+    grep -qiF "${DCO_CHECK}" <<<"${checks}" || return 0
+    ghapi -X GET "repos/${repo}/contents/${SIGNOFF_WORKFLOW}" -f ref="${base}" --jq .path >/dev/null || rc=$?
+    if test "${rc}" -eq 0; then
+        # shellcheck disable=SC2016 # literal backticks
+        echo 'Maintainers: this repository requires DCO; comment `/signoff` to add your `Signed-off-by` to these commits.'
+    else
+        test "${rc}" -eq "${EX_NOTFOUND}" || warn "cannot tell whether ${repo} has ${SIGNOFF_WORKFLOW}; describing the manual signoff"
+        echo "Maintainers: this repository requires DCO, and these commits have no \`Signed-off-by\`. To add yours, run \`git rebase --signoff <upstream>/${base}\` on this branch and force-push it."
+    fi
+}
+
+# with_note BODY NOTE: prints BODY with the paragraph NOTE added before
+# its final '${LLMS_TRAILER}' line (or at the end), unless it's there.
+with_note() {
+    local body=$1 note=$2
+    if test -z "${note}" || grep -qxF -- "${note}" <<<"${body}"; then
+        printf '%s\n' "${body}"
+    elif grep -qxF -- "${LLMS_TRAILER}" <<<"${body}"; then
+        awk -v note="${note}" -v trailer="${LLMS_TRAILER}" \
+            '$0 == trailer && !done { print note; print ""; done = 1 } { print }' <<<"${body}"
+    else
+        printf '%s\n\n%s\n' "${body}" "${note}"
+    fi
+}
+
 # push_time FORK NUMBER BRANCH: sets the caller's 'pushed' to when its
 # 'head_sha' became the head of the fork PR, if its 'activity' has a
 # '${PROMOTE_COMMAND}' or go-ahead comment that needs it (else leaves it
@@ -1301,6 +1346,12 @@ cmd_promote() {
     ! grep -qF 'bot-meta' <<<"${body}" || fatal "${url}'s body still mentions bot-meta after stripping the section; fix its markers"
     test -n "${body}" || fatal "${url}'s body is empty without the bot-meta section"
     grep -qxF "${LLMS_TRAILER}" <<<"${body}" || warn "${url}'s body has no '${LLMS_TRAILER}' line"
+    local dco
+    dco=$(dco_note "${upstream}" "${base}")
+    if test -n "${dco}" && ! grep -qxF -- "${dco}" <<<"${body}" && grep -qF "${DCO_CHECK}" <<<"${body}"; then
+        warn "${url}'s body already mentions ${DCO_CHECK}; promote adds its own line too, so drop the old note from the fork PR body before promoting"
+    fi
+    body=$(with_note "${body}" "${dco}")
 
     local activity approved wants_draft pushed
     activity=$(reviewer_activity "${FORK}" "${NUMBER}")
