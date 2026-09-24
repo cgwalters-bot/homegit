@@ -24,7 +24,7 @@ Rules:
   - AI trailer: `Generated-by: AI` by default, unless the target project's AGENTS.md/CONTRIBUTING says otherwise. Never name models or tools.
   - Push branches only to cgwalters-bot and cgwalters-forge forks (via `bot-pr fork-pr`); create a personal fork via REST `gh api -X POST repos/O/R/forks` if needed.
   - Do NOT open upstream PRs (only draft PRs on the forge fork via `bot-pr fork-pr`), and do NOT comment, review, label or react upstream, except: when cgwalters (login) explicitly @-mentioned @cgwalters-bot with an ask, you may post one concise reply with the answer in that thread (see the workstream skill).
-- **PR bodies:** if the repository enforces DCO (a required check or DCO workflow on main, or CONTRIBUTING says so), the body says a human Signed-off-by is needed before upstreaming; otherwise don't mention DCO. Only claim CI results you can link to. Edit fork PR bodies with `bot-pr get-body`/`set-body`, never `gh pr edit`.
+- **PR bodies:** if the repository enforces DCO, the body says a maintainer must sign off before merging; otherwise don't mention DCO. Decide that from the branch rules API and workflows as upstream-pr/SKILL.md describes (`gh api repos/O/R/rules/branches/<default>`: a required status check with a DCO context), never from CONTRIBUTING text. Only claim CI results you can link to. Edit fork PR bodies with `bot-pr get-body`/`set-body`, never `gh pr edit`.
 
 Final report:
 - the branch compare URL, fork PR URL or gist URL;

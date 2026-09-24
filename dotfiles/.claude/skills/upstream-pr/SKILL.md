@@ -66,8 +66,9 @@ maintainers' review queue.
 
 Before writing code, read the target project's `CONTRIBUTING.md`, `AGENTS.md`,
 `CLAUDE.md`, `.github/pull_request_template.md` and similar docs. Their rules on
-commit format, DCO/sign-off, AI disclosure, testing, and PR process take
-precedence over everything below. If the project forbids AI-generated
+commit format, AI disclosure, testing, and PR process take precedence over
+everything below. Whether DCO is required is the exception: check that as
+described under Commits, not from the docs. If the project forbids AI-generated
 contributions, stop and set the item to Needs human.
 
 ## Setup
@@ -88,8 +89,25 @@ topic branch per change.
 - Follow the project's commit style; otherwise Linux kernel style subjects
   with a body explaining why (see the shared AGENTS.md guidance).
 - **Never add `Signed-off-by`.** That is for a human to add. If the project
-  requires DCO sign-off, leave it out anyway and note in the PR that a human
-  needs to sign off before merge.
+  requires DCO sign-off, leave it out anyway and say in the PR body that a
+  maintainer must sign off before merging (e.g. `git rebase --signoff <base>`
+  and force-push); if it doesn't, don't mention DCO.
+- **Whether DCO is required** comes from what GitHub enforces, never from
+  CONTRIBUTING or other prose, which is easy to misread. It is required if
+  the default branch's rules require a status check named like DCO:
+
+  ```bash
+  gh api repos/OWNER/REPO/rules/branches/DEFAULT --jq '.[]
+    | select(.type == "required_status_checks")
+    | .parameters.required_status_checks[].context
+    | select(test("dco"; "i"))'
+  ```
+
+  or if a workflow in `.github/workflows/` checks sign-offs. Classic branch
+  protection isn't readable without admin rights, so if neither shows
+  anything, also look for a DCO check among the check runs of a recent
+  commit on the default branch
+  (`gh api repos/OWNER/REPO/commits/SHA/check-runs --jq '.check_runs[].name'`).
 - AI disclosure per project policy; by default end each commit message with
   a `Generated-by: AI` trailer (`Assisted-by: AI` only when a human wrote
   a substantial part of the change).
