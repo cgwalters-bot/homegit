@@ -96,6 +96,17 @@ case "$1 $2" in
         ;;
     "project item-edit") exit 0 ;;
 esac
+# Notifications: nothing new. $FAKE_GH/on-poll runs first, if it exists,
+# to simulate another machine writing meanwhile.
+if test "$1 $2" = "api -i" && [[ "$3" == notifications\?* ]]; then
+    test ! -x "${store}/on-poll" || "${store}/on-poll"
+    printf 'HTTP/2.0 304 Not Modified\r\nDate: Thu, 24 Sep 2026 00:00:00 GMT\r\nX-Poll-Interval: 60\r\n\r\n'
+    echo "gh: HTTP 304" 1>&2
+    exit 1
+fi
+if test "$1 $2 $3" = "api -X PATCH" && [[ "$4" == notifications/threads/* ]]; then
+    exit 0
+fi
 # No fork PRs, open or closed.
 if [[ " $* " == *" search/issues "* ]]; then
     exit 0
@@ -305,6 +316,84 @@ test_pr_inbox_migration() {
     "${BIN}/bot-pr" inbox 2>"${WORK}/err"
     ! grep -q 'Moved' "${WORK}/err" || fail "migrated twice"
     expect_json "$(project_state pr-inbox | jq -c '.prs | keys')" '["A","B"]' "inbox state after the next run"
+}
+
+# --- bot-notify -------------------------------------------------------------
+
+# request URL THREAD_ID: a pending request record.
+request() {
+    jq -nc --arg u "$1" --arg t "$2" '{reason: "mention", repo: "o/r", private: false, number: "1",
+        title: "t", thread_url: "https://github.com/o/r/issues/1", thread_id: $t,
+        author: "cgwalters", url: $u, excerpt: "please", located: true}'
+}
+
+test_notify_migration() {
+    local legacy recent
+    recent=$(date -u -d '1 day ago' +%FT%TZ)
+    set_project_state notifications '{"since":"2026-09-20T00:00:00Z","last_modified":"LM"}'
+    legacy=${XDG_STATE_HOME}/bot-notify/pending.json
+    mkdir -p "$(dirname "${legacy}")"
+    jq -nc --argjson r "$(request U1 11)" --arg recent "${recent}" \
+        '{version: 1, pending: {U1: $r}, acked: {U0: $recent}}' >"${legacy}"
+    # A dry run prints the old file's request, and writes nothing.
+    reset_calls
+    "${BIN}/bot-notify" --dry-run >"${WORK}/out" 2>&1
+    grep -q '^request .*"url":"U1"' "${WORK}/out" || fail "dry run did not print the old request: $(cat "${WORK}/out")"
+    expect_eq "$(graphql_calls)" 1 "GraphQL calls of a dry run"
+    test -e "${legacy}" || fail "a dry run moved the old file"
+    # A real run moves it to the board, leaving the poll position alone.
+    "${BIN}/bot-notify" >"${WORK}/out" 2>&1
+    grep -q 'Moved the unacked requests' "${WORK}/out" || fail "no migration note: $(cat "${WORK}/out")"
+    test ! -e "${legacy}" || fail "the old file is still there"
+    expect_json "$(project_state notifications | jq -c '{since, last_modified, p: (.pending | keys), a: (.acked | keys)}')" \
+        '{"since":"2026-09-20T00:00:00Z","last_modified":"LM","p":["U1"],"a":["U0"]}' "migrated notifications state"
+    # Still printed by the next run, which has nothing to write.
+    reset_calls
+    "${BIN}/bot-notify" >"${WORK}/out" 2>&1
+    grep -q '^request .*"url":"U1"' "${WORK}/out" || fail "the migrated request is not printed"
+    grep -q 'No changes' "${WORK}/out" || fail "an unchanged run wrote: $(cat "${WORK}/out")"
+    expect_eq "$(graphql_calls)" 1 "GraphQL calls of an unchanged run"
+    # Acking it records that on the board.
+    "${BIN}/bot-notify" ack 11 >/dev/null
+    expect_json "$(project_state notifications | jq -c '{p: (.pending | keys), a: (.acked | keys)}')" \
+        '{"p":[],"a":["U0","U1"]}' "state after the ack"
+}
+
+test_notify_ack_retried() {
+    set_project_state notifications "$(jq -nc --argjson r "$(request U1 11)" \
+        '{since: "2026-09-20T00:00:00Z", last_modified: "LM", pending: {U1: $r}, acked: {}}')"
+    # The ack's write fails...
+    touch "${FAKE_GH}/fail-write"
+    ! "${BIN}/bot-notify" ack 11 >/dev/null 2>&1 || fail "an ack whose write failed succeeded"
+    rm "${FAKE_GH}/fail-write"
+    expect_json "$(project_state notifications | jq -c '.pending | keys')" '["U1"]' "state after the failed ack"
+    # ... so the next run, with nothing new of its own, writes it.
+    "${BIN}/bot-notify" >"${WORK}/out" 2>&1
+    ! grep -q '^request ' "${WORK}/out" || fail "the acked request is still printed: $(cat "${WORK}/out")"
+    expect_json "$(project_state notifications | jq -c '{p: (.pending | keys), a: (.acked | keys)}')" \
+        '{"p":[],"a":["U1"]}' "state after the next run"
+}
+
+test_notify_race() {
+    local legacy item draft
+    set_project_state notifications "$(jq -nc --argjson r "$(request U1 11)" \
+        '{since: "2026-09-20T00:00:00Z", last_modified: "LM", pending: {U1: $r}, acked: {}}')"
+    # This machine still has a request of its own to move to the board...
+    legacy=${XDG_STATE_HOME}/bot-notify/pending.json
+    mkdir -p "$(dirname "${legacy}")"
+    jq -nc --argjson r "$(request U2 22)" '{version: 1, pending: {U2: $r}, acked: {}}' >"${legacy}"
+    # ... while another machine acks U1 during its poll.
+    read -r item draft <<<"$(state_ids notifications)"
+    printf 'x\n\n```json\n%s\n```\n' "$(jq -nc \
+        '{since: "2026-09-20T00:00:00Z", last_modified: "LM", pending: {}, acked: {U1: "2026-09-24T00:00:00Z"}}')" \
+        >"${FAKE_GH}/race.body"
+    printf '#!/bin/sh\nmv -f "%s" "%s"\n' "${FAKE_GH}/race.body" "${FAKE_GH}/items/${draft}.body" >"${FAKE_GH}/on-poll"
+    chmod +x "${FAKE_GH}/on-poll"
+    "${BIN}/bot-notify" >"${WORK}/out" 2>&1
+    grep -q 'changed since it was read' "${WORK}/out" || fail "no merge note: $(cat "${WORK}/out")"
+    # U1 stays acked, and U2 is added.
+    expect_json "$(project_state notifications | jq -c '{p: (.pending | keys), a: (.acked | keys)}')" \
+        '{"p":["U2"],"a":["U1"]}' "state after the race"
 }
 
 # --- runner -----------------------------------------------------------------

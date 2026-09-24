@@ -21,16 +21,19 @@ readonly API=https://api.github.com
 readonly DEFAULT_LOOKBACK_DAYS=7
 readonly PER_PAGE=50
 readonly EXCERPT_LEN=300
-# Poll state lives on the Workstream board, in the archived draft item
-# 'bot-state: notifications' (see 'bot-board state-get'), so it is shared
-# by every machine the bot runs on.
+# The poll state and the requests printed but not acked yet (plus
+# recently acked ones, so they aren't printed again) live on the Workstream
+# board, in the archived draft item 'bot-state: notifications' (see
+# 'bot-board state-get'), so they are shared by every machine the bot
+# runs on.
 readonly STATE_NAME=notifications
-# Local to this machine: the lock, the requests printed but not acked yet
-# (plus recently acked ones, so they aren't printed again), and the
-# triggers already filed as issues.
+# Local to this machine: the lock and the triggers already filed as
+# issues (a cache; the issues' markers are what counts).
 readonly LOCAL_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-notify
-readonly PENDING_FILE=${LOCAL_DIR}/pending.json
 readonly FILED_FILE=${LOCAL_DIR}/filed.json
+# Where the requests were kept before; merged into the board's on first
+# use.
+readonly LEGACY_PENDING_FILE=${LOCAL_DIR}/pending.json
 readonly LOCAL_VERSION=1
 # Acked requests are remembered this long, well past any notification lag.
 readonly ACKED_KEEP_DAYS=30
@@ -72,11 +75,13 @@ mention, team mention, review request and assignment:
 
 Threads in ${FORGE_ORG} are skipped: 'bot-pr inbox' covers them. Other
 threads are marked read once routed, unless they hold unacked requests.
-Unacked requests and filed triggers are kept in ${LOCAL_DIR}.
-The poll state (since, Last-Modified) is kept in the archived
-'bot-state: ${STATE_NAME}' draft item on the board, created on the first run, and
-only advances when every thread was routed, so a failed run is retried.
-A 304 from GitHub means nothing new and costs no write.
+The poll state (since, Last-Modified) and the unacked requests are kept
+in the archived 'bot-state: ${STATE_NAME}' draft item on the board,
+shared by every machine. The poll state only advances when every thread
+was routed, so a failed run is retried. It is written once, at the end
+of a run, and only if something changed (a 304 from GitHub means
+nothing new), with a checked write that merges in what another machine
+wrote meanwhile. Filed triggers are cached in ${LOCAL_DIR}.
 
 Options:
   --dry-run           Report only: file and add nothing, mark nothing read,
@@ -88,7 +93,7 @@ Options:
 This is a one-shot command; it prints GitHub's X-Poll-Interval, the
 minimum time to wait before polling again. The token needs the classic
 'notifications' scope. REST is used for everything but the state (one
-GraphQL read per run, one write per poll that saw changes).
+GraphQL read per run, and a reread and a write per run that changed it).
 EOF
 }
 
@@ -210,8 +215,9 @@ login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh 
 test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}; these would be someone else's notifications"
 
 # Two runs on this machine must not both route the same threads or race on
-# the state. (Runs on different machines are serialized by nothing but the
-# issue dedupe, which keeps them safe.)
+# the state. (Runs on different machines are serialized by nothing: the
+# issue dedupe keeps filing safe, and the checked state write merges their
+# requests and acks.)
 mkdir -p "${LOCAL_DIR}"
 exec {lock_fd}>"${LOCAL_DIR}/lock" || fatal "cannot open ${LOCAL_DIR}/lock"
 flock -n "${lock_fd}" || fatal "another $(basename "$0") run holds ${LOCAL_DIR}/lock"
@@ -225,7 +231,7 @@ load_local() {
     shift
     if test -s "${file}"; then
         jq -ce --argjson v "${LOCAL_VERSION}" 'if .version == $v then . else error("unsupported version \(.version)") end' "${file}" ||
-            fatal "cannot parse ${file}; fix it or move it away (unacked requests in it would be lost)"
+            fatal "cannot parse ${file}; fix it or move it away"
     else
         jq -nc --argjson v "${LOCAL_VERSION}" '$ARGS.positional | map({(.): {}}) | add + {version: $v}' --args "$@"
     fi
@@ -238,10 +244,64 @@ save_local() {
     mv -f "$1.tmp.$$" "$1"
 }
 
-# {pending: {TRIGGER_URL: record}, acked: {TRIGGER_URL: time}}
-PENDING_JSON=$(load_local "${PENDING_FILE}" pending acked)
 # {filed: {TRIGGER_URL: issue URL}}
 FILED_JSON=$(load_local "${FILED_FILE}" filed)
+
+# --- State on the board ---------------------------------------------------
+
+# board_failed STATUS MESSAGE: after a failed bot-board call, pass a
+# rate-limit exit through (bot-board printed why), else fail.
+board_failed() {
+    test "$1" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
+    fatal "$2"
+}
+
+# {since, last_modified, pending: {TRIGGER_URL: record},
+#  acked: {TRIGGER_URL: time}, updated_at, host}
+track=(--track)
+! ${dry_run} || track=()
+STATE_JSON=$("${BOT_BOARD}" state-get "${track[@]}" "${STATE_NAME}") || board_failed $? "reading the state failed"
+# {pending, acked}, changed as the run goes and written by save_state.
+PENDING_JSON=$(jq -c '{pending: (.pending // {}), acked: (.acked // {})}' <<<"${STATE_JSON}")
+if test -s "${LEGACY_PENDING_FILE}"; then
+    PENDING_JSON=$(jq -c --slurpfile old "${LEGACY_PENDING_FILE}" '($old[0] | {pending, acked}) * .' <<<"${PENDING_JSON}") ||
+        fatal "cannot parse ${LEGACY_PENDING_FILE}, the old unacked requests; fix it or move it away"
+fi
+
+# save_state [SINCE LAST_MODIFIED]: writes PENDING_JSON's requests, and
+# the new poll position if given, unless nothing changed (or in a dry
+# run). Changes that an earlier run on this machine failed to write are
+# part of STATE_JSON already, so the checked write is made anyway; with
+# nothing to write it costs no call.
+save_state() {
+    local new failed="recording the state failed; the next run will redo this poll"
+    test $# -gt 0 || failed="recording the requests failed; they are kept locally for the next run"
+    new=$(jq -c --argjson p "${PENDING_JSON}" '. + $p
+        | if $ARGS.positional != [] then .since = $ARGS.positional[0] | .last_modified = $ARGS.positional[1] else . end' \
+        --args "$@" <<<"${STATE_JSON}")
+    if jq -e --argjson new "${new}" 'del(.updated_at, .host) == ($new | del(.updated_at, .host))' <<<"${STATE_JSON}" >/dev/null; then
+        ${dry_run} || "${BOT_BOARD}" state-put --checked "${STATE_NAME}" "${STATE_JSON}" || board_failed $? "${failed}"
+        echo "No changes; state unchanged."
+        return 0
+    fi
+    if ${dry_run}; then
+        echo "Dry run: state unchanged."
+        return 0
+    fi
+    new=$(jq -c --arg now "$(iso_now)" --arg host "$(hostname)" '.updated_at = $now | .host = $host' <<<"${new}")
+    "${BOT_BOARD}" state-put --checked "${STATE_NAME}" "${new}" || board_failed $? "${failed}"
+    STATE_JSON=${new}
+    if test -e "${LEGACY_PENDING_FILE}"; then
+        mv -f "${LEGACY_PENDING_FILE}" "${LEGACY_PENDING_FILE}.migrated" ||
+            fatal "cannot move ${LEGACY_PENDING_FILE} away; its requests are on the board now, so remove it"
+        echo "Moved the unacked requests from ${LEGACY_PENDING_FILE} to the board; the old file is ${LEGACY_PENDING_FILE}.migrated." 1>&2
+    fi
+    if test $# -gt 0; then
+        echo "State advanced to since=$1."
+    else
+        echo "Recorded the requests; the poll state is unchanged."
+    fi
+}
 
 mark_read() {
     local rc=0
@@ -269,31 +329,23 @@ if test "${subcmd}" = ack; then
     rc=0
     for id in "${ack_ids[@]}"; do
         n=$(jq --arg id "${id}" '[.pending[] | select(.thread_id == $id)] | length' <<<"${PENDING_JSON}")
-        test "${n}" -gt 0 || warn "thread ${id} has no pending request on this machine; marking it read anyway"
+        test "${n}" -gt 0 || warn "thread ${id} has no pending request; marking it read anyway"
         mark_read "${id}" || { rc=1; continue; }
         PENDING_JSON=$(jq -c --arg id "${id}" --arg now "${now}" '
             ([.pending | to_entries[] | select(.value.thread_id == $id) | .key]) as $urls
             | .acked += ($urls | map({(.): $now}) | add // {})
             | .pending |= with_entries(select(.value.thread_id != $id))' <<<"${PENDING_JSON}")
-        save_local "${PENDING_FILE}" "${PENDING_JSON}"
         echo "Acked thread ${id} (${n} requests); marked it read."
     done
+    save_state >/dev/null
     exit "${rc}"
 fi
 
 PENDING_JSON=$(jq -c --arg cutoff "$(date -u -d "${ACKED_KEEP_DAYS} days ago" +%FT%TZ)" \
     '.acked |= with_entries(select(.value >= $cutoff))' <<<"${PENDING_JSON}")
 
-# --- State on the board ---------------------------------------------------
+# --- Poll position --------------------------------------------------------
 
-# board_failed STATUS MESSAGE: after a failed bot-board call, pass a
-# rate-limit exit through (bot-board printed why), else fail.
-board_failed() {
-    test "$1" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
-    fatal "$2"
-}
-
-STATE_JSON=$("${BOT_BOARD}" state-get "${STATE_NAME}") || board_failed $? "reading the poll state failed"
 since=$(jq -r '.since // empty' <<<"${STATE_JSON}")
 last_modified=$(jq -r '.last_modified // empty' <<<"${STATE_JSON}")
 test -n "${since}" || since=$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%FT%TZ)
@@ -569,13 +621,11 @@ add_assignment() {
 # ack_trigger URL: remembers a trigger as handled.
 ack_trigger() {
     PENDING_JSON=$(jq -c --arg url "$1" --arg now "$(iso_now)" '.acked[$url] = $now | del(.pending[$url])' <<<"${PENDING_JSON}")
-    save_local "${PENDING_FILE}" "${PENDING_JSON}"
 }
 
 # add_pending TRIGGER: keeps a request until 'ack' says it's on the board.
 add_pending() {
     PENDING_JSON=$(jq -c --argjson t "$1" '.pending[$t.url] = $t' <<<"${PENDING_JSON}")
-    save_local "${PENDING_FILE}" "${PENDING_JSON}"
 }
 
 nselected=0
@@ -662,19 +712,12 @@ print_pending
 # --- Advance the state ---------------------------------------------------
 
 if test "${nfailed}" -gt 0; then
-    echo "${nfailed} threads failed; the state stays at since=${since} so the next run retries them." 1>&2
+    echo "${nfailed} threads failed; the poll state stays at since=${since} so the next run retries them." 1>&2
+    save_state
     exit 1
 fi
-if ${dry_run}; then
-    echo "Dry run: state unchanged (since=${since})."
-    exit 0
-fi
 if test "$(jq length <<<"${threads}")" -eq 0 && test "${new_last_modified}" = "${last_modified}"; then
-    echo "No changes; state unchanged."
-    exit 0
+    save_state
+else
+    save_state "${poll_start}" "${new_last_modified}"
 fi
-new_state=$(jq -nc --arg since "${poll_start}" --arg lm "${new_last_modified}" --arg now "$(iso_now)" \
-    --arg host "$(hostname)" '{since: $since, last_modified: $lm, updated_at: $now, host: $host}')
-"${BOT_BOARD}" state-put "${STATE_NAME}" "${new_state}" ||
-    board_failed $? "recording the state failed; the next run will redo this poll"
-echo "State advanced to since=${poll_start}."

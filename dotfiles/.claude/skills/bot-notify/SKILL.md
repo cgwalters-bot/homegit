@@ -109,26 +109,30 @@ For each one:
    in your report), ack it: `bot-notify ack THREAD_ID`. That marks the
    thread read and stops the record from being printed again.
 
-Until acked, a record is kept in
-`${XDG_STATE_HOME:-~/.local/state}/bot-notify/pending.json` and printed by
-every run, even a 304 one, so a session that stops halfway loses nothing.
-Never ack a record you haven't handled. That file is per machine; the
+Until acked, a record is kept on the board (see State) and printed by
+every run, even a 304 one, on any machine, so a session that stops
+halfway loses nothing. Never ack a record you haven't handled. The
 thread stays unread on GitHub meanwhile, so a missed record also shows
 up in the notifications web UI.
 
 ## State
 
 The poll state (`since`, the start of the last fully routed poll, and
-GitHub's `Last-Modified` for `If-Modified-Since`) lives on the Workstream
-board in the draft item `bot-state: notifications`, which is archived so
-it doesn't show on the board and has Workflow manual. Never edit, unarchive
-or claim it. The script reads it through `bot-board state-get` (one
-GraphQL call per run) and writes it with `bot-board state-put` once per
-poll that saw changes; a 304 costs no write. GitHub can't list archived
-items, so bot-board knows the item by its id. Next to the local lock, `pending.json` holds the
-unacked requests (and, for 30 days, the acked ones, so a thread seen again
-doesn't bring them back) and `filed.json` the triggers already filed as
-issues, checked before the lagging issue list.
+GitHub's `Last-Modified` for `If-Modified-Since`) and the unacked requests
+(and, for 30 days, the acked ones, so a thread seen again doesn't bring
+them back) live on the Workstream board in the draft item
+`bot-state: notifications`, which is archived so it doesn't show on the
+board and has Workflow manual. Never edit, unarchive or claim it. The
+script reads it through `bot-board state-get` (one GraphQL call per run)
+and writes it at the end of a run that changed it, with a checked
+`bot-board state-put` (a reread and a write): if another machine wrote
+it meanwhile, say by acking a request, both changes are kept. A 304 with
+nothing to ack costs no write. GitHub can't list archived items, so
+bot-board knows the item by its id. Next to the local lock, `filed.json`
+caches the triggers already filed as issues, checked before the lagging
+issue list; losing it is harmless, since the issues carry markers. A
+`pending.json` from before the board held the requests is merged in and
+moved to `pending.json.migrated` by the first run that writes.
 
 ## Testing
 
