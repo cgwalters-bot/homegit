@@ -38,7 +38,8 @@ Runners are billed while they run, and larger ones cost more. So:
 - Pick the smallest size that fits: `--cores 4` for a quick Rust crate,
   16 (default) for bootc-sized builds, 64 only for heavy VM or
   compose-style tests. Pick the shortest `--duration` that covers the work
-  (30/60/120/240 minutes; default 240), since it's a hard upper bound.
+  (30/60/120/240 minutes, other values round up; default 240), since
+  it's a hard upper bound.
 - **Stop it as soon as the task's testing is done**, and before parking
   the item as Draft or Needs human. Never leave one running between
   tasks "just in case".
