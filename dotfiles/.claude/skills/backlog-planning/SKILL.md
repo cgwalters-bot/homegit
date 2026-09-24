@@ -297,10 +297,11 @@ $SHORT_SUMMARY")
 
 Then, in one call, record the rationale in the **Why** field (one sentence
 quoting or linking the triggering comment), and set its **Priority** and
-**Workflow**:
+**Workflow**, plus **Org** for a draft (`add` derives it from the URL, a
+draft has none; use the organization the work is in, or `other`):
 
 ```bash
-bot-board set "$ITEM_ID" --priority P1 --workflow branch \
+bot-board set "$ITEM_ID" --priority P1 --workflow branch --org bootc-dev \
   --why "cgwalters: \"we should add a test for this\" ($COMMENT_URL)"
 ```
 

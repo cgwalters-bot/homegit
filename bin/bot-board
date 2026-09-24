@@ -10,9 +10,27 @@ readonly BOARD_URL=https://github.com/users/${OWNER}/projects/${NUMBER}
 readonly ITEM_LIMIT=1000
 readonly TITLE_WIDTH=70
 # Board fields that 'set' can change, and the option that sets each.
-readonly SET_OPTIONS=(--status --priority --workflow --why --branch --gist)
+readonly SET_OPTIONS=(--status --priority --workflow --org --why --branch --gist)
 # Free-text fields; the rest of SET_OPTIONS are single-selects.
 readonly TEXT_FIELDS=(Why Branch Gist)
+# The Org field groups items by upstream organization. The fork PRs in
+# FORGE_OWNER's forks belong to the fork's parent. (The bot's own forks
+# don't show up that way: its compare URLs name the upstream repository,
+# and its non-fork repositories like homegit stay cgwalters-bot.)
+readonly FORGE_OWNER=cgwalters-forge
+# Org for owners with no Org option of their own.
+readonly ORG_OTHER=other
+# Org by the first word of a title, for draft items without a repository
+# link; the word is lowercased, with a trailing ':' removed.
+readonly -A TITLE_ORGS=(
+    [bootc]=bootc-dev [bcvk]=bootc-dev [infra]=bootc-dev [devspace]=bootc-dev
+    [composefs]=composefs [composefs-rs]=composefs
+    [ostree]=ostreedev [bootupd]=coreos [zlink]=z-galaxy [podman]=containers
+    [bot-board]=cgwalters-bot [bot-notify]=cgwalters-bot [bot-pr]=cgwalters-bot
+    [bot-watch]=cgwalters-bot [homegit]=cgwalters-bot
+)
+# Org edits sent per GraphQL request by fill-org.
+readonly ORG_BATCH=20
 # Every gh project call spends the bot's GraphQL quota (5000 points/hour),
 # which all agents share, so reads are cached on disk.
 readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-board
@@ -42,19 +60,28 @@ Usage: $(basename "$0") [--refresh] COMMAND [ARGS...]
 Read and update the Workstream board (${BOARD_URL}).
 
 Commands:
-  list [--status S] [--json]  List items by priority (P0 first): item id,
-                              priority, status, workflow, title, url.
-                              '--status none' lists untriaged items.
+  list [--status S] [--org O] [--json]
+                              List items by priority (P0 first): item id,
+                              priority, status, workflow, org, title, url.
+                              '--status none' lists untriaged items,
+                              '--org none' items without an Org.
   show ITEM                   Show all fields of one item
-  add URL                     Add an issue or PR; prints the new item id
+  add URL                     Add an issue or PR and set its Org from the
+                              URL's owner (a ${FORGE_OWNER} fork's
+                              parent); prints the new item id
   draft TITLE BODY            Create a draft item; prints the new item id
-  set ITEM [--status S] [--priority P] [--workflow W] [--why TEXT]
+  set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT]
            [--branch URL...] [--gist URL...]
                               Update fields of an item. Branch holds the
                               fork or upstream PR URL (or compare URLs of
                               pushed branches), Gist the write-up URL(s);
                               separate several with spaces.
                               An empty value clears a text field.
+  fill-org [--all] [--dry-run]
+                              Set Org on items that have none (--all: on
+                              every item), from the content URL, else the
+                              first Branch URL, else the title's first
+                              word; '${ORG_OTHER}' when nothing matches
   state-get NAME              Print the JSON state kept in the archived
                               draft item '${STATE_PREFIX}NAME' ({} if it
                               doesn't exist yet)
@@ -67,7 +94,7 @@ Options:
   --refresh                   Ignore cached board data and refetch it
 
 ITEM is a project item id (PVTI_...), an issue/PR URL, or OWNER/REPO#N.
-Valid values for Status, Priority and Workflow are read from the board.
+Valid values for Status, Priority, Workflow and Org are read from the board.
 
 Board calls use the bot's GraphQL quota, shared by all agents, so field
 definitions are cached for ${FIELDS_TTL}s and the item list for ${ITEMS_TTL}s in
@@ -214,11 +241,13 @@ resolve_item() {
 }
 
 cmd_list() {
-    local status="" json=false
+    local status="" org="" json=false
     while test $# -gt 0; do
         case "$1" in
             --status) test $# -ge 2 || fatal "--status requires an argument"; status=$2; shift 2 ;;
             --status=*) status=${1#--status=}; shift ;;
+            --org) test $# -ge 2 || fatal "--org requires an argument"; org=$2; shift 2 ;;
+            --org=*) org=${1#--org=}; shift ;;
             --json) json=true; shift ;;
             *) fatal "unknown argument for list: $1 (see --help)" ;;
         esac
@@ -227,21 +256,25 @@ cmd_list() {
         load_fields
         option_id Status "${status}" >/dev/null
     fi
+    if test -n "${org}" && test "${org}" != none; then
+        load_fields
+        option_id Org "${org}" >/dev/null
+    fi
     load_items
     # Unset priorities sort last; sort_by is stable, so board order is kept
     # within a priority.
     local sorted
-    sorted=$(jq --arg status "${status}" '
-        [.items[]
-         | select($status == "" or ($status == "none" and .status == null) or .status == $status)]
+    sorted=$(jq --arg status "${status}" --arg org "${org}" '
+        def matches($want; $have): $want == "" or ($want == "none" and $have == null) or $have == $want;
+        [.items[] | select(matches($status; .status) and matches($org; .org))]
         | sort_by(.priority // "P9")' <<<"${ITEMS_JSON}")
     if ${json}; then
         echo "${sorted}"
         return 0
     fi
     jq -r --argjson width "${TITLE_WIDTH}" '
-        ["ITEM", "PRI", "STATUS", "WORKFLOW", "TITLE", "URL"],
-        (.[] | [.id, .priority // "-", .status // "-", .workflow // "-",
+        ["ITEM", "PRI", "STATUS", "WORKFLOW", "ORG", "TITLE", "URL"],
+        (.[] | [.id, .priority // "-", .status // "-", .workflow // "-", .org // "-",
                 (.title | if length > $width then .[:$width - 3] + "..." else . end),
                 .content.url // "(draft)"])
         | @tsv' <<<"${sorted}" | column -t -s $'\t'
@@ -258,7 +291,7 @@ cmd_show() {
            ["url", .content.url // "-"],
            ["draft id", (if .content.type == "DraftIssue" then .content.id else null end)],
            ["status", .status // "-"], ["priority", .priority // "-"],
-           ["workflow", .workflow // "-"],
+           ["workflow", .workflow // "-"], ["org", .org // "-"],
            ["assignees", ((.assignees // []) | join(", "))],
            ["linked PRs", ((."linked pull requests" // []) | join(" "))],
            ["branch", .branch], ["gist", .gist],
@@ -271,8 +304,17 @@ cmd_show() {
 cmd_add() {
     test $# -eq 1 || fatal "usage: $(basename "$0") add URL"
     [[ "$1" == https://github.com/* ]] || fatal "expected an issue or PR URL on github.com, got '$1'"
+    local org id
+    load_fields
+    # A failed fork lookup shouldn't keep the item off the board.
+    org=$(org_of_url "$1") || org=
     invalidate_items
-    ghq project item-add "${NUMBER}" --owner "${OWNER}" --url "$1" --format json --jq .id
+    id=$(ghq project item-add "${NUMBER}" --owner "${OWNER}" --url "$1" --format json --jq .id) ||
+        fail_after $? "adding $1 to the board failed"
+    echo "${id}"
+    if test -z "${org}" || ! set_org "${id}" "${org}"; then
+        echo "warning: Org is not set on ${id}; run: $(basename "$0") fill-org" 1>&2
+    fi
 }
 
 cmd_draft() {
@@ -307,7 +349,7 @@ validate_links() {
 }
 
 cmd_set() {
-    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--why TEXT] [--branch URL] [--gist URL]"
+    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT] [--branch URL] [--gist URL]"
     local item=$1
     shift
     test $# -gt 0 || fatal "nothing to set; valid options: ${SET_OPTIONS[*]}"
@@ -316,7 +358,7 @@ cmd_set() {
     load_fields
     while test $# -gt 0; do
         case "$1" in
-            --status|--priority|--workflow|--why|--branch|--gist)
+            --status|--priority|--workflow|--org|--why|--branch|--gist)
                 test $# -ge 2 || fatal "$1 requires an argument"
                 field=${1#--}
                 field=${field^}
@@ -358,6 +400,116 @@ cmd_set() {
             --field-id "${field_ids[i]}" "${args[i]}" >/dev/null ||
             fatal "setting ${names[i]} on ${id} failed"
         echo "${id}: ${names[i]}"
+    done
+    invalidate_items
+}
+
+# --- Org -------------------------------------------------------------------
+
+# org_option OWNER: the Org option named OWNER (ignoring case), else
+# ORG_OTHER; requires load_fields.
+org_option() {
+    field_json Org | jq -r --arg owner "${1,,}" --arg other "${ORG_OTHER}" '
+        first(.options[].name | select(ascii_downcase == $owner)) // $other'
+}
+
+# org_of_url URL: the Org of a github.com repository URL (issue, PR,
+# compare, blob, ...), or nothing for other URLs; requires load_fields.
+# Resolving a fork's parent is a REST call, outside the GraphQL quota.
+org_of_url() {
+    [[ "$1" =~ ^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+) ]] || return 0
+    local owner=${BASH_REMATCH[1]} repo=${BASH_REMATCH[2]} parent
+    if test "${owner,,}" = "${FORGE_OWNER}"; then
+        parent=$(gh api "repos/${owner}/${repo}" --jq '.parent.owner.login // empty') ||
+            fatal "looking up the parent of ${owner}/${repo} failed"
+        test -z "${parent}" || owner=${parent}
+    fi
+    org_option "${owner}"
+}
+
+# item_org ITEM_JSON: the Org derived from an item's content URL, else its
+# first Branch URL, else its title's first word, else nothing; requires
+# load_fields.
+item_org() {
+    local url branch title word org
+    { read -r url; read -r branch; read -r title; } < <(jq -r '
+        .content.url // "", ((.branch // "") | split(" ") | map(select(. != "")) | first // ""),
+        (.title // "" | gsub("[\n\t]"; " "))' <<<"$1")
+    for url in "${url}" "${branch}"; do
+        # Command substitutions don't inherit set -e, so pass failures on.
+        org=$(org_of_url "${url}") || exit
+        test -z "${org}" || { echo "${org}"; return 0; }
+    done
+    read -r word _ <<<"${title,,}"
+    word=${word%:}
+    test -z "${word}" || echo "${TITLE_ORGS[${word}]:-}"
+}
+
+# set_org ITEM ORG: sets one item's Org; requires load_fields.
+set_org() {
+    local field option project
+    field=$(field_json Org | jq -r .id)
+    option=$(option_id Org "$2")
+    project=$(project_id) || return
+    invalidate_items
+    ghq project item-edit --project-id "${project}" --id "$1" --field-id "${field}" \
+        --single-select-option-id "${option}" >/dev/null
+}
+
+cmd_fill_org() {
+    local all=false dry_run=false
+    while test $# -gt 0; do
+        case "$1" in
+            --all) all=true; shift ;;
+            --dry-run) dry_run=true; shift ;;
+            *) fatal "unknown argument for fill-org: $1 (see --help)" ;;
+        esac
+    done
+    load_fields
+    load_items
+    local field item id org title updates=() leftovers=()
+    field=$(field_json Org | jq -r .id)
+    while IFS= read -r item; do
+        id=$(jq -r .id <<<"${item}")
+        [[ "${id}" =~ ^PVTI_[A-Za-z0-9_-]+$ ]] || fatal "unexpected item id '${id}'"
+        title=$(jq -r .title <<<"${item}")
+        org=$(item_org "${item}")
+        if test -z "${org}"; then
+            org=${ORG_OTHER}
+            leftovers+=("${id}  ${title}")
+        fi
+        test "$(jq -r '.org // ""' <<<"${item}")" = "${org}" && continue
+        printf '%s\t%s\t%s\n' "${id}" "${org}" "${title:0:${TITLE_WIDTH}}"
+        updates+=("${id} $(option_id Org "${org}")")
+    done < <(jq -c --argjson all "${all}" '.items[] | select($all or .org == null)' <<<"${ITEMS_JSON}")
+    if test "${#leftovers[@]}" -gt 0; then
+        echo "No org derivable for these, so they get '${ORG_OTHER}':" 1>&2
+        printf '  %s\n' "${leftovers[@]}" 1>&2
+    fi
+    echo "${#updates[@]} item(s) to update" 1>&2
+    if ${dry_run} || test "${#updates[@]}" -eq 0; then
+        return 0
+    fi
+    local project requests remaining start i query option
+    project=$(project_id) || fail_after $? "cannot look up the project id"
+    # Each request is one mutation of ORG_BATCH aliased edits.
+    requests=$(( (${#updates[@]} + ORG_BATCH - 1) / ORG_BATCH ))
+    remaining=$(gh api rate_limit --jq .resources.graphql.remaining 2>/dev/null) || remaining=
+    if test -n "${remaining}" && test "${remaining}" -lt $((requests * ORG_BATCH + QUOTA_MARGIN)); then
+        rate_limited "only ${remaining} GraphQL points left, not starting ${#updates[@]} edit(s)"
+    fi
+    invalidate_items
+    for ((start = 0; start < ${#updates[@]}; start += ORG_BATCH)); do
+        query='mutation($project: ID!, $field: ID!) {'
+        for ((i = start; i < start + ORG_BATCH && i < ${#updates[@]}; i++)); do
+            read -r id option <<<"${updates[i]}"
+            query+=" m${i}: updateProjectV2ItemFieldValue(input: {projectId: \$project, itemId: \"${id}\",
+                fieldId: \$field, value: {singleSelectOptionId: \"${option}\"}}) { projectV2Item { id } }"
+        done
+        query+=' }'
+        gqlq "${query}" -f project="${project}" -f field="${field}" >/dev/null ||
+            fail_after $? "setting Org on items $((start + 1))-${i} of ${#updates[@]} failed; rerun fill-org to retry the rest"
+        echo "set Org on items $((start + 1))-${i} of ${#updates[@]}" 1>&2
     done
     invalidate_items
 }
@@ -498,6 +650,7 @@ shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
     list|show|add|draft|set) ;;
+    fill-org) command=fill_org ;;
     state-get) command=state_get ;;
     state-put) command=state_put ;;
     *) fatal "unknown command '${command}' (see --help)" ;;

@@ -38,6 +38,12 @@ fields hold result links: the fork PR URL while Draft, the upstream PR URL
 once In Review (or compare URLs, for fixup branches on cgwalters' PRs),
 and secret gist write-up URLs. **Priority** ranks the work
 (below), and **Workflow** says what kind of output the item wants.
+**Org** groups items by upstream organization (`bootc-dev`, `composefs`,
+`ostreedev`, `coreos`, `cgwalters-bot`, `z-galaxy`, `containers`, or
+`other`): the owner of the item's repository, where a fork PR in
+cgwalters-forge counts as its upstream's. `bot-board add` sets it; set it
+yourself on draft items (`--org`), and `bot-board fill-org` fills in any
+item that lacks one.
 
 ## Workflow
 
@@ -131,11 +137,12 @@ and resolves field and option IDs at runtime. Run `bot-board --help`.
 ```bash
 bot-board list                        # all items, P0 first
 bot-board list --status "In Progress" # already-claimed work: resume it first
+bot-board list --org composefs        # one org's items ('--org none': unset)
 bot-board list --status Todo --json   # full item JSON, for jq
 bot-board show ITEM                   # every field, plus a draft's body
 bot-board set ITEM --status Draft --branch URL --why "..."
-                                      # also --gist, --priority, --workflow
-bot-board add URL                     # prints the new item id
+                                      # also --gist, --priority, --workflow, --org
+bot-board add URL                     # prints the new item id; sets Org
 bot-board draft TITLE BODY            # prints the new item id
 ```
 
@@ -158,7 +165,7 @@ history and confuse the human.
 Underneath, it uses `gh project field-list`/`item-list` (the item JSON has
 `id`, `content` with `type`, `url` and, for drafts, `id` and `body`, plus one
 key per field with only the first letter lowercased: `status`, `priority`,
-`workflow`, `why`, `branch`, `gist`, `"linked pull requests"`, ...; unset
+`workflow`, `org`, `why`, `branch`, `gist`, `"linked pull requests"`, ...; unset
 fields are absent) and `gh project item-edit --project-id ... --id ITEM --field-id ...` with
 `--single-select-option-id` or `--text`. The `project` scope is required
 (`gh auth status` shows scopes; for an OAuth login use
