@@ -85,13 +85,20 @@ Commands:
         The upstream PR is a draft with --draft, or when ${REVIEWER}'s latest
         '${DRAFT_COMMAND}' or '${READY_COMMAND}' comment line is '${DRAFT_COMMAND}'. --dry-run checks
         everything and prints what would happen without changing anything.
+  get-body FORK_PR_URL
+        Print a fork PR's description without its bot-meta section, to
+        edit and pass to set-body, and remember it as the base that
+        set-body checks for changes.
   set-body FORK_PR_URL --body-file FILE [--force]
         Replace a fork PR's description with FILE, keeping its bot-meta
         section, and record it as the bot's, so that inbox doesn't report
         it as an edit. Use this for every change the bot makes to a fork
-        PR's body. It refuses if ${REVIEWER} edited the body since the bot
-        last wrote it: read his version (gh pr view URL), keep his text
-        in FILE, and rerun with --force.
+        PR's body, starting from get-body's output. It refuses if the body
+        changed since get-body, or, without get-body, if ${REVIEWER}
+        edited it since the bot last wrote it: then run get-body again,
+        keep his text in FILE, and rerun (--force skips the checks).
+        GitHub can't make the write conditional, so an edit in the second
+        between the check and the write is still overwritten.
   inbox [--since DATE] [--dry-run]
         List the bot's open fork PRs in ${FORGE_ORG} (and, from before
         it, in ${BOT_LOGIN}'s own forks) with activity by ${REVIEWER} since the last
@@ -101,9 +108,11 @@ Commands:
   -h, --help
         Show this help
 
-REST is used, except for one GraphQL call per fork PR whose body changed
-other than through bot-pr, to find out who edited it (REST doesn't say):
-the GraphQL quota is shared with the board tooling. Only activity whose GitHub author is the '${REVIEWER}' login counts.
+REST is used, except to find out who edited a fork PR's body, which only
+GraphQL says: one call when set-body finds a body that isn't the bot's
+last write, and in inbox per fork PR whose body changed other than
+through set-body. The GraphQL quota is shared with the board tooling.
+Only activity whose GitHub author is the '${REVIEWER}' login counts.
 inbox state lives in ${STATE_FILE}. BOT_PR_FORGE overrides the
 organization (${FORGE_ORG}).
 EOF
@@ -435,14 +444,17 @@ def strip_meta: normalize | gsub("\\s*<!-- bot-meta -->[\\s\\S]*?<!-- /bot-meta 
 def excerpt($n): normalize | gsub("\\s+"; " ") | if length > $n then .[:$n] + "..." else . end;
 '
 
-# Inbox state: {version, last_check, prs: {URL: {body, seen, bot_body,
-# bot_at, reviewer_edit}}, closed: {URL: true}}. Body edits have no REST
-# event, so they show up as a change of 'body', the sha256 of the body
-# inbox last saw; 'seen' is when a PR's activity was last reported.
-# 'bot_body' is the hash of the body fork-pr or set-body last wrote, at
-# 'bot_at': a body that is the bot's own last write needs no GraphQL call
-# to know it isn't the reviewer's. 'reviewer_edit' is when the reviewer
-# edited a body that 'set-body --force' replaced before inbox saw it.
+# Inbox state: {version, last_check, prs: {URL: {body, seen, edits_seen,
+# bot_body, base_body, reviewer_edit}}, closed: {URL: true}}. Body edits
+# have no REST event, so they show up as a change of 'body', the sha256 of
+# the body inbox last saw; 'seen' is when a PR's activity was last
+# reported, and 'edits_seen' how many body edits GitHub listed when inbox
+# last asked who made them. 'bot_body' is the hash of the body fork-pr or
+# set-body last wrote: a body that is the bot's own last write needs no
+# GraphQL call to know it isn't the reviewer's. 'base_body' is the hash
+# get-body printed, which set-body compares with. 'reviewer_edit' is
+# {at, note}: an edit by the reviewer (or, with GraphQL down, possibly by
+# him) that set-body replaced before inbox saw it.
 lock_state() {
     require_cmd flock "install util-linux"
     mkdir -p "${STATE_DIR}" || fatal "cannot create ${STATE_DIR}"
@@ -469,25 +481,34 @@ body_hash() {
     jq -r "${BODY_JQ} .body | normalize" | sha256sum | cut -d' ' -f1
 }
 
-# reviewer_body_edits REPO NUMBER SINCE: prints when REVIEWER edited the
-# PR's body since SINCE, one time per line, oldest first. REST doesn't say
-# who edited a body, so this is a GraphQL call; on failure (rate limits
-# included) it returns nonzero rather than exiting, so callers can fall
-# back.
-reviewer_body_edits() {
+# body_edits REPO NUMBER: prints the edits of a PR's body as JSON,
+# {total, nodes: [{at, by}]} with the newest 100 nodes, newest first. The
+# first edit also adds a node for the original body, by the PR's author.
+# REST doesn't say who edited a body, so this is a GraphQL call; on
+# failure (rate limits included) it returns nonzero rather than exiting,
+# so callers can fall back.
+body_edits() {
     # shellcheck disable=SC2016 # GraphQL variables, not shell
     local query='query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      userContentEdits(last: 100) { nodes { editedAt editor { login } } }
+      userContentEdits(first: 100) { totalCount nodes { editedAt editor { login } } }
     }
   }
-}' edits
-    edits=$(gh api graphql -f query="${query}" -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" \
-        --jq '.data.repository.pullRequest.userContentEdits.nodes' 2>/dev/null) || return 1
-    jq -r --arg since "$3" --arg r "${REVIEWER}" \
-        'map(select(.editedAt >= $since and .editor.login == $r) | .editedAt) | sort | .[]' <<<"${edits}"
+}'
+    gh api graphql -f query="${query}" -f owner="${1%%/*}" -f name="${1#*/}" -F number="$2" \
+        --jq '.data.repository.pullRequest.userContentEdits
+              | {total: .totalCount, nodes: [.nodes[] | {at: .editedAt, by: (.editor.login // "ghost")}]}' 2>/dev/null
 }
+
+# jq over body_edits output, with $bot and $r the bot's and reviewer's
+# logins. Edits are told apart by their order, not their time, which is
+# GitHub's clock and may be the same second for several.
+# shellcheck disable=SC2016 # jq, not shell
+readonly EDITS_JQ='
+def since_bot: .nodes | (map(.by == $bot) | index(true)) as $i | .[:($i // length)];
+def reviewers: [.[] | select(.by == $r) | .at] | reverse | .[];
+'
 
 cmd_fork_pr() {
     local upstream="" base="" branch="" item="" title="" body_file="" from=.
@@ -572,7 +593,7 @@ cmd_fork_pr() {
         state=$(load_state)
         hash=$(body_hash <<<"${created}")
         save_state "$(jq -c --arg u "${url}" --arg h "${hash}" --arg now "$(date -u +%FT%TZ)" \
-            '.prs[$u] = {body: $h, seen: $now, bot_body: $h, bot_at: $now}' <<<"${state}")"
+            '.prs[$u] = {body: $h, seen: $now, bot_body: $h}' <<<"${state}")"
     ) || warn "recording ${url} in ${STATE_FILE} failed; inbox will pick it up without its original body"
 
     local perm
@@ -607,6 +628,29 @@ cmd_fork_setup() {
     fork_setup "${fork}"
 }
 
+# read_fork_pr URL: sets FORK, NUMBER and PR (the PR's JSON) for an open
+# fork PR of the bot's that has a bot-meta section.
+read_fork_pr() {
+    parse_fork_pr_url "$1"
+    PR=$(ghapi "repos/${FORK}/pulls/${NUMBER}") || fatal "cannot read $1"
+    test "$(jq -r .user.login <<<"${PR}")" = "${BOT_LOGIN}" || fatal "$1 was not opened by ${BOT_LOGIN}"
+    test "$(jq -r .state <<<"${PR}")" = open || fatal "$1 is not open"
+    test -n "$(jq -r "${BODY_JQ} .body | meta" <<<"${PR}")" ||
+        fatal "$1 has no complete ${META_START} ... ${META_END} section; was it opened with fork-pr? Restore it in the PR body"
+}
+
+cmd_get_body() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") get-body FORK_PR_URL"
+    local url=$1 FORK NUMBER PR state
+    check_login
+    lock_state
+    state=$(load_state)
+    read_fork_pr "${url}"
+    save_state "$(jq -c --arg u "${url}" --arg h "$(body_hash <<<"${PR}")" \
+        '.prs[$u] = ((.prs[$u] // {}) + {base_body: $h})' <<<"${state}")"
+    jq -r "${BODY_JQ} .body | strip_meta" <<<"${PR}"
+}
+
 cmd_set_body() {
     local url="" body_file="" force=false
     while test $# -gt 0; do
@@ -621,57 +665,69 @@ cmd_set_body() {
         fatal "usage: $(basename "$0") set-body FORK_PR_URL --body-file FILE [--force]"
     fi
     test -s "${body_file}" || fatal "--body-file '${body_file}' is missing or empty"
-    local FORK NUMBER
+    local FORK NUMBER PR
     parse_fork_pr_url "${url}"
     check_login
     # Held from the check to the write, so that an inbox run can't
     # record the reviewer's edit as seen in between.
     lock_state
-    local state pr
+    local state meta body
     state=$(load_state)
-    pr=$(ghapi "repos/${FORK}/pulls/${NUMBER}") || fatal "cannot read ${url}"
-    test "$(jq -r .user.login <<<"${pr}")" = "${BOT_LOGIN}" || fatal "${url} was not opened by ${BOT_LOGIN}"
-    test "$(jq -r .state <<<"${pr}")" = open || fatal "${url} is not open"
-    local meta body
-    meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
-    test -n "${meta}" || fatal "${url} has no complete ${META_START} ... ${META_END} section; was it opened with fork-pr? Restore it in the PR body"
-    # FILE may have the section or not (e.g. when it comes from 'gh pr
-    # view'); the PR's current one is kept either way.
+    read_fork_pr "${url}"
+    meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${PR}")
+    # FILE may have the section or not; the PR's current one is kept
+    # either way.
     body=$(jq -Rsr "${BODY_JQ} strip_meta" <"${body_file}")
     test -n "${body}" || fatal "${body_file} has nothing besides a bot-meta section"
     ! grep -qF 'bot-meta' <<<"${body}" || fatal "${body_file} mentions bot-meta outside a complete section; fix its markers"
     grep -qxF "${LLMS_TRAILER}" <<<"${body}" ||
         warn "${body_file} has no '${LLMS_TRAILER}' line; add one unless the project's policy says otherwise"
 
-    # Unless the body is still the bot's own last write, find out whether
-    # the reviewer edited it since.
-    local hash edits="" check_failed=false
-    hash=$(body_hash <<<"${pr}")
-    if test "${hash}" != "$(jq -r --arg u "${url}" '.prs[$u].bot_body // empty' <<<"${state}")"; then
-        local since
-        since=$(jq -r --arg u "${url}" '.prs[$u].bot_at // empty' <<<"${state}")
-        since=${since:-$(jq -r .created_at <<<"${pr}")}
-        edits=$(reviewer_body_edits "${FORK}" "${NUMBER}" "${since}") || check_failed=true
-        if ! ${force}; then
+    local hash bot_body base_body seen_body
+    hash=$(body_hash <<<"${PR}")
+    read -r bot_body base_body seen_body < <(jq -r --arg u "${url}" \
+        '.prs[$u] // {} | "\(.bot_body // "-") \(.base_body // "-") \(.body // "-")"' <<<"${state}")
+    # Unless the body is still the bot's own last write, find the
+    # reviewer's edits since that write.
+    local edits his="" check_failed=false
+    if test "${hash}" != "${bot_body}"; then
+        if edits=$(body_edits "${FORK}" "${NUMBER}"); then
+            his=$(jq -r --arg bot "${BOT_LOGIN}" --arg r "${REVIEWER}" "${EDITS_JQ} since_bot | reviewers" <<<"${edits}")
+        else
+            check_failed=true
+        fi
+    fi
+    local redo
+    redo="run '$(basename "$0") get-body ${url} > ${body_file}', keep his text, and rerun set-body"
+    if ! ${force}; then
+        if test "${base_body}" != -; then
+            test "${hash}" = "${base_body}" ||
+                fatal "${url}'s body changed since get-body${his:+ (${REVIEWER} edited it)}; ${redo}"
+        else
             ! ${check_failed} ||
-                fatal "cannot tell whether ${REVIEWER} edited ${url}'s body (GraphQL failed); check with 'gh pr view ${url}', keep any text of his in ${body_file}, and rerun with --force"
-            test -z "${edits}" ||
-                fatal "${REVIEWER} edited ${url}'s body since the bot last wrote it (at $(paste -sd' ' <<<"${edits}")); read it with 'gh pr view ${url}', keep his text in ${body_file}, and rerun with --force"
+                fatal "cannot tell whether ${REVIEWER} edited ${url}'s body (GraphQL failed); ${redo}"
+            test -z "${his}" ||
+                fatal "${REVIEWER} edited ${url}'s body since the bot last wrote it (at $(sort <<<"${his}" | paste -sd' ')); ${redo}"
         fi
     fi
 
-    local updated now
+    local updated
     updated=$(jq -n --arg body "${body}"$'\n\n'"${meta}" '{body: $body}' |
         ghapi -X PATCH "repos/${FORK}/pulls/${NUMBER}" --input -) || fatal "updating the body of ${url} failed"
-    now=$(date -u +%FT%TZ)
     # An edit of his that inbox hasn't shown yet still is, though replaced.
-    local pending=""
-    if test -n "${edits}" && test "${hash}" != "$(jq -r --arg u "${url}" '.prs[$u].body // empty' <<<"${state}")"; then
-        pending=$(tail -n1 <<<"${edits}")
+    local pending=null how="then replaced with set-body"
+    ! ${force} || how+=" --force"
+    if test "${hash}" != "${seen_body}"; then
+        if test -n "${his}"; then
+            pending=$(jq -nc --arg at "$(sort <<<"${his}" | tail -n1)" --arg n " (${how})" '{at: $at, note: $n}')
+        elif ${check_failed}; then
+            pending=$(jq -nc --arg at "$(jq -r .updated_at <<<"${PR}")" \
+                --arg n " (possibly by ${REVIEWER}: GraphQL was down; ${how})" '{at: $at, note: $n}')
+        fi
     fi
-    save_state "$(jq -c --arg u "${url}" --arg h "$(body_hash <<<"${updated}")" --arg now "${now}" --arg p "${pending}" '
-        .prs[$u] = ((.prs[$u] // {}) + {bot_body: $h, bot_at: $now}
-            | if $p != "" then .reviewer_edit = $p else . end)' <<<"${state}")"
+    save_state "$(jq -c --arg u "${url}" --arg h "$(body_hash <<<"${updated}")" --argjson p "${pending}" '
+        .prs[$u] = ((.prs[$u] // {}) + {bot_body: $h} | del(.base_body)
+            | if $p != null then .reviewer_edit = $p else . end)' <<<"${state}")"
     info "Updated the body of ${url}"
 }
 
@@ -967,7 +1023,7 @@ cmd_inbox() {
     closed=$(jq -c --arg m "${META_START}" '[.[] | select((.body // "") | contains($m))]' <<<"${closed}")
 
     local nreported=0 found url repo number pr head_sha pr_since activity events lines verdict hash old_hash
-    local bot_body reviewer_edit edits body_note
+    local bot_body edits_seen pending edits body_note
     while IFS= read -r found; do
         test -n "${found}" || continue
         url=$(jq -r .url <<<"${found}")
@@ -987,30 +1043,40 @@ cmd_inbox() {
                   | {kind: \"renamed\", at: .created_at, from: .rename.from, to: .rename.to}" | jq -sc .) ||
             fatal "cannot read the timeline of ${url}"
         hash=$(body_hash <<<"${pr}")
-        read -r old_hash bot_body reviewer_edit < <(jq -r --arg u "${url}" \
-            '.prs[$u] // {} | "\(.body // "-") \(.bot_body // "-") \(.reviewer_edit // "-")"' <<<"${state}")
+        read -r old_hash bot_body edits_seen < <(jq -r --arg u "${url}" \
+            '.prs[$u] // {} | "\(.body // "-") \(.bot_body // "-") \(.edits_seen // "-")"' <<<"${state}")
+        pending=$(jq -c --arg u "${url}" '.prs[$u].reviewer_edit // null' <<<"${state}")
+        events=$(jq -c --argjson p "${pending}" '. + [$p // empty | {kind: "body edited", at, note}]' <<<"${events}")
         body_note=""
-        test "${reviewer_edit}" = - ||
-            events=$(jq -c --arg at "${reviewer_edit}" \
-                '. + [{kind: "body edited", at: $at, note: " (then replaced with set-body --force)"}]' <<<"${events}")
         # A new body that isn't the bot's own last write: ask who edited it.
         if test "${old_hash}" != - && test "${hash}" != "${old_hash}" && test "${hash}" != "${bot_body}"; then
-            if edits=$(reviewer_body_edits "${repo}" "${number}" "${pr_since}"); then
-                # Minus the one set-body --force replaced, listed above.
-                events=$(jq -c --arg e "${edits}" --arg r "${reviewer_edit}" \
-                    '. + [$e | splits("\n") | select(. != "" and . != $r) | {kind: "body edited", at: ., note: ""}]' <<<"${events}")
+            if edits=$(body_edits "${repo}" "${number}"); then
+                # The edits since the last check: counted, since GitHub's
+                # clock is not ours; by time for --since or at first.
+                test -z "${since}" || edits_seen=-
+                events=$(jq -c --argjson e "${edits}" --arg seen "${edits_seen}" --arg since "${pr_since}" \
+                    --arg bot "${BOT_LOGIN}" --arg r "${REVIEWER}" --argjson p "${pending}" "${EDITS_JQ}"'
+                    . + [$e | if $seen != "-" and .total != null and ($seen | tonumber) <= .total
+                              then .nodes[:(.total - ($seen | tonumber))]
+                              else [.nodes[] | select(.at >= $since)] end
+                        | reviewers
+                        # the one set-body replaced, listed already
+                        | select(. != $p.at) | {kind: "body edited", at: ., note: ""}]' <<<"${events}")
+                edits_seen=$(jq -r '.total // "-"' <<<"${edits}")
             else
                 warn "cannot tell who edited the body of ${url} (GraphQL failed)"
-                body_note="  body edited (since the last check; by ${REVIEWER} or the bot)"
+                body_note="  body edited (since the last check; by ${REVIEWER} or the bot, GraphQL failed)"
             fi
         fi
-        state=$(jq -c --arg u "${url}" --arg h "${hash}" --arg now "${now}" \
-            '.prs[$u] = ((.prs[$u] // {}) + {body: $h, seen: $now} | del(.reviewer_edit))' <<<"${state}")
+        state=$(jq -c --arg u "${url}" --arg h "${hash}" --arg now "${now}" --arg e "${edits_seen}" '
+            .prs[$u] = ((.prs[$u] // {}) + {body: $h, seen: $now} | del(.reviewer_edit)
+                | if $e != "-" then .edits_seen = ($e | tonumber) else . end)' <<<"${state}")
         lines=$(jq -r --arg since "${pr_since}" --argjson n "${EXCERPT_LEN}" --argjson events "${events}" "${BODY_JQ}"'
             [(.[] | select(.at >= $since)
                   # the container of inline comments, which are listed anyway
                   | select(.kind != "review" or .state != "COMMENTED" or (.body // "") != "")),
-             ($events[] | select(.at >= $since))] | sort_by(.at) | .[]
+             # body edits are selected already, by count where possible
+             ($events[] | select(.at >= $since or .kind == "body edited"))] | sort_by(.at) | .[]
             | if .kind == "renamed" then "  \(.at) title edited: \(.from | tojson) -> \(.to | tojson)"
               elif .kind == "body edited" then "  \(.at) body edited\(.note)"
               elif .kind == "review" then "  \(.at) review \(.state): \(.url)\(if (.body // "") != "" then "\n    > " + (.body | excerpt($n)) else "" end)"
@@ -1060,6 +1126,7 @@ case "${command}" in
     fork-pr) command=fork_pr ;;
     fork-setup) command=fork_setup ;;
     set-body) command=set_body ;;
+    get-body) command=get_body ;;
     promote|inbox) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac

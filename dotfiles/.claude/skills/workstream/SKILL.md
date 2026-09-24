@@ -237,10 +237,11 @@ requests), and remembers what it showed. Then, per PR:
   to reword a commit message is a reword in that rebase. If he edited the
   title or description (inbox shows `body edited` for his edits only),
   keep his text: those are what goes upstream. Change a fork PR's
-  description only with `bot-pr set-body <fork-pr-url> --body-file FILE`,
-  never `gh pr edit` or the API: it records the body as the bot's, so
-  inbox doesn't report it, and refuses to overwrite an edit of his (read
-  it with `gh pr view`, keep his text, then rerun with `--force`).
+  description only with `bot-pr get-body <fork-pr-url> > FILE`, then
+  `bot-pr set-body <fork-pr-url> --body-file FILE`, never `gh pr edit`
+  or the API: set-body records the body as the bot's, so inbox doesn't
+  report it, and refuses if the body changed since get-body (then run
+  get-body again and redo the change on his text).
   Update Why on the board only if the test summary changed. An approval
   covers only the commit he approved: after pushing fixups to an approved
   fork PR, say so in the reply and wait for him to approve again (inbox
@@ -327,6 +328,7 @@ below.
   The base is usually the upstream default branch; for fixups on top of
   a Renovate PR it is that PR's branch, which fork-pr copies to the fork.
   To update the description later (e.g. new test results), use
+  `bot-pr get-body "$FORK_PR" > pr-body.md`, edit it, then
   `bot-pr set-body "$FORK_PR" --body-file pr-body.md`.
 - **analysis**: `gh gist create --desc "..." writeup.md` (secret by
   default), then set Draft with `--gist <gist-url>` and a one-line

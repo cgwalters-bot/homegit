@@ -152,13 +152,22 @@ approved they are posted upstream as they stand then, minus the bot-meta
 section. The fork PR also runs the project's `pull_request` CI, minus
 anything that needs upstream's secrets or runners.
 
-To change the fork PR's description afterwards, always use
-`bot-pr set-body <fork-pr-url> --body-file pr-body.md` (it keeps the
-bot-meta section), not `gh pr edit`: cgwalters edits these descriptions
-before approving, and set-body both keeps `bot-pr inbox` from reporting
-the bot's own rewrites as his edits and refuses to overwrite his. When it
-refuses, start from his version (`gh pr view <fork-pr-url>`) and rerun
-with `--force`.
+To change the fork PR's description afterwards, never use `gh pr edit`;
+start from its current text and write it back with bot-pr:
+
+```bash
+bot-pr get-body <fork-pr-url> > pr-body.md   # without the bot-meta section
+# edit pr-body.md
+bot-pr set-body <fork-pr-url> --body-file pr-body.md
+```
+
+cgwalters edits these descriptions before approving. set-body keeps the
+bot-meta section, keeps `bot-pr inbox` from reporting the bot's own
+rewrites as his edits, and refuses if the body changed since get-body
+(or, without get-body, if he edited it since the bot last wrote it).
+When it refuses, run get-body again, redo the change on top of his text,
+and rerun set-body; `--force` skips the checks and is for when you
+already did that.
 
 ## The PR description
 
