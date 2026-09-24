@@ -1,0 +1,11 @@
+# Synthetic: a PR bot with a schedule; pull_request_target doesn't make it CI.
+on:
+  schedule:
+    - cron: "0 0 * * *"
+  pull_request_target:
+jobs:
+  triage:
+    if: ${{ secrets.BOT_KEY != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./triage ${{ secrets.github_token }}

@@ -1,0 +1,9 @@
+# Synthetic: a manual-only job needs no disabling, whatever its secrets.
+on: workflow_dispatch
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - run: ./deploy
+        env:
+          TOKEN: ${{ secrets.DEPLOY_TOKEN }}

@@ -30,6 +30,8 @@ readonly WHY_MAX=400
 readonly EXCERPT_LEN=100
 readonly SHORT_SHA=10
 readonly CHECKS_PER_PAGE=100
+# Check run conclusions that make CI red.
+readonly FAILED_CONCLUSIONS='["failure", "timed_out", "startup_failure"]'
 readonly PER_PAGE=100
 # Conditional requests answered 304 are free; the cache is local and only
 # an HTTP cache, so it is written even in a dry run.
@@ -61,6 +63,8 @@ sweep saw and report:
     who made them; other new commits with their committer (GitHub
     doesn't say who pushed them), unless that is ${BOT_LOGIN};
   - CI turning red (or green again), flagged on the bot's own branches.
+    Failures of workflows disabled since (as 'bot-pr fork-setup' does
+    with ones that can't work on a fork) don't count.
 
 On the bot's fork PRs (its PRs in ${FORK_OWNERS}) only pushes and CI
 are reported; 'bot-pr inbox' covers cgwalters' review there. A URL seen for
@@ -282,11 +286,28 @@ readonly EXCERPT_JQ='def excerpt:
     | (first // "") | gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ")
     | if length > $len then .[:$len] + "..." else . end;'
 
+# disabled_suites REPO SHA: prints the ids of the check suites of SHA's
+# Actions runs whose workflow is disabled now, as a JSON array. Their
+# failures are not news: 'bot-pr fork-setup' disables workflows that
+# can't work on a fork (upstream's PR bots, which fail for lack of its
+# secrets), usually after they already failed on some fork PR.
+disabled_suites() {
+    local runs workflows
+    runs=$(rest_get "repos/$1/actions/runs?head_sha=$2&per_page=${PER_PAGE}") || return
+    workflows=$(rest_get "repos/$1/actions/workflows?per_page=${PER_PAGE}") || return
+    printf '%s\n%s\n' "${runs}" "${workflows}" | jq -sc '
+        [.[1].workflows[] | select(.state | startswith("disabled")) | .id] as $disabled
+        | [.[0].workflow_runs[] | select(.workflow_id | IN($disabled[])) | .check_suite_id]'
+}
+
 # checks_state REPO SHA: prints failure, pending, success or none for the
 # check runs and commit statuses of SHA, plus the failing names:
-# {checks, failing}.
+# {checks, failing}. Check runs of disabled workflows (see
+# disabled_suites) don't count. A workflow left enabled that fails only
+# for want of upstream's secrets does: telling that apart would take its
+# logs, but 'bot-pr fork-setup' names such workflows in the fork PR.
 checks_state() {
-    local runs='' page=1 body total status
+    local runs='' page=1 body total status ignored='[]'
     while :; do
         body=$(rest_get "repos/$1/commits/$2/check-runs?per_page=${CHECKS_PER_PAGE}&page=${page}") || return
         runs+=$(jq -c '.check_runs[]' <<<"${body}")$'\n'
@@ -294,14 +315,21 @@ checks_state() {
         test $((page * CHECKS_PER_PAGE)) -lt "${total}" || break
         page=$((page + 1))
     done
+    # Only worth two more requests when something failed.
+    if jq -se --argjson failed "${FAILED_CONCLUSIONS}" 'any(.[]; .conclusion | IN($failed[]))' >/dev/null <<<"${runs}"; then
+        ignored=$(disabled_suites "$1" "$2") ||
+            { warn "cannot list the Actions runs of $1@$2; counting failures of disabled workflows too"; ignored='[]'; }
+    fi
     status=$(rest_get "repos/$1/commits/$2/status?per_page=${CHECKS_PER_PAGE}") || return
     # Its state covers every status; only the names can be cut short.
     if test "$(jq .total_count <<<"${status}")" -gt "${CHECKS_PER_PAGE}"; then
         warn "$1@$2 has over ${CHECKS_PER_PAGE} commit statuses; only the first ${CHECKS_PER_PAGE} are named"
     fi
     # Too big for jq's argument list.
-    printf '%s\n%s\n' "$(jq -sc . <<<"${runs}")" "${status}" | jq -sc '.[0] as $runs | .[1] as $status
-        | ([$runs[] | select(.conclusion | IN("failure", "timed_out", "startup_failure")) | .name]
+    printf '%s\n%s\n%s\n' "$(jq -sc . <<<"${runs}")" "${status}" "${ignored}" | jq -sc --argjson failed "${FAILED_CONCLUSIONS}" '
+        .[0] as $all | .[1] as $status | .[2] as $ignored
+        | [$all[] | select(.check_suite.id | IN($ignored[]) | not)] as $runs
+        | ([$runs[] | select(.conclusion | IN($failed[])) | .name]
          + [$status.statuses[] | select(.state | IN("failure", "error")) | .context]) as $failing
         | {failing: $failing,
            checks: (if ($failing | length) > 0 or ($status.total_count > 0 and $status.state == "failure") then "failure"

@@ -149,14 +149,18 @@ bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
 
 Run it in the clone that has the branch. It creates `cgwalters-forge/REPO`
 if needed, syncs the fork's copy of the base with upstream, enables
-Actions except for scheduled workflows (`bot-pr fork-setup REPO` redoes
-just that), pushes the branch there, opens the PR inside the fork, and
+Actions except for workflows that can't work on the fork (scheduled jobs,
+PR bots and release jobs that need upstream's secrets, gh-aw agents;
+`bot-pr fork-setup REPO` redoes just that and says why it disabled each),
+pushes the branch there, opens the PR inside the fork, and
 appends a bot-meta section with the upstream target, the board item and
 review instructions. Write the title
 and body as the upstream PR (the PR description rules below apply): once
 approved they are posted upstream as they stand then, minus the bot-meta
 section. The fork PR also runs the project's `pull_request` CI, minus
-anything that needs upstream's secrets or runners.
+anything that needs upstream's secrets or runners. CI workflows that use
+upstream's secrets stay enabled and are listed in the bot-meta section: a
+failure there may just be a missing secret.
 
 To change the fork PR's description afterwards, never use `gh pr edit`;
 start from its current text and write it back with bot-pr:
