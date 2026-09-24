@@ -39,6 +39,25 @@ arg() { # arg NAME ARGS...: the value of '-f NAME=...'
 draft_of() { # draft_of ITEM_ID
     grep -lx "$1" "${store}"/items/*.item 2>/dev/null | head -n1 | xargs -r basename -s .item
 }
+# REST fixtures: a GET of PATH (query string ignored) answers with
+# $FAKE_GH/rest/PATH.json, if it exists, filtered by --jq like gh does.
+if test "$1" = api && test -d "${store}/rest"; then
+    method=GET path="" filter="" args=("${@:2}")
+    while test "${#args[@]}" -gt 0; do
+        case "${args[0]}" in
+            -X) method=${args[1]}; args=("${args[@]:2}") ;;
+            -f|-F|-H) args=("${args[@]:2}") ;;
+            --jq) filter=${args[1]}; args=("${args[@]:2}") ;;
+            -*) args=("${args[@]:1}") ;;
+            *) test -n "${path}" || path=${args[0]%%\?*}; args=("${args[@]:1}") ;;
+        esac
+    done
+    fixture=${store}/rest/${path}.json
+    if test "${method}" = GET && test -e "${fixture}"; then
+        jq -rc "${filter:-.}" "${fixture}"
+        exit 0
+    fi
+fi
 case "$1 $2" in
     "api user") echo "${FAKE_GH_LOGIN:-cgwalters-bot}"; exit 0 ;;
     "api rate_limit") echo 5000; exit 0 ;;
