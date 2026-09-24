@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Offline tests of the state the bot scripts keep on the Workstream board
 # ('bot-board state-get/state-put'), against a fake 'gh' that keeps the
-# project's state items in a temporary directory. No network, no quota.
+# project's state items in a temporary directory, and of what 'bot-pr
+# promote' takes as an approval, against REST fixtures in that fake gh.
+# No network, no quota.
 #   tests/bot-state.sh [TEST...]
 # State bodies hold literal backquotes (a fenced JSON block).
 # shellcheck disable=SC2016
@@ -340,6 +342,105 @@ test_pr_inbox_migration() {
     "${BIN}/bot-pr" inbox 2>"${WORK}/err"
     ! grep -q 'Moved' "${WORK}/err" || fail "migrated twice"
     expect_json "$(project_state pr-inbox | jq -c '.prs | keys')" '["A","B"]' "inbox state after the next run"
+}
+
+# --- bot-pr promote ----------------------------------------------------------
+
+readonly PR_FORK=cgwalters-forge/demo PR_BRANCH=bot/demo PR_HEAD=2222222222222222222222222222222222222222
+
+# rest PATH JSON: a REST fixture for the fake gh.
+rest() {
+    mkdir -p "$(dirname "${FAKE_GH}/rest/$1")"
+    printf '%s\n' "$2" >"${FAKE_GH}/rest/$1.json"
+}
+
+# promote_world COMMENTS REVIEWS LOGGED_PUSH TIMELINE: a fork PR whose head
+# PR_HEAD the fork's activity log last shows pushed as LOGGED_PUSH
+# ({at, after}), with the issue COMMENTS and REVIEWS as [{login, at, body}]
+# and [{login, at, state, commit}], and the PR's TIMELINE events.
+promote_world() {
+    local body
+    body=$'Why.\n\nGenerated-by: https://github.com/cgwalters/#llms\n\n<!-- bot-meta -->\n- Upstream: `up/demo`, base `main`\n- Board item: `PVTI_demo`\n<!-- /bot-meta -->'
+    rest "repos/${PR_FORK}/pulls/1" "$(jq -nc --arg b "${body}" --arg h "${PR_HEAD}" --arg ref "${PR_BRANCH}" --arg f "${PR_FORK}" \
+        '{user: {login: "cgwalters-bot"}, state: "open", title: "Demo", body: $b,
+          head: {ref: $ref, sha: $h, repo: {full_name: $f}}, base: {ref: "main"}}')"
+    rest "repos/${PR_FORK}" '{"parent": {"full_name": "up/demo"}, "source": {"full_name": "up/demo"}}'
+    rest "repos/${PR_FORK}/issues/1/comments" "$(jq -c '[.[] | {user: {login}, created_at: .at, updated_at: .at,
+        html_url: "https://github.com/\("'"${PR_FORK}"'")/pull/1#issuecomment-\(.at)", body}]' <<<"$1")"
+    rest "repos/${PR_FORK}/pulls/1/reviews" "$(jq -c '[.[] | {user: {login}, submitted_at: .at, state, body: "",
+        id: 7, commit_id: .commit, html_url: "https://github.com/x/review"}]' <<<"$2")"
+    rest "repos/${PR_FORK}/pulls/1/comments" '[]'
+    rest "repos/${PR_FORK}/activity" "$(jq -c '[{timestamp: .at, after, activity_type: "push"}]' <<<"$3")"
+    rest "repos/${PR_FORK}/issues/1/timeline" "$4"
+    rest "repos/up/demo/pulls" '[]'
+    rest "repos/up/demo/compare/main...cgwalters-forge:${PR_BRANCH}" '{"ahead_by": 1, "behind_by": 0}'
+}
+
+# The head was pushed at 10:00, from a commit made at 09:50.
+readonly PUSHED_10='{"at": "2026-09-24T10:00:00Z", "after": "2222222222222222222222222222222222222222"}'
+readonly COMMITTED_0950='[{"event": "committed", "sha": "2222222222222222222222222222222222222222", "committer": {"date": "2026-09-24T09:50:00Z"}}]'
+
+# expect_promote WHAT APPROVED PATTERN: 'promote --dry-run' approves (yes)
+# or refuses (no), and its output matches the extended regex PATTERN.
+expect_promote() {
+    local out
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1) ||
+        fail "$1: promote --dry-run failed: ${out}"
+    if grep -q 'a real promote would stop here' <<<"${out}"; then
+        test "$2" = no || fail "$1: expected an approval, got: ${out}"
+    else
+        test "$2" = yes || fail "$1: expected a refusal, got: ${out}"
+    fi
+    grep -qE "$3" <<<"${out}" || fail "$1: output doesn't match '$3': ${out}"
+}
+
+test_pr_promote_command() {
+    local cmd='[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "/promote"}]'
+    promote_world "${cmd}" '[]' "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "/promote on the current head" yes 'cgwalters: APPROVED by /promote https://'
+    # With leading text and CRLF line ends, as the web UI sends them.
+    promote_world '[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "Thanks!\r\n  /promote \r\n"}]' '[]' \
+        "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "/promote on a line of its own" yes 'open a ready-for-review PR'
+    promote_world '[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "/draft\r\n/promote"}]' '[]' \
+        "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "/promote with /draft" yes 'open a draft PR'
+}
+
+test_pr_promote_command_void() {
+    local cmd='[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "/promote"}]'
+    local pushed_1010='{"at": "2026-09-24T10:10:00Z", "after": "2222222222222222222222222222222222222222"}'
+    promote_world "${cmd}" '[]' "${pushed_1010}" \
+        '[{"event": "head_ref_force_pushed", "created_at": "2026-09-24T10:10:00Z"}]'
+    expect_promote "/promote, then a force-push" no 'commits pushed after cgwalters approved'
+    # Only the push log shows that a commit made before the comment was
+    # pushed after it.
+    promote_world "${cmd}" '[]' "${pushed_1010}" "${COMMITTED_0950}"
+    expect_promote "/promote, then a push of an older commit" no 'commits pushed after cgwalters approved'
+    promote_world "${cmd}" '[]' '{"at": "2026-09-24T10:00:00Z", "after": "1111111111111111111111111111111111111111"}' \
+        "${COMMITTED_0950}"
+    expect_promote "/promote, push log behind the head" no "can't be told"
+    promote_world "${cmd}" '[{"login": "cgwalters", "at": "2026-09-24T10:07:00Z", "state": "CHANGES_REQUESTED", "commit": "2222222222222222222222222222222222222222"}]' \
+        "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "/promote, then changes requested" no 'is not approved'
+    promote_world '[{"login": "someone", "at": "2026-09-24T10:05:00Z", "body": "/promote"}]' '[]' \
+        "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "/promote by another login" no 'is not approved'
+    promote_world '[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "please /promote this"}]' '[]' \
+        "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "/promote inside a sentence" no 'is not approved'
+}
+
+test_pr_promote_go_ahead_hint() {
+    promote_world '[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "Looks fine go ahead and push a PR to proper upstream"}]' \
+        '[]' "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "a go-ahead in words" no "issuecomment-2026-09-24T10:05:00Z reads like a go-ahead.*reply '/promote'"
+    # Not for one from before the current head was pushed.
+    promote_world '[{"login": "cgwalters", "at": "2026-09-24T09:55:00Z", "body": "LGTM"}]' \
+        '[]' "${PUSHED_10}" "${COMMITTED_0950}"
+    local out
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
+    ! grep -q 'go-ahead' <<<"${out}" || fail "a go-ahead from before the last push was pointed out: ${out}"
 }
 
 # --- bot-notify -------------------------------------------------------------

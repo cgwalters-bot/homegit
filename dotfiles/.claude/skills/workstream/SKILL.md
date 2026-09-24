@@ -258,6 +258,14 @@ requests), and remembers what it showed. Then, per PR:
   covers only the commit he approved: after pushing fixups to an approved
   fork PR, say so in the reply and wait for him to approve again (inbox
   shows `APPROVED earlier; new commits since`).
+- **Approval** is his approving review, or a conversation comment with a
+  line that is exactly `/promote`, which approves the head the fork PR
+  had when he wrote it (a push after it voids it, like a stale review).
+  Nothing else he writes is an approval, however clear it sounds. When a
+  comment reads like one ("go ahead", "ship it", "push a PR upstream"),
+  inbox prints a `-> hint:` line: pass that on to cgwalters (via the
+  coordinator's report, or a reply on the fork PR) asking him to comment
+  `/promote` or approve; don't promote on your own reading of it.
 - **`[APPROVED]`**: run the command inbox prints,
   `bot-pr promote <fork-pr-url>` (with `--draft` if he commented
   `/draft`, which a later `/ready` takes back). It rebases onto the current upstream base, opens the

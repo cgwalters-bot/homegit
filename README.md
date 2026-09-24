@@ -104,13 +104,16 @@ already written as the upstream PR. A trailing section between
 `<!-- bot-meta -->` markers names the upstream repository and base
 branch, and the board item. On that PR:
 
-- **Approve** it to have it opened upstream, ready for review.
-- Comment **`/draft`** and approve to have it opened upstream as a draft
-  (a later `/ready` takes that back).
+- **Approve** it, or comment **`/promote`** on a line of its own, to have
+  it opened upstream, ready for review. Other wording ("go ahead", "ship
+  it") is not an approval; the bot's inbox flags it so you get asked for
+  `/promote`.
+- Add a **`/draft`** line (in the `/promote` comment, or earlier) to have
+  it opened upstream as a draft (a later `/ready` takes that back).
 - **Comment** (inline or on the PR) to ask for changes, including commit
   message rewording; the bot answers with squashed fixups and a reply.
-  An approval covers the commit you approved, so changes pushed after it
-  need another approval.
+  An approval or `/promote` covers the commits pushed before it, so
+  changes pushed after it need another one.
 - **Edit** the title and description as you like: they are copied
   upstream as they stand at approval, minus the bot-meta section.
 - **Close** it to drop the change; the item becomes Done as dropped.

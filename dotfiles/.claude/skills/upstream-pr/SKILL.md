@@ -195,7 +195,8 @@ Generated-by: https://github.com/cgwalters/#llms
 
 Only two ways, never anything else:
 
-- **Promotion.** When cgwalters approved the fork PR,
+- **Promotion.** When cgwalters approved the fork PR (a review, or a
+  `/promote` comment line; never other wording),
   `bot-pr promote <fork-pr-url>` opens the upstream PR (ready for review,
   or a draft if he commented `/draft`), closes the fork PR and updates the
   board; see "Review loop" in `workstream`.

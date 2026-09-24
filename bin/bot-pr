@@ -22,6 +22,14 @@ readonly LLMS_TRAILER='Generated-by: https://github.com/cgwalters/#llms'
 readonly DRAFT_COMMAND=/draft
 # ... and this, later, takes that back.
 readonly READY_COMMAND=/ready
+# A line consisting of this, in a conversation comment by REVIEWER,
+# approves the head the fork PR had when he wrote the comment, like an
+# approving review of that commit.
+readonly PROMOTE_COMMAND=/promote
+# Comments by REVIEWER matching this (case-insensitively) read like a
+# go-ahead. They approve nothing, but inbox and promote point them out so
+# that he can be asked for a '/promote' line or an approval.
+readonly GO_AHEAD_RE='\b(go ahead|ship it|lgtm|looks (good|fine)|(push|open|send|file|submit)( up)?( a| an| the| it| this)?( upstream)? pr( to| for)?( the)? upstream|(push|send|take|open) (it|this) upstream|promote (it|this))\b'
 # The inbox state lives on the Workstream board, in the archived draft
 # item 'bot-state: pr-inbox' (see 'bot-board state-get'), so that every
 # machine the bot runs on shares it; STATE_DIR only holds the local lock.
@@ -92,7 +100,12 @@ Commands:
         this script. fork-pr does this on every run; safe to repeat.
   promote FORK_PR_URL [--draft] [--why TEXT] [--dry-run]
         Open the upstream PR for a fork PR whose current head ${REVIEWER}
-        approved (commits pushed after his approval need a new one):
+        approved (commits pushed after his approval need a new one).
+        Approving is an approving review, or a conversation comment with
+        a '${PROMOTE_COMMAND}' line, which approves the head the PR had
+        when he wrote it (per the fork's push log and the PR's timeline;
+        if that can't be told, it approves nothing). Other comments never
+        approve, but one that reads like a go-ahead is pointed out. Then:
         rebase onto the upstream base if it moved (on conflicts, dismiss
         the approval and stop), open the PR from ${FORGE_ORG}:${BRANCH_PREFIX}SLUG
         with the fork PR's current title and body minus the bot-meta
@@ -138,7 +151,10 @@ Commands:
         it, in ${BOT_LOGIN}'s own forks) with activity by ${REVIEWER} since the last
         check (or DATE): reviews, review and issue comments, title and body
         edits, and fork PRs he closed. Approved PRs are always listed, since
-        they are waiting for 'promote'. --dry-run doesn't record the check.
+        they are waiting for 'promote'. A listed PR that isn't approved but
+        has a comment of his since its last push that reads like a
+        go-ahead gets a hint to ask him for '${PROMOTE_COMMAND}' or an approval.
+        --dry-run doesn't record the check.
   -h, --help
         Show this help
 
@@ -617,8 +633,8 @@ ${META_START}
 - Board item: \`${item}\`${notes}
 
 To review:
-- **Approve** to open it upstream, ready for review.
-- Comment \`${DRAFT_COMMAND}\`, then approve, to open it upstream as a draft (\`${READY_COMMAND}\` undoes that).
+- **Approve**, or comment \`${PROMOTE_COMMAND}\` on a line of its own, to open it upstream, ready for review. Either covers only the commits pushed so far.
+- Add a \`${DRAFT_COMMAND}\` line (in the same comment or before) to open it upstream as a draft (\`${READY_COMMAND}\` undoes that).
 - **Close** to drop it.
 - Edit the title and description freely: they become the upstream PR's. Review comments are addressed with fixup commits and a reply here.
 ${META_END}
@@ -1097,33 +1113,83 @@ reviewer_activity() {
     {
         ghapi --paginate "repos/${fork}/pulls/${number}/reviews?per_page=100" \
             --jq ".[] | select(.user.login == \"${REVIEWER}\")
-                  | {kind: \"review\", at: .submitted_at, url: .html_url, state, body, id, commit_id}" ||
+                  | {kind: \"review\", at: .submitted_at, created: .submitted_at, url: .html_url, state, body, id, commit_id}" ||
             fatal "cannot list the reviews of ${fork}#${number}"
         ghapi --paginate "repos/${fork}/pulls/${number}/comments?per_page=100" \
             --jq ".[] | select(.user.login == \"${REVIEWER}\")
-                  | {kind: \"review comment\", at: .updated_at, url: .html_url, body, path}" ||
+                  | {kind: \"review comment\", at: .updated_at, created: .created_at, url: .html_url, body, path}" ||
             fatal "cannot list the review comments of ${fork}#${number}"
         ghapi --paginate "repos/${fork}/issues/${number}/comments?per_page=100" \
             --jq ".[] | select(.user.login == \"${REVIEWER}\")
-                  | {kind: \"comment\", at: .updated_at, url: .html_url, body}" ||
+                  | {kind: \"comment\", at: .updated_at, created: .created_at, url: .html_url, body}" ||
             fatal "cannot list the comments of ${fork}#${number}"
     } | jq -sc .
 }
 
-# jq over reviewer_activity output, with \$head the PR's head commit:
-# whether the latest review that decides anything approves (a later
+# jq over reviewer_activity output, with \$head the PR's head commit and
+# \$pushed when it became the head (see push_time; empty if unknown or not
+# looked up): whether the latest approval or verdict approves (a later
 # dismissal or change request cancels it) and approved the current head,
-# since commits pushed after it are unreviewed; and whether the latest
-# '/draft' or '/ready' line in a comment or review body asks for a draft.
+# since commits pushed after it are unreviewed. A conversation comment
+# with a '${PROMOTE_COMMAND}' line approves the head it was written on:
+# the current one if written after \$pushed, else an older one. Also:
+# whether the latest '${DRAFT_COMMAND}' or '${READY_COMMAND}' line in a comment or review
+# body asks for a draft, and the URL of the latest comment since \$pushed
+# that reads like a go-ahead (\$go_ahead) without a '${PROMOTE_COMMAND}' line.
 readonly VERDICT_JQ="
-def approval: [.[] | select(.kind == \"review\" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\")))]
+def has_line(\$cmd): (.body // \"\") | gsub(\"\\r\"; \"\") | split(\"\\n\") | any(gsub(\"^[ \\t]+|[ \\t]+\$\"; \"\") == \$cmd);
+def promotions: [.[] | select(.kind == \"comment\" and has_line(\"${PROMOTE_COMMAND}\"))
+    | {kind: \"review\", state: \"APPROVED\", at: .created, url, id: null, via: \"${PROMOTE_COMMAND}\",
+       commit_id: (if \$pushed != \"\" and .created > \$pushed then \$head else null end)}];
+def approval: [(.[] | select(.kind == \"review\" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\")))),
+        promotions[]]
     | sort_by(.at) | last;
 def approved_any: approval.state == \"APPROVED\";
 def approved: approved_any and approval.commit_id == \$head;
 def wants_draft: [.[] | {at, cmd: ((.body // \"\") | gsub(\"\\r\"; \"\")
         | [scan(\"(?:^|\\n)[ \\t]*(${DRAFT_COMMAND}|${READY_COMMAND})[ \\t]*(?=\\n|\$)\")[0]] | last)}
     | select(.cmd != null)] | sort_by(.at) | last | .cmd == \"${DRAFT_COMMAND}\";
+def go_aheads: [.[] | select(.kind != \"review comment\" and (.state // \"\" | IN(\"APPROVED\", \"CHANGES_REQUESTED\") | not)
+        and (has_line(\"${PROMOTE_COMMAND}\") | not) and ((.body // \"\") | test(\$go_ahead; \"i\")))];
+def needs_push_time: (promotions | length > 0) or (go_aheads | length > 0);
+def go_ahead: [go_aheads[] | select(\$pushed == \"\" or .created > \$pushed)] | sort_by(.created) | last | .url // empty;
 "
+
+# verdict JQ: prints JQ, with VERDICT_JQ's definitions, over the caller's
+# 'activity', with its 'head_sha' and 'pushed'.
+verdict() {
+    jq -r --arg head "${head_sha}" --arg pushed "${pushed}" --arg go_ahead "${GO_AHEAD_RE}" \
+        "${VERDICT_JQ} $1" <<<"${activity}"
+}
+
+# push_time FORK NUMBER BRANCH: sets the caller's 'pushed' to when its
+# 'head_sha' became the head of the fork PR, if its 'activity' has a
+# '${PROMOTE_COMMAND}' or go-ahead comment that needs it (else leaves it
+# empty, saving the calls). That is the latest of: the push that made it the
+# head, from the fork's activity log, which records every push with its
+# time; any force-push in the PR's timeline; the committer date of any of
+# its commits. Commit dates alone can't tell, since a commit made before a
+# comment can be pushed after it. If the log's latest push to BRANCH isn't
+# of head_sha (it lags, or no longer goes back that far), 'pushed' stays
+# empty, and every '${PROMOTE_COMMAND}' is void.
+push_time() {
+    local fork=$1 number=$2 branch=$3 logged times
+    pushed=""
+    test "$(verdict needs_push_time)" = true || return 0
+    logged=$(ghapi -X GET "repos/${fork}/activity" -f ref="refs/heads/${branch}" -f direction=desc -f per_page=1 \
+        --jq ".[0] // {} | select(.after == \"${head_sha}\") | .timestamp") ||
+        fatal "cannot read the activity log of ${fork}"
+    if test -z "${logged}"; then
+        test "$(verdict 'promotions | length > 0')" = false ||
+            warn "the activity log of ${fork} doesn't show when ${branch} was pushed at ${head_sha:0:12}, so ${REVIEWER}'s '${PROMOTE_COMMAND}' comments there count for nothing"
+        return 0
+    fi
+    times=$(ghapi --paginate "repos/${fork}/issues/${number}/timeline?per_page=100" \
+        --jq '.[] | if .event == "head_ref_force_pushed" then .created_at elif .event == "committed" then .committer.date else empty end') ||
+        fatal "cannot read the timeline of ${fork}#${number}"
+    # shellcheck disable=SC2086 # one timestamp per word
+    pushed=$(printf '%s\n' "${logged}" ${times} | sort | tail -n1)
+}
 
 # parse_fork_pr_url URL: sets FORK and NUMBER. Fork PRs from before the
 # forge are in the bot's own forks.
@@ -1236,15 +1302,24 @@ cmd_promote() {
     test -n "${body}" || fatal "${url}'s body is empty without the bot-meta section"
     grep -qxF "${LLMS_TRAILER}" <<<"${body}" || warn "${url}'s body has no '${LLMS_TRAILER}' line"
 
-    local activity approved wants_draft
+    local activity approved wants_draft pushed
     activity=$(reviewer_activity "${FORK}" "${NUMBER}")
-    approved=$(jq -r --arg head "${head_sha}" "${VERDICT_JQ} approved" <<<"${activity}")
-    wants_draft=$(jq -r --arg head "${head_sha}" "${VERDICT_JQ} wants_draft" <<<"${activity}")
+    push_time "${FORK}" "${NUMBER}" "${head}"
+    approved=$(verdict approved)
+    wants_draft=$(verdict wants_draft)
     if test "${approved}" != true; then
-        local why_not="is not approved by ${REVIEWER}; only his approval promotes a fork PR"
-        if test "$(jq -r --arg head "${head_sha}" "${VERDICT_JQ} approved_any" <<<"${activity}")" = true; then
-            why_not="has commits pushed after ${REVIEWER} approved it; he needs to approve the current head"
+        local why_not="is not approved by ${REVIEWER}; only his approving review or a comment with a '${PROMOTE_COMMAND}' line promotes a fork PR"
+        if test "$(verdict approved_any)" = true; then
+            if test "$(verdict approval.via)" = "${PROMOTE_COMMAND}" && test -z "${pushed}"; then
+                why_not="has a '${PROMOTE_COMMAND}' by ${REVIEWER}, but when its head was pushed can't be told; he needs to approve it"
+            else
+                why_not="has commits pushed after ${REVIEWER} approved it; he needs to approve the current head or comment '${PROMOTE_COMMAND}' again"
+            fi
         fi
+        local go_ahead
+        go_ahead=$(verdict go_ahead)
+        test -z "${go_ahead}" ||
+            why_not+=". His comment ${go_ahead} reads like a go-ahead, but isn't one without a '${PROMOTE_COMMAND}' line: ask him to reply '${PROMOTE_COMMAND}' or approve"
         ${dry_run} || fatal "${url} ${why_not}"
         warn "${url} ${why_not}; a real promote would stop here"
     fi
@@ -1263,7 +1338,7 @@ cmd_promote() {
 
     if ${dry_run}; then
         cat <<EOF
-Fork PR:   ${url} (${REVIEWER}: $(jq -r --arg head "${head_sha}" "${VERDICT_JQ} approval.state // \"no verdict\"" <<<"${activity}"))
+Fork PR:   ${url} (${REVIEWER}: $(verdict 'approval | if . == null then "no verdict" elif .via then "\(.state) by \(.via) \(.url)" else .state end'))
 Upstream:  ${upstream}, base ${base}, from ${owner}:${head} (${ahead} ahead, ${behind} behind)
 Board:     ${item:-(none)}
 
@@ -1291,10 +1366,14 @@ EOF
         test "${rc}" -eq 0 || test "${rc}" -eq "${EX_CONFLICT}" || exit "${rc}"
         if test "${rc}" -eq "${EX_CONFLICT}"; then
             local review_id
-            review_id=$(jq -r --arg head "${head_sha}" "${VERDICT_JQ} approval.id" <<<"${activity}")
-            ghapi -X PUT "repos/${FORK}/pulls/${NUMBER}/reviews/${review_id}/dismissals" \
-                -f message="Upstream ${base} moved and this no longer rebases cleanly; needs another look after the conflicts are resolved." >/dev/null ||
-                warn "dismissing the approval on ${url} failed; the next inbox will still show it as approved"
+            review_id=$(verdict 'approval.id // empty')
+            # A '/promote' comment can't be dismissed; the push that
+            # resolves the conflicts voids it.
+            if test -n "${review_id}"; then
+                ghapi -X PUT "repos/${FORK}/pulls/${NUMBER}/reviews/${review_id}/dismissals" \
+                    -f message="Upstream ${base} moved and this no longer rebases cleanly; needs another look after the conflicts are resolved." >/dev/null ||
+                    warn "dismissing the approval on ${url} failed; the next inbox will still show it as approved"
+            fi
             ghapi -X POST "repos/${FORK}/issues/${NUMBER}/comments" -f body="Not promoted: \`${upstream}:${base}\` moved and \`${head}\` no longer rebases cleanly (conflicts in: ${out}). Back to Draft; I'll resolve the conflicts here and ask for another review." >/dev/null ||
                 warn "commenting on ${url} failed"
             if test -n "${item}"; then
@@ -1389,6 +1468,7 @@ cmd_inbox() {
     closed=$(jq -c --arg m "${META_START}" '[.[] | select((.body // "") | contains($m))]' <<<"${closed}")
 
     local nreported=0 found url repo number pr head_sha pr_since activity events lines verdict hash old_hash
+    local pushed go_ahead
     local bot_body edits_seen pending edits body_note
     while IFS= read -r found; do
         test -n "${found}" || continue
@@ -1449,16 +1529,22 @@ cmd_inbox() {
               elif .kind == "review comment" then "  \(.at) review comment on \(.path): \(.url)\n    > \(.body | excerpt($n))"
               else "  \(.at) comment: \(.url)\n    > \(.body | excerpt($n))" end' <<<"${activity}")
         test -z "${body_note}" || lines+=${lines:+$'\n'}${body_note}
-        verdict=$(jq -r --arg head "${head_sha}" "${VERDICT_JQ}"'
+        push_time "${repo}" "${number}" "$(jq -r .head.ref <<<"${pr}")"
+        verdict=$(verdict '
             [if approved then "APPROVED" elif approved_any then "APPROVED earlier; new commits since" else empty end,
-             if wants_draft then "'"${DRAFT_COMMAND}"'" else empty end] | join(", ")' <<<"${activity}")
+             if wants_draft then "'"${DRAFT_COMMAND}"'" else empty end] | join(", ")')
         test -n "${lines}" || test -n "${verdict}" || continue
         echo "${url}${verdict:+  [${verdict}]}  $(jq -r .title <<<"${pr}")"
         test -z "${lines}" || echo "${lines}"
         if [[ "${verdict}" == APPROVED ]] || [[ "${verdict}" == "APPROVED, "* ]]; then
             echo "  -> approved: $(basename "$0") promote ${url}$([[ "${verdict}" == *"${DRAFT_COMMAND}"* ]] && echo " --draft")"
-        elif [[ "${verdict}" == *"new commits since"* ]]; then
-            echo "  -> needs ${REVIEWER} to approve the current head before promote"
+        else
+            if [[ "${verdict}" == *"new commits since"* ]]; then
+                echo "  -> needs ${REVIEWER} to approve the current head (or comment '${PROMOTE_COMMAND}' again) before promote"
+            fi
+            go_ahead=$(verdict go_ahead)
+            test -z "${go_ahead}" ||
+                echo "  -> hint: ${go_ahead} by ${REVIEWER} reads like a go-ahead, but approves nothing; ask him to reply '${PROMOTE_COMMAND}' (on a line of its own) or to approve"
         fi
         nreported=$((nreported + 1))
     done < <(jq -c '.[]' <<<"${open}")
