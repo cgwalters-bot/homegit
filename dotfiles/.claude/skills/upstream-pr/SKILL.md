@@ -91,7 +91,9 @@ topic branch per change.
 - **Never add `Signed-off-by`.** That is for a human to add. If the project
   requires DCO sign-off, leave it out anyway and say in the PR body that a
   maintainer must sign off before merging (e.g. `git rebase --signoff <base>`
-  and force-push); if it doesn't, don't mention DCO.
+  and force-push); if it doesn't, don't mention DCO. For the bot's PRs,
+  cgwalters does that with `bin/dco-signoff`, which refuses to run as the
+  bot; `dco-signoff --list-only` shows which open PRs still wait on it.
 - **Whether DCO is required** comes from what GitHub enforces, never from
   CONTRIBUTING or other prose, which is easy to misread. It is required if
   the default branch's rules require a status check named like DCO:

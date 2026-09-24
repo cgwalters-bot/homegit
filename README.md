@@ -135,6 +135,28 @@ run `bot-pr inbox` at the start of every session. What inbox has already
 reported is kept in the archived `bot-state: pr-inbox` board item, so it
 doesn't matter which machine runs it.
 
+### Signing off the bot's PRs (DCO)
+
+The bot never adds `Signed-off-by`, so its upstream PRs to projects that
+require DCO (bootc-dev, among others) sit with a failing DCO check until a
+human signs off. `bin/dco-signoff`, run by me with my own git identity and
+gh login, finds them and fixes that:
+
+```
+dco-signoff --dry-run      # list them and prepare the rewrite, push nothing
+dco-signoff                # ask before pushing each one
+dco-signoff https://github.com/bootc-dev/bootc/pull/2494 --yes
+```
+
+It looks at the open PRs authored by cgwalters-bot and those from
+cgwalters-forge branches, keeps those whose base branch requires a DCO
+status check, and for each one missing my sign-off rebases its commits
+with `git rebase --signoff` onto their existing merge-base (hooks off),
+checks that every rewritten commit has the original tree and author,
+and force-pushes with a lease on the head it fetched. It refuses to run
+as the bot, and to sign off other people's commits without
+`--include-others`; `tests/dco-signoff.sh` tests it offline.
+
 To pick up changes from the upstream repository:
 
 ```
