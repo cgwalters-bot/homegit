@@ -374,6 +374,9 @@ declare -rA WORKFLOW_OVERRIDES=(
     # need its app's key, but push isn't a sign of PR-less jobs in general.
     [infra/sync-common.yml]=disable
     [infra/sync-labels.yml]=disable
+    # Hourly Renovate run with upstream's app key; its PR-time config
+    # validation isn't worth an hourly failure on the fork.
+    [infra/renovate.yml]=disable
 )
 
 # Set by fork_setup: the workflows it left running with a schedule trigger,
