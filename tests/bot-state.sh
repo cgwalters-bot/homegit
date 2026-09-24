@@ -341,12 +341,13 @@ test_notify_migration() {
     grep -q '^request .*"url":"U1"' "${WORK}/out" || fail "dry run did not print the old request: $(cat "${WORK}/out")"
     expect_eq "$(graphql_calls)" 1 "GraphQL calls of a dry run"
     test -e "${legacy}" || fail "a dry run moved the old file"
-    # A real run moves it to the board, leaving the poll position alone.
+    # A real run moves it to the board; a 304 moves a poll position that
+    # is over an hour old up to the poll.
     "${BIN}/bot-notify" >"${WORK}/out" 2>&1
     grep -q 'Moved the unacked requests' "${WORK}/out" || fail "no migration note: $(cat "${WORK}/out")"
     test ! -e "${legacy}" || fail "the old file is still there"
     expect_json "$(project_state notifications | jq -c '{since, last_modified, p: (.pending | keys), a: (.acked | keys)}')" \
-        '{"since":"2026-09-20T00:00:00Z","last_modified":"LM","p":["U1"],"a":["U0"]}' "migrated notifications state"
+        '{"since":"2026-09-24T00:00:00Z","last_modified":"LM","p":["U1"],"a":["U0"]}' "migrated notifications state"
     # Still printed by the next run, which has nothing to write.
     reset_calls
     "${BIN}/bot-notify" >"${WORK}/out" 2>&1

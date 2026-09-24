@@ -21,6 +21,9 @@ readonly API=https://api.github.com
 readonly DEFAULT_LOOKBACK_DAYS=7
 readonly PER_PAGE=50
 readonly EXCERPT_LEN=300
+# A 304 leaves the state alone, but 'since' is rewritten at least this
+# often, so it tracks the last poll rather than the last notification.
+readonly SINCE_REFRESH_SECS=3600
 # The poll state and the requests printed but not acked yet (plus
 # recently acked ones, so they aren't printed again) live on the Workstream
 # board, in the archived draft item 'bot-state: notifications' (see
@@ -80,8 +83,9 @@ in the archived 'bot-state: ${STATE_NAME}' draft item on the board,
 shared by every machine. The poll state only advances when every thread
 was routed, so a failed run is retried. It is written once, at the end
 of a run, and only if something changed (a 304 from GitHub means
-nothing new), with a checked write that merges in what another machine
-wrote meanwhile. Filed triggers are cached in ${LOCAL_DIR}.
+nothing new, though 'since' still moves up hourly), with a checked
+write that merges in what another machine wrote meanwhile. Filed
+triggers are cached in ${LOCAL_DIR}.
 
 Options:
   --dry-run           Report only: file and add nothing, mark nothing read,
@@ -716,7 +720,10 @@ if test "${nfailed}" -gt 0; then
     save_state
     exit 1
 fi
-if test "$(jq length <<<"${threads}")" -eq 0 && test "${new_last_modified}" = "${last_modified}"; then
+# By GitHub's clock, like poll_start.
+since_age=$(($(date -u -d "${poll_start}" +%s) - $(date -u -d "${since}" +%s)))
+if test "$(jq length <<<"${threads}")" -eq 0 && test "${new_last_modified}" = "${last_modified}" &&
+    test "${since_age}" -lt "${SINCE_REFRESH_SECS}"; then
     save_state
 else
     save_state "${poll_start}" "${new_last_modified}"
