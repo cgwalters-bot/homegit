@@ -111,9 +111,10 @@ Forge forks start with a clean `main` synced from upstream, both accounts
 can push to them, and PRs into them run the project's own CI. The bot's
 personal forks (`cgwalters-bot/REPO`) are only for scratch work.
 
-`bot-pr` (REST only) implements the bot's side: `fork-pr` creates the
-forge fork if needed and opens the fork PR, `inbox` lists your activity on them since its last run (only the
-`cgwalters` login counts), and `promote` rebases onto upstream, opens the
+`bot-pr` implements the bot's side: `fork-pr` creates the
+forge fork if needed and opens the fork PR, `set-body` updates its
+description without overwriting your edits, `inbox` lists your activity on them since its last run (only the
+`cgwalters` login counts, so the bot's own edits, pushes and comments are left out), and `promote` rebases onto upstream, opens the
 upstream PR, closes the fork PR and moves the item to In Review. Agents
 run `bot-pr inbox` at the start of every session.
 

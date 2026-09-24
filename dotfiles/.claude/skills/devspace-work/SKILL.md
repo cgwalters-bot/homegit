@@ -126,7 +126,8 @@ fork-pr`, which pushes it to the project's cgwalters-forge fork and opens
 the fork PR (see `upstream-pr` for the setup, and `workstream` for what
 happens next on the board). Record what was run and the result in one
 line in the board item's Why (e.g. `just test: 312 passed on a 16-core
-RHEL 10 devspace`) and in the fork PR's description.
+RHEL 10 devspace`) and in the fork PR's description (to update that
+later, use `bot-pr set-body`; see `upstream-pr`).
 
 ## Stop
 
