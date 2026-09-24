@@ -810,44 +810,59 @@ cmd_set_body() {
     grep -qxF "${LLMS_TRAILER}" <<<"${body}" ||
         warn "${body_file} has no '${LLMS_TRAILER}' line; add one unless the project's policy says otherwise"
 
-    local hash bot_body base_body seen_body
+    local hash base_body HIS EDITS_UNKNOWN
     hash=$(body_hash <<<"${PR}")
-    read -r bot_body base_body seen_body < <(jq -r --arg u "${url}" \
-        '.prs[$u] // {} | "\(.bot_body // "-") \(.base_body // "-") \(.body // "-")"' <<<"${state}")
-    # Unless the body is still the bot's own last write, find the
-    # reviewer's edits since that write.
-    local edits his="" check_failed=false
-    if test "${hash}" != "${bot_body}"; then
-        if edits=$(body_edits "${FORK}" "${NUMBER}"); then
-            his=$(jq -r --arg bot "${BOT_LOGIN}" --arg r "${REVIEWER}" "${EDITS_JQ} since_bot | reviewers" <<<"${edits}")
-        else
-            check_failed=true
-        fi
-    fi
+    base_body=$(jq -r --arg u "${url}" '.prs[$u].base_body // "-"' <<<"${state}")
+    reviewer_edits_since_bot "${url}"
     local redo
     redo="run '$(basename "$0") get-body ${url} > ${body_file}', keep his text, and rerun set-body"
     if ! ${force}; then
         if test "${base_body}" != -; then
             test "${hash}" = "${base_body}" ||
-                fatal "${url}'s body changed since get-body${his:+ (${REVIEWER} edited it)}; ${redo}"
+                fatal "${url}'s body changed since get-body${HIS:+ (${REVIEWER} edited it)}; ${redo}"
         else
-            ! ${check_failed} ||
+            ! ${EDITS_UNKNOWN} ||
                 fatal "cannot tell whether ${REVIEWER} edited ${url}'s body (GraphQL failed); ${redo}"
-            test -z "${his}" ||
-                fatal "${REVIEWER} edited ${url}'s body since the bot last wrote it (at $(sort <<<"${his}" | paste -sd' ')); ${redo}"
+            test -z "${HIS}" ||
+                fatal "${REVIEWER} edited ${url}'s body since the bot last wrote it (at $(sort <<<"${HIS}" | paste -sd' ')); ${redo}"
         fi
     fi
-
-    local updated
-    updated=$(jq -n --arg body "${body}"$'\n\n'"${meta}" '{body: $body}' |
-        ghapi -X PATCH "repos/${FORK}/pulls/${NUMBER}" --input -) || fatal "updating the body of ${url} failed"
-    # An edit of his that inbox hasn't shown yet still is, though replaced.
-    local pending=null how="then replaced with set-body"
+    local how="then replaced with set-body"
     ! ${force} || how+=" --force"
-    if test "${hash}" != "${seen_body}"; then
-        if test -n "${his}"; then
-            pending=$(jq -nc --arg at "$(sort <<<"${his}" | tail -n1)" --arg n " (${how})" '{at: $at, note: $n}')
-        elif ${check_failed}; then
+    write_body "${url}" "${body}"$'\n\n'"${meta}" "${how}"
+    info "Updated the body of ${url}"
+}
+
+# reviewer_edits_since_bot URL: for the fork PR that read_fork_pr read,
+# with the inbox state in 'state', sets HIS to the times of REVIEWER's
+# body edits since the bot last wrote the body (none if it still is that
+# write), or EDITS_UNKNOWN to true if GraphQL couldn't say.
+reviewer_edits_since_bot() {
+    local url=$1 bot_body edits
+    HIS="" EDITS_UNKNOWN=false
+    bot_body=$(jq -r --arg u "${url}" '.prs[$u].bot_body // "-"' <<<"${state}")
+    test "$(body_hash <<<"${PR}")" != "${bot_body}" || return 0
+    if edits=$(body_edits "${FORK}" "${NUMBER}"); then
+        HIS=$(jq -r --arg bot "${BOT_LOGIN}" --arg r "${REVIEWER}" "${EDITS_JQ} since_bot | reviewers" <<<"${edits}")
+    else
+        EDITS_UNKNOWN=true
+    fi
+}
+
+# write_body URL BODY HOW: replaces the body of the fork PR that
+# read_fork_pr read with BODY, and records it in 'state' as the bot's
+# write. The reviewer's edits found by reviewer_edits_since_bot (HIS,
+# EDITS_UNKNOWN) that inbox hasn't reported yet are kept for it to show,
+# noting HOW they were followed up. Needs lock_state.
+write_body() {
+    local url=$1 body=$2 how=$3 seen_body updated pending=null
+    seen_body=$(jq -r --arg u "${url}" '.prs[$u].body // "-"' <<<"${state}")
+    updated=$(jq -n --arg body "${body}" '{body: $body}' |
+        ghapi -X PATCH "repos/${FORK}/pulls/${NUMBER}" --input -) || fatal "updating the body of ${url} failed"
+    if test "$(body_hash <<<"${PR}")" != "${seen_body}"; then
+        if test -n "${HIS}"; then
+            pending=$(jq -nc --arg at "$(sort <<<"${HIS}" | tail -n1)" --arg n " (${how})" '{at: $at, note: $n}')
+        elif ${EDITS_UNKNOWN}; then
             pending=$(jq -nc --arg at "$(jq -r .updated_at <<<"${PR}")" \
                 --arg n " (possibly by ${REVIEWER}: GraphQL was down; ${how})" '{at: $at, note: $n}')
         fi
@@ -855,7 +870,6 @@ cmd_set_body() {
     save_state "$(jq -c --arg u "${url}" --arg h "$(body_hash <<<"${updated}")" --argjson p "${pending}" '
         .prs[$u] = ((.prs[$u] // {}) + {bot_body: $h} | del(.base_body)
             | if $p != null then .reviewer_edit = $p else . end)' <<<"${state}")"
-    info "Updated the body of ${url}"
 }
 
 # The reviewer's comments, reviews and inline review comments on a fork
