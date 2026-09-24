@@ -38,6 +38,8 @@ readonly PROVISION_PACKAGES=(
     libzstd-devel clang-devel ostree-devel glib2-devel
     rust cargo rustfmt clippy
     python3 git
+    # VM stack for bcvk-based integration tests
+    qemu-kvm libvirt virtiofsd
 )
 
 usage() {
