@@ -396,6 +396,67 @@ test_notify_race() {
         '{"p":["U2"],"a":["U1"]}' "state after the race"
 }
 
+# --- bot-work ---------------------------------------------------------------
+
+# run_bot_work: runs bot-work with a fake agent that saves the lease it
+# sees on the project as $WORK/lease-seen; prints bot-work's stderr.
+run_bot_work() {
+    local draft
+    read -r _ draft <<<"$(state_ids lease)"
+    printf '#!/bin/sh\ncp "%s" "%s"\n' "${FAKE_GH}/items/${draft}.body" "${WORK}/lease-seen" >"${WORK}/bin/opencode"
+    chmod +x "${WORK}/bin/opencode"
+    rm -f "${WORK}/lease-seen"
+    "${BIN}/bot-work" 2>&1
+}
+
+# wait_lease_cleared: waits for the background keeper to clear the lease.
+wait_lease_cleared() {
+    local _
+    for _ in $(seq 50); do
+        test "$(project_state lease)" != '{}' || return 0
+        sleep 0.2
+    done
+    fail "the lease was not cleared after the run: $(project_state lease)"
+}
+
+test_lease() {
+    local future past out me
+    future=$(date -u -d '10 minutes' +%FT%TZ)
+    past=$(date -u -d '1 minute ago' +%FT%TZ)
+    # Free: taken for the run, and cleared after it.
+    set_project_state lease '{}'
+    run_bot_work >/dev/null
+    test -e "${WORK}/lease-seen" || fail "the agent did not run"
+    me=$(awk '/^```json/ { f = 1; next } f && /^```/ { exit } f' "${WORK}/lease-seen" | jq -r .host)
+    [[ "${me}" == "$(hostname)"* ]] || fail "lease holder during the run: expected this machine, got '${me}'"
+    wait_lease_cleared
+    # Held by another machine: refused.
+    set_project_state lease "$(jq -nc --arg e "${future}" '{host: "elsewhere", pid: 1, token: "t", expires_at: $e}')"
+    if out=$(run_bot_work); then
+        fail "ran while another machine held the lease"
+    fi
+    grep -q 'bot-work run on elsewhere (pid 1) holds the lease' <<<"${out}" || fail "unexpected refusal: ${out}"
+    test ! -e "${WORK}/lease-seen" || fail "the agent ran while another machine held the lease"
+    # A lease this machine failed to write is not ours later.
+    set_project_state lease '{}'
+    touch "${FAKE_GH}/fail-write"
+    ! run_bot_work >/dev/null || fail "ran without writing the lease"
+    rm "${FAKE_GH}/fail-write"
+    set_project_state lease "$(jq -nc --arg e "${future}" '{host: "elsewhere", pid: 2, token: "t", expires_at: $e}')"
+    out=$(run_bot_work) && fail "ran while another machine held the lease, after a failed write"
+    grep -q 'bot-work run on elsewhere (pid 2) holds the lease' <<<"${out}" || fail "unexpected refusal: ${out}"
+    # Lapsed, or held by an earlier run here that is gone: taken over.
+    local holder
+    for holder in elsewhere "${me}"; do
+        set_project_state lease "$(jq -nc --arg h "${holder}" --arg e "${past}" --arg f "${future}" \
+            '{host: $h, pid: 1, token: "t", expires_at: (if $h == "elsewhere" then $e else $f end)}')"
+        out=$(run_bot_work)
+        grep -q 'Taking over the lease' <<<"${out}" || fail "no takeover of ${holder}'s lease: ${out}"
+        test -e "${WORK}/lease-seen" || fail "the agent did not run after taking over ${holder}'s lease"
+        wait_lease_cleared
+    done
+}
+
 # --- runner -----------------------------------------------------------------
 
 all_tests() {

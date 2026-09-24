@@ -37,7 +37,10 @@ opencode and picks up or advances the next board item; `bot-work --agent
 claude` uses Claude Code instead, and any extra arguments are passed along
 as additional instructions. `bot-work --plan` instead reviews recent GitHub
 activity (the last week, or `--since YYYY-MM-DD`) and adds candidate items
-to the board for triage.
+to the board for triage. Only one session runs at a time, across all
+machines: besides a local lock, `bot-work` holds a lease in an archived
+board item (`bot-state: lease`) while the agent runs, which lapses 20
+minutes after its machine stops renewing it.
 
 People often react to the bot with an emoji rather than a comment, so
 the `bot-feedback` skill has an agent review each new 👎 or 😕 on

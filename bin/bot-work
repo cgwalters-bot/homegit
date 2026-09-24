@@ -6,6 +6,24 @@ readonly DEFAULT_AGENT=opencode
 readonly BOT_LOGIN=cgwalters-bot
 readonly BOARD_URL=https://github.com/users/${BOT_LOGIN}/projects/1
 readonly LOCK_FILE=${XDG_RUNTIME_DIR:-/tmp}/bot-work.lock
+# Only one run on any machine at a time: besides the local lock, a run
+# holds a lease in the archived 'bot-state: lease' board item (see
+# 'bot-board state-get'), {host, pid, token, agent, acquired_at,
+# expires_at}, renewed every LEASE_RENEW seconds while the agent runs and
+# cleared when it exits. If the machine dies, the lease lapses after
+# LEASE_TTL seconds.
+readonly LEASE_NAME=lease
+readonly LEASE_TTL=1200
+readonly LEASE_RENEW=300
+# Exit status of 'bot-board state-put --checked --strict' on a conflict.
+readonly EX_CONFLICT=3
+# How long a run waits for the local lock, which the previous run's lease
+# keeper holds for a moment while it clears the lease.
+readonly LOCK_WAIT=30
+# flock's exit status on a timeout, as told with -E.
+readonly EX_LOCK_TIMEOUT=10
+BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
+readonly BOT_BOARD
 
 usage() {
     cat <<EOF
@@ -24,13 +42,127 @@ Options:
 Any remaining arguments are appended to the prompt as extra instructions.
 
 gh must be authenticated as ${BOT_LOGIN}, and only one run at a time is
-allowed (lock file: ${LOCK_FILE}).
+allowed, on this machine (lock file: ${LOCK_FILE}) and across machines:
+a run holds a lease in the archived 'bot-state: ${LEASE_NAME}' board item
+while its agent runs, renewed every $((LEASE_RENEW / 60)) minutes. A lease that
+wasn't renewed for $((LEASE_TTL / 60)) minutes (its machine died, say) has
+lapsed, and one held by an earlier run on this machine is taken over,
+since that run no longer holds the local lock. To clear a lease whose
+machine is gone for good: bot-board state-put ${LEASE_NAME} '{}'
 EOF
 }
 
 fatal() {
     echo "error: $*" 1>&2
     exit 1
+}
+
+# host_id: prints this machine's name in a lease. The hostname alone
+# can be as generic as 'toolbx', so the machine id tells machines apart.
+host_id() {
+    local id=
+    read -r id 2>/dev/null </etc/machine-id || true
+    echo "$(hostname)${id:+/${id:0:8}}"
+}
+
+# lease_until: prints the ISO time a lease taken or renewed now lasts until.
+lease_until() {
+    date -u -d "@$(($(date +%s) + LEASE_TTL))" +%FT%TZ
+}
+
+# put_lease JSON WHAT: a strict checked write of the lease. On failure,
+# says WHAT and returns EX_CONFLICT if another machine changed the lease
+# since this one last read or wrote it, else 1.
+put_lease() {
+    local rc=0
+    "${BOT_BOARD}" state-put --checked --strict "${LEASE_NAME}" "$1" || rc=$?
+    case "${rc}" in
+        0) ;;
+        "${EX_CONFLICT}")
+            echo "$2: another machine changed the lease (bot-state: ${LEASE_NAME}) meanwhile" 1>&2
+            return "${EX_CONFLICT}"
+            ;;
+        *) echo "$2: writing the lease (bot-state: ${LEASE_NAME}) failed" 1>&2; return 1 ;;
+    esac
+}
+
+# read_lease: prints the lease on the board, host, pid, expiry and token
+# tab-separated, and tracks it as the base for put_lease.
+read_lease() {
+    local lease
+    lease=$("${BOT_BOARD}" state-get --track "${LEASE_NAME}") || return 1
+    jq -r '[.host // "", (.pid // "" | tostring), .expires_at // "", .token // ""] | @tsv' <<<"${lease}"
+}
+
+# acquire_lease: takes the lease for this run, or fails if a run on
+# another machine holds it. Sets LEASE (the lease written).
+acquire_lease() {
+    local lease host pid expires token me
+    me=$(host_id)
+    lease=$(read_lease) || fatal "reading the lease (bot-state: ${LEASE_NAME}) failed; see above"
+    IFS=$'\t' read -r host pid expires _ <<<"${lease}"
+    if test -n "${host}"; then
+        if test "${host}" != "${me}" && [[ "${expires}" > "$(date -u +%FT%TZ)" ]]; then
+            fatal "a bot-work run on ${host} (pid ${pid}) holds the lease until ${expires}; wait for it to finish (if that machine is gone for good: bot-board state-put ${LEASE_NAME} '{}')"
+        fi
+        if test "${host}" = "${me}"; then
+            echo "Taking over the lease of an earlier run on this machine (pid ${pid}), which is gone: this run holds the local lock." 1>&2
+        else
+            echo "Taking over the lease of ${host} (pid ${pid}), which lapsed at ${expires}." 1>&2
+        fi
+    fi
+    token=$(cat /proc/sys/kernel/random/uuid)
+    LEASE=$(jq -nc --arg host "${me}" --argjson pid $$ --arg token "${token}" --arg agent "${agent}" \
+        --arg now "$(date -u +%FT%TZ)" --arg until "$(lease_until)" \
+        '{host: $host, pid: $pid, token: $token, agent: $agent, acquired_at: $now, expires_at: $until}')
+    put_lease "${LEASE}" "error: cannot take the lease" || exit 1
+    # The checked write rereads the lease just before writing, but two
+    # machines can still both write in that moment; the later one wins,
+    # and the other one sees it here.
+    lease_is_ours || fatal "another machine took the lease at the same moment; not starting"
+}
+
+# lease_is_ours: whether the lease on the board is still LEASE (tracking
+# it for put_lease); if not, says who holds it now.
+lease_is_ours() {
+    local lease host token
+    lease=$(read_lease) || { echo "warning: cannot read the lease (bot-state: ${LEASE_NAME})" 1>&2; return 1; }
+    IFS=$'\t' read -r host _ _ token <<<"${lease}"
+    test "${token}" = "$(jq -r .token <<<"${LEASE}")" && return 0
+    echo "warning: the lease (bot-state: ${LEASE_NAME}) is no longer this run's (held by: ${host:-nobody}); leaving it alone" 1>&2
+    return 1
+}
+
+# keep_lease: in the background, renews the lease while the agent runs,
+# and clears it once the agent (and anything it left holding the lock
+# fd) is gone, which it notices by getting the local lock itself. A
+# lease that is no longer this run's is left alone.
+keep_lease() {
+    (
+        # Not holding the agent's lock fd, nor its stdout; and still
+        # clearing the lease when the terminal goes away.
+        exec {lock_fd}>&- >/dev/null
+        trap '' HUP
+        exec {wait_fd}>"${LOCK_FILE}"
+        local rc
+        while true; do
+            rc=0
+            flock -E "${EX_LOCK_TIMEOUT}" -w "${LEASE_RENEW}" "${wait_fd}" || rc=$?
+            test "${rc}" -eq "${EX_LOCK_TIMEOUT}" || break
+            if ! lease_is_ours; then
+                echo "warning: this bot-work run (pid $$) keeps running without the lease; another machine may start a session meanwhile" 1>&2
+                exit 0
+            fi
+            LEASE=$(jq -c --arg until "$(lease_until)" '.expires_at = $until' <<<"${LEASE}")
+            put_lease "${LEASE}" "warning: cannot renew the lease" || true
+        done
+        if test "${rc}" -ne 0; then
+            echo "warning: waiting for the agent to finish failed; the lease lapses at $(jq -r .expires_at <<<"${LEASE}")" 1>&2
+            exit 0
+        fi
+        lease_is_ours || exit 0
+        put_lease '{}' "warning: cannot clear the lease; it lapses at $(jq -r .expires_at <<<"${LEASE}")" || true
+    ) &
 }
 
 require_cmd() {
@@ -102,5 +234,7 @@ test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', no
 # pass straight through) and the lock is held exactly as long as the agent
 # runs, plus anything it leaves running in the background with the fd open.
 exec {lock_fd}>"${LOCK_FILE}" || fatal "cannot open lock file ${LOCK_FILE}"
-flock -n "${lock_fd}" || fatal "another bot-work run is still active (it holds ${LOCK_FILE}); wait for it to finish"
+flock -w "${LOCK_WAIT}" "${lock_fd}" || fatal "another bot-work run is still active (it holds ${LOCK_FILE}); wait for it to finish"
+acquire_lease
+keep_lease
 exec "${cmd[@]}"
