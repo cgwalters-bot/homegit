@@ -20,7 +20,9 @@ picked up by both agent CLIs: `workstream` (using the board),
 `bot-feedback` (surfacing reactions on the bot's work), `bot-notify`
 (routing mentions of and requests to the bot),
 `upstream-pr` (how to contribute as the bot, with `bot-pr`), `devspace-work` (building
-and testing on a remote runner), plus the upstream ones like
+and testing on a remote runner), `coordinator` (running a top-level
+session that polls, dispatches worker and reviewer subagents, and writes
+the morning brief; the preambles it briefs them with live next to it), plus the upstream ones like
 `commit-review`.
 
 The bot uses two agents, each on its own subscription. opencode is
