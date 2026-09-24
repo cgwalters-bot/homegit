@@ -232,9 +232,11 @@ requests), and remembers what it showed. Then, per PR:
 
 - **Comments and review comments**: address them like upstream review
   (see `upstream-pr`): `git commit --fixup=<sha>`, squash with
-  `git rebase --autosquash`, retest as needed, force-push the branch, and
-  reply in the fork PR thread saying what changed (or why not). A request
-  to reword a commit message is a reword in that rebase. If he edited the
+  `git rebase --autosquash`, retest as needed, force-push the branch,
+  run `bot-pr prune-runs REPO` (the forge's forks share one pool of
+  runners, and the replaced head's CI would otherwise stay queued ahead
+  of everyone's current work), and reply in the fork PR thread saying
+  what changed (or why not). A request to reword a commit message is a reword in that rebase. If he edited the
   title or description (inbox shows `body edited` for his edits only),
   keep his text: those are what goes upstream. Change a fork PR's
   description only with `bot-pr get-body <fork-pr-url> > FILE`, then

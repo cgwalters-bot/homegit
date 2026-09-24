@@ -85,6 +85,18 @@ Commands:
         The upstream PR is a draft with --draft, or when ${REVIEWER}'s latest
         '${DRAFT_COMMAND}' or '${READY_COMMAND}' comment line is '${DRAFT_COMMAND}'. --dry-run checks
         everything and prints what would happen without changing anything.
+  prune-runs [--dry-run] [REPO...]
+        Cancel the queued, pending and in-progress Actions runs in the
+        forks REPO (default: every fork in ${FORGE_ORG}) that CI started
+        for a commit since superseded: pull_request runs for a commit that
+        is no longer the head of an open PR there, and push runs for one
+        that is also no longer the head of its branch or the default
+        branch. All forks in ${FORGE_ORG} share its runners, so every
+        force-push otherwise leaves the old head's CI queued ahead of
+        current work. Runs of other events (e.g. workflow_dispatch) are
+        never cancelled. fork-pr and promote run this for their fork; run
+        it after force-pushing to a fork PR by hand. --dry-run lists what
+        would be cancelled.
   get-body FORK_PR_URL
         Print a fork PR's description without its bot-meta section, to
         edit and pass to set-body, and remember it as the base that
@@ -363,6 +375,78 @@ fork_setup() {
     info "Set up Actions on ${fork}: ${changed} workflow(s) changed"
 }
 
+# Run statuses that still hold, or wait for, one of the organization's
+# runners.
+readonly ACTIVE_RUN_STATUSES=(requested waiting pending queued in_progress)
+# The only events whose runs prune_runs cancels: the CI of a pushed commit.
+# Runs of anything else, such as workflow_dispatch runs started on purpose
+# on a bot branch, are never touched.
+readonly PRUNE_EVENTS='["pull_request", "push"]'
+
+# prune_runs FORK DRY_RUN [KEEP_SHA...]: cancels FORK's active pull_request
+# and push runs for commits that were superseded, since all forks in the
+# forge share its runners and a force-pushed branch otherwise leaves the
+# old head's full CI queued ahead of everyone's current work. A
+# pull_request run is superseded when its commit is no longer the head of
+# an open PR in FORK; a push run when its commit is also no longer the
+# head of its branch or of the default branch. Push runs whose ref isn't
+# a branch any more (a deleted branch, a tag) are left alone. KEEP_SHAs
+# are never superseded: fork-pr passes what it just pushed, in case the
+# PR listing lags behind the push.
+prune_runs() {
+    local fork=$1 dry_run=$2
+    shift 2
+    [[ "${fork}" == "${FORGE_ORG}/"* ]] || return 0
+    local runs status
+    runs=$(for status in "${ACTIVE_RUN_STATUSES[@]}"; do
+        ghapi --paginate "repos/${fork}/actions/runs?status=${status}&per_page=100" \
+            --jq '.workflow_runs[] | {id, event, status, name, head_sha, head_branch, created_at}' ||
+            fatal "cannot list the ${status} Actions runs of ${fork}"
+    done | jq -sc --argjson ev "${PRUNE_EVENTS}" 'unique_by(.id) | map(select(.event | IN($ev[])))') ||
+        fatal "cannot list the Actions runs of ${fork}"
+    if test "$(jq length <<<"${runs}")" -eq 0; then
+        return 0
+    fi
+    local pr_heads default default_sha keep
+    pr_heads=$(ghapi --paginate "repos/${fork}/pulls?state=open&per_page=100" --jq '.[].head.sha' | jq -Rsc 'split("\n") - [""]') ||
+        fatal "cannot list the open PRs of ${fork}"
+    default=$(ghapi "repos/${fork}" --jq .default_branch) || fatal "cannot read ${fork}"
+    default_sha=$(ref_sha "${fork}" "${default}")
+    keep=$(jq -nc --argjson prs "${pr_heads}" --arg d "${default_sha}" '$prs + [$d] + $ARGS.positional - [""]' --args "$@")
+    # Branch heads, for push runs only, looked up once per branch.
+    local branches heads="{}" branch sha
+    branches=$(jq -r --argjson keep "${keep}" \
+        '.[] | select(.event == "push" and (.head_sha | IN($keep[]) | not)) | .head_branch // empty' <<<"${runs}" | sort -u)
+    while IFS= read -r branch; do
+        test -n "${branch}" || continue
+        sha=$(ref_sha "${fork}" "${branch}")
+        heads=$(jq -c --arg b "${branch}" --arg s "${sha}" '.[$b] = $s' <<<"${heads}")
+    done <<<"${branches}"
+    local superseded ncancel=0 id line
+    superseded=$(jq -r --argjson keep "${keep}" --argjson heads "${heads}" '.[]
+        | select(.head_sha | IN($keep[]) | not)
+        | select(.event == "pull_request"
+                 or (.head_sha as $run | $heads[.head_branch // ""] // "" | . != "" and . != $run))
+        | "\(.id)\t\(.event) \(.head_branch) \(.head_sha[:12]), \(.name), \(.status) since \(.created_at)"' \
+        <<<"${runs}") || fatal "internal error: selecting the superseded runs of ${fork} failed"
+    while IFS=$'\t' read -r id line; do
+        test -n "${id}" || continue
+        if ${dry_run}; then
+            echo "would cancel ${fork} run ${id}: ${line}"
+        elif ghapi -X POST "repos/${fork}/actions/runs/${id}/cancel" >/dev/null; then
+            info "Cancelled ${fork} run ${id}: ${line}"
+        else
+            # e.g. 409: it finished in the meantime.
+            warn "cancelling ${fork} run ${id} failed: ${line}"
+            continue
+        fi
+        ncancel=$((ncancel + 1))
+    done <<<"${superseded}"
+    if ${dry_run} || test "${ncancel}" -gt 0; then
+        info "${fork}: $(jq length <<<"${runs}") active pull_request/push run(s), ${ncancel} superseded$(${dry_run} || echo " and cancelled")"
+    fi
+}
+
 # sync_base UPSTREAM FORK BRANCH: make the fork's copy of BRANCH match
 # upstream's. The forge's forks are direct forks of upstream, so the
 # default branch is synced with merge-upstream, which fails if the fork's
@@ -560,6 +644,9 @@ cmd_fork_pr() {
     local head_sha compare ahead behind
     head_sha=$(ref_sha "${fork}" "${branch}")
     test -n "${head_sha}" || fatal "${fork} has no branch ${branch}; run fork-pr in a clone that has it (or pass --from), or push it first"
+    # The push, or an earlier force-push by hand, may have left the old
+    # head's CI queued; and sync_base moves the base.
+    prune_after_push "${fork}" "${head_sha}"
     compare=$(ghapi "repos/${upstream}/compare/${base}...${owner}:${branch}" --jq '"\(.ahead_by) \(.behind_by)"') ||
         fatal "cannot compare ${branch} with ${upstream}:${base}"
     read -r ahead behind <<<"${compare}"
@@ -626,6 +713,46 @@ cmd_fork_setup() {
     test "${rc}" -ne "${EX_NOTFOUND}" || fatal "${fork} does not exist"
     test "${rc}" -eq 0 || fatal "cannot read ${fork}"
     fork_setup "${fork}"
+}
+
+cmd_prune_runs() {
+    local dry_run=false repos=() repo
+    while test $# -gt 0; do
+        case "$1" in
+            --dry-run) dry_run=true; shift ;;
+            -*) fatal "unknown argument for prune-runs: $1 (see --help)" ;;
+            *)
+                repo=$1
+                [[ "${repo}" == */* ]] || repo=${FORGE_ORG}/${repo}
+                if ! valid_repo "${repo}" || test "${repo%%/*}" != "${FORGE_ORG}"; then
+                    fatal "prune-runs takes forks in ${FORGE_ORG} (REPO or ${FORGE_ORG}/REPO), not '$1'"
+                fi
+                repos+=("${repo}")
+                shift
+                ;;
+        esac
+    done
+    check_login
+    if test "${#repos[@]}" -eq 0; then
+        local listed
+        listed=$(ghapi --paginate "orgs/${FORGE_ORG}/repos?per_page=100" \
+            --jq '.[] | select(.fork and (.archived | not)) | .full_name') ||
+            fatal "cannot list the repositories of ${FORGE_ORG}"
+        mapfile -t repos <<<"${listed}"
+    fi
+    # One fork failing doesn't keep the others' runs queued.
+    local failed=()
+    for repo in "${repos[@]}"; do
+        test -n "${repo}" || continue
+        (prune_runs "${repo}" "${dry_run}") || failed+=("${repo}")
+    done
+    test "${#failed[@]}" -eq 0 || fatal "pruning the runs of ${failed[*]} failed"
+}
+
+# prune_after_push FORK [KEEP_SHA...]: prune_runs for commands that push,
+# where a failure must not fail the push.
+prune_after_push() {
+    (prune_runs "$1" false "${@:2}") || warn "cancelling superseded Actions runs in $1 failed; rerun '$(basename "$0") prune-runs ${1#*/}'"
 }
 
 # read_fork_pr URL: sets FORK, NUMBER and PR (the PR's JSON) for an open
@@ -968,6 +1095,9 @@ EOF
         warn "commenting on ${url} failed"
     ghapi -X PATCH "repos/${FORK}/pulls/${NUMBER}" -f state=closed >/dev/null ||
         warn "closing ${url} failed; close it by hand"
+    # CI for the closed fork PR, and for the head the rebase replaced, is
+    # now upstream's to run.
+    prune_after_push "${FORK}"
     if test -n "${item}"; then
         local board_args=(set "${item}" --status "In Review" --branch "${upstream_url}")
         ${have_why} && board_args+=(--why "${why}")
@@ -1127,6 +1257,7 @@ case "${command}" in
     fork-setup) command=fork_setup ;;
     set-body) command=set_body ;;
     get-body) command=get_body ;;
+    prune-runs) command=prune_runs ;;
     promote|inbox) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac

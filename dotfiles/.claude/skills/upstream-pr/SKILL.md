@@ -126,7 +126,13 @@ time. Later pushes, such as review fixups, go to the `forge` remote:
 
 ```bash
 git push -u forge HEAD:bot/<short-slug>
+bot-pr prune-runs REPO
 ```
+
+Each push to a fork PR starts its whole CI again, and the forge's forks
+share one pool of runners: `prune-runs` cancels the runs still queued
+for the commits the push replaced. fork-pr and promote do this
+themselves.
 
 The push goes from this machine, never from a devspace, and never to
 `upstream`.
