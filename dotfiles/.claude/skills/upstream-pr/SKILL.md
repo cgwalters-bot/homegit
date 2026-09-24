@@ -89,11 +89,16 @@ topic branch per change.
 - Follow the project's commit style; otherwise Linux kernel style subjects
   with a body explaining why (see the shared AGENTS.md guidance).
 - **Never add `Signed-off-by`.** That is for a human to add. If the project
-  requires DCO sign-off, leave it out anyway and say in the PR body that a
-  maintainer must sign off before merging (e.g. `git rebase --signoff <base>`
-  and force-push); if it doesn't, don't mention DCO. For the bot's PRs,
-  cgwalters does that with `bin/dco-signoff`, which refuses to run as the
-  bot; `dco-signoff --list-only` shows which open PRs still wait on it.
+  requires DCO sign-off, leave it out anyway: `bot-pr promote` then adds a
+  line for the maintainers to the upstream PR body, telling them to comment
+  `/signoff` where the repository has that command (bootc-dev/actions'
+  pr-signoff workflow, `.github/workflows/signoff.yml`), and how to sign off
+  by hand otherwise. So fork PR bodies don't need a DCO note; only an
+  upstream PR opened without promote (Workflow `pr`) needs that line
+  written by hand. If DCO isn't required, don't mention it. For the bot's
+  PRs, cgwalters can also sign off with `bin/dco-signoff`, which refuses to
+  run as the bot; `dco-signoff --list-only` shows which open PRs still wait
+  on it.
 - **Whether DCO is required** comes from what GitHub enforces, never from
   CONTRIBUTING or other prose, which is easy to misread. It is required if
   the default branch's rules require a status check named like DCO:
