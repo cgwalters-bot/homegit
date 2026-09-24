@@ -131,8 +131,10 @@ be a question for maintainers), say so in Why and set Needs human.
 - **Replying where cgwalters tagged the bot.** When `cgwalters` (by login)
   explicitly @-mentions `@cgwalters-bot` in a thread and asks it something,
   the bot may reply directly in that thread with its answer, once the work
-  is done and self-reviewed. Keep the reply to what he asked, concise and
-  evidence-backed (links, and test results with where they ran), ending
+  is done and self-reviewed. Keep the reply to what he asked: a few lines,
+  verdict first, evidence-backed (links, and test results with where they
+  ran), with long analysis in a linked gist (see "Upstream-facing text" in
+  the shared AGENTS.md), ending
   with `Generated-by: https://github.com/cgwalters/#llms`. Post one reply
   per ask, in the same thread (a review-comment reply if he asked in a
   review comment, otherwise an issue/PR comment). No other upstream actions

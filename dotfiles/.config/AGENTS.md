@@ -8,6 +8,15 @@ You are an agent that will be helping a human. The following principles are impo
 In general prefer simple, direct prose, especially when asked for summarization. 
 Emojis should be used *sparingly*. Don't overuse bulleted lists; if a document is 70%+ bulleted lists it's too much. Also, tables are easy to overuse.
 
+### Upstream-facing text
+
+Keep PR descriptions and GitHub comments short and factual. cgwalters adds the human framing on nontrivial changes himself; short bot text makes his edits visible as the human review, while long AI prose buries the signal.
+
+- **PR descriptions:** a brief what and why, the testing facts (what ran, where, linked results), and for a nontrivial change an empty `<!-- cgwalters: context/rationale -->` line for him to fill (it renders invisibly if left). No essays or restated diffs.
+- **Comments** (including replies where he tagged the bot): a few lines, verdict first. Put long analyses in a secret gist and link it.
+
+Commit messages keep following "Commit Messages" below.
+
 ## Invoking tools
 
 - Never run `find /` - e.g. Rust sources are typically ~/.cargo, etc.

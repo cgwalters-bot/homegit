@@ -207,10 +207,13 @@ already did that.
 ## The PR description
 
 Whether it goes on the fork first or (Workflow `pr`) straight upstream,
-the body explains the motivation and how it was tested, links the issue
-(`Fixes OWNER/REPO#N` when it fully resolves it), states caveats (such as
-commits that still need a human's DCO sign-off), follows any PR template,
-and ends with:
+the body is short, per "Upstream-facing text" in the shared AGENTS.md:
+a brief what and why, how it was tested, the
+`<!-- cgwalters: context/rationale -->` placeholder for a nontrivial
+change, the issue link
+(`Fixes OWNER/REPO#N` when it fully resolves it) and caveats (such as
+commits that still need a human's DCO sign-off). It follows any PR
+template and ends with:
 
 ```
 Generated-by: https://github.com/cgwalters/#llms
@@ -251,8 +254,8 @@ Force-pushing your own topic branch is fine. **Never force-push over
 someone else's commits**: if a maintainer pushed to your branch, fetch and
 rebase on top of their work first, and never force-push to branches you
 did not create. Reply to each review comment saying what changed, or why
-you disagree. If a comment on an upstream PR needs a judgment call from
-Colin, put the question in the board item (see `workstream`) and set
+you disagree, in a few lines. If a comment on an upstream PR needs a
+judgment call from Colin, put the question in the board item (see `workstream`) and set
 Needs human rather than asking on the PR; ask on the PR only when the
 question is for the maintainers.
 

@@ -23,7 +23,8 @@ Rules:
   - Never add Signed-off-by.
   - AI trailer: `Generated-by: AI` by default, unless the target project's AGENTS.md/CONTRIBUTING says otherwise. Never name models or tools.
   - Push branches only to cgwalters-bot and cgwalters-forge forks (via `bot-pr fork-pr`); create a personal fork via REST `gh api -X POST repos/O/R/forks` if needed.
-  - Do NOT open upstream PRs (only draft PRs on the forge fork via `bot-pr fork-pr`), and do NOT comment, review, label or react upstream, except: when cgwalters (login) explicitly @-mentioned @cgwalters-bot with an ask, you may post one concise reply with the answer in that thread (see the workstream skill).
+  - Do NOT open upstream PRs (only draft PRs on the forge fork via `bot-pr fork-pr`), and do NOT comment, review, label or react upstream, except: when cgwalters (login) explicitly @-mentioned @cgwalters-bot with an ask, you may post one reply with the answer in that thread (see the workstream skill).
+- **Upstream-facing text:** keep PR bodies and comments short and factual, leaving the narrative to cgwalters; see "Upstream-facing text" in the shared AGENTS.md.
 - **PR bodies:** don't write a DCO note in fork PR bodies: when the repository enforces DCO (decided from the branch rules API as upstream-pr/SKILL.md describes, never from CONTRIBUTING text), `bot-pr promote` appends the maintainers' line to the upstream body itself (comment `/signoff` where the repo has that command, else how to sign off by hand). Only an upstream PR opened without promote needs that line written by hand. Only claim CI results you can link to. Edit fork PR bodies with `bot-pr get-body`/`set-body`, never `gh pr edit`.
 
 Final report:
