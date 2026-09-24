@@ -12,6 +12,8 @@ readonly REVIEWER=cgwalters
 # them and edit PRs, and PRs into them run the project's own CI.
 readonly FORGE_ORG=${BOT_PR_FORGE:-cgwalters-forge}
 readonly BRANCH_PREFIX=bot/
+# A board item id, as recorded in a fork PR's bot-meta section.
+readonly ITEM_ID_RE='PVTI_[A-Za-z0-9_-]+'
 readonly META_START='<!-- bot-meta -->'
 readonly META_END='<!-- /bot-meta -->'
 readonly LLMS_TRAILER='Generated-by: https://github.com/cgwalters/#llms'
@@ -56,7 +58,7 @@ reviews it, and only his approval opens the upstream PR.
 
 Commands:
   fork-pr --repo OWNER/REPO --base BRANCH --branch ${BRANCH_PREFIX}SLUG --item PVTI_...
-          --title TITLE --body-file FILE [--from DIR]
+          --title TITLE --body-file FILE [--from DIR] [--force]
         Fork OWNER/REPO into ${FORGE_ORG} if needed, sync the fork's
         BRANCH with upstream, set up its Actions (see fork-setup), push
         ${BRANCH_PREFIX}SLUG to the fork from the git repository DIR (default:
@@ -66,7 +68,10 @@ Commands:
         name. TITLE and FILE are the future upstream PR: why, what was
         tested, caveats, ending with '${LLMS_TRAILER}'.
         A trailing ${META_START} section records the upstream target
-        and board item, with instructions for the reviewer.
+        and board item, with instructions for the reviewer. It refuses if
+        another open fork PR in the fork already records that item, which
+        is usually a copied id (after splitting a PR, the new part needs
+        its own item); --force allows that.
   fork-setup REPO
         Enable Actions on the fork ${FORGE_ORG}/REPO and the workflows
         GitHub disabled when forking, but disable those that run on a
@@ -85,6 +90,12 @@ Commands:
         The upstream PR is a draft with --draft, or when ${REVIEWER}'s latest
         '${DRAFT_COMMAND}' or '${READY_COMMAND}' comment line is '${DRAFT_COMMAND}'. --dry-run checks
         everything and prints what would happen without changing anything.
+  set-item FORK_PR_URL PVTI_... [--force]
+        Change the board item recorded in a fork PR's bot-meta section,
+        which promote moves to In Review, and leave the rest of the body
+        as is. Like set-body, this is recorded as the bot's edit. It
+        refuses if another open fork PR in that fork records the item,
+        unless --force. The board's own Branch fields are not changed.
   prune-runs [--dry-run] [REPO...]
         Cancel the queued, pending and in-progress Actions runs in the
         forks REPO (default: every fork in ${FORGE_ORG}) that CI started
@@ -594,10 +605,34 @@ def since_bot: .nodes | (map(.by == $bot) | index(true)) as $i | .[:($i // lengt
 def reviewers: [.[] | select(.by == $r) | .at] | reverse | .[];
 '
 
+# recorded_item < PR_JSON: prints the board item in the PR's bot-meta
+# section, if any.
+recorded_item() {
+    jq -r --arg re "Board item: \`(${ITEM_ID_RE})\`" "${BODY_JQ}"' .body | meta | [match($re).captures[0].string] | first // empty'
+}
+
+# check_item_free FORK ITEM SELF_URL SELF_BRANCH: fails unless no open PR
+# in FORK other than SELF_URL or the one from SELF_BRANCH records ITEM in
+# its bot-meta section. Two fork PRs for one item are usually a copied
+# id, and promote would then move the wrong item.
+check_item_free() {
+    local fork=$1 item=$2 self_url=$3 self_branch=$4 prs others
+    prs=$(ghapi --paginate "repos/${fork}/pulls?state=open&per_page=100" --jq '.[] | @json') ||
+        fatal "cannot list the open PRs of ${fork}"
+    others=$(while IFS= read -r pr; do
+        test -n "${pr}" || continue
+        test "$(recorded_item <<<"${pr}")" = "${item}" || continue
+        jq -r --arg u "${self_url}" --arg b "${self_branch}" 'select(.html_url != $u and .head.ref != $b) | .html_url' <<<"${pr}"
+    done <<<"${prs}" | paste -sd' ')
+    test -z "${others}" ||
+        fatal "board item ${item} is already recorded as the item of the open fork PR(s) ${others}. A PR split off another needs its own board item (bot-board add or draft). Pass --force if this PR belongs to ${item} as well, or fix the other PR's recorded item with '$(basename "$0") set-item FORK_PR_URL PVTI_...'"
+}
+
 cmd_fork_pr() {
-    local upstream="" base="" branch="" item="" title="" body_file="" from=.
+    local upstream="" base="" branch="" item="" title="" body_file="" from=. force=false
     while test $# -gt 0; do
         case "$1" in
+            --force) force=true; shift ;;
             --repo|--base|--branch|--item|--title|--body-file|--from)
                 test $# -ge 2 || fatal "$1 requires an argument"
                 case "$1" in
@@ -624,7 +659,7 @@ cmd_fork_pr() {
         "${BOT_LOGIN}"|"${FORGE_ORG}") fatal "--repo is the upstream repository, not a fork" ;;
     esac
     [[ "${branch}" == "${BRANCH_PREFIX}"?* ]] || fatal "--branch must be ${BRANCH_PREFIX}<slug>, not '${branch}'"
-    [[ "${item}" =~ ^PVTI_[A-Za-z0-9_-]+$ ]] || fatal "--item must be a board item id (PVTI_...), not '${item}'"
+    [[ "${item}" =~ ^${ITEM_ID_RE}$ ]] || fatal "--item must be a board item id (PVTI_...), not '${item}'"
     test -s "${body_file}" || fatal "--body-file '${body_file}' is missing or empty"
     local body
     body=$(<"${body_file}")
@@ -637,6 +672,7 @@ cmd_fork_pr() {
     local fork owner
     fork=$(ensure_fork "${upstream}")
     owner=${fork%%/*}
+    ${force} || check_item_free "${fork}" "${item}" "" "${branch}"
     sync_base "${upstream}" "${fork}" "${base}"
     fork_setup "${fork}"
     push_branch "${from}" "${fork}" "${branch}"
@@ -657,11 +693,16 @@ cmd_fork_pr() {
     existing=$(ghapi -X GET "repos/${upstream}/pulls" -f head="${owner}:${branch}" -f state=open --jq '.[0].html_url // empty') ||
         fatal "cannot list the PRs of ${upstream}"
     test -z "${existing}" || fatal "${branch} is already open upstream as ${existing}"
-    existing=$(ghapi -X GET "repos/${fork}/pulls" -f head="${owner}:${branch}" -f state=open --jq '.[0].html_url // empty') ||
+    existing=$(ghapi -X GET "repos/${fork}/pulls" -f head="${owner}:${branch}" -f state=open --jq '.[0] // empty') ||
         fatal "cannot list the PRs of ${fork}"
     if test -n "${existing}"; then
+        local existing_url recorded
+        existing_url=$(jq -r .html_url <<<"${existing}")
+        recorded=$(recorded_item <<<"${existing}")
         info "A fork PR for ${branch} is already open; not opening another"
-        echo "${existing}"
+        test "${recorded}" = "${item}" ||
+            warn "${existing_url} records board item ${recorded:-(none)}, not ${item}; if --item is right, run '$(basename "$0") set-item ${existing_url} ${item}'"
+        echo "${existing_url}"
         return 0
     fi
 
@@ -690,6 +731,51 @@ cmd_fork_pr() {
         *) warn "${REVIEWER} has '${perm}' access to ${fork}, so he can review and comment but not edit the title and body" ;;
     esac
     echo "${url}"
+}
+
+cmd_set_item() {
+    local url="" item="" force=false
+    while test $# -gt 0; do
+        case "$1" in
+            --force) force=true; shift ;;
+            -*) fatal "unknown argument for set-item: $1 (see --help)" ;;
+            *)
+                if test -z "${url}"; then url=$1
+                elif test -z "${item}"; then item=$1
+                else fatal "set-item takes one fork PR URL and one item"
+                fi
+                shift
+                ;;
+        esac
+    done
+    if test -z "${url}" || test -z "${item}"; then
+        fatal "usage: $(basename "$0") set-item FORK_PR_URL PVTI_... [--force]"
+    fi
+    [[ "${item}" =~ ^${ITEM_ID_RE}$ ]] || fatal "ITEM must be a board item id (PVTI_...), not '${item}'"
+    local FORK NUMBER PR HIS EDITS_UNKNOWN
+    parse_fork_pr_url "${url}"
+    check_login
+    lock_state
+    local state recorded body
+    state=$(load_state)
+    read_fork_pr "${url}"
+    recorded=$(recorded_item <<<"${PR}")
+    if test "${recorded}" = "${item}"; then
+        info "${url} already records board item ${item}"
+        return 0
+    fi
+    ${force} || check_item_free "${FORK}" "${item}" "${url}" ""
+    # Only the bot-meta section changes; without a Board item line (a
+    # hand-edited section), one goes after the Upstream line.
+    body=$(jq -r --arg item "${item}" --arg re "Board item: \`${ITEM_ID_RE}\`" "${BODY_JQ}"'
+        .body | strip_meta + "\n\n" + (meta
+            | if test($re) then sub($re; "Board item: `\($item)`")
+              else sub("(?<u>- Upstream: [^\n]*)"; "\(.u)\n- Board item: `\($item)`") end)' <<<"${PR}")
+    [[ "${body}" == *"Board item: \`${item}\`"* ]] ||
+        fatal "cannot find where to record the item in ${url}'s bot-meta section; restore its '- Upstream:' line"
+    reviewer_edits_since_bot "${url}"
+    write_body "${url}" "${body}" "kept; then set-item changed the board item" true
+    info "${url} now records board item ${item} (was ${recorded:-none}); set the items' Branch fields with bot-board if they need it"
 }
 
 cmd_fork_setup() {
@@ -853,9 +939,13 @@ reviewer_edits_since_bot() {
 # read_fork_pr read with BODY, and records it in 'state' as the bot's
 # write. The reviewer's edits found by reviewer_edits_since_bot (HIS,
 # EDITS_UNKNOWN) that inbox hasn't reported yet are kept for it to show,
-# noting HOW they were followed up. Needs lock_state.
+# noting HOW they were followed up. With KEEP_BASE true (a write that
+# leaves the text outside bot-meta alone), a get-body base that still
+# matched carries over to the new body, and one that didn't stays, so
+# that set-body keeps refusing over the edits it would lose. Needs
+# lock_state.
 write_body() {
-    local url=$1 body=$2 how=$3 seen_body updated pending=null
+    local url=$1 body=$2 how=$3 keep_base=${4:-false} seen_body updated pending=null
     seen_body=$(jq -r --arg u "${url}" '.prs[$u].body // "-"' <<<"${state}")
     updated=$(jq -n --arg body "${body}" '{body: $body}' |
         ghapi -X PATCH "repos/${FORK}/pulls/${NUMBER}" --input -) || fatal "updating the body of ${url} failed"
@@ -867,8 +957,10 @@ write_body() {
                 --arg n " (possibly by ${REVIEWER}: GraphQL was down; ${how})" '{at: $at, note: $n}')
         fi
     fi
-    save_state "$(jq -c --arg u "${url}" --arg h "$(body_hash <<<"${updated}")" --argjson p "${pending}" '
-        .prs[$u] = ((.prs[$u] // {}) + {bot_body: $h} | del(.base_body)
+    save_state "$(jq -c --arg u "${url}" --arg h "$(body_hash <<<"${updated}")" --arg old "$(body_hash <<<"${PR}")" \
+        --argjson keep "${keep_base}" --argjson p "${pending}" '
+        .prs[$u] = ((.prs[$u] // {}) + {bot_body: $h}
+            | if $keep | not then del(.base_body) elif .base_body == $old then .base_body = $h else . end
             | if $p != null then .reviewer_edit = $p else . end)' <<<"${state}")"
 }
 
@@ -993,7 +1085,7 @@ cmd_promote() {
     meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
     test -n "${meta}" || fatal "${url} has no complete ${META_START} ... ${META_END} section; was it opened with fork-pr? Restore it in the PR body"
     # shellcheck disable=SC2016 # literal backticks
-    local upstream_re='Upstream: `([^`]+)`, base `([^`]+)`' item_re='Board item: `(PVTI_[A-Za-z0-9_-]+)`'
+    local upstream_re='Upstream: `([^`]+)`, base `([^`]+)`' item_re="Board item: \`(${ITEM_ID_RE})\`"
     [[ "${meta}" =~ ${upstream_re} ]] ||
         fatal "cannot find the 'Upstream: \`OWNER/REPO\`, base \`BRANCH\`' line in ${url}'s bot-meta section"
     upstream=${BASH_REMATCH[1]}
@@ -1272,6 +1364,7 @@ case "${command}" in
     set-body) command=set_body ;;
     get-body) command=get_body ;;
     prune-runs) command=prune_runs ;;
+    set-item) command=set_item ;;
     promote|inbox) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac

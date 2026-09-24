@@ -332,6 +332,13 @@ below.
   To update the description later (e.g. new test results), use
   `bot-pr get-body "$FORK_PR" > pr-body.md`, edit it, then
   `bot-pr set-body "$FORK_PR" --body-file pr-body.md`.
+
+  `--item` is what promote later moves to In Review, so it must be the
+  item this PR resolves: when you split a PR, the new part gets its own
+  item (`bot-board draft` or `add`), not the original's id. fork-pr
+  refuses an item that another open fork PR in that fork already
+  records (`--force` if both really belong to it). To fix the item a
+  fork PR records, use `bot-pr set-item "$FORK_PR" PVTI_...`.
 - **analysis**: `gh gist create --desc "..." writeup.md` (secret by
   default), then set Draft with `--gist <gist-url>` and a one-line
   summary in Why.
