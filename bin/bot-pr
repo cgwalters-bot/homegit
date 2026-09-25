@@ -40,6 +40,8 @@ readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-pr
 readonly LEGACY_STATE_FILE=${STATE_DIR}/inbox.json
 readonly STATE_VERSION=2
 readonly CLONE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-pr/clones
+# Prefix of the URLs git fetches from and pushes to, followed by OWNER/REPO.
+readonly GIT_URL_PREFIX=${BOT_PR_GIT_URL:-https://github.com/}
 readonly DEFAULT_LOOKBACK_DAYS=7
 # How far back each inbox run re-searches closed PRs, for search index lag.
 readonly SEARCH_OVERLAP="1 hour"
@@ -184,7 +186,8 @@ The inbox state lives in the archived 'bot-state: ${STATE_NAME}' draft
 item on the board, shared by every machine: each command that uses it
 reads it once (one GraphQL call) and writes it at most once (two: a
 checked write, merging with whatever another machine wrote meanwhile).
-BOT_PR_FORGE overrides the organization (${FORGE_ORG}).
+BOT_PR_FORGE overrides the organization (${FORGE_ORG}), and BOT_PR_GIT_URL
+the prefix of the URLs git uses (${GIT_URL_PREFIX}, then OWNER/REPO).
 EOF
 }
 
@@ -728,7 +731,7 @@ push_branch() {
     sha=$(git -C "${dir}" rev-parse -q --verify "refs/heads/${branch}^{commit}" 2>/dev/null) || return 0
     # Quietly: GitHub's "create a pull request" hint doesn't apply here.
     local out
-    out=$(git -C "${dir}" push -q "https://github.com/${fork}" "${sha}:refs/heads/${branch}" 2>&1) ||
+    out=$(git -C "${dir}" push -q "$(git_url "${fork}")" "${sha}:refs/heads/${branch}" 2>&1) ||
         fatal "pushing ${branch} from ${dir} to ${fork} failed: ${out}"
     info "Pushed ${branch} (${sha:0:12}) to ${fork}"
 }
@@ -1383,30 +1386,45 @@ parse_fork_pr_url() {
     NUMBER=${BASH_REMATCH[3]}
 }
 
+# git_url REPO: the URL git fetches and pushes REPO (OWNER/NAME) with.
+git_url() {
+    printf '%s%s\n' "${GIT_URL_PREFIX}" "$1"
+}
+
+# open_clone FORK BRANCH OLD_SHA UPSTREAM BASE: sets CLONE to the cached
+# clone of FORK, locked until the calling (sub)shell exits, with BRANCH
+# fetched as refs/bot-pr/head and UPSTREAM's BASE as refs/bot-pr/base, and
+# exits unless BRANCH is still at OLD_SHA.
+open_clone() {
+    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 clone_lock
+    require_cmd git "install git"
+    require_cmd flock "install util-linux"
+    CLONE=${CLONE_DIR}/${fork//\//_}
+    mkdir -p "${CLONE_DIR}" || fatal "cannot create ${CLONE_DIR}"
+    exec {clone_lock}>"${CLONE}.lock" || fatal "cannot open ${CLONE}.lock"
+    flock "${clone_lock}" || fatal "cannot lock ${CLONE}.lock"
+    if ! test -d "${CLONE}/.git"; then
+        rm -rf "${CLONE}"
+        git clone -q --filter=blob:none --no-checkout "$(git_url "${fork}")" "${CLONE}" 1>&2 ||
+            fatal "cloning ${fork} into ${CLONE} failed"
+    fi
+    git -C "${CLONE}" fetch -q --filter=blob:none "$(git_url "${fork}")" "+refs/heads/${branch}:refs/bot-pr/head" 1>&2 ||
+        fatal "fetching ${fork}:${branch} into ${CLONE} failed"
+    git -C "${CLONE}" fetch -q --filter=blob:none "$(git_url "${upstream}")" "+refs/heads/${base}:refs/bot-pr/base" 1>&2 ||
+        fatal "fetching ${upstream}:${base} into ${CLONE} failed"
+    test "$(git -C "${CLONE}" rev-parse refs/bot-pr/head)" = "${old_sha}" ||
+        fatal "${fork}:${branch} moved while promoting; rerun promote"
+}
+
 # rebase_onto_upstream FORK BRANCH OLD_SHA UPSTREAM BASE: rebases the
 # branch in a cached clone, force-pushes it and prints the new head. On
 # conflicts, prints the conflicting paths and returns EX_CONFLICT. Any
 # other failure exits. It runs in a '||' list, where errexit is off, so
 # every step checks for itself.
 rebase_onto_upstream() {
-    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 dir conflicts new_sha clone_lock
-    require_cmd git "install git"
-    require_cmd flock "install util-linux"
-    dir=${CLONE_DIR}/${fork//\//_}
-    mkdir -p "${CLONE_DIR}" || fatal "cannot create ${CLONE_DIR}"
-    exec {clone_lock}>"${dir}.lock" || fatal "cannot open ${dir}.lock"
-    flock "${clone_lock}" || fatal "cannot lock ${dir}.lock"
-    if ! test -d "${dir}/.git"; then
-        rm -rf "${dir}"
-        git clone -q --filter=blob:none --no-checkout "https://github.com/${fork}" "${dir}" 1>&2 ||
-            fatal "cloning ${fork} into ${dir} failed"
-    fi
-    git -C "${dir}" fetch -q --filter=blob:none "https://github.com/${fork}" "+refs/heads/${branch}:refs/bot-pr/head" 1>&2 ||
-        fatal "fetching ${fork}:${branch} into ${dir} failed"
-    git -C "${dir}" fetch -q --filter=blob:none "https://github.com/${upstream}" "+refs/heads/${base}:refs/bot-pr/base" 1>&2 ||
-        fatal "fetching ${upstream}:${base} into ${dir} failed"
-    test "$(git -C "${dir}" rev-parse refs/bot-pr/head)" = "${old_sha}" ||
-        fatal "${fork}:${branch} moved while promoting; rerun promote"
+    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 dir conflicts new_sha CLONE
+    open_clone "$@"
+    dir=${CLONE}
     git -C "${dir}" rebase --abort >/dev/null 2>&1 || true
     git -C "${dir}" checkout -q --force --detach refs/bot-pr/head 1>&2 ||
         fatal "checking out ${branch} in ${dir} failed"
@@ -1423,7 +1441,7 @@ rebase_onto_upstream() {
     git -C "${dir}" merge-base --is-ancestor refs/bot-pr/base "${new_sha}" ||
         fatal "the rebased ${branch} in ${dir} doesn't contain ${upstream}:${base}; not pushing it"
     git -C "${dir}" push -q --force-with-lease="refs/heads/${branch}:${old_sha}" \
-        "https://github.com/${fork}" "${new_sha}:refs/heads/${branch}" 1>&2 ||
+        "$(git_url "${fork}")" "${new_sha}:refs/heads/${branch}" 1>&2 ||
         fatal "pushing the rebased ${branch} to ${fork} failed"
     echo "${new_sha}"
 }
