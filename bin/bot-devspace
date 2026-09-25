@@ -39,7 +39,9 @@ readonly EX_NOTFOUND=4
 # Baseline toolchain; all of these exist in RHEL 10 (+ EPEL, which the
 # workflow enables). The workflow installs them (its packages.txt) for
 # '${SSH_USER}', who can't; provision installs them only on legacy devspaces
-# and otherwise checks they are there.
+# and otherwise checks they are there. This duplicates packages.txt in
+# the devspace repository: keep the two in step until the legacy path
+# goes, then check against packages.txt itself.
 readonly PROVISION_PACKAGES=(
     podman buildah skopeo
     gcc gcc-c++ make pkgconf openssl-devel
