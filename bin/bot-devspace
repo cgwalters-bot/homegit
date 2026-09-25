@@ -51,12 +51,12 @@ readonly PROVISION_PACKAGES=(
     python3 python3-pip git
     # VM stack for bcvk-based integration tests. virt-fw-vars (from
     # python3-virt-firmware) is what bcvk enrolls Secure Boot keys with,
-    # which sealed UKI tests need.
-    bcvk qemu-kvm libvirt virtiofsd python3-virt-firmware
+    # which sealed UKI tests need. bcvk itself comes from below.
+    qemu-kvm libvirt virtiofsd python3-virt-firmware
 )
-# EPEL's bcvk and tmt are too old for bootc's tmt tests, so provision also
-# installs these into ~/.local/bin (ahead of /usr/bin in PATH), matching
-# bootc CI: bcvk from bootc-dev/actions' bootc-ubuntu-setup, tmt from
+# EPEL's bcvk and tmt are too old for bootc's tmt tests, so provision
+# installs these into ~/.local/bin instead (ahead of /usr/bin in PATH),
+# matching bootc CI: bcvk from bootc-dev/actions' bootc-ubuntu-setup, tmt from
 # bootc's .github/actions/install-tmt. Keep them in sync with those.
 readonly BCVK_VERSION=0.19.0
 readonly TMT_VERSION=1.78.0
