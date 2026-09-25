@@ -959,6 +959,24 @@ recorded_item() {
     jq -r --arg re "Board item: \`(${ITEM_ID_RE})\`" "${BODY_JQ}"' .body | meta | [match($re).captures[0].string] | first // empty'
 }
 
+# parse_meta URL META: sets META_UPSTREAM and META_BASE from the bot-meta
+# section META of the fork PR URL, and META_ITEM to its board item (empty
+# if it has none).
+parse_meta() {
+    local url=$1 meta=$2
+    # shellcheck disable=SC2016 # literal backticks
+    local upstream_re='Upstream: `([^`]+)`, base `([^`]+)`' item_re="Board item: \`(${ITEM_ID_RE})\`"
+    [[ "${meta}" =~ ${upstream_re} ]] ||
+        fatal "cannot find the 'Upstream: \`OWNER/REPO\`, base \`BRANCH\`' line in ${url}'s bot-meta section"
+    META_UPSTREAM=${BASH_REMATCH[1]}
+    META_BASE=${BASH_REMATCH[2]}
+    valid_repo "${META_UPSTREAM}" || fatal "invalid upstream '${META_UPSTREAM}' in ${url}'s bot-meta section"
+    META_ITEM=
+    if [[ "${meta}" =~ ${item_re} ]]; then
+        META_ITEM=${BASH_REMATCH[1]}
+    fi
+}
+
 # check_item_free FORK ITEM SELF_URL SELF_BRANCH: fails unless no open PR
 # in FORK other than SELF_URL or the one from SELF_BRANCH records ITEM in
 # its bot-meta section. Two fork PRs for one item are usually a copied
@@ -1817,26 +1835,18 @@ cmd_promote() {
 
     # The upstream repository comes from the bot-meta section: a fork's
     # parent is not necessarily the upstream.
-    local meta upstream meta_base item title body
+    local meta upstream meta_base item title body META_UPSTREAM META_BASE META_ITEM
     meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
     test -n "${meta}" || fatal "${url} has no complete ${META_START} ... ${META_END} section; was it opened with fork-pr? Restore it in the PR body"
-    # shellcheck disable=SC2016 # literal backticks
-    local upstream_re='Upstream: `([^`]+)`, base `([^`]+)`' item_re="Board item: \`(${ITEM_ID_RE})\`"
-    [[ "${meta}" =~ ${upstream_re} ]] ||
-        fatal "cannot find the 'Upstream: \`OWNER/REPO\`, base \`BRANCH\`' line in ${url}'s bot-meta section"
-    upstream=${BASH_REMATCH[1]}
-    meta_base=${BASH_REMATCH[2]}
-    valid_repo "${upstream}" || fatal "invalid upstream '${upstream}' in ${url}'s bot-meta section"
+    parse_meta "${url}" "${meta}"
+    upstream=${META_UPSTREAM}
+    meta_base=${META_BASE}
     local network
     network=$(ghapi "repos/${FORK}" --jq '"\(.parent.full_name) \(.source.full_name)"') || fatal "cannot read ${FORK}"
     [[ " ${network} " == *" ${upstream} "* ]] ||
         fatal "bot-meta names upstream ${upstream}, but ${FORK} is a fork of ${network% *} (network root ${network#* })"
-    item=
-    if [[ "${meta}" =~ ${item_re} ]]; then
-        item=${BASH_REMATCH[1]}
-    else
-        warn "no board item in ${url}'s bot-meta section; the board won't be updated"
-    fi
+    item=${META_ITEM}
+    test -n "${item}" || warn "no board item in ${url}'s bot-meta section; the board won't be updated"
     local base=${meta_base} owner=${FORK%%/*}
     test "${fork_base}" = "${base}" ||
         warn "the fork PR targets '${fork_base}', but bot-meta says upstream base '${base}'; using '${base}'"
