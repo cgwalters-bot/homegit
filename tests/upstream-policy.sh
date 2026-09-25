@@ -15,7 +15,7 @@ readonly EX_ERROR=1 EX_MISSING=3 EX_STALE=4 EX_HUMAN_TEXT=5 EX_REFUSED=6 EX_INVA
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/upstream-policy-test.XXXXXX")
 readonly WORK
 trap 'rm -rf "${WORK}"' EXIT
-export FAKE_GH=${WORK}/gh UPSTREAM_POLICY_DIR=${WORK}/homegit/upstream-policy
+export FAKE_GH=${WORK}/gh UPSTREAM_POLICY_DIR=${WORK}/homegit/upstream-policy XDG_STATE_HOME=${WORK}/state
 export GIT_CONFIG_GLOBAL=${WORK}/gitconfig GIT_CONFIG_NOSYSTEM=1
 export PATH=${WORK}/bin:${PATH}
 
@@ -109,11 +109,19 @@ readonly SOURCES="sources:
   - path: src/HACKING.md
     sha: \"${HACKING}\""
 
-# vouch [VERIFIED LOGIN]: what GitHub says of homegit's HEAD commit
-# (default: verified, by cgwalters).
+# vouch [VERIFIED LOGIN [COMMIT]]: what GitHub says of homegit's COMMIT
+# (default: HEAD; verified, by cgwalters).
 vouch() {
     jq -n --argjson v "${1:-true}" --arg l "${2:-cgwalters}" '{commit: {verification: {verified: $v}}, author: {login: $l}}' |
-        fixture "repos/cgwalters-bot/homegit/commits/$(git -C "${HOMEGIT}" rev-parse HEAD)"
+        fixture "repos/cgwalters-bot/homegit/commits/$(git -C "${HOMEGIT}" rev-parse "${3:-HEAD}")"
+}
+
+# publish MESSAGE: commit all of homegit, push it and vouch for it.
+publish() {
+    git -C "${HOMEGIT}" add -A
+    git -C "${HOMEGIT}" commit -q -m "$1"
+    git -C "${HOMEGIT}" push -q origin HEAD:main
+    vouch
 }
 
 # record VERDICT [SOURCES] [MODE]: write, commit and push acme/proj's
@@ -247,6 +255,67 @@ vouch false cgwalters-bot
 run "loosened via a deletion" "${EX_INVALID}" 'from no-go to bot-ok' check acme/proj
 vouch
 run "loosened via a deletion, vouched" 0 '^bot-ok$' check acme/proj
+
+# Every loosening counts, not only the last commit that touched the
+# verdict line: a later edit doesn't hide one.
+record human-text
+record bot-ok "" unvouched
+LOOSENED=$(git -C "${HOMEGIT}" rev-parse HEAD)
+vouch false cgwalters-bot
+sed -i 's/^verdict: bot-ok$/verdict: "bot-ok"/' "${RECORD}"
+publish "quote the verdict"
+run "hidden: quoted" "${EX_INVALID}" "from human-text to bot-ok in ${LOOSENED:0:12}" check acme/proj
+echo "verdict: no-go, says the body" >>"${RECORD}"
+publish "a body line like a verdict"
+run "hidden: body line" "${EX_INVALID}" "from human-text to bot-ok in ${LOOSENED:0:12}" check acme/proj
+vouch true cgwalters "${LOOSENED}"
+run "hidden, vouched" 0 '^bot-ok$' check acme/proj
+
+# Moving a record doesn't make it new: a rename, or a record deleted and
+# added back under another case of the same name.
+record no-go
+mkdir -p "${UPSTREAM_POLICY_DIR}/elsewhere"
+git -C "${HOMEGIT}" mv "${RECORD}" "${UPSTREAM_POLICY_DIR}/elsewhere/proj.md"
+sed -i 's/^verdict: no-go$/verdict: bot-ok/' "${UPSTREAM_POLICY_DIR}/elsewhere/proj.md"
+git -C "${HOMEGIT}" commit -q -am "move away, loosened"
+MOVED=$(git -C "${HOMEGIT}" rev-parse HEAD)
+git -C "${HOMEGIT}" mv "${UPSTREAM_POLICY_DIR}/elsewhere/proj.md" "${RECORD}"
+publish "move back"
+vouch false cgwalters-bot "${MOVED}"
+run "moved" "${EX_INVALID}" "from no-go to bot-ok in ${MOVED:0:12}" check acme/proj
+vouch true cgwalters "${MOVED}"
+run "moved, vouched" 0 '^bot-ok$' check acme/proj
+# The same repository's record under another case, never moved there by
+# git: deleted, and added back looser under the usual name.
+git -C "${HOMEGIT}" rm -q "${RECORD}"
+publish "drop"
+mkdir -p "${UPSTREAM_POLICY_DIR}/ACME"
+git -C "${HOMEGIT}" show "HEAD~1:upstream-policy/acme/proj.md" | sed 's/^verdict: "bot-ok"$/verdict: no-go/; s/^verdict: bot-ok$/verdict: no-go/' \
+    >"${UPSTREAM_POLICY_DIR}/ACME/Proj.md"
+publish "other case, tighter"
+git -C "${HOMEGIT}" rm -q "${UPSTREAM_POLICY_DIR}/ACME/Proj.md"
+publish "drop the other case"
+record bot-ok "" unvouched
+vouch false cgwalters-bot
+run "deleted, added back in another case" "${EX_INVALID}" "from no-go to bot-ok in $(git -C "${HOMEGIT}" rev-parse --short=12 HEAD)" check acme/proj
+vouch true cgwalters
+run "deleted, added back, vouched" 0 '^bot-ok$' check acme/proj
+
+# Rewritten history: origin's main must descend from the one the last
+# check accepted.
+ACCEPTED=$(git -C "${HOMEGIT}" rev-parse HEAD)
+git -C "${HOMEGIT}" reset -q --hard HEAD~3
+record bot-ok "" unpushed
+git -C "${HOMEGIT}" push -q -f origin HEAD:main
+vouch
+run "force-pushed" "${EX_INVALID}" "does not descend from ${ACCEPTED:0:12}, which the last check accepted" check acme/proj
+rm -r "${XDG_STATE_HOME}/upstream-policy"
+run "force-pushed, state removed" 0 '^bot-ok$' check acme/proj
+git -C "${HOMEGIT}" reset -q --hard "${ACCEPTED}"
+git -C "${HOMEGIT}" push -q -f origin HEAD:main
+run "forward again" "${EX_INVALID}" "does not descend from" check acme/proj
+rm -r "${XDG_STATE_HOME}/upstream-policy"
+run "forward again, state removed" 0 '^bot-ok$' check acme/proj
 
 # Invalid records.
 while IFS='|' read -r name verdict sources pattern; do

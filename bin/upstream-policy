@@ -6,6 +6,7 @@
 "use strict";
 
 const { execFileSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -23,6 +24,11 @@ const REMOTE_BRANCH = "main";
 const HOMEGIT_REPO = "cgwalters-bot/homegit";
 // The only login that may loosen a verdict, in a commit GitHub verified.
 const OWNER_LOGIN = "cgwalters";
+// Where check remembers the last REMOTE_BRANCH it accepted, per remote.
+const STATE_DIR = path.join(
+  process.env.XDG_STATE_HOME || path.join(require("node:os").homedir(), ".local", "state"),
+  "upstream-policy",
+);
 // Verdicts from the loosest to the strictest.
 const VERDICTS = {
   "bot-ok": "the bot may write the code and the text, with the AI trailer",
@@ -106,12 +112,14 @@ Commands:
         (anywhere in those repositories); it must list all of these.
 
 A record counts only when it is committed and is what ${REMOTE}/${REMOTE_BRANCH}
-has (check fetches it first). When the commit there that last changed
-its verdict made it looser than before (human-text to bot-ok, say),
-GitHub must report that commit as verified and authored by
-${OWNER_LOGIN}: the policy-check subagent creates records and may
-tighten them, but only he loosens one. A renamed repository's record
-must move to its new name.
+has (check fetches it first). Every commit there that made its verdict
+looser than before (human-text to bot-ok, say), across deletions and
+moves of the record, must be one GitHub reports as verified and
+authored by ${OWNER_LOGIN}: the policy-check subagent creates records
+and may tighten them, but only he loosens one. ${REMOTE}/${REMOTE_BRANCH} must also
+descend from the one the last check accepted (kept in ${STATE_DIR}),
+so that rewritten history can't hide a loosening. A renamed
+repository's record must move to its new name.
 
 UPSTREAM_POLICY_DIR overrides the records' directory, for tests only.
 REST only: a few calls per repository.
@@ -310,13 +318,20 @@ function gitMaybe(dir, args) {
   }
 }
 
-// verdictAt(dir, rev, rel): the verdict in REV:REL; null if REL doesn't
-// exist there, "" if it has none.
+// verdictAt(dir, rev, rel): the verdict in the front matter of REV:REL;
+// null if REL doesn't exist there, "" if it has no front matter verdict
+// (which ranks as the strictest, see strictness).
 function verdictAt(dir, rev, rel) {
   const text = gitMaybe(dir, ["show", `${rev}:${rel}`]);
   if (text === null) return null;
-  const m = text.match(/^verdict:[ \t]*(.*)$/m);
-  return m ? unquote(m[1]) : "";
+  const lines = text.split(/\r?\n/);
+  if (lines[0] !== "---") return "";
+  for (const line of lines.slice(1)) {
+    if (line === "---") break;
+    const m = line.match(/^verdict:[ \t]*(.*)$/);
+    if (m) return unquote(m[1]);
+  }
+  return "";
 }
 
 // strictness(verdict): its rank, loosest first; anything unknown ranks as
@@ -326,35 +341,91 @@ function strictness(verdict) {
   return i < 0 ? Infinity : i;
 }
 
-// checkLoosening(top, rel, verdict): the commit on the remote branch that
-// last changed REL's verdict line may make it no looser than the record's
-// previous version had it, or create the record; otherwise GitHub must
-// report that commit as verified and authored by OWNER_LOGIN. The
-// policy-check subagent records and tightens verdicts; only he loosens.
-function checkLoosening(top, rel, verdict) {
-  const upstream = `${REMOTE}/${REMOTE_BRANCH}`;
-  const changed = git(top, ["log", "-m", "--first-parent", "-1", "--format=%H", "-G^verdict:", upstream, "--", rel], `find what set ${rel}'s verdict`);
-  if (!changed) return;
-  const parent = gitMaybe(top, ["rev-parse", "-q", "--verify", `${changed}^1`]);
-  if (parent === null) return;
-  // The version before: the file as the last commit before CHANGED that
-  // had it left it, skipping a deletion, which would hide a loosening.
-  let previous = null;
-  const earlier = git(top, ["rev-list", "--first-parent", parent.trim(), "--", rel], `read ${rel}'s history`);
-  for (const c of earlier.split("\n").filter(Boolean)) {
-    previous = verdictAt(top, c, rel);
-    if (previous !== null) break;
+// history(top, rel): the verdicts REL had, oldest first, as [{commit,
+// verdict}]: one per first-parent commit on the remote branch that added
+// or changed a record that is REL under another name, deletions left out.
+// Records are the same when their paths differ only in case (the same
+// repository) or git's rename detection saw one moved to the other, so
+// deleting a record or moving it doesn't make it look new.
+function history(top, rel) {
+  const dir = rel.split("/")[0];
+  const log = git(top, ["log", "-m", "--first-parent", "-M", "--format=@%H", "--name-status", `${REMOTE}/${REMOTE_BRANCH}`, "--", `${dir}/`], "read the records' history");
+  const entries = [];
+  let commit = null;
+  for (const line of log.split("\n")) {
+    if (line.startsWith("@")) commit = line.slice(1);
+    else if (commit && line.includes("\t")) {
+      const [status, ...paths] = line.split("\t");
+      entries.push({ commit, status: status[0], paths });
+    }
   }
-  if (previous === null || strictness(verdict) >= strictness(previous)) return;
-  const commit = gh([`repos/${HOMEGIT_REPO}/commits/${changed}`]);
-  const verified = Boolean(commit && commit.commit && commit.commit.verification && commit.commit.verification.verified === true);
-  const login = commit && commit.author && commit.author.login;
-  if (!verified || login !== OWNER_LOGIN) {
+  // Union the names that are one record, keyed by lower case.
+  const parent = new Map();
+  const find = (k) => {
+    while (parent.has(k) && parent.get(k) !== k) k = parent.get(k);
+    return k;
+  };
+  const union = (a, b) => {
+    const [ra, rb] = [find(a.toLowerCase()), find(b.toLowerCase())];
+    if (ra !== rb) parent.set(ra, rb);
+  };
+  for (const e of entries) if (e.status === "R" || e.status === "C") union(e.paths[0], e.paths[1]);
+  const group = find(rel.toLowerCase());
+  return entries
+    .reverse()
+    .filter((e) => e.status !== "D" && find(e.paths[e.paths.length - 1].toLowerCase()) === group)
+    .map((e) => ({ commit: e.commit, verdict: verdictAt(top, e.commit, e.paths[e.paths.length - 1]) }));
+}
+
+// checkLoosening(top, rel): every first-parent commit on the remote
+// branch that made REL's verdict looser than the one before it (across
+// deletions and moves, see history) must be one GitHub reports as
+// verified and authored by OWNER_LOGIN. Creating a record, or tightening
+// one, needs no one: the policy-check subagent does that; only he
+// loosens.
+function checkLoosening(top, rel) {
+  let last = null;
+  for (const { commit, verdict } of history(top, rel)) {
+    if (last !== null && strictness(verdict) < strictness(last)) {
+      const info = gh([`repos/${HOMEGIT_REPO}/commits/${commit}`]);
+      const verified = Boolean(info && info.commit && info.commit.verification && info.commit.verification.verified === true);
+      const login = info && info.author && info.author.login;
+      if (!verified || login !== OWNER_LOGIN) {
+        throw new Exit(
+          EX_INVALID,
+          `${rel}'s verdict went from ${last || "none"} to ${verdict || "none"} in ${commit.slice(0, 12)}, which is not a commit by ${OWNER_LOGIN} that GitHub verified (verified: ${verified}, author: ${login || "unknown"}); only he loosens a verdict`,
+        );
+      }
+    }
+    last = verdict;
+  }
+}
+
+// checkHistoryKept(top): REMOTE_BRANCH must descend from the one the last
+// check accepted, recorded in STATE_DIR: a force-push could otherwise
+// rewrite a record's history so that it looks created as it is now.
+function checkHistoryKept(top) {
+  const upstream = `${REMOTE}/${REMOTE_BRANCH}`;
+  const tip = git(top, ["rev-parse", upstream], `read ${upstream}`);
+  const url = git(top, ["remote", "get-url", REMOTE], `read ${REMOTE}'s URL`);
+  const file = path.join(STATE_DIR, `${crypto.createHash("sha256").update(url).digest("hex").slice(0, 16)}.accepted`);
+  let accepted = null;
+  try {
+    accepted = fs.readFileSync(file, "utf8").trim();
+  } catch (e) {
+    if (e.code !== "ENOENT") throw new Exit(EX_ERROR, `cannot read ${file}: ${e.message}`);
+  }
+  if (accepted && gitMaybe(top, ["merge-base", "--is-ancestor", accepted, tip]) === null) {
     throw new Exit(
       EX_INVALID,
-      `${rel}'s verdict went from ${previous} to ${verdict} in ${changed.slice(0, 12)}, which is not a commit by ${OWNER_LOGIN} that GitHub verified (verified: ${verified}, author: ${login || "unknown"}); only he loosens a verdict`,
+      `${upstream} (${tip.slice(0, 12)}) does not descend from ${accepted.slice(0, 12)}, which the last check accepted: its history was rewritten, which could hide how a verdict was loosened. If cgwalters did that on purpose, he removes ${file}`,
     );
   }
+  return () => {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+    fs.writeFileSync(`${file}.tmp`, `${tip}\n`);
+    fs.renameSync(`${file}.tmp`, file);
+  };
 }
 
 // readRecord(name): the path and parsed record of NAME. Git is the source
@@ -386,8 +457,10 @@ function readRecord(name) {
         : `${file} is not on ${upstream}; push it first`,
     );
   }
+  const accept = checkHistoryKept(top);
   const record = parseRecord(fs.readFileSync(file, "utf8"), file);
-  checkLoosening(top, rel, record.verdict);
+  checkLoosening(top, rel);
+  accept();
   return { file, record };
 }
 

@@ -174,7 +174,13 @@ default branch, no new policy file has appeared, and the verdict is
 one, I edit its verdict. Records count only as pushed to homegit's
 main, and a commit there that loosens a verdict (say human-text to
 bot-ok) must be one of mine that GitHub shows as verified, so the bot
-can record and tighten verdicts but not loosen them.
+can record and tighten verdicts but not loosen them. Every loosening in
+a record's history counts, across edits, deletions and moves (git's
+rename detection, and paths that differ only in case). A ruleset on
+this repository blocks force-pushes to main and deleting it, and the
+check also refuses a main that doesn't descend from the last one it
+accepted (kept in `~/.local/state/upstream-policy/`), since rewritten
+history could make a loosened record look newly created.
 
 For `human-text`, I retitle the fork PR, rewrite its body and reword
 the commits myself, push them myself, and approve with a `/promote
