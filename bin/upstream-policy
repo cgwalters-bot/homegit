@@ -112,11 +112,13 @@ Commands:
         (anywhere in those repositories); it must list all of these.
 
 A record counts only when it is committed and is what ${REMOTE}/${REMOTE_BRANCH}
-has (check fetches it first). Every commit there that made its verdict
-looser than before (human-text to bot-ok, say), across deletions and
-moves of the record, must be one GitHub reports as verified and
-authored by ${OWNER_LOGIN}: the policy-check subagent creates records
-and may tighten them, but only he loosens one. ${REMOTE}/${REMOTE_BRANCH} must also
+has (check fetches it first), as a regular file (no symlinks). Its
+verdict may be no looser than the strictest it held, across deletions
+and moves of the record, since ${OWNER_LOGIN} last loosened it (human-text to
+bot-ok, say) in a commit GitHub reports as verified and authored by him:
+the policy-check subagent creates records and may tighten them, but only
+he loosens one, and anyone else's loosening counts until the verdict is
+tightened back. ${REMOTE}/${REMOTE_BRANCH} must also
 descend from the one the last check accepted (kept in ${STATE_DIR}),
 so that rewritten history can't hide a loosening. A renamed
 repository's record must move to its new name.
@@ -377,27 +379,47 @@ function history(top, rel) {
     .map((e) => ({ commit: e.commit, verdict: verdictAt(top, e.commit, e.paths[e.paths.length - 1]) }));
 }
 
-// checkLoosening(top, rel): every first-parent commit on the remote
-// branch that made REL's verdict looser than the one before it (across
-// deletions and moves, see history) must be one GitHub reports as
-// verified and authored by OWNER_LOGIN. Creating a record, or tightening
-// one, needs no one: the policy-check subagent does that; only he
-// loosens.
+// vouched(commit): whether GitHub reports COMMIT of homegit as verified
+// and authored by OWNER_LOGIN, and what it says.
+function vouched(commit) {
+  const info = gh([`repos/${HOMEGIT_REPO}/commits/${commit}`]);
+  const verified = Boolean(info && info.commit && info.commit.verification && info.commit.verification.verified === true);
+  const login = (info && info.author && info.author.login) || "unknown";
+  return { ok: verified && login === OWNER_LOGIN, why: `verified: ${verified}, author: ${login}` };
+}
+
+// checkLoosening(top, rel): REL's verdict may be no looser than the
+// strictest one it held since cgwalters last loosened it (or since it was
+// created), across deletions and moves (see history). He loosens by
+// changing the verdict in a commit GitHub reports as verified and
+// authored by OWNER_LOGIN (merely touching an already loosened record
+// doesn't vouch for it). Anyone else's loosening doesn't count, but
+// tightening the verdict again undoes it. The policy-check subagent
+// creates and tightens.
 function checkLoosening(top, rel) {
-  let last = null;
+  let baseline = null;
+  let previous = null;
+  let unvouched = null;
   for (const { commit, verdict } of history(top, rel)) {
-    if (last !== null && strictness(verdict) < strictness(last)) {
-      const info = gh([`repos/${HOMEGIT_REPO}/commits/${commit}`]);
-      const verified = Boolean(info && info.commit && info.commit.verification && info.commit.verification.verified === true);
-      const login = info && info.author && info.author.login;
-      if (!verified || login !== OWNER_LOGIN) {
-        throw new Exit(
-          EX_INVALID,
-          `${rel}'s verdict went from ${last || "none"} to ${verdict || "none"} in ${commit.slice(0, 12)}, which is not a commit by ${OWNER_LOGIN} that GitHub verified (verified: ${verified}, author: ${login || "unknown"}); only he loosens a verdict`,
-        );
+    if (baseline === null || strictness(verdict) >= strictness(baseline)) {
+      baseline = verdict;
+      unvouched = null;
+    } else if (verdict !== previous) {
+      const v = vouched(commit);
+      if (v.ok) {
+        baseline = verdict;
+        unvouched = null;
+      } else {
+        unvouched = { commit, from: previous, why: v.why };
       }
     }
-    last = verdict;
+    previous = verdict;
+  }
+  if (unvouched) {
+    throw new Exit(
+      EX_INVALID,
+      `${rel}'s verdict went from ${unvouched.from || "none"} to ${previous || "none"} in ${unvouched.commit.slice(0, 12)}, which is not a commit by ${OWNER_LOGIN} that GitHub verified (${unvouched.why}), and it is still looser than ${baseline || "none"}; only he loosens a verdict, or set it back`,
+    );
   }
 }
 
@@ -434,21 +456,38 @@ function checkHistoryKept(top) {
 // there counts even before this checkout pulls it.
 function readRecord(name) {
   const file = path.join(POLICY_DIR, `${name}.md`);
-  if (!fs.existsSync(file)) {
+  let stat = null;
+  try {
+    stat = fs.lstatSync(file);
+  } catch (e) {
+    if (e.code !== "ENOENT") throw new Exit(EX_ERROR, `cannot read ${file}: ${e.message}`);
+  }
+  if (!stat) {
     throw new Exit(
       EX_MISSING,
       `${name} has no policy record (${file}); have a policy-check subagent write one (see homegit's dotfiles/.claude/skills/coordinator/policy-check.md)`,
     );
   }
-  const top = git(path.dirname(file), ["rev-parse", "--show-toplevel"], `find the git repository of ${file}`);
-  const rel = path.relative(top, fs.realpathSync(file));
+  // A symlink would make its target's history the record's.
+  if (!stat.isFile()) throw new Exit(EX_INVALID, `${file} is not a regular file (a symlink?); a record must be one`);
+  // The path in git, unresolved below the records' directory's parent,
+  // so that a symlinked directory there is refused too (see below).
+  const parent = fs.realpathSync(path.dirname(POLICY_DIR));
+  const top = git(parent, ["rev-parse", "--show-toplevel"], `find the git repository of ${file}`);
+  const rel = path.posix.join(path.relative(top, parent).split(path.sep).join("/"), path.basename(POLICY_DIR), `${name}.md`);
   if (git(top, ["status", "--porcelain", "--", rel], `tell whether ${file} is committed`) !== "") {
     throw new Exit(EX_INVALID, `${file} has uncommitted changes; commit and push it first`);
   }
   const upstream = `${REMOTE}/${REMOTE_BRANCH}`;
   git(top, ["fetch", "-q", REMOTE, REMOTE_BRANCH], `fetch ${upstream} to check ${file} against it`);
-  const pushed = (gitMaybe(top, ["rev-parse", "-q", "--verify", `${upstream}:${rel}`]) || "").trim();
-  const local = git(top, ["rev-parse", `HEAD:${rel}`], `read ${rel} at HEAD`);
+  // Git's view: a regular file at that very path (a symlink, or a path
+  // through one, doesn't list as 100644), the same at HEAD and upstream.
+  const entry = (rev) => (gitMaybe(top, ["ls-tree", rev, "--", rel]) || "").trim();
+  const pushed = entry(upstream);
+  const local = entry("HEAD");
+  if (!/^100644 blob [0-9a-f]+\t/.test(local)) {
+    throw new Exit(EX_INVALID, `${rel} is not a regular file in git at HEAD (${local || "missing"}); a record must be one`);
+  }
   if (pushed !== local) {
     throw new Exit(
       EX_INVALID,
@@ -458,7 +497,7 @@ function readRecord(name) {
     );
   }
   const accept = checkHistoryKept(top);
-  const record = parseRecord(fs.readFileSync(file, "utf8"), file);
+  const record = parseRecord(git(top, ["show", `HEAD:${rel}`], `read ${rel}`), file);
   checkLoosening(top, rel);
   accept();
   return { file, record };

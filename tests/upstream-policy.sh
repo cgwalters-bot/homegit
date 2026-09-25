@@ -301,10 +301,52 @@ run "deleted, added back in another case" "${EX_INVALID}" "from no-go to bot-ok 
 vouch true cgwalters
 run "deleted, added back, vouched" 0 '^bot-ok$' check acme/proj
 
+# A loosening that doesn't count is undone by tightening the verdict
+# again; one by cgwalters sets a new baseline.
+record human-text
+record bot-ok "" unvouched
+vouch false cgwalters-bot
+run "bot loosened" "${EX_INVALID}" 'from human-text to bot-ok in .*still looser than human-text' check acme/proj
+record human-only
+run "bot loosened, tightened again" "${EX_REFUSED}" 'policy is human-only' check acme/proj
+record human-text "" unvouched
+vouch false cgwalters-bot
+run "bot loosened, still within the baseline" "${EX_INVALID}" 'from human-only to human-text in .*still looser than human-only' check acme/proj
+vouch true cgwalters
+run "loosened by cgwalters" "${EX_HUMAN_TEXT}" 'policy is human-text' check acme/proj
+record bot-ok "" unvouched
+vouch false cgwalters-bot
+run "bot loosened past his baseline" "${EX_INVALID}" 'still looser than human-text' check acme/proj
+vouch true cgwalters
+run "his baseline" 0 '^bot-ok$' check acme/proj
+
+# A record must be a regular file, in git too: a symlink would make
+# another file's history the record's.
+mkdir -p "${UPSTREAM_POLICY_DIR}/zz"
+sed 's/^verdict: .*/verdict: bot-ok/' "${RECORD}" >"${UPSTREAM_POLICY_DIR}/zz/fresh.md"
+record human-text
+ln -sf ../zz/fresh.md "${RECORD}"
+publish "symlink the record"
+run "symlinked record" "${EX_INVALID}" 'not a regular file \(a symlink\?\)' check acme/proj
+rm "${RECORD}"
+mv "${UPSTREAM_POLICY_DIR}/zz/fresh.md" "${UPSTREAM_POLICY_DIR}/zz/proj.md"
+rmdir "${UPSTREAM_POLICY_DIR}/acme"
+ln -s zz "${UPSTREAM_POLICY_DIR}/acme"
+publish "symlink the directory"
+run "symlinked directory" "${EX_INVALID}" 'upstream-policy/acme/proj.md is not a regular file in git at HEAD' check acme/proj
+rm "${UPSTREAM_POLICY_DIR}/acme"
+mkdir -p "${UPSTREAM_POLICY_DIR}/acme"
+git -C "${HOMEGIT}" mv "${UPSTREAM_POLICY_DIR}/zz/proj.md" "${RECORD}"
+sed -i 's/^verdict: .*/verdict: human-text/' "${RECORD}"
+publish "a record again"
+run "a record again" "${EX_HUMAN_TEXT}" 'policy is human-text' check acme/proj
+record bot-ok
+run "loosened again by cgwalters" 0 '^bot-ok$' check acme/proj
+
 # Rewritten history: origin's main must descend from the one the last
 # check accepted.
 ACCEPTED=$(git -C "${HOMEGIT}" rev-parse HEAD)
-git -C "${HOMEGIT}" reset -q --hard HEAD~3
+git -C "${HOMEGIT}" reset -q --hard HEAD~1
 record bot-ok "" unpushed
 git -C "${HOMEGIT}" push -q -f origin HEAD:main
 vouch
