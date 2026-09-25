@@ -275,7 +275,7 @@ jq -e --arg pr "${PR}" '.dropped | has($pr) | not' "${WORK}/away.state" >/dev/nu
 values PROMOTED | comments "${PR_ISSUE_API}"
 
 # What answers his review, or doesn't. After a push, answering needs the
-# head commit's committer to be the bot.
+# head commit's committer to be the bot or him.
 # CASE|HEAD|HEAD_DATE|COMMITTER|OUTSTANDING|REVIEW_STATE|COUNT|REVIEWS|COMMENTS,
 # the last two as keys of FIX; REVIEW_STATE and COUNT of the one listed.
 FIX[REPLY]=$(comment "${PR}" 901 "${BOT}" 2026-09-25T13:40:00Z "Split in two.")
@@ -305,7 +305,10 @@ done <<EOF
 pushed|${NEW_HEAD}|2026-09-25T13:35:00Z|${BOT}|0|-|0|CHANGES|PROMOTED
 push-predates-review|${NEW_HEAD}|2026-09-25T13:20:00Z|${BOT}|1|CHANGES_REQUESTED|1|CHANGES|PROMOTED
 update-branch-by-web-flow|${NEW_HEAD}|2026-09-25T13:35:00Z|web-flow|1|CHANGES_REQUESTED|1|CHANGES|PROMOTED
-pushed-by-him|${NEW_HEAD}|2026-09-25T13:35:00Z|cgwalters|1|CHANGES_REQUESTED|1|CHANGES|PROMOTED
+pushed-by-him|${NEW_HEAD}|2026-09-25T13:35:00Z|cgwalters|0|-|0|CHANGES|PROMOTED
+his-push-after-line-comments|${NEW_HEAD}|2026-09-25T14:00:00Z|cgwalters|0|-|0|CHANGES COMMENTED LINE_ONLY|PROMOTED
+web-flow-after-line-comments|${NEW_HEAD}|2026-09-25T14:00:00Z|web-flow|1|COMMENTED|2|CHANGES COMMENTED LINE_ONLY|PROMOTED
+pushed-by-someone|${NEW_HEAD}|2026-09-25T13:35:00Z|someone|1|CHANGES_REQUESTED|1|CHANGES|PROMOTED
 reply-doesnt-answer-changes|${OLD_HEAD}|2026-09-25T13:10:00Z|${BOT}|1|CHANGES_REQUESTED|1|CHANGES|PROMOTED REPLY
 bot-line-reply|${OLD_HEAD}|2026-09-25T13:10:00Z|${BOT}|1|CHANGES_REQUESTED|1|CHANGES BOTLINE|PROMOTED
 reply-answers-commented|${OLD_HEAD}|2026-09-25T13:10:00Z|${BOT}|0|-|0|COMMENTED|PROMOTED REPLY

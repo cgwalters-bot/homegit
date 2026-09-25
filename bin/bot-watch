@@ -84,9 +84,9 @@ counts from when it was last seen.
 Apart from those changes, every sweep lists the "Outstanding reviews by
 ${REQUESTER}" on the bot's open upstream PRs (board items or not: one
 search finds them), until they are answered: a review requesting
-changes by a push of the bot's (a push by anyone else, like GitHub's
-"Update branch", answers nothing), or by his own later review; his
-other reviews and comments by such a push or a reply of the bot's.
+changes by a push of the bot's or his own (one by anyone else, like
+GitHub's "Update branch", answers nothing), or by his own later review;
+his other reviews and comments by such a push or a reply of the bot's.
 After his approval, only his later reviews and his comments that
 mention @${BOT_LOGIN} count. So nothing the edge-triggered report
 missed is lost.
@@ -385,20 +385,21 @@ checks_state() {
 # null. It's reported on every sweep until answered, so that news the
 # edge-triggered report missed (or that was read and dropped) can't lose
 # the work. A review requesting changes is answered by a push of the
-# bot's after it or by his own later review (a dismissed one is gone);
-# his other reviews and comments by such a push or a reply of the bot's.
-# His approval answers all before it; after it, only his reviews and
-# the comments that mention the bot count, until another review. REVIEWS is the PR's reviews,
-# one per line.
+# bot's or his own after it, or by his own later review (a dismissed one
+# is gone); his other reviews and comments by such a push or a reply of
+# the bot's. His approval answers all before it; after it, only his
+# reviews and the comments that mention the bot count, until another
+# review. REVIEWS is the PR's reviews, one per line.
 outstanding_review() {
-    local repo=$1 number=$2 head=$3 reviews=$4 commit bot_push comments
+    local repo=$1 number=$2 head=$3 reviews=$4 commit push comments
     commit=$(rest_get "repos/${repo}/commits/${head}") || return
-    # Only the bot's own push can answer him: not GitHub's "Update
-    # branch" (committed by web-flow), a maintainer's rebase or his own.
-    bot_push=$(jq -r --arg bot "${BOT_LOGIN}" \
-        'if .committer.login == $bot then .commit.committer.date else "" end' <<<"${commit}") || return
+    # Only a push of the bot's, or his own (he acted on it himself), can
+    # answer him: not GitHub's "Update branch" (committed by web-flow)
+    # or anyone else's push.
+    push=$(jq -r --arg bot "${BOT_LOGIN}" --arg req "${REQUESTER}" \
+        'if .committer.login | IN($bot, $req) then .commit.committer.date else "" end' <<<"${commit}") || return
     comments=$(rest_pages "repos/${repo}/issues/${number}/comments") || return
-    printf '%s\n' "${reviews}" "${comments}" | jq -sc --arg bot_push "${bot_push}" --arg bot "${BOT_LOGIN}" \
+    printf '%s\n' "${reviews}" "${comments}" | jq -sc --arg push "${push}" --arg bot "${BOT_LOGIN}" \
         --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
         [.[] | select(.user.login == $bot or .user.login == $req)
          | if has("submitted_at") then select(.submitted_at != null and (.state | IN("PENDING", "DISMISSED") | not))
@@ -416,8 +417,8 @@ outstanding_review() {
            | select(.type == "review" or ([$his_reviews[] | select(.at <= $x.at)] | last | .review_state) != "APPROVED"
                     or (.body | test("@" + $bot + "(?![A-Za-z0-9-])"; "i")))
            | select(if .review_state == "CHANGES_REQUESTED"
-                    then ($bot_push > $x.at or any($his_reviews[]; .at > $x.at)) | not
-                    else [$bot_push, $bot_reply] | max <= $x.at end)]
+                    then ($push > $x.at or any($his_reviews[]; .at > $x.at)) | not
+                    else [$push, $bot_reply] | max <= $x.at end)]
         | sort_by(.at) as $open
         | if ($open | length) == 0 then null
           else $open[-1] + {count: ($open | length), excerpt: ($open[-1].body | excerpt)} | del(.author, .body) end'
