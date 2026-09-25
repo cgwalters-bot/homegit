@@ -1,0 +1,268 @@
+#!/usr/bin/env node
+// Land the current branch on one of the bot's own repositories through a
+// pull request that auto-merges (rebase) once CI is green; see --help.
+// Node's standard library only, and gh and git, like upstream-policy.
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1]);
+const BOT_GIT = path.join(path.dirname(fs.realpathSync(process.argv[1])), "bot-git");
+const REMOTE = "origin";
+// The job the main branch rulesets require.
+const CHECK_NAME = "ci";
+const AI_TRAILER = "Generated-by: AI";
+const DEFAULT_TIMEOUT_MIN = 30;
+const POLL_SECONDS = Number(process.env.BOT_LAND_POLL_SECONDS || 20);
+// A GitHub remote URL: https://github.com/O/R(.git), git@github.com:O/R(.git), ssh://git@github.com/O/R.
+const GITHUB_URL_RE = /github\.com[:/]([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+?)(?:\.git)?\/?$/;
+
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+const EX_FAILED = 3;
+const EX_TIMEOUT = 4;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} [--title TITLE] [--body BODY] [--repo OWNER/REPO]
+                [--no-auto] [--no-wait] [--timeout MINUTES]
+
+Lands the current branch of this worktree on one of the bot's own
+repositories (homegit, cgwalters-bot/*, cgwalters-forge's own), whose
+main takes changes only as pull requests with a green '${CHECK_NAME}' check,
+up to date with main, rebase-merged:
+
+  1. runs 'bot-git check ${REMOTE}/BASE..HEAD';
+  2. pushes the branch to ${REMOTE} (with a lease, so a rebase can re-push);
+  3. opens a pull request into the default branch BASE, or reuses the
+     open one for this branch. TITLE defaults to the subject of a single
+     commit (it is required for more); BODY to a list of the commits'
+     subjects, plus '${AI_TRAILER}';
+  4. enables auto-merge by rebase, unless --no-auto (for a pull request
+     that waits for cgwalters' approval, such as one loosening an
+     upstream-policy verdict);
+  5. unless --no-wait (or --no-auto), waits until it merges: when main
+     moved on, it rebases the branch with bot-git and pushes it again;
+     when '${CHECK_NAME}' fails or the pull request closes, it stops. Then it
+     fast-forwards the shared clone this worktree belongs to, if that has
+     BASE checked out and is clean.
+
+--repo defaults to the OWNER/REPO of ${REMOTE}'s URL. --timeout (default
+${DEFAULT_TIMEOUT_MIN}) bounds the wait.
+
+Exit status: 0 merged (or opened, without waiting), ${EX_FAILED} '${CHECK_NAME}' failed
+or the pull request was closed, ${EX_TIMEOUT} still open after the timeout,
+${EX_USAGE} usage, ${EX_ERROR} anything else.
+`;
+}
+
+function parseArgs(argv) {
+  const opts = { title: null, body: null, repo: null, auto: true, wait: true, timeout: DEFAULT_TIMEOUT_MIN };
+  const value = (i, name) => {
+    if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
+    return argv[i + 1];
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "-h":
+      case "--help":
+        process.stdout.write(usage());
+        process.exit(0);
+      case "--title":
+        opts.title = value(i++, a);
+        break;
+      case "--body":
+        opts.body = value(i++, a);
+        break;
+      case "--repo":
+        opts.repo = value(i++, a);
+        break;
+      case "--no-auto":
+        opts.auto = false;
+        break;
+      case "--no-wait":
+        opts.wait = false;
+        break;
+      case "--timeout":
+        opts.timeout = Number(value(i++, a));
+        if (!Number.isFinite(opts.timeout) || opts.timeout <= 0) throw new Exit(EX_USAGE, `--timeout takes a positive number of minutes`);
+        break;
+      default:
+        throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    }
+  }
+  if (opts.repo !== null && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(opts.repo)) {
+    throw new Exit(EX_USAGE, `--repo takes OWNER/REPO, not '${opts.repo}'`);
+  }
+  return opts;
+}
+
+// run(cmd, args, what): CMD's trimmed output, or an EX_ERROR failure
+// saying it couldn't WHAT, with CMD's error output.
+function run(cmd, args, what, input) {
+  try {
+    return execFileSync(cmd, args, { encoding: "utf8", input, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] }).trim();
+  } catch (e) {
+    throw new Exit(EX_ERROR, `cannot ${what}: ${String(e.stderr || e.message).trim()}`);
+  }
+}
+
+const git = (args, what) => run("git", args, what);
+const ghJSON = (args, what) => JSON.parse(run("gh", ["api", ...args], what) || "null");
+
+function log(msg) {
+  process.stderr.write(`${PROG}: ${msg}\n`);
+}
+
+const sleep = (s) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, s * 1000);
+
+function repoOf(opts) {
+  if (opts.repo) return opts.repo;
+  const url = git(["remote", "get-url", REMOTE], `read ${REMOTE}'s URL`);
+  const m = url.match(GITHUB_URL_RE);
+  if (!m) throw new Exit(EX_ERROR, `${REMOTE} (${url}) is not a GitHub repository; pass --repo`);
+  return m[1];
+}
+
+// push(branch): push HEAD to BRANCH on REMOTE, over what we last saw there.
+function push(branch) {
+  git(["push", "--quiet", "--force-with-lease", "--set-upstream", REMOTE, `HEAD:refs/heads/${branch}`], `push ${branch} to ${REMOTE}`);
+}
+
+// openPull(repo, owner, branch, base, opts): the open pull request of
+// BRANCH into BASE, opened now if there is none.
+function openPull(repo, owner, branch, base, opts) {
+  const open = ghJSON([`repos/${repo}/pulls?state=open&base=${encodeURIComponent(base)}&head=${encodeURIComponent(`${owner}:${branch}`)}`], "list pull requests");
+  if (Array.isArray(open) && open.length > 0) {
+    log(`reusing ${open[0].html_url}`);
+    return open[0];
+  }
+  const subjects = git(["log", "--reverse", "--format=%s", `${REMOTE}/${base}..HEAD`], "list the commits").split("\n");
+  let title = opts.title;
+  if (title === null) {
+    if (subjects.length !== 1) throw new Exit(EX_USAGE, `${subjects.length} commits: pass --title`);
+    title = subjects[0];
+  }
+  const body = opts.body !== null ? opts.body : `${subjects.map((s) => `- ${s}`).join("\n")}\n\n${AI_TRAILER}`;
+  const out = run(
+    "gh",
+    ["api", "-X", "POST", `repos/${repo}/pulls`, "-f", `title=${title}`, "-f", `head=${branch}`, "-f", `base=${base}`, "-F", "body=@-"],
+    "open the pull request",
+    body,
+  );
+  const pr = JSON.parse(out);
+  log(`opened ${pr.html_url}`);
+  return pr;
+}
+
+// checkFailed(repo, sha): the URL of a failed CHECK_NAME run on SHA, if any.
+function checkFailed(repo, sha) {
+  const runs = ghJSON([`repos/${repo}/commits/${sha}/check-runs?check_name=${CHECK_NAME}`], `read the ${CHECK_NAME} check`);
+  const failed = ((runs && runs.check_runs) || []).find(
+    (r) => r.status === "completed" && !["success", "neutral", "skipped"].includes(r.conclusion),
+  );
+  return failed ? failed.html_url || failed.conclusion : null;
+}
+
+// rebaseIfBehind(branch, base): rebase HEAD onto REMOTE/BASE with
+// bot-git and push it again, unless it already has REMOTE/BASE (GitHub
+// can take a while to see a push).
+function rebaseIfBehind(branch, base) {
+  git(["fetch", "--quiet", REMOTE, base], `fetch ${REMOTE}/${base}`);
+  if (git(["merge-base", `${REMOTE}/${base}`, "HEAD"], "find the merge-base") === git(["rev-parse", `${REMOTE}/${base}`], "read the base")) return;
+  log(`${base} moved on; rebasing onto it`);
+  try {
+    execFileSync(BOT_GIT, ["rebase", `${REMOTE}/${base}`], { stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    execFileSync("git", ["rebase", "--abort"], { stdio: "ignore" });
+    throw new Exit(EX_FAILED, `the branch doesn't rebase cleanly onto ${REMOTE}/${base}; rebase it by hand: ${String(e.stderr || e.message).trim()}`);
+  }
+  push(branch);
+}
+
+// fastForwardShared(base): fast-forward the clone this worktree belongs to,
+// if it has BASE checked out and is clean; say so otherwise.
+function fastForwardShared(base) {
+  const common = path.resolve(git(["rev-parse", "--git-common-dir"], "find the shared clone"));
+  const shared = path.dirname(common);
+  if (path.basename(common) !== ".git" || !fs.existsSync(shared)) return;
+  let branch = "";
+  try {
+    branch = execFileSync("git", ["-C", shared, "symbolic-ref", "--quiet", "--short", "HEAD"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  } catch {
+    // Detached: not updated.
+  }
+  const dirty = run("git", ["-C", shared, "status", "--porcelain", "--untracked-files=no"], "read the shared clone's status");
+  if (branch !== base || dirty !== "") {
+    log(`not updating ${shared}: it has ${branch || "no branch"} checked out${dirty ? " with changes" : ""}`);
+    return;
+  }
+  run("git", ["-C", shared, "pull", "--quiet", "--ff-only", REMOTE, base], `fast-forward ${shared}`);
+  log(`fast-forwarded ${shared} to ${REMOTE}/${base}`);
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const repo = repoOf(opts);
+  const owner = repo.split("/")[0];
+  const branch = git(["symbolic-ref", "--quiet", "--short", "HEAD"], "read the current branch (detached HEAD?)");
+  const info = ghJSON([`repos/${repo}`], `read ${repo}`);
+  const base = info.default_branch;
+  if (branch === base) throw new Exit(EX_USAGE, `on ${base} itself: commit on a topic branch (bot/<slug>)`);
+  git(["fetch", "--quiet", REMOTE, base], `fetch ${REMOTE}/${base}`);
+  const ahead = git(["rev-list", "--count", `${REMOTE}/${base}..HEAD`], "count the commits");
+  if (ahead === "0") throw new Exit(EX_USAGE, `${branch} has no commits over ${REMOTE}/${base}`);
+  try {
+    execFileSync(BOT_GIT, ["check", `${REMOTE}/${base}..HEAD`], { stdio: ["ignore", "inherit", "inherit"] });
+  } catch {
+    throw new Exit(EX_ERROR, `bot-git check failed; fix the commits first`);
+  }
+  push(branch);
+  const pr = openPull(repo, owner, branch, base, opts);
+  if (!opts.auto) {
+    console.log(pr.html_url);
+    return;
+  }
+  run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--auto", "--rebase"], "enable auto-merge");
+  if (!opts.wait) {
+    console.log(pr.html_url);
+    return;
+  }
+  const deadline = Date.now() + opts.timeout * 60 * 1000;
+  for (;;) {
+    const cur = ghJSON([`repos/${repo}/pulls/${pr.number}`], `read ${pr.html_url}`);
+    if (cur.merged) {
+      log(`merged ${pr.html_url}`);
+      git(["fetch", "--quiet", REMOTE, base], `fetch ${REMOTE}/${base}`);
+      fastForwardShared(base);
+      console.log(pr.html_url);
+      return;
+    }
+    if (cur.state === "closed") throw new Exit(EX_FAILED, `${pr.html_url} was closed without merging`);
+    // Only this head's runs count: a rebase cancels the previous one's.
+    const head = git(["rev-parse", "HEAD"], "read HEAD");
+    const failed = cur.head.sha === head ? checkFailed(repo, head) : null;
+    if (failed) throw new Exit(EX_FAILED, `${CHECK_NAME} failed on ${pr.html_url}: ${failed}`);
+    // Behind main: auto-merge waits for the branch to be up to date.
+    if (cur.mergeable_state === "behind") rebaseIfBehind(branch, base);
+    if (Date.now() > deadline) throw new Exit(EX_TIMEOUT, `${pr.html_url} is still open after ${opts.timeout} minutes`);
+    sleep(POLL_SECONDS);
+  }
+}
+
+try {
+  main();
+} catch (e) {
+  if (!(e instanceof Exit)) throw e;
+  process.stderr.write(`${PROG}: ${e.message}\n`);
+  process.exit(e.status);
+}
