@@ -17,6 +17,9 @@ readonly WORK
 trap 'rm -rf "${WORK}"' EXIT
 export FAKE_GH=${WORK}/gh UPSTREAM_POLICY_DIR=${WORK}/homegit/upstream-policy XDG_STATE_HOME=${WORK}/state
 export GIT_CONFIG_GLOBAL=${WORK}/gitconfig GIT_CONFIG_NOSYSTEM=1
+# Fixed commit dates, so that runs don't depend on how fast they are:
+# commits with the same parent, tree and message are then the same commit.
+export GIT_AUTHOR_DATE=2026-09-25T12:00:00Z GIT_COMMITTER_DATE=2026-09-25T12:00:00Z
 export PATH=${WORK}/bin:${PATH}
 
 failures=0
@@ -396,7 +399,9 @@ run "loosened again by cgwalters" 0 '^bot-ok$' check acme/proj
 # check accepted.
 ACCEPTED=$(git -C "${HOMEGIT}" rev-parse HEAD)
 git -C "${HOMEGIT}" reset -q --hard HEAD~1
-record bot-ok "" unpushed
+record bot-ok "" uncommitted
+git -C "${HOMEGIT}" commit -q -am "rewritten history"
+test "$(git -C "${HOMEGIT}" rev-parse HEAD)" != "${ACCEPTED}" || fail "force-pushed: the rewrite is the accepted commit"
 git -C "${HOMEGIT}" push -q -f origin HEAD:main
 vouch
 run "force-pushed" "${EX_INVALID}" "does not descend from ${ACCEPTED:0:12}, which the last check accepted" check acme/proj
