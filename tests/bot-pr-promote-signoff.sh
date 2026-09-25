@@ -12,6 +12,9 @@ TESTS=$(cd "$(dirname "$0")" && pwd)
 readonly TESTS
 readonly BOT_PR=${TESTS}/../bin/bot-pr
 readonly BOT_NAME="Colin Walters" BOT_EMAIL=walters+llm@verbum.org
+# The name of the bot's older commits, which promote replaces with BOT_NAME
+# where it rewrites them.
+readonly BOT_LEGACY_NAME=cgwalters-bot
 readonly HUMAN_NAME="Colin Walters" HUMAN_EMAIL=walters@verbum.org
 readonly OTHER_NAME="Other Person" OTHER_EMAIL=other@example.com
 readonly SOB="Signed-off-by: ${HUMAN_NAME} <${HUMAN_EMAIL}>"
@@ -171,19 +174,20 @@ fixture() {
     cat >"${FAKE_GH}/rest/$1.json"
 }
 
-# commit_as bot|human|other|bot-by-human FILE MESSAGE: commit a change to
-# FILE in SRC, authored and committed by that person (bot-by-human:
-# authored by the bot, committed by the human, as promote signs off), and
-# print its id.
+# commit_as bot|legacy|human|other[-by-human] FILE MESSAGE: commit a
+# change to FILE in SRC, authored and committed by that person (legacy:
+# the bot under its old name; -by-human: committed by the human, as
+# promote signs off), and print its id.
 commit_as() {
     local name email cname cemail
-    case "$1" in
-        bot|bot-by-human) name=${BOT_NAME} email=${BOT_EMAIL} ;;
+    case "${1%-by-human}" in
+        bot) name=${BOT_NAME} email=${BOT_EMAIL} ;;
+        legacy) name=${BOT_LEGACY_NAME} email=${BOT_EMAIL} ;;
         human) name=${HUMAN_NAME} email=${HUMAN_EMAIL} ;;
         other) name=${OTHER_NAME} email=${OTHER_EMAIL} ;;
     esac
     cname=${name} cemail=${email}
-    test "$1" != bot-by-human || cname=${HUMAN_NAME} cemail=${HUMAN_EMAIL}
+    test "$1" = "${1%-by-human}" || cname=${HUMAN_NAME} cemail=${HUMAN_EMAIL}
     echo "$3" >>"${SRC}/$2"
     git -C "${SRC}" add "$2"
     GIT_AUTHOR_NAME=${name} GIT_AUTHOR_EMAIL=${email} GIT_COMMITTER_NAME=${cname} GIT_COMMITTER_EMAIL=${cemail} \
@@ -270,11 +274,16 @@ R1=$(commit_as bot rebased "rebased"$'\n\n'"${SOB}")
 new_branch bot/forged
 F1=$(commit_as bot forged "approved")
 F2=$(commit_as bot forged "not approved"$'\n\n'"${SOB}")
+# #9: the bot's commits from before its rename: one signed off already,
+# one not.
+new_branch bot/legacy
+G1=$(commit_as legacy-by-human legacy "legacy, signed"$'\n\n'"${SOB}")
+G2=$(commit_as legacy legacy "legacy"$'\n\n'"Generated-by: AI")
 # #6: a commit pushed after the approval.
 new_branch bot/stale
 T1=$(commit_as bot stale "approved")
 T2=$(commit_as bot stale "pushed later")
-git -C "${SRC}" push -q forge bot/sign bot/signed bot/mixed bot/lease bot/stale bot/rebased bot/forged
+git -C "${SRC}" push -q forge bot/sign bot/signed bot/mixed bot/lease bot/stale bot/rebased bot/forged bot/legacy
 git -C "${SRC}" push -q nodco bot/plain
 
 fork_pr proj 1 bot/sign "${S3}"
@@ -285,6 +294,7 @@ fork_pr proj 5 bot/lease "${L1}"
 fork_pr proj 6 bot/stale "${T1}"
 fork_pr proj 7 bot/rebased "${R1}"
 fork_pr proj 8 bot/forged "${F1}"
+fork_pr proj 9 bot/legacy "${G2}"
 jq -n --arg a "${F1}" --arg s "${F2}" --arg u "https://github.com/cgwalters-forge/proj/pull/8#pullrequestreview-800" '
     [{user: {login: "cgwalters-bot"}, created_at: "2026-09-25T12:00:00Z", html_url: "https://github.com/cgwalters-forge/proj/pull/8#c0",
       body: "Signed off 1 commit(s)\n\n<!-- bot-pr signoff approved=\($a) signed=\($s) approval=\($u) review=800 -->"}]' \
@@ -332,9 +342,19 @@ opened() {
     find "${FAKE_GH}/opened" -name '*.json' -exec cat {} + 2>/dev/null | jq -sc --arg h "cgwalters-forge:$1" '[.[] | select(.head == $h)] | first // empty'
 }
 
+# author_of DIR COMMIT: its author and date, the bot's old name replaced
+# by its new one.
+author_of() {
+    local a legacy="${BOT_LEGACY_NAME} <${BOT_EMAIL}> "
+    a=$(git -C "$1" show -s --format='%an <%ae> %ad' --date=raw "$2")
+    test "${a}" = "${a#"${legacy}"}" || a="${BOT_NAME} <${BOT_EMAIL}> ${a#"${legacy}"}"
+    echo "${a}"
+}
+
 # same_but_signed NAME OLD NEW: NEW is OLD, commit by commit since BASE,
-# with the same trees, authors and messages plus the sign-off, committed
-# by cgwalters where the sign-off is new.
+# with the same trees, authors (but for the bot's old name, see
+# author_of) and messages plus the sign-off, committed by cgwalters where
+# the sign-off is new.
 same_but_signed() {
     local name=$1 dir=${REMOTES}/cgwalters-forge/proj old new i o n om nm rest
     mapfile -t old < <(git -C "${dir}" rev-list --reverse "${BASE}..$2")
@@ -344,8 +364,8 @@ same_but_signed() {
         o=${old[i]} n=${new[i]}
         test "$(git -C "${dir}" rev-parse "${o}^{tree}")" = "$(git -C "${dir}" rev-parse "${n}^{tree}")" ||
             fail "${name}: the tree of commit ${i} changed"
-        test "$(git -C "${dir}" show -s --format='%an <%ae> %ad' --date=raw "${o}")" = \
-            "$(git -C "${dir}" show -s --format='%an <%ae> %ad' --date=raw "${n}")" || fail "${name}: the author of commit ${i} changed"
+        test "$(author_of "${dir}" "${o}")" = "$(author_of "${dir}" "${n}")" ||
+            fail "${name}: the author of commit ${i} changed"
         om=$(git -C "${dir}" cat-file commit "${o}" | sed '1,/^$/d'; echo x)
         nm=$(git -C "${dir}" cat-file commit "${n}" | sed '1,/^$/d'; echo x)
         # The DCO check wants the sign-off from the author or committer.
@@ -437,6 +457,23 @@ same_but_signed "rebased" "${R1}" "${rebased}"
 opened bot/rebased | jq -r .body | grep -qF "approval of the review draft: ${URL}/proj/pull/7#pullrequestreview-700" ||
     fail "rebased: the body doesn't name the approval"
 
+# --- The bot's old name: normalized where rewritten, and the record of
+# that rewrite still checks out on a rerun ---
+touch "${FAKE_GH}/fail-open"
+if run "legacy name" fail promote "${URL}/proj/pull/9"; then
+    expect "legacy name" "Added cgwalters's sign-off to 1 commit" 'opening the PR in acme/proj failed'
+fi
+legacy=$(remote_ref "${FORGE}" bot/legacy)
+test "${legacy}" != "${G2}" || fail "legacy name: not pushed"
+same_but_signed "legacy name" "${G2}" "${legacy}"
+test "$(git -C "${REMOTES}/${FORGE}" rev-parse "${legacy}~1")" = "${G1}" || fail "legacy name: the signed-off commit was rewritten"
+test "$(git -C "${REMOTES}/${FORGE}" show -s --format='%an <%ae>' "${legacy}")" = "${BOT_NAME} <${BOT_EMAIL}>" ||
+    fail "legacy name: the rewritten commit's author wasn't normalized"
+if run "legacy name, rerun" ok promote "${URL}/proj/pull/9"; then
+    expect "legacy name, rerun" '!Added' 'plus his sign-off, per the bot.s record; checking that'
+fi
+test "$(opened bot/legacy | jq -r .head_sha)" = "${legacy}" || fail "legacy name: no upstream PR from the signed-off head"
+
 # --- A forged record: the head isn't the approved one plus the sign-off ---
 REFS_BEFORE=$(all_refs)
 if run "forged record" fail promote "${URL}/proj/pull/8"; then
@@ -468,4 +505,4 @@ test "$(remote_ref "${FORGE}" bot/lease)" = "${moved}" || fail "lease: the moved
 test -z "$(opened bot/lease)" || fail "lease: an upstream PR was opened"
 
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: promote signs off on approval, keeps the approval, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases"
+echo "ok: promote signs off on approval, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases"

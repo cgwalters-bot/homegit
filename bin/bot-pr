@@ -144,7 +144,8 @@ Commands:
         DCO check, his approval also signs off: add '${SIGNOFF_TRAILER}'
         to each commit since the merge-base that lacks it, keeping its
         tree, author and message and making him its committer (the DCO
-        check wants the author's or committer's sign-off), force-push
+        check wants the author's or committer's sign-off; the bot's
+        commits named '${BOT_GIT_LEGACY_NAME}' also get its current name), force-push
         that with a lease on the approved head, and record it on the
         fork PR, so that a rerun still counts his approving review once
         it checked that in git (a '${PROMOTE_COMMAND}' needs repeating). Commits by
@@ -1541,10 +1542,23 @@ ours() {
     test "${login}" = "${BOT_LOGIN}" || test "${login}" = "${REVIEWER}"
 }
 
+# author_ident DIR COMMIT: COMMIT's author as '%an <%ae> %ad' (raw date),
+# the bot's old name replaced by its current one, as add_signoff writes
+# it.
+author_ident() {
+    local ident
+    ident=$(sgit -C "$1" show -s --format='%an <%ae> %ad' --date=raw "$2")
+    if [[ "${ident,,}" == "${BOT_GIT_LEGACY_NAME,,} <${BOT_GIT_EMAIL,,}> "* ]]; then
+        ident=${BOT_GIT_NAME}${ident:${#BOT_GIT_LEGACY_NAME}}
+    fi
+    printf '%s\n' "${ident}"
+}
+
 # verify_signoff DIR BASE OLD NEW: NEW must be OLD with SIGNOFF_TRAILER
 # added to every commit after BASE that lacked it, each commit passing
 # the DCO check (see dco_ok), and nothing else changed: the same trees,
-# authors, and messages otherwise, still on BASE. The same checks as
+# authors (but for the bot's old name, see author_ident), and messages
+# otherwise, still on BASE. The same checks as
 # bin/dco-signoff's verify.
 verify_signoff() {
     local dir=$1 base=$2 old new i
@@ -1556,8 +1570,7 @@ verify_signoff() {
         local o=${old[i]} n=${new[i]} os ns
         test "$(sgit -C "${dir}" rev-parse "${o}^{tree}")" = "$(sgit -C "${dir}" rev-parse "${n}^{tree}")" ||
             { info "${n:0:12}'s tree differs from ${o:0:12}'s"; return 1; }
-        test "$(sgit -C "${dir}" show -s --format='%an <%ae> %ad' --date=raw "${o}")" = \
-            "$(sgit -C "${dir}" show -s --format='%an <%ae> %ad' --date=raw "${n}")" ||
+        test "$(author_ident "${dir}" "${o}")" = "$(author_ident "${dir}" "${n}")" ||
             { info "${n:0:12}'s author differs from ${o:0:12}'s"; return 1; }
         test "$(message_sans_signoff "${dir}" "${o}")" = "$(message_sans_signoff "${dir}" "${n}")" ||
             { info "${n:0:12}'s message differs from ${o:0:12}'s by more than the sign-off"; return 1; }
@@ -1580,7 +1593,8 @@ verify_signoff() {
 # the sign-off to be by the commit's author or committer, so the commits
 # it signs off are committed as him, as are those that have his trailer
 # but neither him as author nor as committer (after a rebase by the bot);
-# each keeps its tree, author and message bytes, plus the trailer. The
+# each keeps its tree, author and message bytes, plus the trailer, except
+# that the bot's commits from before its rename get its current name. The
 # commits before the first one that needs this stay as they are, and
 # those after it keep their committer where they pass already. Commits
 # lacking the trailer by others than the bot and REVIEWER are refused
@@ -1614,7 +1628,7 @@ add_signoff() {
         return "${EX_OTHERS}"
     fi
 
-    local msg parent=${mb} rewriting=false new author_date committer
+    local msg parent=${mb} rewriting=false new author_name author_email author_date committer
     msg=$(mktemp) || fatal "cannot create a temporary file"
     for c in "${commits[@]}"; do
         if dco_ok "${dir}" "${c}"; then
@@ -1642,10 +1656,15 @@ add_signoff() {
                 --trailer "${SIGNOFF_TRAILER}" "${msg}" ||
                 { rm -f "${msg}"; fatal "adding the sign-off to the message of ${c:0:12} failed"; }
         fi
+        author_name=$(sgit -C "${dir}" show -s --format=%an "${c}")
+        author_email=$(sgit -C "${dir}" show -s --format=%ae "${c}")
         author_date=$(sgit -C "${dir}" show -s --format=%ad --date=raw "${c}")
+        # Upstream sees the bot's commits under one name.
+        if test "${author_email,,}" = "${BOT_GIT_EMAIL,,}" && test "${author_name,,}" = "${BOT_GIT_LEGACY_NAME,,}"; then
+            author_name=${BOT_GIT_NAME}
+        fi
         new=$(env -u GIT_COMMITTER_DATE \
-            GIT_AUTHOR_NAME="$(sgit -C "${dir}" show -s --format=%an "${c}")" \
-            GIT_AUTHOR_EMAIL="$(sgit -C "${dir}" show -s --format=%ae "${c}")" \
+            GIT_AUTHOR_NAME="${author_name}" GIT_AUTHOR_EMAIL="${author_email}" \
             GIT_AUTHOR_DATE="${author_date}" "${committer[@]}" \
             git -c core.hooksPath=/dev/null -c commit.gpgSign=false -c i18n.commitEncoding=UTF-8 -C "${dir}" \
             commit-tree --no-gpg-sign "${c}^{tree}" -p "${parent}" -F "${msg}") ||
