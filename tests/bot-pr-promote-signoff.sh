@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# Offline tests of how 'bot-pr promote' adds cgwalters' DCO sign-off on
-# his approval: local bare repositories stand in for GitHub's (acme/proj,
-# which requires DCO, acme/nodco, which doesn't, and their cgwalters-forge
-# forks), and a fake gh answers the REST calls promote makes from fixtures
-# and from those repositories, and records what promote writes. No
-# network.
+# Offline tests of how 'bot-pr promote' and 'bot-pr signoff' add
+# cgwalters' DCO sign-off on his approval: local bare repositories stand
+# in for GitHub's (acme/proj, which requires DCO, acme/dcoapp, which runs
+# the DCO app without requiring its check, acme/nodco, which has neither,
+# and their cgwalters-forge forks), and a fake gh answers the REST calls
+# they make from fixtures and from those repositories, and records what
+# they write. No network.
 #   tests/bot-pr-promote-signoff.sh
 set -euo pipefail
 
@@ -42,12 +43,13 @@ fail() {
 mkdir -p "${WORK}/bin" "${FAKE_GH}/rest" "${FAKE_GH}/opened" "${WORK}/hooks"
 # The fake gh. GETs are answered from $FAKE_GH/rest/PATH.json (query
 # string ignored), except for what follows the repositories in $REMOTES:
-# branches, compare, and PR heads (the fixture's head.sha is replaced by
-# its branch's commit). Issue comments default to none, and POSTs to them
-# add one by the bot. POST .../pulls opens an upstream PR (listed by GET
-# .../pulls), unless $FAKE_GH/fail-open exists, which it removes; PATCH
-# .../pulls/N closes one. Anything else fails. Every call is logged to
-# $FAKE_GH/calls.
+# branches, compare, and fork PR heads (the fixture's head.sha is replaced
+# by its branch's commit, frozen when it's closed, as GitHub does). Issue
+# comments default to none, and POSTs to them add one by the bot. POST
+# .../pulls opens an upstream PR (listed by GET .../pulls, read with its
+# commits by GET .../pulls/N), unless $FAKE_GH/fail-open exists, which it
+# removes; PATCH .../pulls/N closes a fork PR. Anything else fails. Every
+# call is logged to $FAKE_GH/calls.
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -72,6 +74,17 @@ notfound() { echo "gh: Not Found (HTTP 404)" 1>&2; exit 1; }
 # GitHub's git, not the user's hooks.
 git() { command "${REAL_GIT}" -c core.hooksPath=/dev/null "$@"; }
 sha() { git -C "${REMOTES}/$1" rev-parse -q --verify "refs/heads/$2" || true; }
+# fork_pr FILE: a fork PR's fixture, with its head and state.
+fork_pr() {
+    local closed=${store}/closed_$(jq -r '"repos/\(.head.repo.full_name)/pulls/\(.number)"' "$1" | tr / _) s
+    if test -e "${closed}"; then
+        s=$(cat "${closed}")
+    else
+        s=$(sha "$(jq -r .head.repo.full_name "$1")" "$(jq -r .head.ref "$1")")
+    fi
+    jq --arg s "${s}" --arg state "$(test -e "${closed}" && echo closed || echo open)" \
+        '.head.sha = $s | .state = $state' "$1"
+}
 json=""
 case "${method} ${path}" in
     "GET user") json='{"login": "cgwalters-bot"}' ;;
@@ -115,20 +128,40 @@ case "${method} ${path}" in
         json=$(jq --arg repo "${repo}" --arg n "$((n + 1))" --arg s "${s}" \
             '. + {repo: $repo, html_url: "https://github.com/\($repo)/pull/\($n)", head_sha: $s}' <<<"${req}")
         printf '%s\n' "${json}" >"${store}/opened/$((n + 1)).json" ;;
-    "GET repos/acme/proj/pulls"|"GET repos/acme/nodco/pulls")
+    GET\ repos/acme/*/pulls)
         repo=${path#repos/}; repo=${repo%/pulls}
         json=$(find "${store}/opened" -name '*.json' -exec cat {} + 2>/dev/null |
             jq -s --arg repo "${repo}" --arg head "$(field head)" '[.[] | select(.repo == $repo and .head == $head)]') ;;
-    PATCH\ repos/*/pulls/*) touch "${store}/closed_${path//\//_}" ;;
+    GET\ repos/acme/*/pulls/*/commits)
+        n=${path%/commits}; n=${n##*/}
+        test -e "${store}/opened/${n}.json" || notfound
+        head=$(jq -r .head "${store}/opened/${n}.json")
+        fork=${head%%:*}/$(jq -r '.repo | sub(".*/"; "")' "${store}/opened/${n}.json")
+        json=$(git -C "${REMOTES}/${fork}" log --reverse -z --format='%H%x00%an%x00%ae%x00%B' "main..refs/heads/${head#*:}" |
+            jq -Rs 'split("\u0000") | [recurse(.[4:]; length >= 4) | select(length >= 4) | .[:4]
+                | {sha: .[0], commit: {author: {name: .[1], email: .[2]}, message: .[3]}}]') ;;
+    GET\ repos/acme/*/pulls/*)
+        n=${path##*/}
+        test -e "${store}/opened/${n}.json" || notfound
+        req=$(cat "${store}/opened/${n}.json")
+        head=$(jq -r .head <<<"${req}")
+        fork=${head%%:*}/$(jq -r '.repo | sub(".*/"; "")' <<<"${req}")
+        json=$(jq --arg s "$(sha "${fork}" "${head#*:}")" --arg fork "${fork}" '
+            {user: {login: "cgwalters-bot"}, state: "open", html_url, base: {ref: .base},
+             head: {ref: (.head | sub("^[^:]*:"; "")), sha: $s, repo: {full_name: $fork}}}' <<<"${req}") ;;
+    PATCH\ repos/*/pulls/*)
+        f=${store}/rest/${path}.json
+        sha "$(jq -r .head.repo.full_name "${f}")" "$(jq -r .head.ref "${f}")" >"${store}/closed_${path//\//_}" ;;
     GET\ repos/cgwalters-forge/*/pulls/*/*)
         test -e "${store}/rest/${path}.json" || notfound
         json=$(cat "${store}/rest/${path}.json") ;;
     GET\ repos/cgwalters-forge/*/pulls/*)
         test -e "${store}/rest/${path}.json" || notfound
-        json=$(jq --arg s "$(sha "$(jq -r .head.repo.full_name "${store}/rest/${path}.json")" \
-            "$(jq -r .head.ref "${store}/rest/${path}.json")")" \
-            --arg state "$(test -e "${store}/closed_${path//\//_}" && echo closed || echo open)" \
-            '.head.sha = $s | .state = $state' "${store}/rest/${path}.json") ;;
+        json=$(fork_pr "${store}/rest/${path}.json") ;;
+    GET\ repos/cgwalters-forge/*/pulls)
+        head=$(field head)
+        json=$(for f in "${store}/rest/${path}"/*.json; do test ! -e "${f}" || fork_pr "${f}"; done |
+            jq -s --arg ref "${head#*:}" '[.[] | select(.head.ref == $ref)]') ;;
     GET\ *)
         test -e "${store}/rest/${path}.json" || notfound
         json=$(cat "${store}/rest/${path}.json") ;;
@@ -227,7 +260,7 @@ fork_pr() {
 }
 
 # --- The repositories and fork PRs ---
-for r in acme/proj acme/nodco cgwalters-forge/proj cgwalters-forge/nodco; do
+for r in acme/proj acme/nodco acme/dcoapp cgwalters-forge/proj cgwalters-forge/nodco cgwalters-forge/dcoapp; do
     git init -q --bare "${REMOTES}/${r}"
     # The failing hooks are the local user's, not GitHub's.
     git -C "${REMOTES}/${r}" config core.hooksPath /dev/null
@@ -237,11 +270,13 @@ git init -q "${SRC}"
 git -C "${SRC}" remote add up "file://${REMOTES}/acme/proj"
 git -C "${SRC}" remote add forge "file://${REMOTES}/cgwalters-forge/proj"
 git -C "${SRC}" remote add nodco "file://${REMOTES}/cgwalters-forge/nodco"
+git -C "${SRC}" remote add app "file://${REMOTES}/cgwalters-forge/dcoapp"
 BASE=$(commit_as other README base)
-for r in up forge nodco; do
+for r in up forge nodco app; do
     git -C "${SRC}" push -q "${r}" HEAD:main
 done
 git -C "${SRC}" push -q "file://${REMOTES}/acme/nodco" HEAD:main
+git -C "${SRC}" push -q "file://${REMOTES}/acme/dcoapp" HEAD:main
 
 new_branch() {
     git -C "${SRC}" switch -q -c "$1" "${BASE}"
@@ -283,8 +318,24 @@ G2=$(commit_as legacy legacy "legacy"$'\n\n'"Generated-by: AI")
 new_branch bot/stale
 T1=$(commit_as bot stale "approved")
 T2=$(commit_as bot stale "pushed later")
+# In acme/dcoapp: #11 is promoted with a sign-off; #12 to #15 are promoted
+# without, and then 'signoff' is run on them: #12 as it is, #13 after a
+# push, #14 without cgwalters' approval, and #15 with someone else's
+# commit.
+new_branch bot/app
+A1=$(commit_as bot app "app")
+new_branch bot/late
+LA1=$(commit_as bot late "late")
+new_branch bot/moved
+MV1=$(commit_as bot moved "moved")
+new_branch bot/unapproved
+U1=$(commit_as bot unapproved "unapproved")
+new_branch bot/others
+commit_as other others "by someone else" >/dev/null
+O2=$(commit_as bot others "by the bot")
 git -C "${SRC}" push -q forge bot/sign bot/signed bot/mixed bot/lease bot/stale bot/rebased bot/forged bot/legacy
 git -C "${SRC}" push -q nodco bot/plain
+git -C "${SRC}" push -q app bot/app bot/late bot/moved bot/unapproved bot/others
 
 fork_pr proj 1 bot/sign "${S3}"
 fork_pr nodco 2 bot/plain "${N1}"
@@ -295,6 +346,11 @@ fork_pr proj 6 bot/stale "${T1}"
 fork_pr proj 7 bot/rebased "${R1}"
 fork_pr proj 8 bot/forged "${F1}"
 fork_pr proj 9 bot/legacy "${G2}"
+fork_pr dcoapp 11 bot/app "${A1}"
+fork_pr dcoapp 12 bot/late "${LA1}"
+fork_pr dcoapp 13 bot/moved "${MV1}"
+fork_pr dcoapp 14 bot/unapproved "${U1}"
+fork_pr dcoapp 15 bot/others "${O2}"
 jq -n --arg a "${F1}" --arg s "${F2}" --arg u "https://github.com/cgwalters-forge/proj/pull/8#pullrequestreview-800" '
     [{user: {login: "cgwalters-bot"}, created_at: "2026-09-25T12:00:00Z", html_url: "https://github.com/cgwalters-forge/proj/pull/8#c0",
       body: "Signed off 1 commit(s)\n\n<!-- bot-pr signoff approved=\($a) signed=\($s) approval=\($u) review=800 -->"}]' \
@@ -304,6 +360,11 @@ echo '{"parent": {"full_name": "acme/nodco"}, "source": {"full_name": "acme/nodc
 jq -n '[{type: "required_status_checks", parameters: {required_status_checks: [{context: "DCO"}, {context: "ci"}]}}]' |
     fixture repos/acme/proj/rules/branches/main
 echo '[{"type": "pull_request"}]' | fixture repos/acme/nodco/rules/branches/main
+echo '{"parent": {"full_name": "acme/dcoapp"}, "source": {"full_name": "acme/dcoapp"}}' | fixture repos/cgwalters-forge/dcoapp
+# The DCO app runs in acme/dcoapp, but its rules require only CI.
+jq -n '[{type: "required_status_checks", parameters: {required_status_checks: [{context: "ci"}]}}]' |
+    fixture repos/acme/dcoapp/rules/branches/main
+jq -n '{check_runs: [{name: "ci"}, {name: "DCO", app: {slug: "dco-2"}}]}' | fixture repos/acme/dcoapp/commits/main/check-runs
 echo '{"path": ".github/workflows/signoff.yml"}' | fixture repos/acme/proj/contents/.github/workflows/signoff.yml
 
 # run NAME EXPECTED_STATUS ARGS...: run bot-pr with the failing hooks and
@@ -351,12 +412,12 @@ author_of() {
     echo "${a}"
 }
 
-# same_but_signed NAME OLD NEW: NEW is OLD, commit by commit since BASE,
-# with the same trees, authors (but for the bot's old name, see
-# author_of) and messages plus the sign-off, committed by cgwalters where
-# the sign-off is new.
+# same_but_signed NAME OLD NEW [FORK]: NEW is OLD, commit by commit since
+# BASE in FORK (default: cgwalters-forge/proj), with the same trees,
+# authors (but for the bot's old name, see author_of) and messages plus
+# the sign-off, committed by cgwalters where the sign-off is new.
 same_but_signed() {
-    local name=$1 dir=${REMOTES}/cgwalters-forge/proj old new i o n om nm rest
+    local name=$1 dir=${REMOTES}/${4:-cgwalters-forge/proj} old new i o n om nm rest
     mapfile -t old < <(git -C "${dir}" rev-list --reverse "${BASE}..$2")
     mapfile -t new < <(git -C "${dir}" rev-list --reverse "${BASE}..$3")
     test "${#old[@]}" -eq "${#new[@]}" || { fail "${name}: ${#old[@]} commits became ${#new[@]}"; return; }
@@ -504,5 +565,67 @@ test "${moved}" != "${L1}" || fail "lease: the branch didn't move"
 test "$(remote_ref "${FORGE}" bot/lease)" = "${moved}" || fail "lease: the moved branch was overwritten"
 test -z "$(opened bot/lease)" || fail "lease: an upstream PR was opened"
 
+readonly APP=cgwalters-forge/dcoapp
+
+# --- The DCO app runs, though the rules don't require its check ---
+if run "DCO app" ok promote "${URL}/dcoapp/pull/11"; then
+    expect "DCO app" "Added cgwalters's sign-off to 1 commit"
+fi
+same_but_signed "DCO app" "${A1}" "$(remote_ref "${APP}" bot/app)" "${APP}"
+test "$(opened bot/app | jq -r .head_sha)" = "$(remote_ref "${APP}" bot/app)" ||
+    fail "DCO app: no upstream PR from the signed-off head"
+
+# --- signoff: an upstream PR promote opened without the sign-off ---
+# upstream_url BRANCH: the upstream PR promote opened from BRANCH, after
+# promoting it with --no-signoff, as promote did before it looked for DCO
+# check runs.
+upstream_url() {
+    opened "$1" | jq -r '.html_url // empty'
+}
+for pr in 12:bot/late 13:bot/moved 14:bot/unapproved 15:bot/others; do
+    if run "promote ${pr#*:}" ok promote "${URL}/dcoapp/pull/${pr%%:*}" --no-signoff; then
+        test -n "$(upstream_url "${pr#*:}")" || fail "promote ${pr#*:}: no upstream PR"
+    fi
+done
+LATE=$(upstream_url bot/late)
+comments=${FAKE_GH}/repos_${APP//\//_}_issues_12_comments.json
+ncomments=$(jq length "${comments}")
+if run "signoff" ok signoff "${LATE}"; then
+    expect "signoff" "Added cgwalters's sign-off to 1 commit\(s\) of ${LATE}" "^$(remote_ref "${APP}" bot/late)\$"
+fi
+late=$(remote_ref "${APP}" bot/late)
+test "${late}" != "${LA1}" || fail "signoff: not pushed"
+same_but_signed "signoff" "${LA1}" "${late}" "${APP}"
+test "$(jq length "${comments}")" -eq "$((ncomments + 1))" || fail "signoff: expected one comment on the fork PR"
+jq -r '.[-1].body' "${comments}" |
+    grep -qF "<!-- bot-pr signoff approved=${LA1} signed=${late} approval=${URL}/dcoapp/pull/12#pullrequestreview-1200 review=1200 -->" ||
+    fail "signoff: no sign-off record on the fork PR"
+ls "${FAKE_GH}"/repos_acme_* >/dev/null 2>&1 && fail "signoff: commented upstream"
+if run "signoff, rerun" ok signoff "${LATE}"; then
+    expect "signoff, rerun" 'plus his sign-off, per the bot.s record; checking that' 'has cgwalters.s sign-off already'
+fi
+test "$(remote_ref "${APP}" bot/late)" = "${late}" || fail "signoff, rerun: pushed again"
+
+# signoff_refused NAME PATTERN ARGS...: signoff ARGS fails with PATTERN,
+# changing no branch.
+signoff_refused() {
+    local name=$1 pattern=$2 before
+    shift 2
+    before=$(all_refs)
+    if run "${name}" fail signoff "$@"; then
+        expect "${name}" "${pattern}"
+    fi
+    test "$(all_refs)" = "${before}" || fail "${name}: the remotes changed"
+}
+
+git -C "${SRC}" switch -q bot/moved
+MV2=$(commit_as bot moved "pushed after promote")
+git -C "${SRC}" push -q app bot/moved
+signoff_refused "signoff, moved" "head ${MV2:0:12} is not ${MV1:0:12}, which promote opened it with" "$(upstream_url bot/moved)"
+echo '[]' | fixture "repos/${APP}/pulls/14/reviews"
+signoff_refused "signoff, unapproved" "has no approval by cgwalters of ${U1:0:12}" "$(upstream_url bot/unapproved)"
+signoff_refused "signoff, others" "commits that aren't cgwalters-bot's" "$(upstream_url bot/others)"
+signoff_refused "signoff, no DCO" "neither requires nor runs a DCO check" "$(upstream_url bot/plain)"
+
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: promote signs off on approval, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases"
+echo "ok: promote signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases; signoff signs off promoted PRs only on that approval, with the same refusals"

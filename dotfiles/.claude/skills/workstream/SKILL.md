@@ -281,13 +281,19 @@ requests), and remembers what it showed. Then, per PR:
   upstream PR from `cgwalters-forge:bot/<slug>` with the fork PR's current
   title and body (minus the bot-meta section), links and closes the fork
   PR, and sets the item In Review with Branch = the upstream PR. If the
-  upstream repository requires DCO, his approval is also his sign-off:
+  upstream repository requires DCO (its branch rules require the DCO
+  check, or the DCO app's check runs there), his approval is also his
+  sign-off:
   promote adds his `Signed-off-by` to the commits lacking it and
   force-pushes them (if promote fails after that, a rerun still counts his
   approving review, but a `/promote` needs repeating), and stops if a
   commit is by someone other than the bot or him; pass `--include-others`
   only if he asked for their sign-off too, or `--no-signoff` to leave it to
-  the maintainers. Pass
+  the maintainers. For an upstream PR promote opened without his sign-off
+  (say, before it looked for DCO check runs), run
+  `bot-pr signoff <upstream-pr-url>` when he asks for it: it checks the
+  same approval, refuses if the head moved since promote or a commit
+  isn't the bot's, and pushes nothing else. Pass
   `--why "<short rationale>. Result: ..."` to refresh Why in the same
   board call. If the rebase conflicts, promote dismisses the approval,
   comments, and sets the item back to Draft: resolve the conflicts on the

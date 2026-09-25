@@ -163,7 +163,11 @@ comment `/promote`) for a project that requires DCO (bootc-dev, among
 others), that approval is my sign-off: `bot-pr promote` adds my
 `Signed-off-by` to the bot's commits, with me as committer, before opening
 the upstream PR, and names the approval in its body. Others' commits get it
-only with `--include-others`.
+only with `--include-others`. A project requires DCO if its branch rules
+require the DCO check or if the DCO app's check runs there anyway. For an
+upstream PR promote opened without my sign-off, `bot-pr signoff
+<upstream-pr-url>` adds it on the same approval, as long as the PR's head
+is still what promote opened it with.
 
 Upstream PRs that didn't go through promote still sit with a failing DCO
 check until a human signs off. `bin/dco-signoff`, run by me with my own git

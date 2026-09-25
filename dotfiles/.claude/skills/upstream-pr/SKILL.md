@@ -93,8 +93,9 @@ topic branch per change.
   fork PR is his sign-off, and `bot-pr promote` adds his
   `Signed-off-by: Colin Walters <walters@verbum.org>` to the commits (with
   him as committer, which the DCO check wants) and names that approval in
-  the upstream PR body. That tool is the only way his sign-off gets added;
-  never add it by hand. Commits by anyone else get it only if he asks
+  the upstream PR body. That tool is the only way his sign-off gets added
+  (and `bot-pr signoff UPSTREAM_PR_URL`, for a PR promote opened without
+  it, on the same approval of the same head); never add it by hand. Commits by anyone else get it only if he asks
   (`promote --include-others`); with `--no-signoff`, promote instead
   tells the maintainers to comment `/signoff` where the repository has
   that command (bootc-dev/actions' pr-signoff workflow,
@@ -104,9 +105,10 @@ topic branch per change.
   mention it. For the bot's PRs opened without promote, cgwalters can sign
   off with `bin/dco-signoff`, which refuses to run as the bot;
   `dco-signoff --list-only` shows which open PRs still wait on it.
-- **Whether DCO is required** comes from what GitHub enforces, never from
-  CONTRIBUTING or other prose, which is easy to misread. It is required if
-  the default branch's rules require a status check named like DCO:
+- **Whether DCO is required** comes from what GitHub enforces or runs,
+  never from CONTRIBUTING or other prose, which is easy to misread. It is
+  required if the default branch's rules require a status check named like
+  DCO:
 
   ```bash
   gh api repos/OWNER/REPO/rules/branches/DEFAULT --jq '.[]
@@ -115,11 +117,14 @@ topic branch per change.
     | select(test("dco"; "i"))'
   ```
 
-  or if a workflow in `.github/workflows/` checks sign-offs. Classic branch
-  protection isn't readable without admin rights, so if neither shows
-  anything, also look for a DCO check among the check runs of a recent
-  commit on the default branch
+  or if a DCO check runs there even though it isn't required: the DCO app
+  fails every PR without sign-offs wherever it's installed, and classic
+  branch protection isn't readable without admin rights anyway. So look
+  for a check named like DCO among the check runs of the default branch's
+  head and of the heads of the repository's latest PRs
   (`gh api repos/OWNER/REPO/commits/SHA/check-runs --jq '.check_runs[].name'`).
+  `bot-pr promote` and `bot-pr signoff` decide it exactly this way. A
+  workflow in `.github/workflows/` that checks sign-offs counts too.
 - AI disclosure per project policy; by default end each commit message with
   a `Generated-by: AI` trailer (`Assisted-by: AI` only when a human wrote
   a substantial part of the change).

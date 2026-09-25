@@ -380,6 +380,7 @@ promote_world() {
     rest "repos/up/demo/pulls" '[]'
     rest "repos/up/demo/compare/main...cgwalters-forge:${PR_BRANCH}" '{"ahead_by": 1, "behind_by": 0}'
     rest "repos/up/demo/rules/branches/main" '[]'
+    rest "repos/up/demo/commits/main/check-runs" '{"check_runs": []}'
 }
 
 # The head was pushed at 10:00, from a commit made at 09:50.

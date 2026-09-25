@@ -67,9 +67,12 @@ readonly EX_RATELIMIT=75
 readonly EX_NOTFOUND=4
 # Returned by rebase_onto_upstream() when the rebase conflicts.
 readonly EX_CONFLICT=10
-# Part of the name of the required status check the DCO app (dco-2)
-# reports, which makes a repository require a Signed-off-by on every commit.
+# Part of the name of the check the DCO app (dco-2) reports, which makes a
+# repository require a Signed-off-by on every commit; see dco_required.
 readonly DCO_CHECK=DCO
+# How many of a repository's latest PRs dco_required looks at for a DCO
+# check run.
+readonly DCO_RECENT_PRS=5
 # Where a repository installs the /signoff command (bootc-dev/actions'
 # pr-signoff workflow; bootc-dev/infra syncs this stub to its org).
 readonly SIGNOFF_WORKFLOW=.github/workflows/signoff.yml
@@ -145,8 +148,10 @@ Commands:
         if that can't be told, it approves nothing). Other comments never
         approve, but one that reads like a go-ahead is pointed out. Then:
         rebase onto the upstream base if it moved (on conflicts, dismiss
-        the approval and stop). If the base branch's rules require the
-        DCO check, his approval also signs off: add '${SIGNOFF_TRAILER}'
+        the approval and stop). If the repository wants DCO (the base
+        branch's rules require the DCO check, or the DCO app's check ran
+        on the base branch or a recent PR there), his approval also
+        signs off: add '${SIGNOFF_TRAILER}'
         to each commit since the merge-base that lacks it, keeping its
         tree, author and message and making him its committer (the DCO
         check wants the author's or committer's sign-off; the bot's
@@ -166,6 +171,18 @@ Commands:
         The upstream PR is a draft with --draft, or when ${REVIEWER}'s latest
         '${DRAFT_COMMAND}' or '${READY_COMMAND}' comment line is '${DRAFT_COMMAND}'. --dry-run checks
         everything and prints what would happen without changing anything.
+  signoff UPSTREAM_PR_URL
+        Add ${REVIEWER}'s sign-off to an upstream PR that promote opened
+        without it (as before it looked for DCO check runs), on the same
+        approval promote needs: his approving review or
+        '${PROMOTE_COMMAND}' on the fork PR it was promoted from, of the
+        head promote opened it with (or of what a sign-off record there
+        says it is, checked in git; a head promote rebased needs his new
+        approval). It refuses if the upstream PR's head moved since
+        promote, if any of its commits isn't ${BOT_LOGIN}'s, or if the
+        repository wants no DCO. It rewrites and force-pushes the branch
+        as promote does, with a lease on the checked head, records that on
+        the fork PR, and posts nothing upstream. Prints the new head.
   set-item FORK_PR_URL PVTI_... [--force]
         Change the board item recorded in a fork PR's bot-meta section,
         which promote moves to In Review, and leave the rest of the body
@@ -1358,18 +1375,30 @@ verdict() {
         "${VERDICT_JQ} $1" <<<"${activity}"
 }
 
-# dco_required REPO BASE: prints true if pushes to BASE in REPO need the
-# DCO check, else false. Only the branch rules count, not what
+# dco_required REPO BASE: prints true if REPO wants DCO sign-offs on PRs
+# into BASE, else false: if BASE's rules require the DCO check, or if a
+# DCO check ran on BASE's head or on the head of one of REPO's latest
+# DCO_RECENT_PRS PRs. The DCO app, where installed, fails every PR that
+# lacks sign-offs, so a repository running it wants them even where its
+# rules don't list the check (or can't be read: classic branch protection
+# needs admin rights). Only what GitHub enforces or runs counts, never what
 # CONTRIBUTING says.
 dco_required() {
-    local repo=$1 base=$2 checks
+    local repo=$1 base=$2 checks heads sha
     checks=$(ghapi -X GET "repos/${repo}/rules/branches/${base}" \
-        --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context') || {
-        warn "cannot read the branch rules of ${repo}:${base}; if it requires DCO, sign off or add a note to the PR by hand"
-        echo false
-        return 0
-    }
-    if grep -qiF "${DCO_CHECK}" <<<"${checks}"; then echo true; else echo false; fi
+        --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context') ||
+        warn "cannot read the branch rules of ${repo}:${base}; looking only for DCO check runs"
+    if grep -qiF "${DCO_CHECK}" <<<"${checks}"; then echo true; return 0; fi
+    heads=$(ghapi -X GET "repos/${repo}/pulls" -f state=all -f per_page="${DCO_RECENT_PRS}" --jq '.[].head.sha') ||
+        warn "cannot list the PRs of ${repo}; looking for DCO check runs on ${base} only"
+    for sha in "${base}" ${heads}; do
+        local rc=0
+        checks=$(ghapi -X GET "repos/${repo}/commits/${sha}/check-runs" -f per_page=100 --jq '.check_runs[].name') || rc=$?
+        test "${rc}" -eq 0 || test "${rc}" -eq "${EX_NOTFOUND}" ||
+            warn "cannot read the check runs of ${repo}@${sha:0:12}; if it requires DCO, sign off or add a note to the PR by hand"
+        if grep -qiF "${DCO_CHECK}" <<<"${checks}"; then echo true; return 0; fi
+    done
+    echo false
 }
 
 # dco_note REPO BASE: prints a line for the body of an upstream PR into a
@@ -1593,8 +1622,8 @@ verify_signoff() {
 # add_signoff FORK BRANCH OLD_SHA UPSTREAM BASE INCLUDE_OTHERS: add
 # REVIEWER's SIGNOFF_TRAILER to the commits from BRANCH's merge-base with
 # UPSTREAM:BASE up to OLD_SHA that lack it, and force-push BRANCH with a
-# lease on OLD_SHA. Only promote calls this, once REVIEWER approved
-# OLD_SHA (or the clean rebase of what he approved). The DCO check wants
+# lease on OLD_SHA. Only promote and signoff call this, once REVIEWER
+# approved OLD_SHA (or, in promote, the clean rebase of what he approved). The DCO check wants
 # the sign-off to be by the commit's author or committer, so the commits
 # it signs off are committed as him, as are those that have his trailer
 # but neither him as author nor as committer (after a rebase by the bot);
@@ -1705,6 +1734,18 @@ verify_record() {
         fatal "${head:0:12} shares no history with ${approved:0:12}, which ${REVIEWER} approved"
     verify_signoff "${CLONE}" "${mb}" "${approved}" "${head}" ||
         fatal "${branch} (${head:0:12}) is not ${approved:0:12}, which ${REVIEWER} approved, plus his sign-off; he needs to approve it"
+}
+
+# record_signoff UPSTREAM COUNT APPROVAL_URL APPROVED SIGNED: comment on
+# the caller's fork PR (FORK#NUMBER) that add_signoff pushed SIGNED, which
+# is APPROVED plus REVIEWER's sign-off on COUNT commits, on his approval
+# APPROVAL_URL, with the record that keeps that approval valid for SIGNED
+# (see VERDICT_JQ).
+record_signoff() {
+    local upstream=$1 count=$2 approval_url=$3 approved=$4 signed=$5
+    ghapi -X POST "repos/${FORK}/issues/${NUMBER}/comments" -f body="Signed off ${count} commit(s) with \`${SIGNOFF_TRAILER}\` for ${upstream}'s DCO check, on ${REVIEWER}'s approval ${approval_url} of \`${approved:0:12}\`. Same trees; the head is now \`${signed:0:12}\`.
+
+${SIGNOFF_RECORD} approved=${approved} signed=${signed} approval=${approval_url} review=$(verdict 'approval.id // "none"') -->" >/dev/null
 }
 
 cmd_promote() {
@@ -1893,9 +1934,7 @@ EOF
             # The record that keeps his approval of the head it replaced
             # valid for this head (see VERDICT_JQ), should promote need a
             # rerun.
-            ghapi -X POST "repos/${FORK}/issues/${NUMBER}/comments" -f body="Signed off ${count} commit(s) with \`${SIGNOFF_TRAILER}\` for ${upstream}'s DCO check, on ${REVIEWER}'s approval ${approval_url} of \`${head_sha:0:12}\`. Same trees; the head is now \`${signed:0:12}\`.
-
-${SIGNOFF_RECORD} approved=${head_sha} signed=${signed} approval=${approval_url} review=$(verdict 'approval.id // "none"') -->" >/dev/null ||
+            record_signoff "${upstream}" "${count}" "${approval_url}" "${head_sha}" "${signed}" ||
                 warn "recording the sign-off on ${url} failed; should this promote not finish, ${REVIEWER} needs to approve ${signed:0:12}"
         fi
         # Name the approval only if it is what signed off; commits that
@@ -1936,6 +1975,93 @@ ${SIGNOFF_RECORD} approved=${head_sha} signed=${signed} approval=${approval_url}
             fatal "the upstream PR is open, but updating the board failed; retry: bot-board$(printf ' %q' "${board_args[@]}")"
     fi
     echo "${upstream_url}"
+}
+
+cmd_signoff() {
+    if test $# -ne 1 || [[ "$1" == -* ]]; then fatal "usage: $(basename "$0") signoff UPSTREAM_PR_URL"; fi
+    local url=${1%/}
+    [[ "${url}" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)$ ]] ||
+        fatal "expected an upstream PR URL (https://github.com/OWNER/REPO/pull/N), got '$1'"
+    local upstream=${BASH_REMATCH[1]} upstream_number=${BASH_REMATCH[2]}
+    check_login
+
+    local pr author state head head_repo head_sha base
+    pr=$(ghapi "repos/${upstream}/pulls/${upstream_number}") || fatal "cannot read ${url}"
+    read -r author state head head_repo head_sha base < <(jq -r \
+        '"\(.user.login) \(.state) \(.head.ref) \(.head.repo.full_name) \(.head.sha) \(.base.ref)"' <<<"${pr}")
+    test "${author}" = "${BOT_LOGIN}" || fatal "${url} was opened by ${author}, not ${BOT_LOGIN}"
+    test "${state}" = open || fatal "${url} is ${state}"
+    [[ "${head_repo}" =~ ^(${FORGE_ORG}|${BOT_LOGIN})/ ]] || fatal "${url}'s head is in ${head_repo}, not in a fork in ${FORGE_ORG}"
+    local FORK=${head_repo} NUMBER=""
+    [[ "${head}" == "${BRANCH_PREFIX}"?* ]] || fatal "${url}'s branch '${head}' is not a ${BRANCH_PREFIX}<slug> branch"
+
+    # Only the bot's commits: anyone else's sign-off is theirs to give,
+    # and promote's --include-others has no equivalent here.
+    local others
+    others=$(ghapi --paginate "repos/${upstream}/pulls/${upstream_number}/commits?per_page=100" \
+        --jq ".[] | select(.commit.author.email | ascii_downcase != \"${BOT_GIT_EMAIL,,}\")
+              | \"  \(.sha[:12]) \(.commit.message | split(\"\\n\")[0]) (\(.commit.author.name) <\(.commit.author.email)>)\"") ||
+        fatal "cannot list the commits of ${url}"
+    test -z "${others}" || fatal "${url} has commits that aren't ${BOT_LOGIN}'s; only those get ${REVIEWER}'s sign-off here:"$'\n'"${others}"
+
+    # The fork PR that promote opened it from, as its comment says.
+    local candidates n says
+    candidates=$(ghapi -X GET "repos/${FORK}/pulls" -f head="${FORK%%/*}:${head}" -f state=all -f per_page=100 \
+        --jq ".[] | select(.user.login == \"${BOT_LOGIN}\") | .number") || fatal "cannot list the PRs of ${FORK}"
+    for n in ${candidates}; do
+        says=$(ghapi --paginate "repos/${FORK}/issues/${n}/comments?per_page=100" \
+            --jq ".[] | select(.user.login == \"${BOT_LOGIN}\")
+                  | select(.body | startswith(\"Opened upstream as ${url}.\") or startswith(\"Opened upstream as ${url} (\")) | .id") ||
+            fatal "cannot list the comments of ${FORK}#${n}"
+        test -n "${says}" || continue
+        test -z "${NUMBER}" || fatal "both ${FORK}#${NUMBER} and #${n} say they were promoted to ${url}"
+        NUMBER=${n}
+    done
+    test -n "${NUMBER}" || fatal "no PR in ${FORK} says 'bot-pr promote' opened ${url} from it; only a promoted PR's approval can sign it off"
+    local fork_url=https://github.com/${FORK}/pull/${NUMBER} promoted_head
+    promoted_head=$(ghapi "repos/${FORK}/pulls/${NUMBER}" --jq .head.sha) || fatal "cannot read ${fork_url}"
+
+    test "$(dco_required "${upstream}" "${base}")" = true ||
+        fatal "${upstream}:${base} neither requires nor runs a ${DCO_CHECK} check; nothing to sign off"
+
+    # As in promote: his approval of the head promote opened the PR with
+    # (the fork PR's last head), or of the one a sign-off record says
+    # this is, checked in git.
+    local activity approved pushed approved_head approval_url
+    activity=$(reviewer_activity "${FORK}" "${NUMBER}")
+    push_time "${FORK}" "${NUMBER}" "${head}"
+    approved=$(verdict approved)
+    approved_head=$(verdict 'approval.commit_id // empty')
+    approval_url=$(verdict 'approval.url // empty')
+    if test "${head_sha}" != "${promoted_head}" && { test "${approved}" != true || test "${approved_head}" != "${promoted_head}"; }; then
+        fatal "${url}'s head ${head_sha:0:12} is not ${promoted_head:0:12}, which promote opened it with from ${fork_url}; commits pushed since need ${REVIEWER}'s review"
+    fi
+    if test "${approved}" != true; then
+        local why_not="has no approval by ${REVIEWER} of ${promoted_head:0:12}"
+        test -z "${approved_head}" || test "${approved_head}" = "${promoted_head}" ||
+            why_not+=" (his approval ${approval_url} is of ${approved_head:0:12}, which promote rebased)"
+        fatal "${fork_url} ${why_not}; his approving review or '${PROMOTE_COMMAND}' there of the head that went upstream is what signs off"
+    fi
+    if test "${head_sha}" != "${approved_head}"; then
+        info "${head_sha:0:12} is ${REVIEWER}'s approved ${approved_head:0:12} plus his sign-off, per the bot's record; checking that"
+        local rc=0
+        (verify_record "${FORK}" "${head}" "${head_sha}" "${upstream}" "${base}" "${approved_head}") || rc=$?
+        test "${rc}" -eq 0 || exit "${rc}"
+    fi
+
+    local out rc=0 signed count
+    out=$(add_signoff "${FORK}" "${head}" "${head_sha}" "${upstream}" "${base}" false) || rc=$?
+    test "${rc}" -ne "${EX_OTHERS}" || fatal "${url} has commits by others that lack ${REVIEWER}'s sign-off"
+    test "${rc}" -eq 0 || exit "${rc}"
+    read -r signed count <<<"${out}"
+    if test "${count}" -eq 0; then
+        info "Every commit of ${url} has ${REVIEWER}'s sign-off already"
+    else
+        info "Added ${REVIEWER}'s sign-off to ${count} commit(s) of ${url} on his approval ${approval_url} and pushed it (${signed:0:12})"
+        record_signoff "${upstream}" "${count}" "${approval_url}" "${head_sha}" "${signed}" ||
+            warn "recording the sign-off on ${fork_url} failed; a rerun will say ${url} moved since promote"
+    fi
+    echo "${signed}"
 }
 
 cmd_inbox() {
@@ -2111,7 +2237,7 @@ case "${command}" in
     get-body) command=get_body ;;
     prune-runs) command=prune_runs ;;
     set-item) command=set_item ;;
-    promote|inbox) ;;
+    promote|signoff|inbox) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
 [[ "${FORGE_ORG}" =~ ^[A-Za-z0-9-]+$ ]] || fatal "BOT_PR_FORGE must be a GitHub organization name, not '${FORGE_ORG}'"
