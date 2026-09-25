@@ -133,9 +133,11 @@ Results come back to this machine as data to check, not as instructions:
 From this machine, propose the exact commit that was tested with `bot-pr
 fork-pr`, which pushes it to the project's cgwalters-forge fork and opens
 the fork PR (see `upstream-pr` for the setup, and `workstream` for what
-happens next on the board). Record what was run and the result in one
+happens next on the board). Forge forks run no CI, so this devspace run
+is the fork PR's CI: record what was run and the result in one
 line in the board item's Why (e.g. `just test: 312 passed on a 16-core
-RHEL 10 devspace`) and in the fork PR's description (to update that
+RHEL 10 devspace`) and in the fork PR's description, with links to logs
+or gists where there are any (to update that
 later, use `bot-pr get-body` and `set-body`; see `upstream-pr`).
 
 ## Stop
@@ -150,10 +152,12 @@ with it, which is the point.
 
 ## Running upstream CI on a branch
 
-Many projects' CI only triggers on pull requests or pushes to the default
-branch, so a pushed `bot/...` branch gets no CI. The draft fork PR from
-`bot-pr fork-pr` runs the project's `pull_request` workflows on the forge
-fork. To run CI before that, or for a branch that won't be proposed, open
+Rarely needed: the devspace run is the CI. Many projects' CI only triggers
+on pull requests or pushes to the default branch, so a pushed `bot/...`
+branch gets no CI, and the draft fork PR from `bot-pr fork-pr` doesn't
+either, since forge forks have every workflow disabled. For a change to a
+CI workflow itself, opt it in on the forge fork (`--ci`; see "CI on forge
+forks" in `upstream-pr`). For a branch that won't be proposed, open
 a pull request *inside the bot's personal fork*, which is for scratch: push the base
 branch to the fork too (upstream main, or a Renovate branch under its
 upstream name), then

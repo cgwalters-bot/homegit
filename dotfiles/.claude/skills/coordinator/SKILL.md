@@ -60,6 +60,13 @@ instead of piping it through `tail` and losing lines for good.
   workers with the load: more when the queue is deep and items are
   independent, fewer when they share a repository or the GraphQL quota
   is running low.
+- **Forge CI is off.** Forge forks run no workflows, so a worker's
+  devspace run is the fork PR's CI: brief workers to put its results in
+  the PR description, and don't wait for, or ask about, fork CI. Only a
+  change to a CI workflow itself gets that workflow opted in on its fork
+  (`bot-pr fork-setup REPO --ci FILE`, or `fork-pr --ci`); once its run
+  is linked in the PR, turn it off again with `bot-pr fork-setup REPO
+  --no-ci`, since until then it runs for every PR on that fork.
 - **Review every result.** When a worker reports back, start an
   independent reviewer subagent on its branch or gist, and send the
   findings to the same worker (SendMessage, so it keeps its context) to

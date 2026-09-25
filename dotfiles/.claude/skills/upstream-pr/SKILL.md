@@ -140,7 +140,9 @@ Run the project's own tests and linters (look at its CI config, Makefile,
 Justfile, `cargo`/`npm`/`go` conventions) and make them pass before pushing
 the branch. Anything beyond a trivial check runs on a devspace (see the
 `devspace-work` skill), which also has podman and KVM for container- and
-VM-based CI steps. If something could not be run, say exactly what in the
+VM-based CI steps. For a fork PR this testing is its CI: forge forks run
+no workflows (see below), so run what the project's CI would, and put the
+results in the PR description. If something could not be run, say exactly what in the
 board item's Why (and in the PR description, for a PR). Then load the
 `commit-review` skill and go through its checklist.
 
@@ -154,10 +156,10 @@ git push -u forge HEAD:bot/<short-slug>
 bot-pr prune-runs REPO
 ```
 
-Each push to a fork PR starts its whole CI again, and the forge's forks
-share one pool of runners: `prune-runs` cancels the runs still queued
-for the commits the push replaced. fork-pr and promote do this
-themselves.
+Forge forks run no CI unless a workflow was opted in (below); where one
+was, each push starts it again, and the forge's forks share one pool of
+runners: `prune-runs` cancels the runs still queued for the commits the
+push replaced. fork-pr and promote do this themselves.
 
 The push goes from this machine, never from a devspace, and never to
 `upstream`.
@@ -173,19 +175,42 @@ bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
 ```
 
 Run it in the clone that has the branch. It creates `cgwalters-forge/REPO`
-if needed, syncs the fork's copy of the base with upstream, enables
-Actions except for workflows that can't work on the fork (scheduled jobs,
-PR bots and release jobs that need upstream's secrets, gh-aw agents;
-`bot-pr fork-setup REPO` redoes just that and says why it disabled each),
+if needed, turns off its CI (`bot-pr fork-setup REPO` redoes just that),
+syncs the fork's copy of the base with upstream,
 pushes the branch there, opens the PR inside the fork, and
 appends a bot-meta section with the upstream target, the board item and
 review instructions. Write the title
 and body as the upstream PR (the PR description rules below apply): once
 approved they are posted upstream as they stand then, minus the bot-meta
-section. The fork PR also runs the project's `pull_request` CI, minus
-anything that needs upstream's secrets or runners. CI workflows that use
-upstream's secrets stay enabled and are listed in the bot-meta section: a
-failure there may just be a missing secret.
+section.
+
+### CI on forge forks
+
+Forge forks run no CI: every workflow there is disabled, since the
+forks share one pool of runners that a single bootc PR's matrix fills
+for hours. Devspace testing is the CI of a fork PR, so its description
+states what ran on the devspace and the results (with links where there
+are any), and never claims fork CI. The project's own CI runs once
+`promote` opens the PR upstream.
+
+The exception is a change to a CI workflow itself, which only running it
+tests (a workflow fix, a new `/signoff` or revdep workflow). Opt that
+workflow in on the fork, which enables it and records it in the fork's
+`BOT_PR_CI` Actions variable so that later fork-pr runs keep it:
+
+```bash
+bot-pr fork-pr ... --ci ci.yml      # or: bot-pr fork-setup REPO --ci ci.yml
+# a workflow_dispatch one can also be run on the branch directly:
+gh api -X POST repos/cgwalters-forge/REPO/actions/workflows/ci.yml/dispatches -f ref=bot/<slug>
+```
+
+fork-setup warns about an opted-in workflow that can't work on a fork
+(scheduled only, PR bots and release jobs that need upstream's secrets,
+gh-aw agents), and the bot-meta section lists it. While opted in it
+runs for every PR and push on that fork, so turn it off again with
+`bot-pr fork-setup REPO --no-ci` once its run is linked in the PR
+description. A PR that adds a new workflow file runs it on the fork by
+itself (GitHub enables new workflows) until the next fork-setup.
 
 To change the fork PR's description afterwards, never use `gh pr edit`;
 start from its current text and write it back with bot-pr:

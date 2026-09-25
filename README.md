@@ -120,8 +120,14 @@ branch, and the board item. On that PR:
   upstream as they stand at approval, minus the bot-meta section.
 - **Close** it to drop the change; the item becomes Done as dropped.
 
-Forge forks start with a clean `main` synced from upstream, both accounts
-can push to them, and PRs into them run the project's own CI. The bot's
+Forge forks start with a clean `main` synced from upstream, and both
+accounts can push to them. They run no CI: every workflow is disabled
+(`bot-pr fork-setup`), because the forks share one runner pool that a
+single bootc PR's matrix fills, and the bot tests every change on a
+devspace, whose results the PR description gives. Upstream CI runs once
+the PR is promoted. A change to a workflow itself is exercised by opting
+that workflow in (`bot-pr fork-setup REPO --ci FILE`, undone with
+`--no-ci`). The bot's
 personal forks (`cgwalters-bot/REPO`) are only for scratch work.
 
 `bot-pr` implements the bot's side: `fork-pr` creates the

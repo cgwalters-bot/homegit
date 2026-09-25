@@ -29,7 +29,10 @@ Every change is first proposed as a draft PR in a fork under the
 [cgwalters-forge](https://github.com/cgwalters-forge) organization (the
 bot's personal `cgwalters-bot/REPO` forks are only for scratch work),
 where cgwalters reviews it, and only his approval opens the upstream PR
-(see "Review loop" below).
+(see "Review loop" below). Forge forks run no CI: the devspace testing
+the PR describes is its CI, and upstream CI runs after promotion (see
+"CI on forge forks" in `upstream-pr` for the rare workflow change that
+needs to run there).
 
 Items also carry a **Why** text field. It holds the rationale for adding the
 item, and is where you put the current result and questions for cgwalters
@@ -207,7 +210,9 @@ with their committer, since GitHub doesn't record who pushed those),
 and CI turning red (flagged on the bot's own branches) or green
 again. On the bot's fork PRs (its own PRs in cgwalters-forge and
 cgwalters-bot repositories) it only reports pushes and CI, since
-`bot-pr inbox` covers his review there; other issues and PRs in those
+`bot-pr inbox` covers his review there; a forge fork PR normally has no
+CI at all, which is expected and never reported, and only a workflow
+opted in there can turn it red; other issues and PRs in those
 repositories get the full report. `--json` prints the same as one
 object. `--apply` does the bookkeeping itself, but only when that sweep
 saw one of the item's PRs merge or close, only once none of them (its
@@ -245,9 +250,11 @@ requests), and remembers what it showed. Then, per PR:
 - **Comments and review comments**: address them like upstream review
   (see `upstream-pr`): `git commit --fixup=<sha>`, squash with
   `git rebase --autosquash`, retest as needed, force-push the branch,
-  run `bot-pr prune-runs REPO` (the forge's forks share one pool of
-  runners, and the replaced head's CI would otherwise stay queued ahead
-  of everyone's current work), and reply in the fork PR thread saying
+  run `bot-pr prune-runs REPO` (in case a workflow is opted in there: the
+  forge's forks share one pool of runners, and the replaced head's CI
+  would otherwise stay queued ahead of everyone's current work), rerun
+  the devspace tests the PR description reports if the fixup affects
+  them, and reply in the fork PR thread saying
   what changed (or why not). A request to reword a commit message is a reword in that rebase. If he edited the
   title or description (inbox shows `body edited` for his edits only),
   keep his text: those are what goes upstream. Change a fork PR's
@@ -337,8 +344,9 @@ below.
   DCO sign-off), `Fixes OWNER/REPO#N` or `Related: <url>`, and the
   `Generated-by: https://github.com/cgwalters/#llms` line last. `fork-pr`
   appends the bot-meta section (upstream target, board item, and how to
-  approve) and prints the fork PR URL. It creates the fork the first time
-  (with Actions enabled, minus scheduled workflows), and syncs its base with upstream:
+  approve) and prints the fork PR URL. It creates the fork the first time,
+  keeps every workflow there disabled (unless one is opted in with `--ci`),
+  and syncs its base with upstream:
 
   ```bash
   FORK_PR=$(bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
