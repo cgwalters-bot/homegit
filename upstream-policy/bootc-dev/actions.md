@@ -13,6 +13,12 @@ sources:
     path: .cursorrules
     sha: 47dc3e3d863cfb5727b87d785d09abf9743c0a72
   - repo: bootc-dev/actions
+    path: .github/agents
+    sha: 6bbb2d214ab5c0dded74153f51268425e029088b
+  - repo: bootc-dev/actions
+    path: .github/agents/agentic-workflows.md
+    sha: 08c6d9a24f466b691812c0f218cafb2e57f184fd
+  - repo: bootc-dev/actions
     path: .gemini
     sha: e74adbff6981febb684371fcd5c9a26add88638f
   - repo: bootc-dev/actions
@@ -27,14 +33,19 @@ sources:
   - repo: bootc-dev/infra
     path: common/REVIEW.md
     sha: 3068dd57b2c3ef45cb1c3147442e8d63505bb643
-checked: 2026-09-25 by the policy-check subagent (coordinator session 929c7a64, converted from an earlier read-only survey and re-read against current upstream)
+checked: 2026-09-25 by the policy-check subagent (coordinator session 929c7a64; re-read in full after .github/agents appeared)
 ---
 
 `AGENTS.md` here is the bootc-dev/infra `common/AGENTS.md` plus one local
 "Scripting" section ("Use Node.js for nontrivial scripts (more than 10 lines)
 rather than shell."), a code rule. `REVIEW.md`, `.claude/CLAUDE.md` and
 `.cursorrules` are the common files; `.gemini/config.yaml` only tunes Gemini
-code review.
+code review. `.github/agents/agentic-workflows.md` is the stock GitHub Agentic
+Workflows (gh-aw) dispatcher agent, which routes requests to author, debug or
+upgrade gh-aw workflows to prompts in github/gh-aw; it says nothing about who
+may contribute, attribution, sign-off or PR text. The repository overlay it
+would load, `.github/aw/instructions.md`, does not exist (`.github/aw` holds
+only `actions-lock.json` and `packages`).
 
 ## Quotes
 
