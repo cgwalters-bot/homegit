@@ -55,7 +55,13 @@ Specifically avoid:
 
 If a particular project has requirements as described in its contributing docs (look for a CONTRIBUTING.md or equiv!), use that instead.
 
-When addressing PR review feedback, always squash fixes into the relevant prior commit using `git commit --fixup=<sha>` + `git rebase --autosquash`. Never leave "Address review feedback" as a standalone commit.
+### Fixes and review feedback
+
+Pushed history never contains `fixup!` or `squash!` commits, nor a standalone "Address review feedback" commit. Who wrote the commit being fixed decides how:
+
+- **Your own commits:** squash the fix directly into the relevant commit (amend it, or `git commit --fixup=<sha>` then `git rebase --autosquash` locally before pushing). Reword the message if the change alters what it says.
+- **cgwalters' commits:** squash into them the same way, keeping his author, existing `Signed-off-by` and other trailers; never add a `Signed-off-by`. Say in the PR reply or body which of his commits changed, so he can re-review the diff.
+- **Anyone else's commits:** never rewrite them (a conflict-only rebase is fine). Add a separate, normal commit with a real subject and the AI trailer.
 
 ## Agent workflow and self-check
 

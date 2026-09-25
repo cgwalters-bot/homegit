@@ -764,7 +764,7 @@ To review:
 - **Approve**, or comment \`${PROMOTE_COMMAND}\` on a line of its own, to open it upstream, ready for review. Either covers only the commits pushed so far.
 - Add a \`${DRAFT_COMMAND}\` line (in the same comment or before) to open it upstream as a draft (\`${READY_COMMAND}\` undoes that).
 - **Close** to drop it.
-- Edit the title and description freely: they become the upstream PR's. Review comments are addressed with fixup commits and a reply here.
+- Edit the title and description freely: they become the upstream PR's. Review comments are squashed into the commits they concern, with a reply here.
 ${META_END}
 EOF
 }

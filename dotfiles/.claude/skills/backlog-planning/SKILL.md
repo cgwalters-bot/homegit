@@ -210,7 +210,7 @@ authored by bot accounts under varying logins, so filter on the head branch
 (`bootc-renovate/`, `renovate/`, `dependabot/`) rather than the author.
 Look at the failing check run before deciding: "artifact not found" and
 mirror 404s mean rerun, not a branch. A mechanical fix (an API change after
-a crate bump) is a branch item whose branch carries fixups on top of the
+a crate bump) is a branch item whose branch carries fix commits on top of the
 Renovate head.
 
 **Flakes.** Search issue titles (`flake`, `test flakes tracker`) as well as
@@ -309,7 +309,7 @@ Pick the Workflow (see the `workstream` skill for what each means) by the
 kind of output the item wants:
 
 - **branch** (the default): anything that ends in a code change, including
-  fixups for cgwalters' own PRs and follow-ups on the bot's own PRs.
+  fixes for cgwalters' own PRs and follow-ups on the bot's own PRs.
 - **analysis**: review requests (a pre-review), explainers, and
   verifications or reproductions ("does this still happen?", "confirm the
   fix works").

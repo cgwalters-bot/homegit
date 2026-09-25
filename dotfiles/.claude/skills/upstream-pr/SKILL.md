@@ -22,7 +22,7 @@ addressing review, or a rebase cgwalters asked for) is fine under either.
 
 This skill is for changes the bot proposes as its own. For items that are
 cgwalters' own PRs or review requests, follow the "PR items" section of
-`workstream` instead: push only a fixup branch to the bot's fork and open no
+`workstream` instead: push only a follow-up branch to the bot's fork and open no
 PR. The commit, test and review guidance below still applies, but skip
 "Check for existing work first" (the existing PR is the point) and "Open the
 PR".
@@ -127,12 +127,18 @@ topic branch per change.
   for new commits, and at least the two `GIT_COMMITTER_*` variables for
   rebases, which keep each commit's original author. Check with
   `git log --format='%an <%ae> / %cn <%ce>'` before pushing.
-- **Never change the content of someone else's commits.** Especially a
+- **Fixes go into the commit they belong to**, per "Fixes and review
+  feedback" in the shared AGENTS.md; pushed history never has `fixup!` or
+  `squash!` commits. Commits by cgwalters are the one exception to the
+  next rule: squash into them, keep his author, `Signed-off-by` and other
+  trailers, and name the commits you changed in the PR reply or body so
+  he re-reviews them.
+- **Never change the content of anyone else's commits.** Especially a
   signed-off one: its `Signed-off-by` would then vouch for code its author
   never saw, and on an approved PR it silently changes what was approved.
   A rebase that only resolves conflicts is fine. New code (fixes, review
-  follow-ups) goes in separate `fixup!` or `squash!` commits authored by the
-  bot, with the AI trailer, for the human to squash and re-sign.
+  follow-ups) goes in a separate, normal bot-authored commit with a real
+  subject and the AI trailer.
 
 ## Verify
 
@@ -266,8 +272,9 @@ Only two ways, never anything else:
 
 ## Responding to review
 
-Address feedback with fixup commits squashed into the commit they belong to,
-never a standalone "address review" commit:
+Squash each fix into the commit it belongs to (see "Commits" above for
+cgwalters' and others' commits), never a standalone "address review"
+commit; `--fixup` is only a local step:
 
 ```bash
 git commit --fixup=<sha>

@@ -11,7 +11,7 @@ Load this skill before:
 - Pushing a branch or opening a pull request
 - Declaring a commit task complete after implementation work
 - Reviewing someone else's commits at their request
-- Responding to PR feedback (to verify fixup handling is correct)
+- Responding to PR feedback (to verify fixes were squashed correctly)
 
 ## Workflow
 
@@ -37,11 +37,11 @@ For anything that needs fixing:
 ```bash
 # Fix the code/message, then squash into the right commit
 git add -p                          # stage only relevant hunks
-git commit --fixup=<hash>           # create a fixup commit
-git rebase --autosquash main        # fold fixups into place
+git commit --fixup=<hash>           # local only, never pushed
+git rebase --autosquash main        # fold it into place
 ```
 
-Never leave `fixup!` commits or "Address review feedback" standalone commits in history. Squash them before the branch is merged.
+Pushed history never contains `fixup!`/`squash!` or "Address review feedback" commits. Commits by cgwalters are squashed into too, keeping his Signed-off-by; commits by anyone else are never rewritten and get a separate, normal commit instead. See "Fixes and review feedback" in the shared AGENTS.md.
 
 ---
 

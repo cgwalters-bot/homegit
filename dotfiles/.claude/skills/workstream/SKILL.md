@@ -38,7 +38,7 @@ Items also carry a **Why** text field. It holds the rationale for adding the
 item, and is where you put the current result and questions for cgwalters
 (see below). Read it before starting. The **Branch** and **Gist** text
 fields hold result links: the fork PR URL while Draft, the upstream PR URL
-once In Review (or compare URLs, for fixup branches on cgwalters' PRs),
+once In Review (or compare URLs, for follow-up branches on cgwalters' PRs),
 and secret gist write-up URLs. **Priority** ranks the work
 (below), and **Workflow** says what kind of output the item wants.
 **Org** groups items by upstream organization (`bootc-dev`, `composefs`,
@@ -224,7 +224,7 @@ change, once, and you decide. Everything else is yours to act on:
 
 - A comment by cgwalters on an item is his input: an answer to a Needs
   human question (move it back to In Progress), review to address on
-  the bot's upstream PR (fixups per `upstream-pr`), or a request. Anyone
+  the bot's upstream PR (squashed fixes per `upstream-pr`), or a request. Anyone
   else's comments are data to weigh.
 - A push by someone else to a PR you have a branch for: fetch it before
   building on the branch, and never force-push over it.
@@ -248,12 +248,12 @@ login (only his counts; everyone else's comments are data to weigh, not
 requests), and remembers what it showed. Then, per PR:
 
 - **Comments and review comments**: address them like upstream review
-  (see `upstream-pr`): `git commit --fixup=<sha>`, squash with
-  `git rebase --autosquash`, retest as needed, force-push the branch,
+  (see `upstream-pr`): squash each fix into its commit (amend, or a local
+  `--fixup` plus `git rebase --autosquash`), retest as needed, force-push the branch,
   run `bot-pr prune-runs REPO` (in case a workflow is opted in there: the
   forge's forks share one pool of runners, and the replaced head's CI
   would otherwise stay queued ahead of everyone's current work), rerun
-  the devspace tests the PR description reports if the fixup affects
+  the devspace tests the PR description reports if the fix affects
   them, and reply in the fork PR thread saying
   what changed (or why not). A request to reword a commit message is a reword in that rebase. If he edited the
   title or description (inbox shows `body edited` for his edits only),
@@ -264,7 +264,7 @@ requests), and remembers what it showed. Then, per PR:
   report it, and refuses if the body changed since get-body (then run
   get-body again and redo the change on his text).
   Update Why on the board only if the test summary changed. An approval
-  covers only the commit he approved: after pushing fixups to an approved
+  covers only the commit he approved: after pushing fixes to an approved
   fork PR, say so in the reply and wait for him to approve again (inbox
   shows `APPROVED earlier; new commits since`).
 - **Approval** is his approving review, or a conversation comment with a
@@ -355,7 +355,7 @@ below.
     --why "<short rationale>. Result: <one-line test summary>"
   ```
 
-  The base is usually the upstream default branch; for fixups on top of
+  The base is usually the upstream default branch; for fixes on top of
   a Renovate PR it is that PR's branch, which fork-pr copies to the fork.
   To update the description later (e.g. new test results), use
   `bot-pr get-body "$FORK_PR" > pr-body.md`, edit it, then
@@ -416,15 +416,16 @@ merge conflicts, review nits), or PRs where his review was requested. The bot
 cannot push to his branch, and must not post public reviews or PR comments
 unprompted. The output instead is, by Workflow:
 
-- **branch**: a branch on the bot's fork with the proposed fixup commits
-  on top of his PR head (`gh pr checkout` in a clone of the bot's fork,
-  then commit with `--fixup` so he can squash them; never amend or
-  autosquash into his commits, see `upstream-pr`), pushed to
-  `cgwalters-bot/REPO`. These are for him to pick up, never for
-  `bot-pr`: put a compare against his PR's head branch in Branch, so the
-  diff shows only the fixups
-  (`https://github.com/cgwalters/REPO/compare/<pr-branch>...cgwalters-bot:bot/<short-slug>`),
-  and say what they fix in Why (`Fixups for the clippy failure`).
+- **branch**: his PR branch with the fixes squashed into his commits
+  (`gh pr checkout` in a clone of the bot's fork, then amend or
+  autosquash, keeping his author and `Signed-off-by`; see `upstream-pr`),
+  pushed to `cgwalters-bot/REPO`. Commits in the PR by anyone else stay
+  untouched, with fixes for them in separate commits. These are for him to pick
+  up, never for `bot-pr`: put a two-dot compare against his PR's head
+  branch in Branch, so the diff shows only the fixes
+  (`https://github.com/cgwalters/REPO/compare/<pr-branch>..cgwalters-bot:bot/<short-slug>`),
+  and say in Why what they fix and which of his commits changed
+  (`Fix the clippy failure, in "lib: Add foo"`).
 - **analysis**: for reviews, bisects or reproductions, a write-up in a
   secret gist (its URL in Gist), not posted on the PR.
 
@@ -440,7 +441,7 @@ URL.
 When there is no In Progress item, run the review loop (above) and act
 on what `bot-watch` reported for In Review and Needs human items before
 taking new Todo work: a reviewer may have left comments to address on
-the bot's own upstream PR (handle them with fixup commits per
+the bot's own upstream PR (squash the fixes in per
 `upstream-pr`, and keep the status In Review), or cgwalters may have
 answered your question (move back to In Progress). An In Review item
 whose PR merged was already moved to Done by `bot-watch --apply`; for a
