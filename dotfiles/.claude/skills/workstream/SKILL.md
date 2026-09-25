@@ -322,9 +322,11 @@ requests), and remembers what it showed. Then, per PR:
   only if he asked for their sign-off too, or `--no-signoff` to leave it to
   the maintainers. For an upstream PR promote opened without his sign-off
   (say, before it looked for DCO check runs), run
-  `bot-pr signoff <upstream-pr-url>` when he asks for it: it checks the
-  same approval, refuses if the head moved since promote or a commit
-  isn't the bot's, and pushes nothing else. Pass
+  `bot-pr signoff <upstream-pr-url>` when he asks for it (an ask counts
+  only from his login) or approves the current head upstream: it checks
+  the same approval, or his approving review of the current head on the
+  upstream PR (needed once the head moved since promote), refuses if a
+  commit isn't the bot's, and pushes nothing else. Pass
   `--why "<short rationale>. Result: ..."` to refresh Why in the same
   board call. If the rebase conflicts, promote dismisses the approval,
   comments, and sets the item back to Draft: resolve the conflicts on the

@@ -48,7 +48,8 @@ mkdir -p "${WORK}/bin" "${FAKE_GH}/rest" "${FAKE_GH}/opened" "${WORK}/hooks"
 # comments default to none, and POSTs to them add one by the bot. POST
 # .../pulls opens an upstream PR (listed by GET .../pulls, filtered by
 # head if given, and read with its commits by GET .../pulls/N), unless $FAKE_GH/fail-open exists, which it
-# removes; PATCH .../pulls/N closes a fork PR. Anything else fails. Every
+# removes; its reviews default to none. PATCH .../pulls/N closes a fork
+# PR. Anything else fails. Every
 # call is logged to $FAKE_GH/calls.
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -132,6 +133,8 @@ case "${method} ${path}" in
         repo=${path#repos/}; repo=${repo%/pulls}
         json=$(find "${store}/opened" -name '*.json' -exec cat {} + 2>/dev/null |
             jq -s --arg repo "${repo}" --arg head "$(field head)" '[.[] | select(.repo == $repo and ($head == "" or .head == $head)) | {html_url, head: {sha: .head_sha}}]') ;;
+    GET\ repos/acme/*/pulls/*/reviews)
+        json=$(cat "${store}/rest/${path}.json" 2>/dev/null || echo '[]') ;;
     GET\ repos/acme/*/pulls/*/commits)
         n=${path%/commits}; n=${n##*/}
         test -e "${store}/opened/${n}.json" || notfound
@@ -682,14 +685,58 @@ git -C "${SRC}" switch -q bot/moved
 MV2=$(commit_as bot moved "pushed after promote")
 git -C "${SRC}" push -q app bot/moved
 signoff_refused "signoff, moved" "head ${MV2:0:12} is not ${MV1:0:12}, which promote opened it with" "$(upstream_url bot/moved)"
+# Reviews on the upstream PR: only cgwalters' approval of its current
+# head, not cancelled since, stands in for the fork PR's.
+MOVED=$(upstream_url bot/moved)
+readonly MOVED_REVIEWS=repos/acme/dcoapp/pulls/${MOVED##*/}/reviews
+# upstream_reviews LOGIN:STATE:COMMIT...: those reviews on MOVED, in order.
+upstream_reviews() {
+    local r i=0
+    for r in "$@"; do
+        i=$((i + 1))
+        jq -n --arg u "${r%%:*}" --arg st "$(cut -d: -f2 <<<"${r}")" --arg c "${r##*:}" --argjson i "${i}" --arg url "${MOVED}" '
+            {user: {login: $u}, state: $st, commit_id: $c, id: (5000 + $i), submitted_at: "2026-09-25T1\($i):00:00Z",
+             html_url: "\($url)#pullrequestreview-\(5000 + $i)", body: ""}'
+    done | jq -s . | fixture "${MOVED_REVIEWS}"
+}
+upstream_reviews "someone:APPROVED:${MV2}"
+signoff_refused "signoff, moved, approved by someone else" "commits pushed since need cgwalters's approving review of ${MV2:0:12}" "${MOVED}"
+upstream_reviews "cgwalters:APPROVED:${MV1}" "cgwalters:COMMENTED:${MV2}"
+signoff_refused "signoff, moved, older head approved upstream" "his approval ${MOVED}#pullrequestreview-5001 there is of ${MV1:0:12}" "${MOVED}"
+upstream_reviews "cgwalters:APPROVED:${MV2}" "cgwalters:CHANGES_REQUESTED:${MV2}"
+signoff_refused "signoff, moved, approval withdrawn upstream" "commits pushed since need cgwalters's approving review" "${MOVED}"
+upstream_reviews "cgwalters:CHANGES_REQUESTED:${MV1}" "cgwalters:APPROVED:${MV2}" "someone:CHANGES_REQUESTED:${MV2}"
+comments=${FAKE_GH}/repos_${APP//\//_}_issues_13_comments.json
+ncomments=$(jq length "${comments}")
+if run "signoff, moved, approved upstream" ok signoff "${MOVED}"; then
+    expect "signoff, moved, approved upstream" "approval ${MOVED}#pullrequestreview-5002 of ${MV2:0:12} on ${MOVED}" \
+        "Added cgwalters's sign-off to 2 commit\(s\)"
+fi
+moved=$(remote_ref "${APP}" bot/moved)
+test "${moved}" != "${MV2}" || fail "signoff, moved, approved upstream: not pushed"
+same_but_signed "signoff, moved, approved upstream" "${MV2}" "${moved}" "${APP}"
+test "$(jq length "${comments}")" -eq "$((ncomments + 1))" || fail "signoff, moved, approved upstream: expected one comment on the fork PR"
+jq -r '.[-1].body' "${comments}" |
+    grep -qF "<!-- bot-pr signoff approved=${MV2} signed=${moved} approval=${MOVED}#pullrequestreview-5002 review=5002 -->" ||
+    fail "signoff, moved, approved upstream: no sign-off record on the fork PR"
+ls "${FAKE_GH}"/repos_acme_* >/dev/null 2>&1 && fail "signoff, moved, approved upstream: commented upstream"
+if run "signoff, moved, rerun" ok signoff "${MOVED}"; then
+    expect "signoff, moved, rerun" 'plus his sign-off, per the bot.s record; checking that' 'has cgwalters.s sign-off already'
+fi
+test "$(remote_ref "${APP}" bot/moved)" = "${moved}" || fail "signoff, moved, rerun: pushed again"
 echo '[]' | fixture "repos/${APP}/pulls/14/reviews"
 signoff_refused "signoff, unapproved" "has no approval by cgwalters of ${U1:0:12}" "$(upstream_url bot/unapproved)"
-signoff_refused "signoff, others" "commits that aren't cgwalters-bot's" "$(upstream_url bot/others)"
+OTHERS=$(upstream_url bot/others)
+jq -n --arg c "${O2}" --arg url "${OTHERS}" '[{user: {login: "cgwalters"}, state: "APPROVED", commit_id: $c, id: 6000,
+    submitted_at: "2026-09-25T12:00:00Z", html_url: "\($url)#pullrequestreview-6000", body: ""}]' |
+    fixture "repos/acme/dcoapp/pulls/${OTHERS##*/}/reviews"
+signoff_refused "signoff, others" "commits that aren't cgwalters-bot's" "${OTHERS}"
 test "$(opened bot/plain | jq -r .head_sha)" = "${N1}" || fail "no DCO: the spoofed check isn't on the upstream PR's head"
 signoff_refused "signoff, no DCO" "neither requires nor runs a DCO check" "$(upstream_url bot/plain)"
 echo '{"truncated": false, "tree": [{"path": "CONTRIBUTING.md", "type": "blob", "sha": "dddddddddddddddddddddddddddddddddddddddd"}]}' |
     fixture repos/acme/dcoapp/git/trees/main
 signoff_refused "signoff, stale policy" "not signing off ${LATE}: acme/dcoapp's contribution policy record is stale; re-check the policy" "${LATE}"
+signoff_refused "signoff, stale policy, approved upstream" "not signing off ${MOVED}: acme/dcoapp's contribution policy record is stale" "${MOVED}"
 policy dcoapp bot-ok
 
 # --- A human-text repository: his text, and his '/promote --human-text' ---
@@ -739,4 +786,4 @@ upstream_pr 91 someone bot/unpromoted
 signoff_refused "signoff, not the bot's PR" "was opened by someone, not cgwalters-bot" https://github.com/acme/dcoapp/pull/91
 
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: promote passes the policy gate only with a current bot-ok record, signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases; signoff signs off promoted PRs only on that approval, with the same refusals"
+echo "ok: promote passes the policy gate only with a current bot-ok record, signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases; signoff signs off promoted PRs only on that approval or cgwalters' upstream approval of the current head, with the same refusals"

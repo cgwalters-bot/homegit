@@ -204,12 +204,14 @@ Commands:
         '${PROMOTE_COMMAND}' on the fork PR it was promoted from, of the
         head promote opened it with (or of what a sign-off record there
         says it is, checked in git; a head promote rebased needs his new
-        approval). It refuses if the upstream PR's head moved since
-        promote, if any of its commits isn't ${BOT_LOGIN}'s, if the
-        repository wants no DCO, or if the policy gate (as in promote)
-        refuses. It rewrites and force-pushes the branch
-        as promote does, with a lease on the checked head, records that on
-        the fork PR, and posts nothing upstream. Prints the new head.
+        approval), or his approving review on the upstream PR itself of
+        its current head. It refuses if the upstream PR's head moved since
+        promote without the latter, if any of its commits isn't
+        ${BOT_LOGIN}'s, if the repository wants no DCO, or if the policy
+        gate (as in promote) refuses. It rewrites and force-pushes the
+        branch as promote does, with a lease on the checked head, records
+        that and the approval on the fork PR, and posts nothing upstream.
+        Prints the new head.
   set-item FORK_PR_URL PVTI_... [--force]
         Change the board item recorded in a fork PR's bot-meta section,
         which promote moves to In Review, and leave the rest of the body
@@ -1914,16 +1916,17 @@ verify_record() {
         fatal "${branch} (${head:0:12}) is not ${approved:0:12}, which ${REVIEWER} approved, plus his sign-off; he needs to approve it"
 }
 
-# record_signoff UPSTREAM COUNT APPROVAL_URL APPROVED SIGNED: comment on
-# the caller's fork PR (FORK#NUMBER) that add_signoff pushed SIGNED, which
-# is APPROVED plus REVIEWER's sign-off on COUNT commits, on his approval
-# APPROVAL_URL, with the record that keeps that approval valid for SIGNED
-# (see VERDICT_JQ).
+# record_signoff UPSTREAM COUNT APPROVAL_URL REVIEW_ID APPROVED SIGNED:
+# comment on the caller's fork PR (FORK#NUMBER) that add_signoff pushed
+# SIGNED, which is APPROVED plus REVIEWER's sign-off on COUNT commits, on
+# his approval APPROVAL_URL (review REVIEW_ID, or "none"), with the record
+# that keeps that approval valid for SIGNED (see VERDICT_JQ, and
+# cmd_signoff for an approval on the upstream PR).
 record_signoff() {
-    local upstream=$1 count=$2 approval_url=$3 approved=$4 signed=$5
+    local upstream=$1 count=$2 approval_url=$3 review_id=$4 approved=$5 signed=$6
     ghapi -X POST "repos/${FORK}/issues/${NUMBER}/comments" -f body="Signed off ${count} commit(s) with \`${SIGNOFF_TRAILER}\` for ${upstream}'s DCO check, on ${REVIEWER}'s approval ${approval_url} of \`${approved:0:12}\`. Same trees; the head is now \`${signed:0:12}\`.
 
-${SIGNOFF_RECORD} approved=${approved} signed=${signed} approval=${approval_url} review=$(verdict 'approval.id // "none"') -->" >/dev/null
+${SIGNOFF_RECORD} approved=${approved} signed=${signed} approval=${approval_url} review=${review_id} -->" >/dev/null
 }
 
 cmd_promote() {
@@ -2125,7 +2128,7 @@ EOF
             # The record that keeps his approval of the head it replaced
             # valid for this head (see VERDICT_JQ), should promote need a
             # rerun.
-            record_signoff "${upstream}" "${count}" "${approval_url}" "${head_sha}" "${signed}" ||
+            record_signoff "${upstream}" "${count}" "${approval_url}" "$(verdict 'approval.id // "none"')" "${head_sha}" "${signed}" ||
                 warn "recording the sign-off on ${url} failed; should this promote not finish, ${REVIEWER} needs to approve ${signed:0:12}"
         fi
         # Name the approval only if it is what signed off; commits that
@@ -2170,6 +2173,18 @@ EOF
             fatal "the upstream PR is open, but updating the board failed; retry: bot-board$(printf ' %q' "${board_args[@]}")"
     fi
     echo "${upstream_url}"
+}
+
+# upstream_approval UPSTREAM NUMBER: prints REVIEWER's latest approving
+# review on UPSTREAM#NUMBER as {url, id, commit_id}, if a later change
+# request or dismissal didn't cancel it; nothing otherwise. It approves
+# only the commit it was written on.
+upstream_approval() {
+    ghapi --paginate "repos/$1/pulls/$2/reviews?per_page=100" \
+        --jq ".[] | select(.user.login == \"${REVIEWER}\" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\")))
+              | {at: .submitted_at, state, url: .html_url, id, commit_id}" |
+        jq -c -s 'sort_by(.at) | last // empty | select(.state == "APPROVED" and .commit_id != null) | {url, id, commit_id}' ||
+        fatal "cannot list the reviews of $1#$2"
 }
 
 cmd_signoff() {
@@ -2225,25 +2240,42 @@ cmd_signoff() {
 
     # As in promote: his approval of the head promote opened the PR with
     # (the fork PR's last head), or of the one a sign-off record says
-    # this is, checked in git.
-    local activity approved pushed approved_head approval_url
+    # this is, checked in git. Or, for commits pushed since promote, his
+    # approving review on the upstream PR itself of its current head (or
+    # of the one a record of a sign-off on that review says this is).
+    local activity approved pushed approved_head approval_url approval_id human_text up up_signed=false
     activity=$(reviewer_activity "${FORK}" "${NUMBER}")
-    push_time "${FORK}" "${NUMBER}" "${head}"
-    approved=$(verdict approved)
-    approved_head=$(verdict 'approval.commit_id // empty')
-    approval_url=$(verdict 'approval.url // empty')
-    if test "${head_sha}" != "${promoted_head}" && { test "${approved}" != true || test "${approved_head}" != "${promoted_head}"; }; then
-        fatal "${url}'s head ${head_sha:0:12} is not ${promoted_head:0:12}, which promote opened it with from ${fork_url}; commits pushed since need ${REVIEWER}'s review"
+    up=$(upstream_approval "${upstream}" "${upstream_number}")
+    if test -n "${up}"; then
+        up_signed=$(jq -r --argjson up "${up}" --arg head "${head_sha}" \
+            'any(.[]; .kind == "signoff" and .signed == $head and .approval == $up.url and .approved == $up.commit_id)' <<<"${activity}")
     fi
-    if test "${approved}" != true; then
-        local why_not="has no approval by ${REVIEWER} of ${promoted_head:0:12}"
-        test -z "${approved_head}" || test "${approved_head}" = "${promoted_head}" ||
-            why_not+=" (his approval ${approval_url} is of ${approved_head:0:12}, which promote rebased)"
-        fatal "${fork_url} ${why_not}; his approving review or '${PROMOTE_COMMAND}' there of the head that went upstream is what signs off"
+    if test -n "${up}" && { test "$(jq -r .commit_id <<<"${up}")" = "${head_sha}" || ${up_signed}; }; then
+        read -r approval_url approval_id approved_head < <(jq -r '"\(.url) \(.id) \(.commit_id)"' <<<"${up}")
+        # Whether the text is his own is decided on the fork PR only.
+        human_text=false
+        info "Using ${REVIEWER}'s approval ${approval_url} of ${approved_head:0:12} on ${url}"
+    else
+        push_time "${FORK}" "${NUMBER}" "${head}"
+        approved=$(verdict approved)
+        approved_head=$(verdict 'approval.commit_id // empty')
+        approval_url=$(verdict 'approval.url // empty')
+        approval_id=$(verdict 'approval.id // "none"')
+        if test "${head_sha}" != "${promoted_head}" && { test "${approved}" != true || test "${approved_head}" != "${promoted_head}"; }; then
+            local older=""
+            test -z "${up}" || older=" (his approval $(jq -r .url <<<"${up}") there is of $(jq -r '.commit_id[:12]' <<<"${up}"))"
+            fatal "${url}'s head ${head_sha:0:12} is not ${promoted_head:0:12}, which promote opened it with from ${fork_url}; commits pushed since need ${REVIEWER}'s approving review of ${head_sha:0:12} on ${url}${older}"
+        fi
+        if test "${approved}" != true; then
+            local why_not="has no approval by ${REVIEWER} of ${promoted_head:0:12}"
+            test -z "${approved_head}" || test "${approved_head}" = "${promoted_head}" ||
+                why_not+=" (his approval ${approval_url} is of ${approved_head:0:12}, which promote rebased)"
+            fatal "${fork_url} ${why_not}; his approving review or '${PROMOTE_COMMAND}' there of the head that went upstream, or his approving review of it on ${url}, is what signs off"
+        fi
+        human_text=$(verdict 'approval.human_text == true')
     fi
     # The contribution policy gate, as in promote.
-    local human_text problems
-    human_text=$(verdict 'approval.human_text == true')
+    local problems
     policy_gate "${upstream}" "${human_text}" "${fork_url}"
     if test -z "${POLICY_REFUSAL}" && ${human_text}; then
         problems=$(human_text_problems "${FORK}" "${NUMBER}" "${head}" "${approved_head}" "${fork_title}")
@@ -2267,7 +2299,7 @@ cmd_signoff() {
         info "Every commit of ${url} has ${REVIEWER}'s sign-off already"
     else
         info "Added ${REVIEWER}'s sign-off to ${count} commit(s) of ${url} on his approval ${approval_url} and pushed it (${signed:0:12})"
-        record_signoff "${upstream}" "${count}" "${approval_url}" "${head_sha}" "${signed}" ||
+        record_signoff "${upstream}" "${count}" "${approval_url}" "${approval_id}" "${head_sha}" "${signed}" ||
             warn "recording the sign-off on ${fork_url} failed; a rerun will say ${url} moved since promote"
     fi
     echo "${signed}"

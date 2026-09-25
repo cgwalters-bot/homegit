@@ -106,8 +106,10 @@ topic branch per change.
   `Signed-off-by: Colin Walters <walters@verbum.org>` to the commits (with
   him as committer, which the DCO check wants) and names that approval in
   the upstream PR body. Promote and `bot-pr signoff UPSTREAM_PR_URL` (for
-  a PR promote opened without it, on the same approval of the same head)
-  are the only ways his sign-off gets added; never add it by hand.
+  a PR promote opened without it, on the same approval of the same head,
+  or, after rework pushed since promote, on his approving review of the
+  current head on the upstream PR itself) are the only ways his sign-off
+  gets added; never add it by hand.
   Commits by anyone else get it only if he asks
   (`promote --include-others`); with `--no-signoff`, promote instead
   tells the maintainers to comment `/signoff` where the repository has
