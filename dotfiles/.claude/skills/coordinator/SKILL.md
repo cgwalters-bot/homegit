@@ -100,6 +100,13 @@ instead of piping it through `tail` and losing lines for good.
   findings to the same worker (SendMessage, so it keeps its context) to
   fix. Repeat until the reviewer says it can ship before pointing
   cgwalters at it.
+- **Questions for cgwalters go on the board**, never into a separate
+  list (a claude.ai artifact, a local file): his queue is the board's
+  "Needs cgwalters" view (Needs human and Draft, by Priority; see
+  "cgwalters' queue" in `workstream`), which GitHub keeps current as he
+  approves, promotes and merges. When a worker reports a question, make
+  sure it landed in the right item's Why with its Status and Priority.
+  When he answers one in the session, act on it and update the item.
 - **Reply where cgwalters tagged the bot**, per the rule in `workstream`:
   his own @-mentions only, one concise answer in the same thread, once
   the work behind it is reviewed.
@@ -116,7 +123,9 @@ again when the sleep ends.
 
 Each morning, open an issue on
 [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues)
-that mentions @cgwalters, with:
+that mentions @cgwalters, with a link to the "Needs cgwalters" view
+(<https://github.com/users/cgwalters-bot/projects/1/views/2>) and a
+summary of it:
 
 - **quick wins**: fork PRs that are small and ready, with links;
 - **review queue**: everything else Draft, in priority order;

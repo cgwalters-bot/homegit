@@ -34,6 +34,33 @@ the PR describes is its CI, and upstream CI runs after promotion (see
 "CI on forge forks" in `upstream-pr` for the rare workflow change that
 needs to run there).
 
+## cgwalters' queue
+
+The board is the only queue of things waiting on cgwalters: the
+"Needs cgwalters" view
+(<https://github.com/users/cgwalters-bot/projects/1/views/2>, filter
+`status:"Needs human",Draft`, sorted by Priority). Needs human items
+are his decisions and actions, each with its question in Why; Draft
+items are ready for his review on the forge (or as a gist). Because the
+items are the issues and PRs themselves, GitHub state keeps it current:
+`bot-pr promote` moves a Draft to In Review, and `bot-watch --apply`
+moves merged PRs to Done. Never keep a second list of questions for him
+anywhere else (no claude.ai artifact, local file or issue checklist); it
+goes stale as soon as he acts on the forge. The review app
+(cgwalters-forge/review) is meant to become the UI over this same view.
+
+- One board item per thing he needs to do: the item of the issue or PR
+  it concerns, else a draft item. Fold several questions about one item
+  into its Why rather than adding more items.
+- An action he must take on an upstream PR (re-review, sign off, rerun
+  a flaked job, merge) sets that PR's item to Needs human with the action
+  in Why. `bot-watch --apply` only suggests Done for a Needs human item
+  whose PR merged, so apply it yourself once the action is moot.
+- For a Draft, Why says in one line what to review; a side question he
+  can answer in his review goes there too. Only a decision that blocks
+  the review makes it Needs human.
+- Set Priority, so the view's order is his reading order.
+
 Items also carry a **Why** text field. It holds the rationale for adding the
 item, and is where you put the current result and questions for cgwalters
 (see below). Read it before starting. The **Branch** and **Gist** text
@@ -398,7 +425,9 @@ make (design choice, ambiguous requirement, missing access, conflicting
 maintainer opinions), set Needs human and write a clear, specific question
 in the item's Why field (for a draft item, at the top of its body; see
 below). Give the options you see and your recommendation, so the human can
-answer in one line. "What should I do?" is not a good question.
+answer in one line. "What should I do?" is not a good question. When the
+context doesn't fit in Why, put it in a secret gist, set Gist to it, and
+keep only the question in Why.
 
 ```bash
 bot-board set "$ITEM" --status "Needs human" \
