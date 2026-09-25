@@ -8,7 +8,7 @@ Rules:
   - `devspace-work/SKILL.md`, for the edit-locally, build and test on a devspace, push-from-local loop;
   - `upstream-pr/SKILL.md`, for commit and contribution rules;
   - `commit-review/SKILL.md`, to self-review before pushing.
-- **Tools:** use `bin/bot-devspace`, `bin/bot-board`, `bin/bot-pr` and `bin/bot-git` from the checkout, by absolute path.
+- **Tools:** use `bin/bot-devspace`, `bin/bot-board`, `bin/bot-pr`, `bin/bot-git` and `bin/bot-land` from the checkout, by absolute path.
 - **GitHub API:** prefer REST (`gh api repos/...`) for reads. The GraphQL quota is shared with other agents running now. Touch the board only via bot-board and only at transitions:
   1. claim: Status "In Progress";
   2. finish: Status "Draft" via `bot-pr fork-pr` (branch work: opens a draft PR on the forge fork; Branch = that fork PR URL) or with Gist set (analysis), plus a short Why. "In Review" is only for PRs open upstream, reached via `bot-pr promote` after cgwalters approves;
