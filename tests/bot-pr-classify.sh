@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Offline tests of how 'bot-pr fork-setup' classifies workflow files,
-# which decides what it disables on forks: 'bot-pr fork-setup
-# --classify-file' over tests/fixtures/workflows. No network.
+# which decides whether it warns that a workflow opted in on a fork can't
+# work there: 'bot-pr fork-setup --classify-file' over
+# tests/fixtures/workflows. No network.
 #   tests/bot-pr-classify.sh
 # The fixtures are real upstream workflows, unmodified unless their header
 # says otherwise, from bootc-dev/bootc@41049ccada2b (bootc-*),

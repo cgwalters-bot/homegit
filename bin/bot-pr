@@ -8,8 +8,9 @@ readonly BOT_LOGIN=cgwalters-bot
 # The only login whose reviews and comments on a fork PR are acted on.
 readonly REVIEWER=cgwalters
 # The organization holding the forks where fork PRs are opened. Its forks
-# start with a clean default branch, both the bot and REVIEWER can push to
-# them and edit PRs, and PRs into them run the project's own CI.
+# start with a clean default branch, and both the bot and REVIEWER can push
+# to them and edit PRs. They run no CI by default (see fork_setup): the
+# bot tests every change on a devspace, and upstream CI runs once promoted.
 readonly FORGE_ORG=${BOT_PR_FORGE:-cgwalters-forge}
 readonly BRANCH_PREFIX=bot/
 # A board item id, as recorded in a fork PR's bot-meta section.
@@ -77,9 +78,10 @@ reviews it, and only his approval opens the upstream PR.
 
 Commands:
   fork-pr --repo OWNER/REPO --base BRANCH --branch ${BRANCH_PREFIX}SLUG --item PVTI_...
-          --title TITLE --body-file FILE [--from DIR] [--force]
-        Fork OWNER/REPO into ${FORGE_ORG} if needed, sync the fork's
-        BRANCH with upstream, set up its Actions (see fork-setup), push
+          --title TITLE --body-file FILE [--from DIR] [--force] [--ci WORKFLOW]...
+        Fork OWNER/REPO into ${FORGE_ORG} if needed, set up its Actions
+        (see fork-setup; --ci is passed on), sync the fork's
+        BRANCH with upstream, push
         ${BRANCH_PREFIX}SLUG to the fork from the git repository DIR (default:
         the current one) if it has that branch, and open a draft PR from
         ${BRANCH_PREFIX}SLUG into BRANCH; print its URL. A non-default BRANCH
@@ -91,19 +93,25 @@ Commands:
         another open fork PR in the fork already records that item, which
         is usually a copied id (after splitting a PR, the new part needs
         its own item); --force allows that.
-  fork-setup REPO
-        Enable Actions on the fork ${FORGE_ORG}/REPO and the workflows
-        GitHub disabled when forking, but disable those that can't work
-        there, printing why: ones that run on a schedule and not for PRs or
-        pushes, which without upstream's secrets just fail; ones that use
-        upstream's secrets and don't test new code, only running for
-        pull_request_target, closed or labeled PRs, issues, workflow_run
-        and the like (PR bots, release jobs), which fail on every fork PR
-        as if its CI did; and gh-aw coding agents. A workflow that runs for
-        pushes, the merge queue, or new commits of a PR is the project's
-        CI and stays enabled, with a warning if it has a schedule or uses
-        such secrets. Corrections per fork are in WORKFLOW_OVERRIDES in
-        this script. fork-pr does this on every run; safe to repeat.
+  fork-setup REPO [--ci WORKFLOW]... [--no-ci]
+        Turn off CI on the fork ${FORGE_ORG}/REPO: Actions stays enabled,
+        but every workflow is disabled, and the queued and running runs of
+        those it disables are cancelled. The forge's forks share one pool
+        of runners that a big project's CI matrix fills for hours, and the
+        bot tests every change on a devspace anyway; upstream CI runs once
+        a fork PR is promoted. Only the workflows opted in stay enabled:
+        --ci adds WORKFLOW (a file in .github/workflows) to the fork's
+        opt-in list, kept in its Actions variable ${CI_VARIABLE}, and
+        --no-ci empties that list first. Opt in only to exercise a change
+        to a workflow itself; it then runs for every PR and push on the
+        fork, and for 'gh api -X POST repos/${FORGE_ORG}/REPO/actions/workflows/WORKFLOW/dispatches
+        -f ref=BRANCH' if it has workflow_dispatch, until '--no-ci'. An
+        opted-in workflow that can't work on a fork gets a warning saying
+        why: one that only runs on a schedule; one that uses upstream's
+        secrets and doesn't test new code (pull_request_target, closed or
+        labeled PRs, issues, workflow_run: PR bots, release jobs); a gh-aw
+        coding agent; or one listed in WORKFLOW_OVERRIDES in this script.
+        fork-pr does this on every run; safe to repeat.
   promote FORK_PR_URL [--draft] [--why TEXT] [--dry-run]
         Open the upstream PR for a fork PR whose current head ${REVIEWER}
         approved (commits pushed after his approval need a new one).
@@ -287,14 +295,17 @@ ensure_fork() {
     echo "${fork}"
 }
 
+# The classification below only matters for workflows opted in to run on
+# a fork (see fork_setup), to warn about those that can't work there.
+#
 # Triggers that make a scheduled workflow part of fork PRs' CI, so that
-# fork_setup leaves it enabled. Not workflow_dispatch: many upstream
+# fork_setup doesn't warn about it. Not workflow_dispatch: many upstream
 # scheduled jobs (releases, dependency bumps) also allow manual runs,
 # which nobody does on a fork.
 readonly CI_TRIGGERS='["pull_request", "pull_request_target", "push", "merge_group"]'
 # Triggers that make a workflow that needs upstream's secrets part of the
-# project's build and test CI, so that fork_setup leaves it enabled (its
-# failures on the fork may then be the missing secrets). Not
+# project's build and test CI, so that fork_setup only notes that its
+# failures on the fork may be the missing secrets. Not
 # pull_request_target: it runs the base branch's workflow with the base
 # repository's secrets, which is how projects give PR bots and triage
 # jobs their tokens, and a fork has none of them.
@@ -303,7 +314,7 @@ readonly CODE_TRIGGERS='["push", "merge_group"]'
 # labeled...) other than these, the ones for new code.
 readonly CODE_PR_TYPES='["opened", "synchronize", "reopened"]'
 # Triggers only a person uses: a workflow with no others never runs by
-# itself, so fork_setup has no reason to disable it.
+# itself, so fork_setup has no reason to warn about it.
 readonly MANUAL_TRIGGERS='["workflow_dispatch", "workflow_call"]'
 # A line of the header gh-aw writes into the workflows it compiles
 # (*.lock.yml). They are coding agents, which need an LLM API key and app
@@ -391,8 +402,9 @@ classify_workflow() {
         --argjson agentic "${agentic}" "${TRIGGERS_JQ}"
 }
 
-# Where fork_setup's heuristics are wrong for a fork: "REPO/FILE" (FILE
-# in .github/workflows of ${FORGE_ORG}/REPO) -> "disable" or "keep".
+# Where fork_setup's heuristics are wrong about a workflow opted in on a
+# fork: "REPO/FILE" (FILE in .github/workflows of ${FORGE_ORG}/REPO) ->
+# "disable" (it can't work there: warn) or "keep" (it can: don't).
 declare -rA WORKFLOW_OVERRIDES=(
     # Upstream's jobs that sync files and labels to its other repositories
     # when main changes, as it does whenever fork-pr syncs the fork: they
@@ -404,31 +416,132 @@ declare -rA WORKFLOW_OVERRIDES=(
     [infra/renovate.yml]=disable
 )
 
-# Set by fork_setup: the workflows it left running with a schedule trigger,
-# because they also run for PRs or pushes.
+# The Actions variable of a fork that lists the workflows opted in to run
+# there (see fork_setup), separated by spaces. On the fork itself, so that
+# every fork-pr run and every machine sees the same list, and cgwalters
+# can change it in the fork's settings.
+readonly CI_VARIABLE=BOT_PR_CI
+# What --ci takes: a file name in .github/workflows.
+readonly WORKFLOW_FILE_RE='^[A-Za-z0-9_.-]+\.ya?ml$'
+
+# Set by fork_setup: the workflows left enabled on the fork (opted in).
+CI_ACTIVE=()
+# ... those of them with a schedule trigger, because they also run for
+# PRs or pushes.
 SCHEDULED_ACTIVE=()
-# ... and those it left running although they reference upstream's
-# secrets, as "FILE (SECRET,...)", because they run for new code: their
-# failures on the fork may be the missing secrets.
+# ... and those that reference upstream's secrets, as "FILE (SECRET,...)",
+# because they run for new code: their failures on the fork may be the
+# missing secrets.
 SECRETS_ACTIVE=()
 
-# fork_setup FORK: turn on Actions for a fork in the forge, so that fork
-# PRs get the project's CI, but disable the workflows that can't work
-# there (see TRIGGERS_JQ, and WORKFLOW_OVERRIDES): scheduled ones that
-# aren't also CI, which fail every time without upstream's secrets, or
-# worse, act (e.g. release) on the fork; ones that need those secrets and
-# don't build or test new code, such as PR bots, which fail on every fork
-# PR and look like its CI failing; and coding agents. Other workflows
-# GitHub disabled on forking are enabled; ones someone disabled by hand
-# are left alone. Idempotent; failures are warnings, since the fork PR is
-# still useful without CI.
+# active_runs FORK: prints FORK's runs that hold or wait for a runner, as
+# a JSON array of {id, workflow_id, event, status, name, head_sha,
+# head_branch, created_at}.
+active_runs() {
+    local fork=$1 status
+    for status in "${ACTIVE_RUN_STATUSES[@]}"; do
+        ghapi --paginate "repos/${fork}/actions/runs?status=${status}&per_page=100" \
+            --jq '.workflow_runs[] | {id, workflow_id, event, status, name, head_sha, head_branch, created_at}' ||
+            { warn "cannot list the ${status} Actions runs of ${fork}"; return 1; }
+    done | jq -sc 'unique_by(.id)'
+}
+
+# workflow_problem FORK DEFAULT PATH: sets PROBLEM to why the workflow at
+# PATH can't work on FORK (see TRIGGERS_JQ and WORKFLOW_OVERRIDES), or to
+# nothing if it can, and then records it in SCHEDULED_ACTIVE or
+# SECRETS_ACTIVE if it has a schedule or uses upstream's secrets. Nothing
+# for a workflow that isn't on DEFAULT, such as one a fork PR adds.
+workflow_problem() {
+    local fork=$1 default=$2 path=$3 name=${3#.github/workflows/} yaml cls triggers secrets="" rc=0
+    PROBLEM=""
+    yaml=$(ghapi -H "Accept: application/vnd.github.raw+json" \
+        "repos/${fork}/contents/${path}?ref=$(jq -rn --arg b "${default}" '$b | @uri')") || rc=$?
+    test "${rc}" -ne "${EX_NOTFOUND}" || return 0
+    if test "${rc}" -ne 0; then
+        warn "cannot read ${fork}:${default}/${path}; cannot tell whether it works on the fork"
+        return 0
+    fi
+    if ! cls=$(classify_workflow <<<"${yaml}") || test -z "${cls}"; then
+        warn "cannot parse ${fork}:${default}/${path}; cannot tell whether it works on the fork"
+        return 0
+    fi
+    IFS=$'\t' read -r cls triggers secrets <<<"${cls}"
+    case "${WORKFLOW_OVERRIDES[${fork#*/}/${name}]:-}:${cls}" in
+        disable:*) PROBLEM="it is listed in bot-pr's WORKFLOW_OVERRIDES (on: ${triggers})" ;;
+        keep:*) ;;
+        :scheduled) PROBLEM="it only runs on a schedule (on: ${triggers})" ;;
+        :secrets) PROBLEM="it needs upstream's secrets (${secrets}) and doesn't test new code (on: ${triggers})" ;;
+        :agentic) PROBLEM="it is a gh-aw coding agent, which needs upstream's secrets (${secrets:-none named})" ;;
+        :unknown) warn "${fork}:${default}/${path} has no readable 'on:' triggers" ;;
+        *)
+            test "${cls}" != mixed || SCHEDULED_ACTIVE+=("${name}")
+            test -z "${secrets}" || SECRETS_ACTIVE+=("${name} (${secrets})")
+            ;;
+    esac
+}
+
+# fork_setup FORK CLEAR [WORKFLOW...]: turn off CI on a fork in the forge.
+# Its forks share one pool of runners, which one project's CI matrix per
+# fork PR (bootc's is ~20 jobs) keeps busy for hours, while every change
+# the bot proposes was already tested on a devspace, and upstream CI runs
+# once it is promoted. So Actions stays enabled, to keep running one
+# workflow possible, but every workflow is disabled except those opted in
+# (the fork's CI_VARIABLE; CLEAR=true empties it first, and the WORKFLOWs
+# are added to it), and the active runs of those it disables are
+# cancelled. Workflows opted in are enabled whatever their state, with a
+# warning if they can't work on a fork (see workflow_problem).
+#
+# A workflow that isn't on the default branch yet (a fork PR adding one)
+# runs for that PR, being new; the next fork_setup disables it unless it
+# is opted in. Idempotent. Failing to turn CI off is a warning, since the
+# fork PR is useful either way; failing to record an opt-in is fatal.
 fork_setup() {
-    local fork=$1 default workflows id state path yaml cls triggers secrets rc name why
-    local changed=0
+    local fork=$1 clear=$2
+    shift 2
+    local want=("$@") w
+    for w in "${want[@]}"; do
+        w=${w#.github/workflows/}
+        [[ "${w}" =~ ${WORKFLOW_FILE_RE} ]] ||
+            fatal "--ci takes a workflow file name in .github/workflows (e.g. ci.yml), not '${w}'"
+    done
+    CI_ACTIVE=()
     SCHEDULED_ACTIVE=()
     SECRETS_ACTIVE=()
     ghapi -X PUT "repos/${fork}/actions/permissions" -F enabled=true -f allowed_actions=all >/dev/null ||
-        { warn "enabling Actions on ${fork} failed; fork PRs there won't run CI until someone does"; return 0; }
+        warn "enabling Actions on ${fork} failed; opted-in workflows won't run there until someone does"
+
+    local recorded rc=0 optins
+    recorded=$(ghapi "repos/${fork}/actions/variables/${CI_VARIABLE}" --jq .value) || rc=$?
+    if test "${rc}" -eq "${EX_NOTFOUND}"; then
+        recorded=""
+    elif test "${rc}" -ne 0; then
+        if test "${#want[@]}" -gt 0 || ${clear}; then
+            fatal "cannot read the ${CI_VARIABLE} variable of ${fork}, so cannot record the opt-in"
+        fi
+        warn "cannot read the ${CI_VARIABLE} variable of ${fork}, so cannot tell which workflows are opted in; leaving its workflows as they are"
+        return 0
+    fi
+    local old=() new=()
+    read -ra old <<<"${recorded}"
+    ${clear} || new=("${old[@]}")
+    new+=("${want[@]#.github/workflows/}")
+    optins=$(printf '%s\n' "${new[@]}" | sed '/^$/d' | sort -u | paste -sd' ')
+    if test "${optins}" != "$(printf '%s\n' "${old[@]}" | sed '/^$/d' | sort -u | paste -sd' ')"; then
+        if test -z "${optins}"; then
+            ghapi -X DELETE "repos/${fork}/actions/variables/${CI_VARIABLE}" >/dev/null ||
+                fatal "removing the ${CI_VARIABLE} variable of ${fork} failed"
+        elif test "${rc}" -eq "${EX_NOTFOUND}"; then
+            ghapi -X POST "repos/${fork}/actions/variables" -f name="${CI_VARIABLE}" -f value="${optins}" >/dev/null ||
+                fatal "creating the ${CI_VARIABLE} variable of ${fork} failed"
+        else
+            ghapi -X PATCH "repos/${fork}/actions/variables/${CI_VARIABLE}" -f value="${optins}" >/dev/null ||
+                fatal "updating the ${CI_VARIABLE} variable of ${fork} failed"
+        fi
+        info "Workflows opted in on ${fork}: ${optins:-none}"
+    fi
+
+    local default workflows id state path name PROBLEM
+    local disabled_ids=() disabled=() enabled=() seen=()
     default=$(ghapi "repos/${fork}" --jq .default_branch) ||
         { warn "cannot read ${fork}; check its workflows by hand"; return 0; }
     workflows=$(ghapi --paginate "repos/${fork}/actions/workflows?per_page=100" \
@@ -440,66 +553,70 @@ fork_setup() {
         # no file and are configured elsewhere.
         [[ "${path}" == .github/workflows/* ]] || continue
         name=${path#.github/workflows/}
-        rc=0
-        yaml=$(ghapi -H "Accept: application/vnd.github.raw+json" \
-            "repos/${fork}/contents/${path}?ref=$(jq -rn --arg b "${default}" '$b | @uri')") || rc=$?
-        if test "${rc}" -eq "${EX_NOTFOUND}"; then
-            # Deleted since; GitHub lists workflows that ever ran.
-            continue
-        elif test "${rc}" -ne 0; then
-            warn "cannot read ${fork}:${default}/${path}; leaving it ${state}"
-            continue
-        fi
-        if ! cls=$(classify_workflow <<<"${yaml}") || test -z "${cls}"; then
-            warn "cannot parse ${fork}:${default}/${path}; leaving it ${state}"
-            continue
-        fi
-        secrets=""
-        IFS=$'\t' read -r cls triggers secrets <<<"${cls}"
-        case "${WORKFLOW_OVERRIDES[${fork#*/}/${name}]:-}:${cls}" in
-            disable:*) why="listed in bot-pr's WORKFLOW_OVERRIDES (on: ${triggers})" ;;
-            keep:*) why="" ;;
-            :scheduled) why="it only runs on a schedule (on: ${triggers})" ;;
-            :secrets) why="it needs upstream's secrets (${secrets}) and doesn't test new code (on: ${triggers})" ;;
-            :agentic) why="it is a gh-aw coding agent, which needs upstream's secrets (${secrets:-none named})" ;;
-            :unknown)
-                warn "${fork}:${default}/${path} has no readable 'on:' triggers; leaving it ${state}"
-                continue
-                ;;
-            *) why="" ;;
-        esac
-        if test -n "${why}"; then
+        if [[ " ${optins} " != *" ${name} "* ]]; then
             test "${state}" = active || continue
             if ghapi -X PUT "repos/${fork}/actions/workflows/${id}/disable" >/dev/null; then
-                info "Disabled ${name} on ${fork}: ${why}"
-                changed=$((changed + 1))
+                disabled_ids+=("${id}")
+                disabled+=("${name}")
             else
-                warn "disabling ${name} on ${fork} failed; it stays active, although ${why}"
+                warn "disabling ${name} on ${fork} failed; it stays active"
             fi
             continue
         fi
-        if test "${state}" = disabled_fork; then
+        seen+=("${name}")
+        workflow_problem "${fork}" "${default}" "${path}"
+        test -z "${PROBLEM}" || warn "${name} is opted in on ${fork}, although ${PROBLEM}"
+        if test "${state}" != active; then
             if ghapi -X PUT "repos/${fork}/actions/workflows/${id}/enable" >/dev/null; then
-                info "Enabled ${name} on ${fork}"
-                changed=$((changed + 1))
-                state=active
+                enabled+=("${name}")
             else
-                warn "enabling ${name} on ${fork} failed"
+                warn "enabling ${name} on ${fork} failed; it stays ${state}"
+                continue
             fi
         fi
-        test "${state}" = active || continue
-        test "${cls}" != mixed || SCHEDULED_ACTIVE+=("${name}")
-        test -z "${secrets}" || SECRETS_ACTIVE+=("${name} (${secrets})")
+        CI_ACTIVE+=("${name}")
     done <<<"${workflows}"
+    read -ra new <<<"${optins}"
+    for w in "${new[@]}"; do
+        [[ " ${seen[*]} " == *" ${w} "* ]] ||
+            warn "${w} is opted in on ${fork} but GitHub lists no such workflow there; a fork PR adding it runs it anyway, and the next fork-setup enables it once it is listed"
+    done
+    test "${#enabled[@]}" -eq 0 || info "Enabled on ${fork}: ${enabled[*]}"
+    test "${#disabled[@]}" -eq 0 || info "Disabled on ${fork}: ${disabled[*]}"
     if test "${#SCHEDULED_ACTIVE[@]}" -gt 0; then
-        warn "left active on ${fork} despite schedule triggers, since they also run for PRs or pushes: ${SCHEDULED_ACTIVE[*]}"
+        warn "opted in on ${fork} with schedule triggers, which also run: ${SCHEDULED_ACTIVE[*]}"
     fi
     if test "${#SECRETS_ACTIVE[@]}" -gt 0; then
         local list
         list=$(printf '%s, ' "${SECRETS_ACTIVE[@]}")
-        warn "left active on ${fork} although they use upstream's secrets, since they run for new code; their failures there may just be the missing secrets: ${list%, }"
+        warn "opted in on ${fork} although they use upstream's secrets; their failures there may just be the missing secrets: ${list%, }"
     fi
-    info "Set up Actions on ${fork}: ${changed} workflow(s) changed"
+    # Disabling a workflow doesn't stop its runs already queued.
+    local ncancel=0
+    if test "${#disabled_ids[@]}" -gt 0; then
+        local runs run_id line ids
+        ids=$(printf '%s\n' "${disabled_ids[@]}" | jq -sc 'map(tonumber)')
+        if runs=$(active_runs "${fork}"); then
+            while IFS=$'\t' read -r run_id line; do
+                test -n "${run_id}" || continue
+                if ghapi -X POST "repos/${fork}/actions/runs/${run_id}/cancel" >/dev/null; then
+                    ncancel=$((ncancel + 1))
+                else
+                    # e.g. 409: it finished in the meantime.
+                    warn "cancelling ${fork} run ${run_id} failed: ${line}"
+                fi
+            done < <(jq -r --argjson ids "${ids}" '.[] | select(.workflow_id | IN($ids[]))
+                | "\(.id)\t\(.name) for \(.event) \(.head_branch), \(.status)"' <<<"${runs}")
+        else
+            warn "the runs of the workflows just disabled on ${fork} may still be queued; cancel them by hand"
+        fi
+    fi
+    local summary="off"
+    test "${#CI_ACTIVE[@]}" -eq 0 ||
+        summary="only ${CI_ACTIVE[*]} (opted in; '$(basename "$0") fork-setup ${fork#*/} --no-ci' turns it off)"
+    test "${#disabled[@]}" -eq 0 || summary+="; ${#disabled[@]} workflow(s) disabled"
+    test "${ncancel}" -eq 0 || summary+=", ${ncancel} run(s) cancelled"
+    info "CI on ${fork}: ${summary}"
 }
 
 # Run statuses that still hold, or wait for, one of the organization's
@@ -524,12 +641,8 @@ prune_runs() {
     local fork=$1 dry_run=$2
     shift 2
     [[ "${fork}" == "${FORGE_ORG}/"* ]] || return 0
-    local runs status
-    runs=$(for status in "${ACTIVE_RUN_STATUSES[@]}"; do
-        ghapi --paginate "repos/${fork}/actions/runs?status=${status}&per_page=100" \
-            --jq '.workflow_runs[] | {id, event, status, name, head_sha, head_branch, created_at}' ||
-            fatal "cannot list the ${status} Actions runs of ${fork}"
-    done | jq -sc --argjson ev "${PRUNE_EVENTS}" 'unique_by(.id) | map(select(.event | IN($ev[])))') ||
+    local runs
+    runs=$(active_runs "${fork}" | jq -c --argjson ev "${PRUNE_EVENTS}" 'map(select(.event | IN($ev[])))') ||
         fatal "cannot list the Actions runs of ${fork}"
     if test "$(jq length <<<"${runs}")" -eq 0; then
         return 0
@@ -623,14 +736,20 @@ push_branch() {
 # The bot-meta section appended to fork PR bodies. Its "Upstream:" and
 # "Board item:" lines are parsed back by promote.
 meta_section() {
-    local upstream=$1 base=$2 item=$3 notes="" list
+    local upstream=$1 base=$2 item=$3 notes list
+    if test "${#CI_ACTIVE[@]}" -eq 0; then
+        notes=$'\n'"- Fork CI: off; the devspace testing described above is this PR's CI, and upstream CI runs once it is opened there"
+    else
+        list=$(printf "\`%s\`, " "${CI_ACTIVE[@]}")
+        notes=$'\n'"- Fork CI: only ${list%, }, opted in on this fork"
+    fi
     if test "${#SCHEDULED_ACTIVE[@]}" -gt 0; then
         list=$(printf "\`%s\`, " "${SCHEDULED_ACTIVE[@]}")
-        notes=$'\n'"- Scheduled triggers left active: ${list%, } (they also run for PRs or pushes, so fork setup didn't disable them)"
+        notes+=$'\n'"- Opted in with scheduled triggers: ${list%, } (they also run for PRs or pushes)"
     fi
     if test "${#SECRETS_ACTIVE[@]}" -gt 0; then
         list=$(printf "\`%s\`, " "${SECRETS_ACTIVE[@]}")
-        notes+=$'\n'"- Workflows left active although they use upstream's secrets: ${list%, } (they run for new code; a failure there may just be a missing secret)"
+        notes+=$'\n'"- Opted in although they use upstream's secrets: ${list%, } (a failure there may just be a missing secret)"
     fi
     cat <<EOF
 ${META_START}
@@ -780,11 +899,11 @@ check_item_free() {
 }
 
 cmd_fork_pr() {
-    local upstream="" base="" branch="" item="" title="" body_file="" from=. force=false
+    local upstream="" base="" branch="" item="" title="" body_file="" from=. force=false ci=()
     while test $# -gt 0; do
         case "$1" in
             --force) force=true; shift ;;
-            --repo|--base|--branch|--item|--title|--body-file|--from)
+            --repo|--base|--branch|--item|--title|--body-file|--from|--ci)
                 test $# -ge 2 || fatal "$1 requires an argument"
                 case "$1" in
                     --repo) upstream=$2 ;;
@@ -794,6 +913,7 @@ cmd_fork_pr() {
                     --title) title=$2 ;;
                     --body-file) body_file=$2 ;;
                     --from) from=$2 ;;
+                    --ci) ci+=("$2") ;;
                 esac
                 shift 2
                 ;;
@@ -824,8 +944,9 @@ cmd_fork_pr() {
     fork=$(ensure_fork "${upstream}")
     owner=${fork%%/*}
     ${force} || check_item_free "${fork}" "${item}" "" "${branch}"
+    # Before sync_base, whose push to the fork would start its CI.
+    fork_setup "${fork}" false "${ci[@]}"
     sync_base "${upstream}" "${fork}" "${base}"
-    fork_setup "${fork}"
     push_branch "${from}" "${fork}" "${branch}"
 
     local head_sha compare ahead behind
@@ -938,18 +1059,35 @@ cmd_fork_setup() {
         classify_workflow <"$2" || fatal "cannot parse $2"
         return 0
     fi
-    test $# -eq 1 || fatal "fork-setup takes a single REPO"
-    local fork=$1
+    local fork="" clear=false ci=()
+    while test $# -gt 0; do
+        case "$1" in
+            --no-ci) clear=true; shift ;;
+            --ci)
+                test $# -ge 2 || fatal "--ci requires a WORKFLOW"
+                ci+=("$2")
+                shift 2
+                ;;
+            -*) fatal "unknown argument for fork-setup: $1 (see --help)" ;;
+            *)
+                test -z "${fork}" || fatal "fork-setup takes a single REPO"
+                fork=$1
+                shift
+                ;;
+        esac
+    done
+    test -n "${fork}" || fatal "fork-setup requires REPO (see --help)"
+    local arg=${fork}
     [[ "${fork}" == */* ]] || fork=${FORGE_ORG}/${fork}
     if ! valid_repo "${fork}" || test "${fork%%/*}" != "${FORGE_ORG}"; then
-        fatal "fork-setup takes a fork in ${FORGE_ORG} (REPO or ${FORGE_ORG}/REPO), not '$1'"
+        fatal "fork-setup takes a fork in ${FORGE_ORG} (REPO or ${FORGE_ORG}/REPO), not '${arg}'"
     fi
     check_login
     local rc=0
     ghapi "repos/${fork}" --jq .fork >/dev/null || rc=$?
     test "${rc}" -ne "${EX_NOTFOUND}" || fatal "${fork} does not exist"
     test "${rc}" -eq 0 || fatal "cannot read ${fork}"
-    fork_setup "${fork}"
+    fork_setup "${fork}" "${clear}" "${ci[@]}"
 }
 
 cmd_prune_runs() {
