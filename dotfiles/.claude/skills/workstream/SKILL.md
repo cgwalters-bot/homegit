@@ -10,6 +10,8 @@ All of the bot's work is coordinated through the GitHub Projects (v2) board
 `cgwalters-bot`, number `1`). The board is how the human sees what you are doing,
 so keep it accurate: it matters more than any local notes.
 
+The [Composefs Stable](https://github.com/users/cgwalters-bot/projects/2) board (`bot-board --project composefs-stable`) is only a milestone view for declaring bootc's composefs backend stable. It also tracks other people's work. Every bot-owned item on it is also on Workstream, so `bot-watch` sweeps only Workstream. When one of those items changes status, lands or gets a new next action, also update its Status, Owner and Next there, using `set --field`.
+
 Items are either issues/PRs (in any repo) or draft issues that exist only on the
 board. Each has a **Status** single-select field:
 
