@@ -27,20 +27,25 @@ readonly PROG=${0##*/}
 readonly AI_TRAILER_KEYS=(Generated-by Assisted-by)
 # Subjects of commits meant to be squashed before pushing.
 readonly SQUASH_SUBJECT_RE='^(fixup|squash|amend)! '
-# git commands for which -s means --signoff (for rebase and merge it
-# picks a strategy).
-readonly SIGNOFF_SHORT_CMDS=(am cherry-pick commit format-patch revert)
-# Short options of those commands that take a value: any letters after
-# them in a cluster are that value, and if there are none, the next
-# argument is (except for those in SHORT_ATTACHED_OPTS, whose value is
-# optional and only ever attached).
-readonly SHORT_VALUE_OPTS=CFmSctvou
-readonly SHORT_ATTACHED_OPTS=Su
+# The git commands for which -s means --signoff (for rebase and merge it
+# picks a strategy), each with its short options that take a value, as
+# "SEPARATE ATTACHED": the letters after one of those in a cluster are
+# its value; if there are none, the next argument is, except for the
+# ATTACHED ones, whose value is optional and only ever attached ('-' for
+# none).
+declare -rA SIGNOFF_SHORT_VALUE_OPTS=(
+    [am]="- CpS"
+    [cherry-pick]="m S"
+    [commit]="CcFmt Su"
+    [format-patch]="ov -"
+    [revert]="m S"
+)
+readonly SIGNOFF_REFUSAL="the bot never adds a Signed-off-by; only 'bot-pr promote' adds cgwalters' own on his approval"
 
 usage() {
     cat <<EOF
 Usage: ${PROG} GIT-ARGS...
-       ${PROG} check [--no-ai-trailer] [RANGE]
+       ${PROG} check [--no-ai-trailer] [--promoted] [RANGE]
 
 The git identity of cgwalters-bot's commits is
 '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'. The email is what marks a commit as the
@@ -54,17 +59,20 @@ Signed-off-by --trailer): the bot never signs off; only 'bot-pr promote'
 adds cgwalters' own on his approval.
 
 ${PROG} check [RANGE] checks the commits in RANGE (default:
-@{upstream}..HEAD, else origin/HEAD..HEAD) before pushing, and lists what's
-wrong with them:
-  - fixup!/squash!/amend! commits, which belong squashed;
+@{upstream}..HEAD, else origin/HEAD..HEAD, which must not be empty) before
+pushing, and lists what's wrong with them:
+  - fixup!/squash!/amend! commits, which belong squashed, and merges;
   - bot commits (by the email) whose author or committer isn't the bot
     (by either name), and others' commits committed by the bot's email
     under another name;
-  - bot commits with a Signed-off-by (unless committed by cgwalters, as
-    'bot-pr promote' does);
+  - bot commits with a Signed-off-by (with --promoted, for a head that
+    'bot-pr promote' signed off, those committed by cgwalters with his);
+  - commits made as cgwalters with a Generated-by trailer, which is the
+    bot's work done with plain git; it warns about those he authored with
+    an AI trailer, and others' commits he committed;
   - bot commits without a ${AI_TRAILER_KEYS[0]} or ${AI_TRAILER_KEYS[1]} trailer
     (--no-ai-trailer skips this, for projects that say not to add one).
-It exits 1 if it found any.
+It exits 1 if it found any errors; warnings don't fail it.
 EOF
 }
 
@@ -73,10 +81,19 @@ die() {
     exit 1
 }
 
+# message_has_signoff TEXT: succeeds if TEXT has a Signed-off-by line,
+# with any blanks git would ignore.
+message_has_signoff() {
+    grep -qiE '^[[:space:]]*signed-off-by[[:space:]]*:' <<<"$1"
+}
+
 # refuse_signoff GIT-ARGS...: exits if the git command would add a
-# Signed-off-by.
+# Signed-off-by: -s/--signoff (or a prefix of it), a Signed-off-by
+# --trailer, or one in a -m message or -F file. This is best effort,
+# since git has more ways (configured trailer aliases, hooks, editing the
+# message); 'check' is the gate before pushing.
 refuse_signoff() {
-    local cmd="" a short_signoff=false
+    local cmd="" a
     # The global options before the command, some with a separate value.
     while test $# -gt 0; do
         case "$1" in
@@ -85,10 +102,8 @@ refuse_signoff() {
             *) cmd=$1; shift; break ;;
         esac
     done
-    local c
-    for c in "${SIGNOFF_SHORT_CMDS[@]}"; do
-        test "${c}" != "${cmd}" || short_signoff=true
-    done
+    local opts=${SIGNOFF_SHORT_VALUE_OPTS[${cmd}]:-}
+    local separate=${opts% *} attached=${opts#* }
     while test $# -gt 0; do
         a=$1
         shift
@@ -97,40 +112,60 @@ refuse_signoff() {
             # git takes unambiguous prefixes of long options too.
             --si*)
                 [[ "--signoff" == "${a%%=*}"* ]] || continue
-                die "refusing '${a}': the bot never adds a Signed-off-by; only 'bot-pr promote' adds cgwalters' own on his approval" ;;
-            --tr*)
-                [[ "--trailer" == "${a%%=*}"* ]] || continue
-                local t=${1:-}
-                test "${a}" = "${a#*=}" || t=${a#*=}
-                if [[ "${t,,}" == signed-off-by* ]]; then
-                    die "refusing a Signed-off-by trailer: the bot never adds one; only 'bot-pr promote' adds cgwalters' own on his approval"
+                die "refusing '${a}': ${SIGNOFF_REFUSAL}" ;;
+            --tr*|--me*|--fi*)
+                local opt=${a%%=*} v=${1:-}
+                [[ "--trailer" == "${opt}"* || "--message" == "${opt}"* || "--file" == "${opt}"* ]] || continue
+                if test "${a}" = "${opt}"; then
+                    shift || true
+                else
+                    v=${a#*=}
+                fi
+                if [[ "--trailer" == "${opt}"* ]]; then
+                    ! message_has_signoff "${v}" || die "refusing a Signed-off-by trailer: ${SIGNOFF_REFUSAL}"
+                elif test "${cmd}" = commit; then
+                    check_message "${opt}" "${v}"
                 fi ;;
             --*) ;;
             -?*)
-                ${short_signoff} || continue
+                test -n "${opts}" || continue
                 # A cluster like -as or -sm MSG: its letters up to the
                 # first that takes a value.
-                local i ch
+                local i ch v
                 for ((i = 1; i < ${#a}; i++)); do
                     ch=${a:i:1}
-                    test "${ch}" != s ||
-                        die "refusing '-s' (--signoff) for 'git ${cmd}': the bot never adds a Signed-off-by; only 'bot-pr promote' adds cgwalters' own on his approval"
-                    [[ "${SHORT_VALUE_OPTS}" == *"${ch}"* ]] || continue
-                    if test "$((i + 1))" -eq "${#a}" && [[ "${SHORT_ATTACHED_OPTS}" != *"${ch}"* ]]; then
+                    test "${ch}" != s || die "refusing '-s' (--signoff) for 'git ${cmd}': ${SIGNOFF_REFUSAL}"
+                    [[ "${separate}${attached}" == *"${ch}"* ]] || continue
+                    v=${a:i+1}
+                    if test -z "${v}" && [[ "${separate}" == *"${ch}"* ]]; then
+                        v=${1:-}
                         shift || true
                     fi
+                    test "${cmd}" != commit || check_message "-${ch}" "${v}"
                     break
                 done ;;
         esac
     done
 }
 
-# default_range: @{upstream}..HEAD, else origin/HEAD..HEAD.
-default_range() {
+# check_message OPTION VALUE: for git commit's -m/--message and
+# -F/--file, exits if the message has a Signed-off-by.
+check_message() {
+    local text
+    case "$1" in
+        -m|--me*) text=$2 ;;
+        -F|--fi*) test "$2" != - && test -r "$2" || return 0; text=$(<"$2") ;;
+        *) return 0 ;;
+    esac
+    ! message_has_signoff "${text}" || die "refusing a message with a Signed-off-by: ${SIGNOFF_REFUSAL}"
+}
+
+# default_base: prints the default base: @{upstream}, else origin/HEAD.
+default_base() {
     local base
     for base in '@{upstream}' origin/HEAD; do
         if git rev-parse -q --verify "${base}^{commit}" >/dev/null 2>&1; then
-            printf '%s..HEAD\n' "${base}"
+            echo "${base}"
             return 0
         fi
     done
@@ -142,72 +177,99 @@ is_bot_name() {
     test "$1" = "${BOT_GIT_NAME}" || test "$1" = "${BOT_GIT_LEGACY_NAME}"
 }
 
-# problems COMMIT CHECK_TRAILER: prints one line per problem with COMMIT.
+# problems COMMIT CHECK_TRAILER PROMOTED: prints one line per problem
+# with COMMIT, as 'error: ...' or 'warning: ...'.
 problems() {
-    local c=$1 check_trailer=$2 an ae cn ce subject sobs trailers key
+    local c=$1 check_trailer=$2 promoted=$3 an ae cn ce parents subject sobs ai key
     local -a f
-    mapfile -t f < <(git show -s --format='%an%n%ae%n%cn%n%ce%n%s' "${c}")
-    an=${f[0]} ae=${f[1]} cn=${f[2]} ce=${f[3]} subject=${f[4]}
+    mapfile -t f < <(git show -s --format='%an%n%ae%n%cn%n%ce%n%p%n%s' "${c}")
+    an=${f[0]} ae=${f[1],,} cn=${f[2]} ce=${f[3],,} parents=${f[4]} subject=${f[5]}
+    sobs=$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "${c}")
+    ai=""
+    for key in "${AI_TRAILER_KEYS[@]}"; do
+        ai+=$(git show -s --format="%(trailers:key=${key})" "${c}")
+    done
     if [[ "${subject}" =~ ${SQUASH_SUBJECT_RE} ]]; then
-        echo "a '${subject%% *}' commit: squash it into the commit it fixes"
+        echo "error: a '${subject%% *}' commit: squash it into the commit it fixes"
     fi
-    if test "${ae,,}" != "${BOT_GIT_EMAIL,,}"; then
-        # Someone else's commit, rebased by the bot.
-        if test "${ce,,}" = "${BOT_GIT_EMAIL,,}" && ! is_bot_name "${cn}"; then
-            echo "committed as '${cn} <${ce}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>': rebase with ${PROG}"
+    if [[ "${parents}" == *" "* ]]; then
+        echo "error: a merge commit: rebase instead ('bot-pr promote' refuses merges)"
+    fi
+    local human=${HUMAN_GIT_EMAIL,,} bot=${BOT_GIT_EMAIL,,}
+    if test "${ae}" != "${bot}"; then
+        if test "${ce}" = "${bot}" && ! is_bot_name "${cn}"; then
+            echo "error: committed as '${cn} <${f[3]}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>': rebase with ${PROG}"
+        fi
+        # The bot's work, done with plain git on this machine, whose own
+        # identity is cgwalters'.
+        if { test "${ae}" = "${human}" || test "${ce}" = "${human}"; } &&
+            git show -s --format="%(trailers:key=${AI_TRAILER_KEYS[0]})" "${c}" | grep -q .; then
+            echo "error: has a ${AI_TRAILER_KEYS[0]} trailer but was made as cgwalters (${an} <${f[1]}> / ${cn} <${f[3]}>): commit with ${PROG}"
+        elif test "${ae}" = "${human}" && test -n "${ai}"; then
+            echo "warning: authored by cgwalters with an AI trailer: if the bot wrote it with plain git, recommit it with ${PROG}"
+        elif test "${ae}" != "${human}" && test "${ce}" = "${human}"; then
+            echo "warning: someone else's commit, committed by cgwalters: if the bot rebased it with plain git, redo that with ${PROG}"
         fi
         return 0
     fi
-    is_bot_name "${an}" || echo "authored as '${an} <${ae}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'"
+    is_bot_name "${an}" || echo "error: authored as '${an} <${f[1]}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'"
     # What 'bot-pr promote' makes of a bot commit on cgwalters' approval:
-    # committed by him, with his sign-off.
-    local promoted=false
-    sobs=$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "${c}")
-    if test "${cn} <${ce,,}>" = "${HUMAN_GIT_NAME} <${HUMAN_GIT_EMAIL}>" &&
+    # committed by him, with his sign-off. Only with --promoted, since a
+    # plain 'git commit --amend -s' here makes the same.
+    local as_promoted=false
+    if ${promoted} && test "${cn} <${ce}>" = "${HUMAN_GIT_NAME} <${human}>" &&
         grep -qxF "${HUMAN_GIT_NAME} <${HUMAN_GIT_EMAIL}>" <<<"${sobs}"; then
-        promoted=true
+        as_promoted=true
     fi
-    if ! ${promoted} && ! { test "${ce,,}" = "${BOT_GIT_EMAIL,,}" && is_bot_name "${cn}"; }; then
-        echo "committed as '${cn} <${ce}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>': commit and rebase with ${PROG}"
+    if ! ${as_promoted} && ! { test "${ce}" = "${bot}" && is_bot_name "${cn}"; }; then
+        echo "error: committed as '${cn} <${f[3]}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>': commit and rebase with ${PROG}"
     fi
-    if test -n "${sobs}" && ! ${promoted}; then
-        echo "has Signed-off-by: $(paste -sd, - <<<"${sobs}" | sed 's/,/, /g'); the bot never adds one (only 'bot-pr promote' adds cgwalters', as committer)"
+    if test -n "${sobs}" && ! ${as_promoted}; then
+        echo "error: has Signed-off-by: $(paste -sd, - <<<"${sobs}" | sed 's/,/, /g'); ${SIGNOFF_REFUSAL} (for a head promote signed off, use --promoted)"
     fi
-    if ${check_trailer}; then
-        trailers=""
-        for key in "${AI_TRAILER_KEYS[@]}"; do
-            trailers+=$(git show -s --format="%(trailers:key=${key})" "${c}")
-        done
-        test -n "${trailers}" || echo "no ${AI_TRAILER_KEYS[0]}: AI (or ${AI_TRAILER_KEYS[1]}) trailer"
+    if ${check_trailer} && test -z "${ai}"; then
+        echo "error: no ${AI_TRAILER_KEYS[0]}: AI (or ${AI_TRAILER_KEYS[1]}) trailer"
     fi
 }
 
 cmd_check() {
-    local range="" check_trailer=true
+    local range="" check_trailer=true promoted=false
     while test $# -gt 0; do
         case "$1" in
             --no-ai-trailer) check_trailer=false; shift ;;
+            --promoted) promoted=true; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) die "unknown option for check: $1 (see --help)" ;;
             *) test -z "${range}" || die "check takes one RANGE"; range=$1; shift ;;
         esac
     done
-    test -n "${range}" || range=$(default_range)
-    local commits c n=0 bad=0 p=()
+    local default=false
+    if test -z "${range}"; then
+        default=true
+        range="$(default_base)..HEAD"
+        echo "checking ${range}"
+    fi
+    local commits c n=0 bad=0 warned=0 p=()
     commits=$(git rev-list --reverse "${range}") || die "cannot list the commits in '${range}'"
     for c in ${commits}; do
         n=$((n + 1))
-        mapfile -t p < <(problems "${c}" "${check_trailer}")
+        mapfile -t p < <(problems "${c}" "${check_trailer}" "${promoted}")
         test "${#p[@]}" -gt 0 || continue
-        bad=$((bad + 1))
+        if printf '%s\n' "${p[@]}" | grep -q '^error:'; then
+            bad=$((bad + 1))
+        else
+            warned=$((warned + 1))
+        fi
         git show -s --format='%h %s (%an <%ae> / %cn <%ce>)' "${c}"
         printf '    %s\n' "${p[@]}"
     done
+    ! ${default} || test "${n}" -gt 0 ||
+        die "no commits in ${range}; pass the RANGE to check, e.g. origin/main..HEAD"
     if test "${bad}" -gt 0; then
         echo "${PROG}: ${bad} of ${n} commits in ${range} need fixing before pushing" 1>&2
         exit 1
     fi
-    echo "ok: ${n} commits in ${range}"
+    echo "ok: ${n} commits in ${range}$(test "${warned}" -eq 0 || echo ", ${warned} with warnings")"
 }
 
 main() {
