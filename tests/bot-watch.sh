@@ -171,16 +171,20 @@ commit cgwalters-forge/bootc "${FORK_HEAD}" 2026-09-25T12:50:00Z
 review 1 cgwalters CHANGES_REQUESTED 2026-09-25T13:00:00Z "No." | reviews repos/cgwalters-forge/bootc/pulls/19
 : | comments repos/cgwalters-forge/bootc/issues/19
 # The bot's upstream PR that isn't on the board, with his review: found
-# by the search, as are fork PRs, which are skipped (#20 has no
-# fixtures: reading it would fail the sweep).
+# by the search, as are fork PRs, which are left out (#20 has no
+# fixtures: reading it would warn), and #2700, which can't be read and
+# is skipped with a warning. The search's answer is well over a pipe's size
+# (64KiB), like the real one.
+readonly UNREADABLE_PR=${GH}/bootc-dev/bootc/pull/2700
 pr bootc-dev/bootc 2600 "${OFF_BOARD_HEAD}" 2026-09-25T13:00:00Z
 commit bootc-dev/bootc "${OFF_BOARD_HEAD}" 2026-09-25T12:00:00Z
 review 2 cgwalters CHANGES_REQUESTED 2026-09-25T13:00:00Z "Off the board." |
     jq -c --arg u "${OFF_BOARD_PR}" '.html_url = "\($u)#pullrequestreview-2"' | reviews repos/bootc-dev/bootc/pulls/2600
 : | comments repos/bootc-dev/bootc/issues/2600
-put search/issues "$(jq -nc --arg a "${PR}" --arg b "${OFF_BOARD_PR}" --arg c "${FORK_PR}" \
-    '{total_count: 4, items: [{html_url: $a}, {html_url: $b}, {html_url: $c},
-                              {html_url: "https://github.com/cgwalters-forge/bootc/pull/20"}]}')"
+put search/issues "$(jq -nc --arg a "${PR}" --arg b "${OFF_BOARD_PR}" --arg c "${FORK_PR}" --arg d "${UNREADABLE_PR}" \
+    '{total_count: 5, items: [{html_url: $a}, {html_url: $b}, {html_url: $c},
+                              {html_url: "https://github.com/cgwalters-forge/bootc/pull/20"},
+                              {html_url: $d, body: ("x" * 1000000)}]}')"
 
 # board [URL...]: the board, with the main PR (unless "no-pr" comes
 # first), the two issues, and the fork PR in the Branch field of the
@@ -256,7 +260,11 @@ if ! grep -qx "Outstanding reviews by cgwalters:" "${WORK}/watch.txt" ||
     ! grep -q "bootc-dev/bootc#2600  (not on the board)" "${WORK}/watch.txt"; then
     fail "watch: the text report lacks the outstanding reviews: $(cat "${WORK}/watch.txt")"
 fi
-if grep -v -e '^304 ' -e '^200 search/issues$' "${FAKE_GH}/calls" | grep -q . ||
+if ! grep -q "reading ${UNREADABLE_PR} (off the board) for outstanding reviews failed (status 66); skipped" "${WORK}/watch.err" ||
+    grep -q -e "checking the bot's open PRs off the board failed" -e pull/20 "${WORK}/watch.err"; then
+    fail "watch: expected only a warning about ${UNREADABLE_PR}: $(cat "${WORK}/watch.err")"
+fi
+if grep -v -e '^304 ' -e '^200 search/issues$' -e '^404 repos/bootc-dev/bootc/pulls/2700$' "${FAKE_GH}/calls" | grep -q . ||
     ! grep -q "^304 ${PR_API}/reviews$" "${FAKE_GH}/calls"; then
     fail "watch: the second sweep read unchanged resources without 304s: $(sort "${FAKE_GH}/calls" | uniq -c)"
 fi

@@ -208,7 +208,9 @@ rest_get() {
         args+=(-H "If-None-Match: $(<"${etag_file}")")
     fi
     gh api "${args[@]}" >"${scratch}/raw" 2>"${scratch}/err" || rc=$?
-    tr -d '\r' <"${scratch}/raw" | sed '/^$/q' >"${scratch}/headers"
+    # Not sed's q: tr would die of SIGPIPE on a body over a pipe's size,
+    # which pipefail makes a failure.
+    tr -d '\r' <"${scratch}/raw" | sed -n '1,/^$/p' >"${scratch}/headers"
     status=$(awk 'NR == 1 { print $2 }' "${scratch}/headers")
     case "${status}" in
         304)
@@ -683,11 +685,13 @@ outstanding=$(jq -c --slurpfile results "${scratch}/results.json" '
 # off_board_outstanding: prints the outstanding reviews on the bot's
 # open upstream PRs that the sweep doesn't probe (not on the board, or
 # not any more), as JSON lines: one search, which has no ETags, then
-# their reviews. Fails if any of it does.
+# their reviews. Fails if the search does; a PR that can't be read is
+# skipped with a warning.
 off_board_outstanding() {
-    local search_q search extra url o
+    local search_q search extra url o rc
     search_q="is:pr+is:open+author:${BOT_LOGIN}$(jq -r 'map("+-user:" + .) | join("")' <<<"${FORK_OWNERS}")"
-    search=$(rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}")
+    search=$(rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}") ||
+        { rc=$?; warn "the search for the bot's open PRs failed (status ${rc})"; return "${rc}"; }
     if test "$(jq .total_count <<<"${search}")" -gt "${PER_PAGE}"; then
         warn "the bot has over ${PER_PAGE} open upstream PRs; only the first ${PER_PAGE} have their reviews checked"
     fi
@@ -698,7 +702,15 @@ off_board_outstanding() {
         | select(capture("^https://github\\.com/(?<o>[^/]+)/").o as $o | $forks | index($o) | not)' <<<"${search}")
     while IFS= read -r url; do
         test -n "${url}" || continue
-        o=$(pr_outstanding "${url}")
+        # pr_outstanding checks every step itself, as errexit is off here.
+        rc=0
+        o=$(pr_outstanding "${url}") || rc=$?
+        if test "${rc}" -eq "${EX_RATELIMIT}"; then
+            return "${rc}"
+        elif test "${rc}" -ne 0; then
+            warn "reading ${url} (off the board) for outstanding reviews failed (status ${rc}); skipped"
+            continue
+        fi
         test "${o}" = null || jq -c --arg u "${url}" '{url: $u, items: []} + .' <<<"${o}"
     done <<<"${extra}"
 }
@@ -721,7 +733,7 @@ case "${rc}" in
         ;;
     *)
         cat "${scratch}/extra.err" 1>&2
-        warn "checking the bot's open PRs off the board failed; only the board's PRs were checked for outstanding reviews"
+        warn "checking the bot's open PRs off the board failed (status ${rc}); only the board's PRs were checked for outstanding reviews"
         search_failed=true
         ;;
 esac
