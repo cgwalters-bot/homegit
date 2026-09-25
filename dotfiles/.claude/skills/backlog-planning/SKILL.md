@@ -260,15 +260,16 @@ Skip:
 Rank by value and assign every item a **Priority** (see the `workstream`
 skill for what each level means):
 
-- **P0**: explicit requests to the bot from cgwalters, and his own open PRs
-  that he is actively working on (updated in the last ~2 weeks) and are
-  blocked on failing CI, merge conflicts, or unanswered review. The same
-  kind of blockage on a dormant PR is P1.
-- **P1**: the bot's own open PRs with failing CI, conflicts, or unanswered
-  review (unless cgwalters asked for the fix, which makes it an explicit
-  request and P0); concrete asks from cgwalters ("we should", "needs a test", a bug he
-  confirmed) in active repositories, and review requests where a pre-review,
-  reproduction, or bisect would clearly help.
+- **P0**: work that moves composefs toward stable, as the `workstream`
+  skill lists it: explicit requests, cgwalters' blocked PRs, the bot's
+  own PRs, and new issues in that area alike.
+- **P1**: outside composefs, explicit requests to the bot from
+  cgwalters and his own open PRs blocked on failing CI, merge conflicts,
+  or unanswered review; the bot's own open PRs in that state; concrete
+  asks from cgwalters ("we should", "needs a test", a bug he confirmed)
+  in active repositories; review requests where a pre-review,
+  reproduction, or bisect would clearly help; and the bot's own
+  infrastructure.
 - **P2**: everything else worth tracking: nice-to-haves, older threads, and
   speculative follow-ups.
 

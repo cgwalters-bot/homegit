@@ -362,9 +362,26 @@ bot-board list --status Todo --json | jq -r '.[]
   | "\(.id) \(.priority // "-") \(.workflow // "branch") \(.title)"'
 ```
 
-The **Priority** field ranks work: **P0** is urgent or blocking cgwalters
-right now (a request he made directly, his own PR stuck on CI or conflicts),
-**P1** should happen soon, **P2** is nice to have. `bot-board list` sorts by
+The **Priority** field ranks work by cgwalters' standing rule: "p0
+priority remains composefs stability overall, other stuff like improving
+our own infra, burning down backlog issues is p1".
+
+- **P0** moves composefs toward stable: the bootc composefs backend,
+  sealing, UKI and Secure Boot for composefs (including sealed composefs
+  images in rhel-bootc-examples), composefs-rs (capi, varlink API v1,
+  upgrade tests, its CI), install and image-builder composefs support,
+  ostree to composefs migration, and composefs CI coverage. Everything on
+  the [Composefs Stable](https://github.com/users/cgwalters-bot/projects/2)
+  board is P0 here too, unless it is marked a stretch goal.
+- **P1** is the bot's own infrastructure (bot tooling, devspaces, the
+  review app, the promote policy gate, CI on our repositories) and
+  burning down the backlog in other repositories (rpm-ostree, ostree,
+  bootupd, bcvk, cargo-vendor-filterer, containers-image-proxy-rs, ...).
+  A direct request from cgwalters or his own stuck PR outside composefs
+  is P1 as well; it is still handled promptly (see `bot-notify`).
+- **P2** is genuinely nice to have or deliberately deferred.
+
+`bot-board list` sorts by
 priority and keeps board order within the same priority; take the first
 candidate. A human may change priorities at any time; never lower one that
 a human set. Read the issue itself (`gh issue view <url> --comments`) before

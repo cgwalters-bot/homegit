@@ -84,7 +84,9 @@ instead of piping it through `tail` and losing lines for good.
 - **Review feedback** on a fork PR goes to a worker, preferably the one
   that wrote it if it's still around.
 - **Dispatch** workers for Todo items (by priority, per `workstream`) and
-  for cgwalters' asks from `bot-notify`. Scale the number of concurrent
+  for cgwalters' asks from `bot-notify`. Composefs stability comes
+  first: fill free worker slots with P0 (composefs-stable) items before
+  any P1 own-infra or backlog item, and only then P2. Scale the number of concurrent
   workers with the load: more when the queue is deep and items are
   independent, fewer when they share a repository or the GraphQL quota
   is running low.
