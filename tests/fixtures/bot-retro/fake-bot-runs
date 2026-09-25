@@ -1,0 +1,25 @@
+#!/usr/bin/env node
+// A stand-in for bin/bot-runs in tests/bot-retro.test.js: answers list,
+// show and transcript (all with --json) from the files next to it.
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const dir = path.join(__dirname, "runs");
+const [cmd, arg] = process.argv.slice(2);
+const out = {
+  list: () => fs.readFileSync(path.join(dir, "list.json"), "utf8"),
+  show: () => fs.readFileSync(path.join(dir, `show-${arg}.json`), "utf8"),
+  transcript: () => {
+    const t = path.join(dir, `transcript-${arg}`);
+    if (!fs.existsSync(t)) {
+      process.stderr.write(`error: run ${arg} has no agent-transcript artifact (expired?)\n`);
+      process.exit(1);
+    }
+    return JSON.stringify({ run_id: Number(arg), dir: t, files: ["sessions/main.jsonl"] });
+  },
+}[cmd];
+if (!out) {
+  process.stderr.write(`fake bot-runs: unexpected command ${cmd}\n`);
+  process.exit(2);
+}
+process.stdout.write(out());
