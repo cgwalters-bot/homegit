@@ -75,6 +75,13 @@ first time is only recorded, unless CI on the bot's branch fails or the
 bot opened it: then the comments and reviews since it was opened are
 new (except on the first sweep, with an empty state).
 
+Apart from those changes, every sweep lists the "Outstanding reviews by
+${REQUESTER}" on the bot's own open upstream PRs: his latest review
+requesting changes or commenting, or comment, when it is newer than the
+PR's head commit and the bot's last comment or review there (and he
+hasn't approved since). It stays listed until a push or a reply answers
+it, so that nothing the edge-triggered report missed is lost.
+
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
 lists (fork PRs included) is open: with one of its upstream PRs merged
@@ -293,6 +300,10 @@ readonly EXCERPT_JQ='def excerpt:
     | (first // "") | gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ")
     | if length > $len then .[:$len] + "..." else . end;'
 
+# OWNER/REPO#N for an issue or PR URL.
+readonly REPO_REF_JQ='def repo_ref:
+    capture("github\\.com/(?<r>[^/]+/[^/]+)/(issues|pull)/(?<n>[0-9]+)") | "\(.r)#\(.n)";'
+
 # disabled_suites REPO SHA: prints the ids of the check suites of SHA's
 # Actions runs whose workflow is disabled now, as a JSON array. Their
 # results are not news: 'bot-pr fork-setup' disables every workflow on a
@@ -347,6 +358,37 @@ checks_state() {
                     else "none" end)}'
 }
 
+# outstanding_review REPO NUMBER HEAD REVIEWS: on the bot's own open
+# upstream PR, prints what REQUESTER asked that has no answer yet (a
+# review requesting changes or commenting, or a comment, newer than both
+# the head commit and the bot's last comment or review), as
+# {at, type, review_state, link, excerpt, count} of his latest; else
+# null. It's reported on every sweep until answered, so that news the
+# edge-triggered report missed (or that was read and dropped) can't lose
+# the work. His approval after all of it answers it too. REVIEWS is the
+# PR's reviews, one per line.
+outstanding_review() {
+    local repo=$1 number=$2 head=$3 reviews=$4 head_date comments
+    # The bot's last word or push can only have answered what came before.
+    head_date=$(rest_get "repos/${repo}/commits/${head}" | jq -r .commit.committer.date) || return
+    test -n "${head_date}" && test "${head_date}" != null || return 1
+    comments=$(rest_pages "repos/${repo}/issues/${number}/comments?since=${head_date}") || return
+    printf '%s\n' "${reviews}" "${comments}" | jq -sc --arg head_date "${head_date}" --arg bot "${BOT_LOGIN}" \
+        --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
+        [.[] | select(.user.login == $bot or .user.login == $req)
+         | if has("submitted_at") then select(.submitted_at != null and (.state | IN("PENDING", "DISMISSED") | not))
+               | {type: "review", review_state: .state, at: .submitted_at}
+           else {type: "comment", at: .created_at} end
+           + {author: .user.login, link: .html_url, excerpt: (.body | excerpt)}]
+        | ([$head_date] + [.[] | select(.author == $bot) | .at] | max) as $answered
+        | [.[] | select(.author == $req)] as $his
+        | ([$his[] | select(.type == "review")] | sort_by(.at) | last) as $last_review
+        | ([$his[] | select(.at > $answered and .review_state != "APPROVED")] | sort_by(.at)) as $open
+        | if ($open | length) == 0
+             or ($last_review.review_state == "APPROVED" and $last_review.at >= $open[-1].at) then null
+          else $open[-1] + {count: ($open | length)} | del(.author) end'
+}
+
 # sub_status STATUS: the status for probe to return after a failed
 # secondary fetch: only its main resource missing means it is gone.
 sub_status() {
@@ -357,7 +399,7 @@ sub_status() {
 # cur is what the state keeps, and PREV what the last sweep kept (null
 # the first time).
 probe() {
-    local url=$1 prev=$2 repo kind number data cur changes='[]' info
+    local url=$1 prev=$2 repo kind number data cur changes='[]' info outstanding=null
     [[ "${url}" =~ ^https://github\.com/([^/]+/[^/]+)/(issues|pull)/([0-9]+)$ ]] || return 1
     repo=${BASH_REMATCH[1]}
     kind=${BASH_REMATCH[2]}
@@ -392,7 +434,7 @@ probe() {
     # cache (a review on a just-promoted PR, say). Anyone else's issue or
     # PR comes with history that is not news, and neither is anything on
     # the very first sweep, whose state is empty.
-    local updated
+    local updated reviews='' reviews_read=false
     updated=$(jq -r .updated_at <<<"${cur}")
     if ! ${fork}; then
         local edge report_since=${prev_updated}
@@ -401,10 +443,11 @@ probe() {
             report_since=$(jq -r .created_at <<<"${info}")
         fi
         if test -z "${prev_updated}" || [[ ! "${updated}" < "${prev_updated}" ]]; then
-            local since=${report_since:-${updated}} notes reviews='' found
+            local since=${report_since:-${updated}} notes found
             notes=$(rest_pages "repos/${repo}/issues/${number}/comments?since=${since}") || return "$(sub_status $?)"
             if test "${kind}" = pull; then
                 reviews=$(rest_pages "repos/${repo}/pulls/${number}/reviews") || return "$(sub_status $?)"
+                reviews_read=true
             fi
             printf '%s\n' "${notes}" | jq -c '{type: "comment", key: "c\(.id)", author: .user.login,
                 at: .created_at, link: .html_url, body}' >"${scratch}/notes"
@@ -472,6 +515,10 @@ probe() {
                     '. + [{type: "push", from: $from, to: $to} + $push]' <<<"${changes}")
             fi
         fi
+        if ! ${fork} && jq -e --arg bot "${BOT_LOGIN}" '.author == $bot' <<<"${info}" >/dev/null; then
+            ${reviews_read} || reviews=$(rest_pages "repos/${repo}/pulls/${number}/reviews") || return "$(sub_status $?)"
+            outstanding=$(outstanding_review "${repo}" "${number}" "${head}" "${reviews}") || return "$(sub_status $?)"
+        fi
         local ci prev_checks checks
         ci=$(checks_state "${repo}" "${head}") || return "$(sub_status $?)"
         checks=$(jq -r .checks <<<"${ci}")
@@ -490,7 +537,8 @@ probe() {
         cur=$(jq -c --arg c "$(jq -r '.checks // empty' <<<"${prev}")" '.checks = (if $c == "" then null else $c end)' <<<"${cur}")
     fi
     jq -cn --argjson cur "${cur}" --argjson changes "${changes}" --argjson info "${info}" --arg prev_state "${prev_state}" \
-        '{cur: $cur, changes: $changes, info: $info, prev_state: $prev_state}'
+        --argjson outstanding "${outstanding}" \
+        '{cur: $cur, changes: $changes, info: $info, prev_state: $prev_state, outstanding: $outstanding}'
 }
 
 results='{}'
@@ -563,6 +611,11 @@ report=$(jq -c --slurpfile results "${scratch}/results.json" --argjson gone "${g
            changes: $changes, retry: $retry,
            actions: [$actions[] | . + {allowed: (($item.status // "") as $s | $apply_from | index($s) != null)}]})' <<<"${watch}")
 retry_ids=$(jq -r '.[] | select(.retry) | .id' <<<"${report}")
+# Not news but a to-do, listed on every sweep, apart from the items.
+outstanding=$(jq -c --slurpfile results "${scratch}/results.json" '
+    $results[0] as $results
+    | [.[] | select($results[.url].outstanding != null)
+       | {url, items: [.items[] | {id, title}]} + $results[.url].outstanding]' <<<"${watch}")
 report=$(jq -c 'map(select((.changes | length) > 0 or (.actions | length) > 0) | del(.retry))' <<<"${report}")
 
 # keep_last_seen ITEM: puts the URLs of ITEM back to their last-seen
@@ -636,12 +689,22 @@ if ${json}; then
     jq --argjson new "${new_urls}" --argjson failed "${failed}" \
         --argjson gone "${gone}" --argjson nurls "${nurls}" --argjson nitems "${nitems}" \
         --argjson advance "${advance}" \
-        '{swept: {urls: $nurls, items: $nitems}, items: ., new_urls: $new,
+        --argjson outstanding "${outstanding}" \
+        '{swept: {urls: $nurls, items: $nitems}, items: ., outstanding_reviews: $outstanding, new_urls: $new,
           failed_urls: $failed, gone_urls: $gone, state_advanced: $advance}' <<<"${report}"
 else
-    jq -r --argjson sha "${SHORT_SHA}" '
+    # First: these are to-dos, the items below only news.
+    jq -r --arg req "${REQUESTER}" "${REPO_REF_JQ}"'
+        if length == 0 then empty else
+            "Outstanding reviews by \($req):",
+            (.[] | "  \(.url | repo_ref)  \(.items | map(.title) | join("; "))",
+                "    \(if .type == "review" then "review \(.review_state)" else "comment" end) at \(.at)"
+                + "\(if .count > 1 then " (+\(.count - 1) more)" else "" end)"
+                + ": \(if .excerpt != "" then .excerpt else "(line comments)" end)",
+                "      \(.link)"),
+            "" end' <<<"${outstanding}"
+    jq -r --argjson sha "${SHORT_SHA}" "${REPO_REF_JQ}"'
         def short: .[:$sha];
-        def repo_ref: capture("github\\.com/(?<r>[^/]+/[^/]+)/(issues|pull)/(?<n>[0-9]+)") | "\(.r)#\(.n)";
         .[] | .status as $status | "\(.title)  [\($status // "no status")]  \(.id)",
         (.changes | group_by(.url)[] | "  \(.[0].url | repo_ref)",
             (.[] | "    " + (
@@ -661,7 +724,7 @@ else
               elif .allowed then " (with --apply)"
               else " (not applied from \($status // "no status"); a human decides)" end),
         ""' <<<"${report}"
-    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${report}") items with news, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
 # Failed URLs kept their last-seen state in new_seen, so their changes

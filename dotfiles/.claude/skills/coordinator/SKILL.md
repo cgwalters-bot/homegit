@@ -49,6 +49,9 @@ instead of piping it through `tail` and losing lines for good.
 
 ## Acting on it
 
+- **Outstanding reviews first.** The "Outstanding reviews by cgwalters"
+  section `bot-watch` prints on every sweep is P0: dispatch a worker for
+  each listed PR (it stays listed until a push or reply answers it).
 - **Promote** a fork PR when inbox shows `[APPROVED]` (an approving
   review, or a `/promote` line): run the `bot-pr promote` command it
   prints. A go-ahead in other words only gets its `-> hint:` passed on;

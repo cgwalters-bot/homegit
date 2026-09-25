@@ -17,6 +17,8 @@ readonly BOT_WATCH=${TESTS}/../bin/bot-watch
 readonly PR=https://github.com/bootc-dev/bootc/pull/2498
 readonly ISSUE=https://github.com/example/proj/issues/5
 readonly OLD_HEAD=1111111111111111111111111111111111111111
+readonly NEW_HEAD=2222222222222222222222222222222222222222
+readonly REVIEW_LINK=${PR}#pullrequestreview-5318238469
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/bot-watch-test.XXXXXX")
 readonly WORK
@@ -116,6 +118,7 @@ commit "${OLD_HEAD}" 2026-09-25T13:10:00Z
 values CHANGES | reviews
 values PROMOTED | comments
 put repos/bootc-dev/bootc/issues/2498/events '[]'
+put repos/bootc-dev/bootc/pulls/2498/comments '[{"id": 30, "pull_request_review_id": 5318238471, "body": "Typo here."}]'
 # Someone else's issue, with a month of history before it reached the board.
 put repos/example/proj/issues/5 '{"state": "open", "title": "Old bug", "updated_at": "2026-09-01T10:00:00Z",
     "created_at": "2026-08-01T10:00:00Z", "user": {"login": "someone"}}'
@@ -163,11 +166,51 @@ expect watch "both URLs are newly tracked" '.new_urls | length == 2'
 grep -q "review CHANGES_REQUESTED by @cgwalters (operator): Please split this commit." "${WORK}/watch.txt" ||
     fail "watch: the text report lacks the review: $(cat "${WORK}/watch.txt")"
 
-# Then it's no news any more, and the very first sweep has none.
+# (c) The unanswered review is listed on every sweep, the second too,
+# though it's no news any more.
+readonly OUTSTANDING_JQ='.outstanding_reviews | length == 1 and .[0].url == $pr
+    and .[0].review_state == "CHANGES_REQUESTED" and .[0].link == $link and .[0].items[0].id == "PVTI_pr"'
+expect watch "the review is outstanding" "${OUTSTANDING_JQ}" --arg pr "${PR}" --arg link "${REVIEW_LINK}"
 sweep watch
 expect watch "the second sweep has no news" '.items == []'
+expect watch "the review is still outstanding" "${OUTSTANDING_JQ}" --arg pr "${PR}" --arg link "${REVIEW_LINK}"
+if ! grep -qx "Outstanding reviews by cgwalters:" "${WORK}/watch.txt" ||
+    ! grep -q "review CHANGES_REQUESTED at 2026-09-25T13:29:02Z: Please split this commit." "${WORK}/watch.txt"; then
+    fail "watch: the text report lacks the outstanding review: $(cat "${WORK}/watch.txt")"
+fi
+
+# The very first sweep reports nothing, but lists the outstanding review.
 sweep first '{}'
 expect first "the first sweep has no news" '.items == []'
+expect first "the first sweep lists the outstanding review" "${OUTSTANDING_JQ}" --arg pr "${PR}" --arg link "${REVIEW_LINK}"
+
+# What answers the review, or doesn't: a newer push; the bot's reply;
+# his approval after it; a comment of his after the bot's reply.
+# CASE|HEAD|HEAD_DATE|OUTSTANDING|REVIEWS|COMMENTS, the last two as keys
+# of FIX.
+FIX[REPLY]=$(comment 901 cgwalters-bot 2026-09-25T13:40:00Z "Split in two.")
+FIX[APPROVED]=$(review 5318238470 cgwalters APPROVED 2026-09-25T13:45:00Z)
+FIX[AGAIN]=$(comment 902 cgwalters 2026-09-25T13:50:00Z "One more thing.")
+FIX[LINE_ONLY]=$(review 5318238471 cgwalters COMMENTED 2026-09-25T13:55:00Z)
+while IFS='|' read -r name head head_date count rev com; do
+    pr "${head}" 2026-09-25T14:00:00Z
+    commit "${head}" "${head_date}"
+    # shellcheck disable=SC2086 # lists of names
+    values ${rev} | reviews
+    # shellcheck disable=SC2086
+    values ${com} | comments
+    sweep "case-${name}" "$(cat "${WORK}/watch.state")"
+    expect "case-${name}" "${count} outstanding" '.outstanding_reviews | length == $n' --argjson n "${count}"
+done <<EOF
+pushed|${NEW_HEAD}|2026-09-25T13:35:00Z|0|CHANGES|PROMOTED
+push-predates-review|${NEW_HEAD}|2026-09-25T13:20:00Z|1|CHANGES|PROMOTED
+replied|${OLD_HEAD}|2026-09-25T13:10:00Z|0|CHANGES|PROMOTED REPLY
+approved|${OLD_HEAD}|2026-09-25T13:10:00Z|0|CHANGES APPROVED|PROMOTED
+asked-again|${OLD_HEAD}|2026-09-25T13:10:00Z|1|CHANGES|PROMOTED REPLY AGAIN
+line-comments|${OLD_HEAD}|2026-09-25T13:10:00Z|1|CHANGES LINE_ONLY|PROMOTED REPLY
+EOF
+grep -q "review COMMENTED at 2026-09-25T13:55:00Z: (line comments)" "${WORK}/case-line-comments.txt" ||
+    fail "case-line-comments: text report: $(cat "${WORK}/case-line-comments.txt")"
 
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
-echo "ok: bot-watch first-sight news as expected"
+echo "ok: bot-watch first-sight news and outstanding reviews as expected"
