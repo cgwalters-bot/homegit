@@ -5,7 +5,8 @@ This is a fork of [cgwalters/homegit](https://github.com/cgwalters/homegit)
 used as the dotfiles and prompt repository for the
 [cgwalters-bot](https://github.com/cgwalters-bot) GitHub account, an agentic
 bot that helps with upstream contributions. Commits made from this
-environment are authored as `cgwalters-bot`, and the agents' work is
+environment are authored as `Colin Walters <walters+llm@verbum.org>` (see
+`bin/bot-git`), and the agents' work is
 coordinated through the [Workstream](https://github.com/users/cgwalters-bot/projects/1)
 project board: a human moves items into Todo, the bot claims them, pushes
 tested branches to forks in the [cgwalters-forge](https://github.com/cgwalters-forge)
