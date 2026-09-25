@@ -9,10 +9,12 @@ shopt -s inherit_errexit
 readonly BOT_LOGIN=cgwalters-bot
 # The bot's git identity; its commits are recognized by BOT_GIT_EMAIL.
 BOT_GIT=$(dirname "$(readlink -f "$0")")/bot-git
-test -r "${BOT_GIT}" || {
-    echo "error: ${BOT_GIT} not found; ${0##*/} needs bot-git from homegit's bin/ next to it" 1>&2
-    exit 1
-}
+for f in "${BOT_GIT}" "$(dirname "${BOT_GIT}")/dco-detect.sh"; do
+    test -r "${f}" || {
+        echo "error: ${f} not found; ${0##*/} needs ${f##*/} from homegit's bin/ next to it" 1>&2
+        exit 1
+    }
+done
 # shellcheck source=bin/bot-git disable=SC1091 # followed with shellcheck -x
 source "${BOT_GIT}"
 # dco_checks, shared with bot-pr.
