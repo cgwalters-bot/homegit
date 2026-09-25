@@ -213,6 +213,15 @@ Commands:
         as is. Like set-body, this is recorded as the bot's edit. It
         refuses if another open fork PR in that fork records the item,
         unless --force. The board's own Branch fields are not changed.
+  refresh-meta FORK_PR_URL
+        Re-render a fork PR's bot-meta section from the current template,
+        keeping the upstream, base and board item it records, after
+        running fork-setup on its fork (so that its Fork CI line is
+        current). The rest of the body is left as is, including edits by
+        ${REVIEWER}; like set-body, this is recorded as the bot's edit.
+        Nothing is written if the section is already current, and it
+        refuses if anyone else edited the section since the bot last
+        wrote it.
   prune-runs [--dry-run] [REPO...]
         Cancel the queued, pending and in-progress Actions runs in the
         forks REPO (default: every fork in ${FORGE_ORG}) that CI started
@@ -584,6 +593,7 @@ fork_setup() {
     CI_ACTIVE=()
     SCHEDULED_ACTIVE=()
     SECRETS_ACTIVE=()
+    FORK_SETUP_UNSURE=""
     ghapi -X PUT "repos/${fork}/actions/permissions" -F enabled=true -f allowed_actions=all >/dev/null ||
         warn "enabling Actions on ${fork} failed; opted-in workflows won't run there until someone does"
 
@@ -596,6 +606,7 @@ fork_setup() {
             fatal "cannot read the ${CI_VARIABLE} variable of ${fork}, so cannot record the opt-in"
         fi
         warn "cannot read the ${CI_VARIABLE} variable of ${fork}, so cannot tell which workflows are opted in; leaving its workflows as they are"
+        FORK_SETUP_UNSURE="cannot read the ${CI_VARIABLE} variable of ${fork}"
         return 0
     fi
     local old=() new=()
@@ -620,10 +631,14 @@ fork_setup() {
     local default workflows id state path name PROBLEM
     local disabled_ids=() disabled=() enabled=() seen=()
     default=$(ghapi "repos/${fork}" --jq .default_branch) ||
-        { warn "cannot read ${fork}; check its workflows by hand"; return 0; }
+        { warn "cannot read ${fork}; check its workflows by hand"; FORK_SETUP_UNSURE="cannot read ${fork}"; return 0; }
     workflows=$(ghapi --paginate "repos/${fork}/actions/workflows?per_page=100" \
         --jq '.workflows[] | [.id, .state, .path] | @tsv') ||
-        { warn "cannot list the workflows of ${fork}; check them by hand"; return 0; }
+        {
+            warn "cannot list the workflows of ${fork}; check them by hand"
+            FORK_SETUP_UNSURE="cannot list the workflows of ${fork}"
+            return 0
+        }
     while IFS=$'\t' read -r id state path; do
         test -n "${id}" || continue
         # GitHub's own dynamic workflows (CodeQL setup, Dependabot) have
@@ -648,6 +663,7 @@ fork_setup() {
                 enabled+=("${name}")
             else
                 warn "enabling ${name} on ${fork} failed; it stays ${state}"
+                FORK_SETUP_UNSURE="enabling ${name} on ${fork} failed"
                 continue
             fi
         fi
@@ -953,6 +969,42 @@ def since_bot: .nodes | (map(.by == $bot) | index(true)) as $i | .[:($i // lengt
 def reviewers: [.[] | select(.by == $r) | .at] | reverse | .[];
 '
 
+# check_meta_unedited URL: for the fork PR that read_fork_pr read, with
+# the inbox state in 'state', fails unless its bot-meta section is still
+# the one the bot last wrote. An edit's "diff" is the whole body after
+# it, so the section is compared with the one in the bot's newest
+# version.
+check_meta_unedited() {
+    local url=$1 bot_body query meta verdict
+    bot_body=$(jq -r --arg u "${url}" '.prs[$u].bot_body // "-"' <<<"${state}")
+    test "$(body_hash <<<"${PR}")" != "${bot_body}" || return 0
+    # shellcheck disable=SC2016 # GraphQL variables, not shell
+    query='query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      userContentEdits(first: 100) { totalCount nodes { editor { login } diff } }
+    }
+  }
+}'
+    meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${PR}")
+    # "same", "unknown", or who edited it.
+    verdict=$(gh api graphql -f query="${query}" -f owner="${FORK%%/*}" -f name="${FORK#*/}" -F number="${NUMBER}" 2>/dev/null |
+        jq -r --arg bot "${BOT_LOGIN}" --arg meta "${meta}" "${BODY_JQ}"'
+            .data.repository.pullRequest.userContentEdits
+            | if .totalCount == 0 then "same"
+              else .nodes | (map(.editor.login == $bot) | index(true)) as $i
+                | if $i == null then "unknown"
+                  elif (.[$i].diff | meta) == $meta then "same"
+                  else [.[:$i][] | .editor.login // "ghost"] | unique | join(", ")
+                  end
+              end') || verdict=unknown
+    case "${verdict}" in
+        same) ;;
+        unknown | "") fatal "cannot tell whether someone edited ${url}'s bot-meta section since the bot last wrote it (GraphQL failed, or the bot's version is too old); check it and update it by hand" ;;
+        *) fatal "${verdict} edited ${url}'s bot-meta section since the bot last wrote it; not overwriting that, so update it by hand" ;;
+    esac
+}
+
 # recorded_item < PR_JSON: prints the board item in the PR's bot-meta
 # section, if any.
 recorded_item() {
@@ -1144,6 +1196,48 @@ cmd_set_item() {
     reviewer_edits_since_bot "${url}"
     write_body "${url}" "${body}" "kept; then set-item changed the board item" true
     info "${url} now records board item ${item} (was ${recorded:-none}); set the items' Branch fields with bot-board if they need it"
+}
+
+# read_refresh_target URL: read_fork_pr, and sets META to its bot-meta
+# section and the fields parse_meta sets; fails unless it records a board
+# item.
+read_refresh_target() {
+    read_fork_pr "$1"
+    META=$(jq -r "${BODY_JQ} .body | meta" <<<"${PR}")
+    parse_meta "$1" "${META}"
+    test -n "${META_ITEM}" ||
+        fatal "no board item in $1's bot-meta section; record one with '$(basename "$0") set-item $1 PVTI_...' first"
+}
+
+cmd_refresh_meta() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") refresh-meta FORK_PR_URL"
+    local url=$1 FORK NUMBER PR HIS EDITS_UNKNOWN META_UPSTREAM META_BASE META_ITEM
+    parse_fork_pr_url "${url}"
+    [[ "${FORK}" == "${FORGE_ORG}/"* ]] ||
+        fatal "${url} is not in ${FORGE_ORG}; refresh-meta only handles forge fork PRs, whose CI fork-setup manages"
+    check_login
+    require_yaml_parser
+    local state META fresh body FORK_SETUP_UNSURE
+    # Once before fork_setup, so that a PR this refuses leaves the fork
+    # alone, and again under the lock. fork_setup comes before the lock
+    # since it makes many calls and needs no state.
+    read_refresh_target "${url}"
+    fork_setup "${FORK}" false
+    test -z "${FORK_SETUP_UNSURE}" ||
+        fatal "${FORK_SETUP_UNSURE}, so the Fork CI line may be wrong; not refreshing ${url}"
+    lock_state
+    state=$(load_state)
+    read_refresh_target "${url}"
+    fresh=$(meta_section "${META_UPSTREAM}" "${META_BASE}" "${META_ITEM}")
+    if test "${META}" = "${fresh}"; then
+        info "${url}'s bot-meta section is already current"
+        return 0
+    fi
+    check_meta_unedited "${url}"
+    body=$(jq -r --arg m "${fresh}" "${BODY_JQ}"' .body | strip_meta + "\n\n" + $m' <<<"${PR}")
+    reviewer_edits_since_bot "${url}"
+    write_body "${url}" "${body}" "kept; then refresh-meta re-rendered the bot-meta section" true
+    info "Refreshed the bot-meta section of ${url}"
 }
 
 cmd_fork_setup() {
@@ -2311,6 +2405,7 @@ case "${command}" in
     get-body) command=get_body ;;
     prune-runs) command=prune_runs ;;
     set-item) command=set_item ;;
+    refresh-meta) command=refresh_meta ;;
     promote|signoff|inbox) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac

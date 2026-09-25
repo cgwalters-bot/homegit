@@ -147,8 +147,9 @@ personal forks (`cgwalters-bot/REPO`) are only for scratch work.
 
 `bot-pr` implements the bot's side: `fork-pr` creates the
 forge fork if needed and opens the fork PR, `get-body` and `set-body`
-update its description without overwriting your edits, `inbox` lists
-your activity on them since its last run (only the `cgwalters` login
+update its description without overwriting your edits, `refresh-meta`
+brings its bot-meta section up to date when the template changes,
+`inbox` lists your activity on them since its last run (only the `cgwalters` login
 counts, so the bot's own edits, pushes and comments are left out), and
 `promote` rebases onto upstream, opens the
 upstream PR, closes the fork PR and moves the item to In Review. Agents
