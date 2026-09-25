@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Offline tests of bin/dco-signoff: local bare repositories stand in for
 # the GitHub repositories it fetches and pushes (acme/proj upstream, which
-# requires DCO, acme/nodco, which doesn't, and their cgwalters-forge
-# forks), and a fake gh serves REST fixtures generated from them. No
+# requires DCO, acme/app, which runs the DCO app without requiring its
+# check, acme/nodco, which has neither, and their cgwalters-forge forks), and a fake gh serves REST fixtures generated from them. No
 # network.
 #   tests/dco-signoff.sh
 set -euo pipefail
@@ -220,7 +220,25 @@ echo '{"parent": {"full_name": "acme/proj"}, "permissions": {"push": true}}' | f
 echo '{"parent": {"full_name": "acme/nodco"}, "permissions": {"push": true}}' | fixture repos/cgwalters-forge/nodco
 jq -s . "${FAKE_GH}/rest/repos/acme/proj/pulls/1.json" "${FAKE_GH}/rest/repos/acme/proj/pulls/4.json" |
     fixture repos/acme/proj/pulls
-echo '[]' | fixture repos/acme/nodco/pulls
+# In acme/nodco, a workflow on a PR head reports a check named DCO: only
+# the DCO app's runs count there.
+jq '[.]' "${FAKE_GH}/rest/repos/acme/nodco/pulls/3.json" | fixture repos/acme/nodco/pulls
+echo '{"check_runs": [{"name": "DCO", "app": {"slug": "github-actions"}, "status": "completed", "conclusion": "failure"}]}' |
+    fixture repos/acme/nodco/commits/0000000000000000000000000000000000000000/check-runs
+# acme/app requires only CI, but the DCO app fails its PR #7.
+readonly APP_HEAD=1111111111111111111111111111111111111111
+jq -n --arg sha "${APP_HEAD}" '{number: 7, html_url: "https://github.com/acme/app/pull/7", title: "DCO app", base: {ref: "main"},
+        user: {login: "cgwalters-bot"}, maintainer_can_modify: true,
+        head: {ref: "bot/app", sha: $sha, repo: {full_name: "cgwalters-forge/app", owner: {login: "cgwalters-forge"}}}}' |
+    fixture repos/acme/app/pulls/7
+jq '[.]' "${FAKE_GH}/rest/repos/acme/app/pulls/7.json" | fixture repos/acme/app/pulls
+jq -n --arg sha "${APP_HEAD}" --arg email "${BOT_EMAIL}" '[{sha: $sha, parents: [{}], author: {login: "cgwalters-bot"},
+        commit: {author: {name: "Colin Walters", email: $email}, message: "app"}}]' |
+    fixture repos/acme/app/pulls/7/commits
+jq -n '[{type: "required_status_checks", parameters: {required_status_checks: [{context: "ci"}]}}]' |
+    fixture repos/acme/app/rules/branches/main
+echo '{"check_runs": [{"name": "DCO", "app": {"slug": "dco-2"}, "status": "completed", "conclusion": "action_required"}]}' |
+    fixture "repos/acme/app/commits/${APP_HEAD}/check-runs"
 
 # run NAME EXPECTED_STATUS ARGS...: run dco-signoff with stdin from
 # $INPUT, output in $OUT; fail NAME if the exit status isn't as expected.
@@ -268,6 +286,9 @@ if run "list-only --repo" ok --list-only --repo acme/nodco; then
 fi
 if run "list-only, explicit PRs" ok --list-only https://github.com/acme/proj/pull/6 acme/proj#2; then
     expect "list-only, explicit PRs" '^2 open PRs need DCO' '^acme/proj#6 ' '^acme/proj#2 ' '!#1 '
+fi
+if run "list-only, DCO app" ok --list-only acme/app#7 acme/nodco#3; then
+    expect "list-only, DCO app" '^1 open PRs need DCO \(1 others don.t\)' '^acme/app#7 failure 1/1 sign ' '!nodco'
 fi
 
 # --- Without bot-git next to it, which holds the bot's identity ---

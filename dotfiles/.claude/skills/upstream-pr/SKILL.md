@@ -108,22 +108,25 @@ topic branch per change.
 - **Whether DCO is required** comes from what GitHub enforces or runs,
   never from CONTRIBUTING or other prose, which is easy to misread. It is
   required if the default branch's rules require a status check named like
-  DCO:
+  DCO (as a whole word):
 
   ```bash
   gh api repos/OWNER/REPO/rules/branches/DEFAULT --jq '.[]
     | select(.type == "required_status_checks")
     | .parameters.required_status_checks[].context
-    | select(test("dco"; "i"))'
+    | select(test("(^|[^[:alnum:]])dco([^[:alnum:]]|$)"; "i"))'
   ```
 
   or if a DCO check runs there even though it isn't required: the DCO app
   fails every PR without sign-offs wherever it's installed, and classic
   branch protection isn't readable without admin rights anyway. So look
   for a check named like DCO among the check runs of the default branch's
-  head and of the heads of the repository's latest PRs
-  (`gh api repos/OWNER/REPO/commits/SHA/check-runs --jq '.check_runs[].name'`).
-  `bot-pr promote` and `bot-pr signoff` decide it exactly this way. A
+  head, and for one by the DCO app (`.app.slug` `dco` or `dco-2`; a PR's
+  own workflows can report any name) on the heads of the repository's
+  latest PRs
+  (`gh api --paginate repos/OWNER/REPO/commits/SHA/check-runs --jq '.check_runs[] | "\(.app.slug) \(.name)"'`).
+  `bot-pr promote`, `bot-pr signoff` and `dco-signoff` decide it exactly
+  this way (`bin/dco-detect.sh`). A
   workflow in `.github/workflows/` that checks sign-offs counts too.
 - AI disclosure per project policy; by default end each commit message with
   a `Generated-by: AI` trailer (`Assisted-by: AI` only when a human wrote

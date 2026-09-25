@@ -46,8 +46,8 @@ mkdir -p "${WORK}/bin" "${FAKE_GH}/rest" "${FAKE_GH}/opened" "${WORK}/hooks"
 # branches, compare, and fork PR heads (the fixture's head.sha is replaced
 # by its branch's commit, frozen when it's closed, as GitHub does). Issue
 # comments default to none, and POSTs to them add one by the bot. POST
-# .../pulls opens an upstream PR (listed by GET .../pulls, read with its
-# commits by GET .../pulls/N), unless $FAKE_GH/fail-open exists, which it
+# .../pulls opens an upstream PR (listed by GET .../pulls, filtered by
+# head if given, and read with its commits by GET .../pulls/N), unless $FAKE_GH/fail-open exists, which it
 # removes; PATCH .../pulls/N closes a fork PR. Anything else fails. Every
 # call is logged to $FAKE_GH/calls.
 cat >"${WORK}/bin/gh" <<'EOF'
@@ -131,7 +131,7 @@ case "${method} ${path}" in
     GET\ repos/acme/*/pulls)
         repo=${path#repos/}; repo=${repo%/pulls}
         json=$(find "${store}/opened" -name '*.json' -exec cat {} + 2>/dev/null |
-            jq -s --arg repo "${repo}" --arg head "$(field head)" '[.[] | select(.repo == $repo and .head == $head)]') ;;
+            jq -s --arg repo "${repo}" --arg head "$(field head)" '[.[] | select(.repo == $repo and ($head == "" or .head == $head)) | {html_url, head: {sha: .head_sha}}]') ;;
     GET\ repos/acme/*/pulls/*/commits)
         n=${path%/commits}; n=${n##*/}
         test -e "${store}/opened/${n}.json" || notfound
@@ -147,7 +147,7 @@ case "${method} ${path}" in
         head=$(jq -r .head <<<"${req}")
         fork=${head%%:*}/$(jq -r '.repo | sub(".*/"; "")' <<<"${req}")
         json=$(jq --arg s "$(sha "${fork}" "${head#*:}")" --arg fork "${fork}" '
-            {user: {login: "cgwalters-bot"}, state: "open", html_url, base: {ref: .base},
+            {user: {login: (.user // "cgwalters-bot")}, state: "open", html_url, base: {ref: .base},
              head: {ref: (.head | sub("^[^:]*:"; "")), sha: $s, repo: {full_name: $fork}}}' <<<"${req}") ;;
     PATCH\ repos/*/pulls/*)
         f=${store}/rest/${path}.json
@@ -333,9 +333,13 @@ U1=$(commit_as bot unapproved "unapproved")
 new_branch bot/others
 commit_as other others "by someone else" >/dev/null
 O2=$(commit_as bot others "by the bot")
+# #16 is approved but was never promoted; its upstream PRs are made up
+# below.
+new_branch bot/unpromoted
+P1=$(commit_as bot unpromoted "unpromoted")
 git -C "${SRC}" push -q forge bot/sign bot/signed bot/mixed bot/lease bot/stale bot/rebased bot/forged bot/legacy
 git -C "${SRC}" push -q nodco bot/plain
-git -C "${SRC}" push -q app bot/app bot/late bot/moved bot/unapproved bot/others
+git -C "${SRC}" push -q app bot/app bot/late bot/moved bot/unapproved bot/others bot/unpromoted
 
 fork_pr proj 1 bot/sign "${S3}"
 fork_pr nodco 2 bot/plain "${N1}"
@@ -351,6 +355,7 @@ fork_pr dcoapp 12 bot/late "${LA1}"
 fork_pr dcoapp 13 bot/moved "${MV1}"
 fork_pr dcoapp 14 bot/unapproved "${U1}"
 fork_pr dcoapp 15 bot/others "${O2}"
+fork_pr dcoapp 16 bot/unpromoted "${P1}"
 jq -n --arg a "${F1}" --arg s "${F2}" --arg u "https://github.com/cgwalters-forge/proj/pull/8#pullrequestreview-800" '
     [{user: {login: "cgwalters-bot"}, created_at: "2026-09-25T12:00:00Z", html_url: "https://github.com/cgwalters-forge/proj/pull/8#c0",
       body: "Signed off 1 commit(s)\n\n<!-- bot-pr signoff approved=\($a) signed=\($s) approval=\($u) review=800 -->"}]' \
@@ -360,6 +365,12 @@ echo '{"parent": {"full_name": "acme/nodco"}, "source": {"full_name": "acme/nodc
 jq -n '[{type: "required_status_checks", parameters: {required_status_checks: [{context: "DCO"}, {context: "ci"}]}}]' |
     fixture repos/acme/proj/rules/branches/main
 echo '[{"type": "pull_request"}]' | fixture repos/acme/nodco/rules/branches/main
+# On acme/nodco's main, only a whole-word DCO name counts.
+echo '{"check_runs": [{"name": "ci"}, {"name": "build-dcollector"}]}' | fixture repos/acme/nodco/commits/main/check-runs
+# A workflow in acme/nodco's PR reports a check named DCO: on a PR head,
+# only the DCO app's runs count.
+echo '{"check_runs": [{"name": "DCO", "app": {"slug": "github-actions"}}]}' |
+    fixture "repos/acme/nodco/commits/${N1}/check-runs"
 echo '{"parent": {"full_name": "acme/dcoapp"}, "source": {"full_name": "acme/dcoapp"}}' | fixture repos/cgwalters-forge/dcoapp
 # The DCO app runs in acme/dcoapp, but its rules require only CI.
 jq -n '[{type: "required_status_checks", parameters: {required_status_checks: [{context: "ci"}]}}]' |
@@ -625,7 +636,24 @@ signoff_refused "signoff, moved" "head ${MV2:0:12} is not ${MV1:0:12}, which pro
 echo '[]' | fixture "repos/${APP}/pulls/14/reviews"
 signoff_refused "signoff, unapproved" "has no approval by cgwalters of ${U1:0:12}" "$(upstream_url bot/unapproved)"
 signoff_refused "signoff, others" "commits that aren't cgwalters-bot's" "$(upstream_url bot/others)"
+test "$(opened bot/plain | jq -r .head_sha)" = "${N1}" || fail "no DCO: the spoofed check isn't on the upstream PR's head"
 signoff_refused "signoff, no DCO" "neither requires nor runs a DCO check" "$(upstream_url bot/plain)"
+
+# upstream_pr N LOGIN BRANCH: make up acme/dcoapp#N, opened by LOGIN from
+# cgwalters-forge:BRANCH without promote.
+upstream_pr() {
+    jq -n --argjson n "$1" --arg user "$2" --arg head "cgwalters-forge:$3" '
+        {repo: "acme/dcoapp", html_url: "https://github.com/acme/dcoapp/pull/\($n)", head: $head, base: "main", user: $user}' \
+        >"${FAKE_GH}/opened/$1.json"
+}
+upstream_pr 90 cgwalters-bot bot/unpromoted
+# Only the bot's word counts for what promote opened.
+jq -n '[{user: {login: "someone"}, created_at: "2026-09-25T12:00:00Z", html_url: "https://github.com/x#c0",
+         body: "Opened upstream as https://github.com/acme/dcoapp/pull/90. Closing this review draft."}]' \
+    >"${FAKE_GH}/repos_${APP//\//_}_issues_16_comments.json"
+signoff_refused "signoff, not promoted" "no PR in ${APP} says 'bot-pr promote' opened" https://github.com/acme/dcoapp/pull/90
+upstream_pr 91 someone bot/unpromoted
+signoff_refused "signoff, not the bot's PR" "was opened by someone, not cgwalters-bot" https://github.com/acme/dcoapp/pull/91
 
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
 echo "ok: promote signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases; signoff signs off promoted PRs only on that approval, with the same refusals"

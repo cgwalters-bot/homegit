@@ -13,6 +13,9 @@ test -r "${BOT_GIT}" || {
 }
 # shellcheck source=bin/bot-git disable=SC1091 # followed with shellcheck -x
 source "${BOT_GIT}"
+# dco_checks, shared with dco-signoff.
+# shellcheck source=bin/dco-detect.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "${BOT_GIT}")/dco-detect.sh"
 # The only login whose reviews and comments on a fork PR are acted on.
 readonly REVIEWER=cgwalters
 # The organization holding the forks where fork PRs are opened. Its forks
@@ -64,15 +67,12 @@ readonly EXCERPT_LEN=120
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
 # Returned by ghapi() when GitHub says the resource does not exist.
-readonly EX_NOTFOUND=4
+readonly EX_NOTFOUND=${DCO_NOTFOUND}
 # Returned by rebase_onto_upstream() when the rebase conflicts.
 readonly EX_CONFLICT=10
-# Part of the name of the check the DCO app (dco-2) reports, which makes a
+# The name of the check the DCO app (dco-2) reports, which makes a
 # repository require a Signed-off-by on every commit; see dco_required.
 readonly DCO_CHECK=DCO
-# How many of a repository's latest PRs dco_required looks at for a DCO
-# check run.
-readonly DCO_RECENT_PRS=5
 # Where a repository installs the /signoff command (bootc-dev/actions'
 # pr-signoff workflow; bootc-dev/infra syncs this stub to its org).
 readonly SIGNOFF_WORKFLOW=.github/workflows/signoff.yml
@@ -149,8 +149,8 @@ Commands:
         approve, but one that reads like a go-ahead is pointed out. Then:
         rebase onto the upstream base if it moved (on conflicts, dismiss
         the approval and stop). If the repository wants DCO (the base
-        branch's rules require the DCO check, or the DCO app's check ran
-        on the base branch or a recent PR there), his approval also
+        branch's rules require a DCO check, one ran on the base branch,
+        or the DCO app's ran on a recent PR there), his approval also
         signs off: add '${SIGNOFF_TRAILER}'
         to each commit since the merge-base that lacks it, keeping its
         tree, author and message and making him its committer (the DCO
@@ -1376,29 +1376,9 @@ verdict() {
 }
 
 # dco_required REPO BASE: prints true if REPO wants DCO sign-offs on PRs
-# into BASE, else false: if BASE's rules require the DCO check, or if a
-# DCO check ran on BASE's head or on the head of one of REPO's latest
-# DCO_RECENT_PRS PRs. The DCO app, where installed, fails every PR that
-# lacks sign-offs, so a repository running it wants them even where its
-# rules don't list the check (or can't be read: classic branch protection
-# needs admin rights). Only what GitHub enforces or runs counts, never what
-# CONTRIBUTING says.
+# into BASE (see dco_checks), else false.
 dco_required() {
-    local repo=$1 base=$2 checks heads sha
-    checks=$(ghapi -X GET "repos/${repo}/rules/branches/${base}" \
-        --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context') ||
-        warn "cannot read the branch rules of ${repo}:${base}; looking only for DCO check runs"
-    if grep -qiF "${DCO_CHECK}" <<<"${checks}"; then echo true; return 0; fi
-    heads=$(ghapi -X GET "repos/${repo}/pulls" -f state=all -f per_page="${DCO_RECENT_PRS}" --jq '.[].head.sha') ||
-        warn "cannot list the PRs of ${repo}; looking for DCO check runs on ${base} only"
-    for sha in "${base}" ${heads}; do
-        local rc=0
-        checks=$(ghapi -X GET "repos/${repo}/commits/${sha}/check-runs" -f per_page=100 --jq '.check_runs[].name') || rc=$?
-        test "${rc}" -eq 0 || test "${rc}" -eq "${EX_NOTFOUND}" ||
-            warn "cannot read the check runs of ${repo}@${sha:0:12}; if it requires DCO, sign off or add a note to the PR by hand"
-        if grep -qiF "${DCO_CHECK}" <<<"${checks}"; then echo true; return 0; fi
-    done
-    echo false
+    if test "$(dco_checks "$1" "$2")" = '[]'; then echo false; else echo true; fi
 }
 
 # dco_note REPO BASE: prints a line for the body of an upstream PR into a

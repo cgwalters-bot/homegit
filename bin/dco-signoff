@@ -15,12 +15,12 @@ test -r "${BOT_GIT}" || {
 }
 # shellcheck source=bin/bot-git disable=SC1091 # followed with shellcheck -x
 source "${BOT_GIT}"
+# dco_checks, shared with bot-pr.
+# shellcheck source=bin/dco-detect.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "${BOT_GIT}")/dco-detect.sh"
 # The organization holding the forks that 'bot-pr promote' opens upstream
 # PRs from, as FORGE_ORG:bot/SLUG.
 readonly FORGE_ORG=${DCO_SIGNOFF_FORGE:-cgwalters-forge}
-# A required status check whose name matches this (case-insensitively) is
-# a DCO check.
-readonly DCO_CONTEXT_RE=dco
 readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/dco-signoff
 readonly PER_PAGE=100
 readonly TITLE_LEN=50
@@ -42,8 +42,9 @@ The bot never adds Signed-off-by by itself ('bot-pr promote' adds yours
 only on your approval of the fork PR), so its other PRs to repositories
 that require DCO stay blocked until a human signs off. This finds the open PRs authored
 by ${BOT_LOGIN}, plus open PRs from ${FORGE_ORG} branches (where
-'bot-pr promote' opens them from), keeps those whose base branch requires a
-DCO status check (per the repository's rules), and prints a table of them:
+'bot-pr promote' opens them from), keeps those whose repository wants DCO (its
+base branch's rules require a DCO check, or the DCO app's check runs
+there), and prints a table of them:
 the DCO check's state and how many commits lack your
 'Signed-off-by: \$(git config user.name) <\$(git config user.email)>'.
 
@@ -210,16 +211,27 @@ discover() {
 
 declare -A CONTEXTS_CACHE=()
 
-# dco_contexts REPO BRANCH: the DCO checks that BRANCH's rules require,
-# as a JSON array of names.
+# ghapi ARGS...: 'gh api ARGS', for dco_checks: its error goes to stderr,
+# except for a 404, which returns DCO_NOTFOUND.
+ghapi() {
+    local err rc=0
+    err=$(mktemp) || die "cannot create a temporary file"
+    gh api "$@" 2>"${err}" || rc=$?
+    if test "${rc}" -ne 0 && grep -q 'HTTP 404' "${err}"; then
+        rc=${DCO_NOTFOUND}
+    elif test "${rc}" -ne 0; then
+        cat "${err}" 1>&2
+    fi
+    rm -f "${err}"
+    return "${rc}"
+}
+
+# dco_contexts REPO BRANCH: the DCO checks of PRs into BRANCH (see
+# dco_checks), as a JSON array of names.
 dco_contexts() {
-    local key="$1@$2" rules
+    local key="$1@$2"
     if test -z "${CONTEXTS_CACHE[${key}]:-}"; then
-        # No access or no rules both mean no requirement we can see.
-        rules=$(gh api "repos/$1/rules/branches/$2" 2>/dev/null) || rules='[]'
-        CONTEXTS_CACHE[${key}]=$(jq -c --arg re "${DCO_CONTEXT_RE}" \
-            '[.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context
-              | select(test($re; "i"))] | unique' <<<"${rules}")
+        CONTEXTS_CACHE[${key}]=$(dco_checks "$1" "$2")
     fi
     printf '%s\n' "${CONTEXTS_CACHE[${key}]}"
 }
