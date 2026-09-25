@@ -1,12 +1,22 @@
 #!/usr/bin/env bash
-# Thin CLI over 'gh project' for the cgwalters-bot Workstream board.
+# Thin CLI over 'gh project' for the cgwalters-bot Workstream board (and
+# the bot's other boards, with --project).
 # GraphQL queries hold literal $variables.
 # shellcheck disable=SC2016
 set -euo pipefail
 
 readonly OWNER=cgwalters-bot
-readonly NUMBER=1
-readonly BOARD_URL=https://github.com/users/${OWNER}/projects/${NUMBER}
+# The boards this tool can target, by --project name. The Workstream
+# board is the bot's work queue and holds the state items; the others are
+# milestone views, often over the same issues and PRs. There is
+# deliberately no environment variable for this: the other bot scripts
+# call bot-board and must always reach the Workstream board.
+readonly -A PROJECTS=([workstream]=1 [composefs-stable]=2)
+readonly WORKSTREAM=workstream
+# Set by select_project.
+NUMBER=
+BOARD_URL=
+BOARD_CACHE=
 readonly ITEM_LIMIT=1000
 readonly TITLE_WIDTH=70
 # Board fields that 'set' can change, and the option that sets each.
@@ -104,9 +114,10 @@ def merge3($b; $o; $t):
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--refresh] COMMAND [ARGS...]
+Usage: $(basename "$0") [--refresh] [--project NAME] COMMAND [ARGS...]
 
-Read and update the Workstream board (${BOARD_URL}).
+Read and update the Workstream board, or another of the bot's boards
+(${BOARD_URL} here).
 
 Commands:
   list [--status S] [--org O] [--json]
@@ -121,11 +132,13 @@ Commands:
                               item id
   draft TITLE BODY            Create a draft item; prints the new item id
   set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT]
-           [--branch URL...] [--gist URL...]
+           [--branch URL...] [--gist URL...] [--field NAME VALUE]...
                               Update fields of an item. Branch holds the
                               fork or upstream PR URL (or compare URLs of
                               pushed branches), Gist the write-up URL(s);
-                              separate several with spaces.
+                              separate several with spaces. --field sets
+                              any other text or single-select field, such
+                              as another board's (--field Area docs).
                               An empty value clears a text field.
   fill-org [--all] [--dry-run]
                               Set Org on items that have none (--all:
@@ -152,13 +165,17 @@ Commands:
 
 Options:
   --refresh                   Ignore cached board data and refetch it
+  --project NAME              The board to use: $(project_names) (default
+                              ${WORKSTREAM}), or a project number of
+                              ${OWNER}. state-get, state-put and fill-org
+                              work on ${WORKSTREAM} only
 
 ITEM is a project item id (PVTI_...), an issue/PR URL, or OWNER/REPO#N.
 Valid values for Status, Priority, Workflow and Org are read from the board.
 
 Board calls use the bot's GraphQL quota, shared by all agents, so field
 definitions are cached for ${FIELDS_TTL}s and the item list for ${ITEMS_TTL}s in
-${CACHE_DIR}; changes made through this tool invalidate the item cache.
+${BOARD_CACHE}; changes made through this tool invalidate the item cache.
 state-get is one GraphQL call, and so is state-put on an existing item
 (creating one takes a few); --checked adds a read, unless there is
 nothing to write.
@@ -221,11 +238,41 @@ ghq() {
 }
 
 refresh=false
+project=${WORKSTREAM}
+
+project_names() {
+    printf '%s\n' "${!PROJECTS[@]}" | sort | paste -sd, - | sed 's/,/, /g'
+}
+
+# select_project NAME|NUMBER: sets NUMBER, BOARD_URL and BOARD_CACHE. The
+# Workstream board keeps the cache directory's top level, where the ids
+# of state items created since the last release of this script live too.
+select_project() {
+    if [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
+        NUMBER=$1
+    else
+        NUMBER=${PROJECTS[$1]:-}
+        test -n "${NUMBER}" || fatal "unknown project '$1'; valid: $(project_names), or a project number of ${OWNER}"
+    fi
+    BOARD_URL=https://github.com/users/${OWNER}/projects/${NUMBER}
+    if test "${NUMBER}" = "${PROJECTS[${WORKSTREAM}]}"; then
+        BOARD_CACHE=${CACHE_DIR}
+    else
+        BOARD_CACHE=${CACHE_DIR}/project-${NUMBER}
+    fi
+}
+
+# workstream_only COMMAND: the state items and the Org field exist only
+# on the Workstream board.
+workstream_only() {
+    test "${NUMBER}" = "${PROJECTS[${WORKSTREAM}]}" ||
+        fatal "'$1' works on the ${WORKSTREAM} board only, not on ${BOARD_URL}"
+}
 
 # cached FILE TTL CMD...: prints FILE if younger than TTL seconds, otherwise
 # runs CMD and stores its output there.
 cached() {
-    local file=${CACHE_DIR}/$1 ttl=$2 out mtime
+    local file=${BOARD_CACHE}/$1 ttl=$2 out mtime
     shift 2
     if ! ${refresh} && mtime=$(stat -c %Y "${file}" 2>/dev/null) &&
         test $(($(date +%s) - mtime)) -lt "${ttl}"; then
@@ -233,14 +280,14 @@ cached() {
         return 0
     fi
     out=$("$@") || return
-    mkdir -p "${CACHE_DIR}"
+    mkdir -p "${BOARD_CACHE}"
     printf '%s\n' "${out}" >"${file}.tmp.$$"
     mv -f "${file}.tmp.$$" "${file}"
     printf '%s\n' "${out}"
 }
 
 invalidate_items() {
-    rm -f "${CACHE_DIR}/items.json"
+    rm -f "${BOARD_CACHE}/items.json"
 }
 
 # Per-invocation copies of the caches. Loaded by calling the load_* functions
@@ -272,6 +319,10 @@ field_json() { # field_json NAME; requires load_fields
     field=$(jq -c --arg name "$1" '.fields[] | select(.name == $name)' <<<"${FIELDS_JSON}")
     test -n "${field}" || fatal "the board has no '$1' field; its layout changed (try --refresh), or update $(basename "$0")"
     echo "${field}"
+}
+
+has_field() { # has_field NAME; requires load_fields
+    jq -e --arg name "$1" 'any(.fields[]; .name == $name)' <<<"${FIELDS_JSON}" >/dev/null
 }
 
 option_names() { # option_names FIELD; requires load_fields
@@ -365,6 +416,9 @@ cmd_show() {
            ["linked PRs", ((."linked pull requests" // []) | join(" "))],
            ["branch", .branch], ["gist", .gist],
            ["why", .why // "-"]]
+          + [to_entries[] | select((.value | type) == "string")
+             | select(.key | IN("id", "title", "status", "priority", "workflow", "org",
+                                "branch", "gist", "why") | not) | [.key, .value]]
           | .[] | select(.[1] != null and .[1] != "") | "\(.[0]):\t\(.[1])"),
           (if $item.content.type == "DraftIssue" and ($item.content.body // "") != ""
            then "\n\($item.content.body)" else empty end)' <<<"${ITEMS_JSON}"
@@ -375,12 +429,17 @@ cmd_add() {
     [[ "$1" == https://github.com/* ]] || fatal "expected an issue or PR URL on github.com, got '$1'"
     local org id
     load_fields
+    # Other boards have no Org field.
+    local want_org=false
+    ! has_field Org || want_org=true
     # A failed fork lookup shouldn't keep the item off the board.
-    org=$(org_of_url "$1") || org=
+    org=
+    ! ${want_org} || org=$(org_of_url "$1") || org=
     invalidate_items
     id=$(ghq project item-add "${NUMBER}" --owner "${OWNER}" --url "$1" --format json --jq .id) ||
         fail_after $? "adding $1 to the board failed"
     echo "${id}"
+    ${want_org} || return 0
     if test -z "${org}" || ! set_org "${id}" "${org}"; then
         echo "warning: Org is not set on ${id}; run: $(basename "$0") fill-org" 1>&2
     fi
@@ -418,7 +477,7 @@ validate_links() {
 }
 
 cmd_set() {
-    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT] [--branch URL] [--gist URL]"
+    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT] [--branch URL] [--gist URL] [--field NAME VALUE]..."
     local item=$1
     shift
     test $# -gt 0 || fatal "nothing to set; valid options: ${SET_OPTIONS[*]}"
@@ -444,7 +503,21 @@ cmd_set() {
                 names+=("${field} = $2")
                 shift 2
                 ;;
-            *) fatal "unknown option for set: '$1'; valid options: ${SET_OPTIONS[*]}" ;;
+            --field)
+                test $# -ge 3 || fatal "--field requires a field name and a value"
+                field_id=$(field_json "$2")
+                field_ids+=("$(jq -r .id <<<"${field_id}")")
+                if jq -e '.options' <<<"${field_id}" >/dev/null; then
+                    option=$(option_id "$2" "$3")
+                    args+=("--single-select-option-id=${option}")
+                else
+                    validate_links "$2" "$3"
+                    if test -n "$3"; then args+=("--text=$3"); else args+=(--clear); fi
+                fi
+                names+=("$2 = $3")
+                shift 3
+                ;;
+            *) fatal "unknown option for set: '$1'; valid options: ${SET_OPTIONS[*]} --field" ;;
         esac
     done
     local id project remaining i
@@ -858,18 +931,21 @@ cmd_state_put() {
 while test $# -gt 0; do
     case "$1" in
         --refresh) refresh=true; shift ;;
+        --project) test $# -ge 2 || fatal "--project requires a board name or number"; project=$2; shift 2 ;;
+        --project=*) project=${1#--project=}; shift ;;
         *) break ;;
     esac
 done
+select_project "${project}"
 test $# -gt 0 || { usage 1>&2; exit 1; }
 command=$1
 shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
     list|show|add|draft|set) ;;
-    fill-org) command=fill_org ;;
-    state-get) command=state_get ;;
-    state-put) command=state_put ;;
+    fill-org) workstream_only "${command}"; command=fill_org ;;
+    state-get) workstream_only "${command}"; command=state_get ;;
+    state-put) workstream_only "${command}"; command=state_put ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
 require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${OWNER}"

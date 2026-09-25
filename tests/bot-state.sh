@@ -124,8 +124,17 @@ case "$1 $2" in
         exit 0
         ;;
     "project view") echo PVT_fake; exit 0 ;;
+    # Per board NUMBER: $FAKE_GH/fields-NUMBER.json and items-NUMBER.json.
     "project field-list")
-        echo '{"fields": [{"id": "F_workflow", "name": "Workflow", "options": [{"id": "O_manual", "name": "manual"}]}]}'
+        if test -e "${store}/fields-$3.json"; then
+            cat "${store}/fields-$3.json"
+        else
+            echo '{"fields": [{"id": "F_workflow", "name": "Workflow", "options": [{"id": "O_manual", "name": "manual"}]}]}'
+        fi
+        exit 0
+        ;;
+    "project item-list")
+        cat "${store}/items-$3.json" 2>/dev/null || echo '{"items": []}'
         exit 0
         ;;
     "project item-edit") exit 0 ;;
@@ -321,6 +330,36 @@ test_create() {
     "${BIN}/bot-board" state-get --track newthing >/dev/null 2>&1
     "${BIN}/bot-board" state-put --checked newthing '{"a":1}' 2>/dev/null
     expect_json "$(project_state newthing)" '{"a":1}' "created state item"
+}
+
+test_other_project() {
+    cat >"${FAKE_GH}/fields-2.json" <<'JSON'
+{"fields": [{"id": "F_area", "name": "Area", "type": "ProjectV2SingleSelectField",
+             "options": [{"id": "O_docs", "name": "docs"}]},
+            {"id": "F_owner", "name": "Owner", "type": "ProjectV2Field"}]}
+JSON
+    echo '{"items": [{"id": "PVTI_a", "title": "t", "area": "docs", "owner": "bot",
+                      "content": {"type": "PullRequest", "url": "https://github.com/o/r/pull/1"}}]}' \
+        >"${FAKE_GH}/items-2.json"
+    reset_calls
+    "${BIN}/bot-board" --project composefs-stable set o/r#1 --field Area docs --field Owner bot >/dev/null
+    grep -qx 'project item-list 2 .*' "${FAKE_GH}/calls" || fail "set didn't read board 2: $(cat "${FAKE_GH}/calls")"
+    grep -q -- '--field-id F_area --single-select-option-id=O_docs' "${FAKE_GH}/calls" || fail "Area not set"
+    grep -q -- '--field-id F_owner --text=bot' "${FAKE_GH}/calls" || fail "Owner not set"
+    ! "${BIN}/bot-board" --project composefs-stable set PVTI_a --field Area nope 2>/dev/null ||
+        fail "an invalid option was accepted"
+    "${BIN}/bot-board" --project=2 show PVTI_a | grep -qx $'area:\tdocs' || fail "show lacks the Area field"
+    test -e "${XDG_CACHE_HOME}/bot-board/project-2/items.json" || fail "board 2 isn't cached apart"
+    # Board-bound commands and the default board.
+    local cmd
+    for cmd in "state-get x" "state-put x {}" "fill-org --dry-run"; do
+        # shellcheck disable=SC2086
+        ! "${BIN}/bot-board" --project composefs-stable ${cmd} 2>/dev/null || fail "${cmd} ran on another board"
+    done
+    ! "${BIN}/bot-board" --project nope list 2>/dev/null || fail "an unknown board was accepted"
+    reset_calls
+    "${BIN}/bot-board" --refresh list >/dev/null
+    grep -qx 'project item-list 1 .*' "${FAKE_GH}/calls" || fail "the default isn't the Workstream board"
 }
 
 # --- bot-pr -----------------------------------------------------------------
