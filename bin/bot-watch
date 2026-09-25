@@ -71,7 +71,9 @@ sweep saw and report:
 On the bot's fork PRs (its PRs in ${FORK_OWNERS}) only pushes and CI
 are reported; 'bot-pr inbox' covers cgwalters' review there. Most have
 no CI at all, which is expected and not reported. A URL seen for the
-first time is only recorded, unless CI on the bot's branch fails.
+first time is only recorded, unless CI on the bot's branch fails or the
+bot opened it: then the comments and reviews since it was opened are
+new (except on the first sweep, with an empty state).
 
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
@@ -276,6 +278,8 @@ watch=$(jq -c --argjson skip_status "${SKIP_STATUSES}" --argjson skip_workflow "
          | {url: ., item: $item}]
     | group_by(.url) | map({url: .[0].url, items: [.[].item] | unique_by(.id)})' <<<"${board}")
 nurls=$(jq length <<<"${watch}")
+# The first sweep has no news: everything is history.
+bootstrap=$(jq 'length == 0' <<<"${seen}")
 nitems=$(jq '[.[].items[].id] | unique | length' <<<"${watch}")
 
 # --- Sweep -----------------------------------------------------------------
@@ -365,12 +369,12 @@ probe() {
             '.user.login == $bot and ($forks | index($owner)) != null' <<<"${data}") || return
         cur=$(jq -c '{updated_at, state: (if .merged then "merged" else .state end), head_sha: .head.sha}' <<<"${data}")
         info=$(jq -c --arg bot "${BOT_LOGIN}" --argjson fork "${fork}" --argjson forks "${FORK_OWNERS}" '
-            {kind: "pr", fork: $fork, title,
+            {kind: "pr", fork: $fork, title, author: .user.login, created_at,
              bot_branch: (.user.login == $bot or ((.head.repo.owner.login // "") as $o | $forks | index($o)) != null)}' <<<"${data}")
     else
         data=$(rest_get "repos/${repo}/issues/${number}") || return
         cur=$(jq -c '{updated_at, state}' <<<"${data}")
-        info=$(jq -c '{kind: "issue", fork: false, title}' <<<"${data}")
+        info=$(jq -c '{kind: "issue", fork: false, title, author: .user.login, created_at}' <<<"${data}")
     fi
     local prev_updated prev_state state
     prev_updated=$(jq -r '.updated_at // empty' <<<"${prev}")
@@ -382,14 +386,22 @@ probe() {
     # sweep's updated_at are new too, except the ones it had seen then:
     # their keys are kept as edge_ids. For the same reason they are read
     # even if updated_at didn't move (unchanged, that costs a free 304),
-    # and the first time a URL is seen, only to record those.
+    # and the first time a URL is seen, to record those. Also to report
+    # them if the bot opened it: everything since then happened while it
+    # was the bot's work, even before it reached the board or the board
+    # cache (a review on a just-promoted PR, say). Anyone else's issue or
+    # PR comes with history that is not news, and neither is anything on
+    # the very first sweep, whose state is empty.
     local updated
     updated=$(jq -r .updated_at <<<"${cur}")
     if ! ${fork}; then
-        local edge
+        local edge report_since=${prev_updated}
         edge=$(jq -c '.edge_ids // []' <<<"${prev}")
+        if test -z "${prev_updated}" && ! ${bootstrap} && jq -e --arg bot "${BOT_LOGIN}" '.author == $bot' <<<"${info}" >/dev/null; then
+            report_since=$(jq -r .created_at <<<"${info}")
+        fi
         if test -z "${prev_updated}" || [[ ! "${updated}" < "${prev_updated}" ]]; then
-            local since=${prev_updated:-${updated}} notes reviews='' found
+            local since=${report_since:-${updated}} notes reviews='' found
             notes=$(rest_pages "repos/${repo}/issues/${number}/comments?since=${since}") || return "$(sub_status $?)"
             if test "${kind}" = pull; then
                 reviews=$(rest_pages "repos/${repo}/pulls/${number}/reviews") || return "$(sub_status $?)"
@@ -398,8 +410,8 @@ probe() {
                 at: .created_at, link: .html_url, body}' >"${scratch}/notes"
             printf '%s\n' "${reviews}" | jq -c 'select(.submitted_at != null) | {type: "review", key: "r\(.id)", id,
                 author: .user.login, at: .submitted_at, link: .html_url, body, review_state: .state}' >>"${scratch}/notes"
-            if test -n "${prev_updated}"; then
-                found=$(jq -sc --arg since "${prev_updated}" --argjson edge "${edge}" --arg bot "${BOT_LOGIN}" \
+            if test -n "${report_since}"; then
+                found=$(jq -sc --arg since "${report_since}" --argjson edge "${edge}" --arg bot "${BOT_LOGIN}" \
                     --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
                     [.[] | select(.author != $bot and .at >= $since and (.key | IN($edge[]) | not))
                          | .excerpt = (.body | excerpt) | del(.body, .key)
@@ -408,7 +420,7 @@ probe() {
                 # its first comment instead.
                 if jq -e 'any(.[]; .type == "review" and .excerpt == "")' <<<"${found}" >/dev/null; then
                     local line_comments
-                    line_comments=$(rest_pages "repos/${repo}/pulls/${number}/comments?since=${prev_updated}") ||
+                    line_comments=$(rest_pages "repos/${repo}/pulls/${number}/comments?since=${report_since}") ||
                         return "$(sub_status $?)"
                     found=$(printf '%s\n' "${line_comments}" | jq -sc --argjson found "${found}" \
                         --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
