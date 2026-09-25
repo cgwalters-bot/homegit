@@ -37,6 +37,9 @@ readonly PER_PAGE=100
 # an HTTP cache, so it is written even in a dry run.
 readonly ETAG_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-watch/etags
 readonly ETAG_KEEP_DAYS=14
+# URLs that left the sweep are remembered this long, so that one coming
+# back (an item reopened from Done, say) doesn't replay old news.
+readonly DROPPED_KEEP_DAYS=30
 readonly LOCK_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-watch
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
@@ -71,16 +74,22 @@ sweep saw and report:
 On the bot's fork PRs (its PRs in ${FORK_OWNERS}) only pushes and CI
 are reported; 'bot-pr inbox' covers cgwalters' review there. Most have
 no CI at all, which is expected and not reported. A URL seen for the
-first time is only recorded, unless CI on the bot's branch fails or the
-bot opened it: then the comments and reviews since it was opened are
-new (except on the first sweep, with an empty state).
+first time is only recorded, unless CI on the bot's branch fails, with
+two exceptions (none on the very first sweep, with no state yet). On an
+issue or PR the bot opened, the comments and reviews since it was opened
+are new; on anything else, only those by ${REQUESTER} since the last
+sweep. A URL that left the sweep and came back within ${DROPPED_KEEP_DAYS} days
+counts from when it was last seen.
 
 Apart from those changes, every sweep lists the "Outstanding reviews by
-${REQUESTER}" on the bot's own open upstream PRs: his latest review
-requesting changes or commenting, or comment, when it is newer than the
-PR's head commit and the bot's last comment or review there (and he
-hasn't approved since). It stays listed until a push or a reply answers
-it, so that nothing the edge-triggered report missed is lost.
+${REQUESTER}" on the bot's open upstream PRs (board items or not: one
+search finds them), until they are answered: a review requesting
+changes by a push of the bot's (a push by anyone else, like GitHub's
+"Update branch", answers nothing), or by his own later review; his
+other reviews and comments by such a push or a reply of the bot's.
+After his approval, only his later reviews and his comments that
+mention @${BOT_LOGIN} count. So nothing the edge-triggered report
+missed is lost.
 
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
@@ -98,7 +107,8 @@ Options:
   -h, --help  Show this help
 
 The last-seen state (url -> updated_at, state, head_sha, checks, and
-edge_ids: the comments seen at updated_at) lives in the archived
+edge_ids: the comments seen at updated_at; when the last sweep that
+wrote it started; and when dropped URLs were last seen) lives in the archived
 'bot-state: ${STATE_NAME}' draft item on the board, read and written
 with 'bot-board state-get/state-put' (one GraphQL call each; the write
 only when something changed), and must stay under the ~64KB a draft
@@ -148,9 +158,11 @@ apply=false
 json=false
 # Hidden test hooks: sweep the items of a 'bot-board list --json' array in
 # a file instead of the board (--apply then only prints the bot-board
-# calls), and keep the state in a file instead of on the board.
+# calls), keep the state in a file instead of on the board, and take
+# another time for now.
 board_file=
 state_file=
+now=
 while test $# -gt 0; do
     case "$1" in
         --dry-run) dry_run=true; shift ;;
@@ -158,6 +170,7 @@ while test $# -gt 0; do
         --json) json=true; shift ;;
         --board-file) test $# -ge 2 || fatal "--board-file requires a file"; board_file=$2; shift 2 ;;
         --state-file) test $# -ge 2 || fatal "--state-file requires a file"; state_file=$2; shift 2 ;;
+        --now) test $# -ge 2 || fatal "--now requires a time"; now=$(date -u -d "$2" +%FT%TZ) || fatal "bad --now: $2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fatal "unknown argument: $1 (see --help)" ;;
     esac
@@ -285,8 +298,16 @@ watch=$(jq -c --argjson skip_status "${SKIP_STATUSES}" --argjson skip_workflow "
          | {url: ., item: $item}]
     | group_by(.url) | map({url: .[0].url, items: [.[].item] | unique_by(.id)})' <<<"${board}")
 nurls=$(jq length <<<"${watch}")
-# The first sweep has no news: everything is history.
-bootstrap=$(jq 'length == 0' <<<"${seen}")
+# When the last sweep that wrote the state started (older states only
+# have when they were written). Without either, this is the first sweep,
+# which has no news: everything is history. Sweeps that change nothing
+# don't write, so it can be older than the last sweep, which only makes
+# a first sight report more.
+last_swept=$(jq -r '.swept_at // .updated_at // empty' <<<"${state}")
+bootstrap=true
+test -z "${last_swept}" || bootstrap=false
+dropped=$(jq -c '.dropped // {}' <<<"${state}")
+swept_at=${now:-$(date -u +%FT%TZ)}
 nitems=$(jq '[.[].items[].id] | unique | length' <<<"${watch}")
 
 # --- Sweep -----------------------------------------------------------------
@@ -359,34 +380,63 @@ checks_state() {
 }
 
 # outstanding_review REPO NUMBER HEAD REVIEWS: on the bot's own open
-# upstream PR, prints what REQUESTER asked that has no answer yet (a
-# review requesting changes or commenting, or a comment, newer than both
-# the head commit and the bot's last comment or review), as
+# upstream PR, prints what REQUESTER asked that has no answer yet, as
 # {at, type, review_state, link, excerpt, count} of his latest; else
 # null. It's reported on every sweep until answered, so that news the
 # edge-triggered report missed (or that was read and dropped) can't lose
-# the work. His approval after all of it answers it too. REVIEWS is the
-# PR's reviews, one per line.
+# the work. A review requesting changes is answered by a push of the
+# bot's after it or by his own later review (a dismissed one is gone);
+# his other reviews and comments by such a push or a reply of the bot's.
+# His approval answers all before it; after it, only his reviews and
+# the comments that mention the bot count, until another review. REVIEWS is the PR's reviews,
+# one per line.
 outstanding_review() {
-    local repo=$1 number=$2 head=$3 reviews=$4 head_date comments
-    # The bot's last word or push can only have answered what came before.
-    head_date=$(rest_get "repos/${repo}/commits/${head}" | jq -r .commit.committer.date) || return
-    test -n "${head_date}" && test "${head_date}" != null || return 1
-    comments=$(rest_pages "repos/${repo}/issues/${number}/comments?since=${head_date}") || return
-    printf '%s\n' "${reviews}" "${comments}" | jq -sc --arg head_date "${head_date}" --arg bot "${BOT_LOGIN}" \
+    local repo=$1 number=$2 head=$3 reviews=$4 commit bot_push comments
+    commit=$(rest_get "repos/${repo}/commits/${head}") || return
+    # Only the bot's own push can answer him: not GitHub's "Update
+    # branch" (committed by web-flow), a maintainer's rebase or his own.
+    bot_push=$(jq -r --arg bot "${BOT_LOGIN}" \
+        'if .committer.login == $bot then .commit.committer.date else "" end' <<<"${commit}") || return
+    comments=$(rest_pages "repos/${repo}/issues/${number}/comments") || return
+    printf '%s\n' "${reviews}" "${comments}" | jq -sc --arg bot_push "${bot_push}" --arg bot "${BOT_LOGIN}" \
         --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
         [.[] | select(.user.login == $bot or .user.login == $req)
          | if has("submitted_at") then select(.submitted_at != null and (.state | IN("PENDING", "DISMISSED") | not))
                | {type: "review", review_state: .state, at: .submitted_at}
            else {type: "comment", at: .created_at} end
-           + {author: .user.login, link: .html_url, excerpt: (.body | excerpt)}]
-        | ([$head_date] + [.[] | select(.author == $bot) | .at] | max) as $answered
+           + {author: .user.login, link: .html_url, body: (.body // "")}]
+        | ([.[] | select(.author == $bot) | .at] | max // "") as $bot_reply
         | [.[] | select(.author == $req)] as $his
-        | ([$his[] | select(.type == "review")] | sort_by(.at) | last) as $last_review
-        | ([$his[] | select(.at > $answered and .review_state != "APPROVED")] | sort_by(.at)) as $open
-        | if ($open | length) == 0
-             or ($last_review.review_state == "APPROVED" and $last_review.at >= $open[-1].at) then null
-          else $open[-1] + {count: ($open | length)} | del(.author) end'
+        | ([$his[] | select(.type == "review")] | sort_by(.at)) as $his_reviews
+        | ([$his_reviews[] | select(.review_state == "APPROVED") | .at] | max // "") as $approved
+        | [$his[] | . as $x
+           | select(.at > $approved and .review_state != "APPROVED")
+           # A comment right after his approval is a thank-you, unless it
+           # asks the bot for something.
+           | select(.type == "review" or ([$his_reviews[] | select(.at <= $x.at)] | last | .review_state) != "APPROVED"
+                    or (.body | test("@" + $bot + "(?![A-Za-z0-9-])"; "i")))
+           | select(if .review_state == "CHANGES_REQUESTED"
+                    then ($bot_push > $x.at or any($his_reviews[]; .at > $x.at)) | not
+                    else [$bot_push, $bot_reply] | max <= $x.at end)]
+        | sort_by(.at) as $open
+        | if ($open | length) == 0 then null
+          else $open[-1] + {count: ($open | length), excerpt: ($open[-1].body | excerpt)} | del(.author, .body) end'
+}
+
+# pr_outstanding URL: outstanding_review for a PR the sweep doesn't
+# probe; prints null for one that isn't open or isn't the bot's.
+pr_outstanding() {
+    local repo number data reviews
+    [[ "$1" =~ ^https://github\.com/([^/]+/[^/]+)/pull/([0-9]+)$ ]] || return 1
+    repo=${BASH_REMATCH[1]}
+    number=${BASH_REMATCH[2]}
+    data=$(rest_get "repos/${repo}/pulls/${number}") || return
+    if ! jq -e --arg bot "${BOT_LOGIN}" '.state == "open" and .user.login == $bot' <<<"${data}" >/dev/null; then
+        echo null
+        return 0
+    fi
+    reviews=$(rest_pages "repos/${repo}/pulls/${number}/reviews") || return
+    outstanding_review "${repo}" "${number}" "$(jq -r .head.sha <<<"${data}")" "${reviews}"
 }
 
 # sub_status STATUS: the status for probe to return after a failed
@@ -395,11 +445,12 @@ sub_status() {
     if test "$1" -eq "${EX_NOTFOUND}"; then echo 1; else echo "$1"; fi
 }
 
-# probe URL PREV: prints {cur, changes, info} for one issue or PR, where
-# cur is what the state keeps, and PREV what the last sweep kept (null
-# the first time).
+# probe URL PREV DROPPED_AT: prints {cur, changes, info} for one issue
+# or PR, where cur is what the state keeps, PREV what the last sweep kept
+# (null the first time), and DROPPED_AT when it was last seen, if it left
+# the sweep since.
 probe() {
-    local url=$1 prev=$2 repo kind number data cur changes='[]' info outstanding=null
+    local url=$1 prev=$2 dropped_at=$3 repo kind number data cur changes='[]' info outstanding=null
     [[ "${url}" =~ ^https://github\.com/([^/]+/[^/]+)/(issues|pull)/([0-9]+)$ ]] || return 1
     repo=${BASH_REMATCH[1]}
     kind=${BASH_REMATCH[2]}
@@ -432,15 +483,23 @@ probe() {
     # them if the bot opened it: everything since then happened while it
     # was the bot's work, even before it reached the board or the board
     # cache (a review on a just-promoted PR, say). Anyone else's issue or
-    # PR comes with history that is not news, and neither is anything on
-    # the very first sweep, whose state is empty.
+    # PR comes with history that is not news, except what REQUESTER wrote
+    # since the last sweep (likely why it's on the board now). Nothing is
+    # news on the very first sweep, nor from before a URL that comes back
+    # was last seen.
     local updated reviews='' reviews_read=false
     updated=$(jq -r .updated_at <<<"${cur}")
     if ! ${fork}; then
-        local edge report_since=${prev_updated}
+        local edge report_since=${prev_updated} only_author=''
         edge=$(jq -c '.edge_ids // []' <<<"${prev}")
-        if test -z "${prev_updated}" && ! ${bootstrap} && jq -e --arg bot "${BOT_LOGIN}" '.author == $bot' <<<"${info}" >/dev/null; then
-            report_since=$(jq -r .created_at <<<"${info}")
+        if test -z "${prev_updated}" && ! ${bootstrap}; then
+            if jq -e --arg bot "${BOT_LOGIN}" '.author == $bot' <<<"${info}" >/dev/null; then
+                report_since=$(jq -r .created_at <<<"${info}")
+            else
+                report_since=${last_swept}
+                only_author=${REQUESTER}
+            fi
+            [[ ! "${dropped_at}" > "${report_since}" ]] || report_since=${dropped_at}
         fi
         if test -z "${prev_updated}" || [[ ! "${updated}" < "${prev_updated}" ]]; then
             local since=${report_since:-${updated}} notes found
@@ -455,8 +514,9 @@ probe() {
                 author: .user.login, at: .submitted_at, link: .html_url, body, review_state: .state}' >>"${scratch}/notes"
             if test -n "${report_since}"; then
                 found=$(jq -sc --arg since "${report_since}" --argjson edge "${edge}" --arg bot "${BOT_LOGIN}" \
-                    --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
+                    --arg only "${only_author}" --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
                     [.[] | select(.author != $bot and .at >= $since and (.key | IN($edge[]) | not))
+                         | select($only == "" or .author == $only)
                          | .excerpt = (.body | excerpt) | del(.body, .key)
                          | .from_requester = (.author == $req)] | sort_by(.at)' "${scratch}/notes")
                 # A review of line comments only has an empty body: show
@@ -549,10 +609,11 @@ new_urls='[]'
 while IFS= read -r url; do
     test -n "${url}" || continue
     prev=$(jq -c --arg u "${url}" '.[$u]' <<<"${seen}")
+    dropped_at=$(jq -r --arg u "${url}" '.[$u] // empty' <<<"${dropped}")
     rc=0
     # In the background, because in 'r=$(probe ...) || rc=$?' errexit would
     # be off throughout probe; this way a failing step stops it.
-    probe "${url}" "${prev}" >"${scratch}/probe.json" &
+    probe "${url}" "${prev}" "${dropped_at}" >"${scratch}/probe.json" &
     wait "$!" || rc=$?
     case "${rc}" in
         0)
@@ -616,6 +677,38 @@ outstanding=$(jq -c --slurpfile results "${scratch}/results.json" '
     $results[0] as $results
     | [.[] | select($results[.url].outstanding != null)
        | {url, items: [.items[] | {id, title}]} + $results[.url].outstanding]' <<<"${watch}")
+# The bot's open upstream PRs that aren't on the board (any more) get
+# the same safety net: one search, which has no ETags.
+search_failed=false
+search_q="is:pr+is:open+author:${BOT_LOGIN}$(jq -r 'map("+-user:" + .) | join("")' <<<"${FORK_OWNERS}")"
+rc=0
+rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}" >"${scratch}/search.json" || rc=$?
+if test "${rc}" -eq 0; then
+    if test "$(jq .total_count "${scratch}/search.json")" -gt "${PER_PAGE}"; then
+        warn "the bot has over ${PER_PAGE} open upstream PRs; only the first ${PER_PAGE} have their reviews checked"
+    fi
+    extra=$(jq -r --argjson watch "${watch}" --argjson forks "${FORK_OWNERS}" '
+        [$watch[].url] as $swept
+        | .items[] | .html_url
+        | select(IN($swept[]) | not)
+        | select(capture("^https://github\\.com/(?<o>[^/]+)/").o as $o | $forks | index($o) | not)' "${scratch}/search.json")
+    while IFS= read -r url; do
+        test -n "${url}" || continue
+        rc=0
+        pr_outstanding "${url}" >"${scratch}/extra.json" &
+        wait "$!" || rc=$?
+        case "${rc}" in
+            0) outstanding=$(jq -c --arg u "${url}" --slurpfile o "${scratch}/extra.json" \
+                   'if $o[0] == null then . else . + [{url: $u, items: []} + $o[0]] end' <<<"${outstanding}") ;;
+            "${EX_RATELIMIT}") exit "${EX_RATELIMIT}" ;;
+            *) warn "checking ${url} for outstanding reviews failed"; search_failed=true ;;
+        esac
+    done <<<"${extra}"
+else
+    test "${rc}" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
+    warn "searching the bot's open PRs failed; only the board's are checked for outstanding reviews"
+    search_failed=true
+fi
 report=$(jq -c 'map(select((.changes | length) > 0 or (.actions | length) > 0) | del(.retry))' <<<"${report}")
 
 # keep_last_seen ITEM: puts the URLs of ITEM back to their last-seen
@@ -674,13 +767,21 @@ done < <(${apply} && jq -c '.[] | {item: {id, why}, action: (.actions[] | select
 # --- Report ----------------------------------------------------------------
 
 nfailed=$(jq length <<<"${failed}")
+# URLs that left the sweep, with when they were last seen (by the last
+# sweep that wrote the state: nothing changed on them since). Back in
+# the sweep, or older than DROPPED_KEEP_DAYS, they are forgotten.
+new_dropped=$(jq -c --argjson seen "${seen}" --argjson new "${new_seen}" --arg last "${last_swept:-${swept_at}}" \
+    --arg cutoff "$(date -u -d "${swept_at} -${DROPPED_KEEP_DAYS} days" +%FT%TZ)" '
+    . + ($seen | with_entries(select((.key as $u | $new | has($u)) | not) | .value = $last))
+    | with_entries(select(.value >= $cutoff and ((.key as $u | $new | has($u)) | not)))' <<<"${dropped}")
 # Written unless it's a dry run or nothing changed: a board write costs
 # GraphQL quota, and the state's timestamp alone isn't worth it.
 advance=true
 if ${dry_run}; then
     advance=false
     why_kept="dry run"
-elif jq -e --argjson new "${new_seen}" '. == $new' <<<"${seen}" >/dev/null; then
+elif jq -e --argjson new "${new_seen}" '. == $new' <<<"${seen}" >/dev/null &&
+    test "$(jq -S . <<<"${dropped}")" = "$(jq -S . <<<"${new_dropped}")"; then
     advance=false
     why_kept="nothing new"
 fi
@@ -690,14 +791,15 @@ if ${json}; then
         --argjson gone "${gone}" --argjson nurls "${nurls}" --argjson nitems "${nitems}" \
         --argjson advance "${advance}" \
         --argjson outstanding "${outstanding}" \
+        --argjson search_failed "${search_failed}" \
         '{swept: {urls: $nurls, items: $nitems}, items: ., outstanding_reviews: $outstanding, new_urls: $new,
-          failed_urls: $failed, gone_urls: $gone, state_advanced: $advance}' <<<"${report}"
+          failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news.
     jq -r --arg req "${REQUESTER}" "${REPO_REF_JQ}"'
         if length == 0 then empty else
             "Outstanding reviews by \($req):",
-            (.[] | "  \(.url | repo_ref)  \(.items | map(.title) | join("; "))",
+            (.[] | "  \(.url | repo_ref)  \(if .items == [] then "(not on the board)" else .items | map(.title) | join("; ") end)",
                 "    \(if .type == "review" then "review \(.review_state)" else "comment" end) at \(.at)"
                 + "\(if .count > 1 then " (+\(.count - 1) more)" else "" end)"
                 + ": \(if .excerpt != "" then .excerpt else "(line comments)" end)",
@@ -732,9 +834,9 @@ fi
 if ! ${advance}; then
     echo "State unchanged (${why_kept})." 1>&2
 else
-    new_state=$(jq -nc --argjson v "${STATE_VERSION}" --argjson items "${new_seen}" \
-        --arg now "$(date -u +%FT%TZ)" --arg host "$(hostname)" \
-        '{version: $v, updated_at: $now, host: $host, items: $items}')
+    new_state=$(jq -nc --argjson v "${STATE_VERSION}" --argjson items "${new_seen}" --argjson dropped "${new_dropped}" \
+        --arg now "$(date -u +%FT%TZ)" --arg swept "${swept_at}" --arg host "$(hostname)" \
+        '{version: $v, updated_at: $now, swept_at: $swept, host: $host, items: $items, dropped: $dropped}')
     if test -n "${state_file}"; then
         printf '%s\n' "${new_state}" >"${state_file}"
     else
@@ -747,3 +849,4 @@ if test "${nfailed}" -gt 0; then
     exit 1
 fi
 test "${napply_failed}" -eq 0 || exit 1
+! ${search_failed} || exit 1
