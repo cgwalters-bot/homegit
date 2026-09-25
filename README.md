@@ -171,15 +171,18 @@ unless the record is committed, every source is unchanged on upstream's
 default branch, no new policy file has appeared, and the verdict is
 `bot-ok`. A separate read-only subagent writes the records
 (`dotfiles/.claude/skills/coordinator/policy-check.md`); to overrule
-one, I edit its verdict. Records count only as pushed to homegit's
-main, and a commit there that loosens a verdict (say human-text to
-bot-ok) must be one of mine that GitHub shows as verified, so the bot
-can record and tighten verdicts but not loosen them: a record's verdict
+one, I have the bot open a pull request that edits its verdict, and
+approve it. Records count only as merged to homegit's main, and a
+commit there that loosens a verdict (say human-text to bot-ok) must
+come from a pull request whose merged head I approved (or be one of
+mine that GitHub shows as verified), so the bot can record and tighten
+verdicts but not loosen them: a record's verdict
 may be no looser than the strictest it held since I last loosened it,
 across edits, deletions and moves (git's rename detection, and paths
 that differ only in case), so anyone else's loosening blocks the gate
-until it's tightened back. Records must be regular files, not symlinks. A ruleset on
-this repository blocks force-pushes to main and deleting it, and the
+until it's tightened back. Records must be regular files, not symlinks.
+A ruleset on this repository blocks force-pushes to main and deleting
+it (and takes changes only as pull requests, see below), and the
 check also refuses a main that doesn't descend from the last one it
 accepted (kept in `~/.local/state/upstream-policy/`), since rewritten
 history could make a loosened record look newly created.

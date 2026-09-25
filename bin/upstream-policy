@@ -22,7 +22,8 @@ const POLICY_DIR =
 const REMOTE = "origin";
 const REMOTE_BRANCH = "main";
 const HOMEGIT_REPO = "cgwalters-bot/homegit";
-// The only login that may loosen a verdict, in a commit GitHub verified.
+// The only login that may loosen a verdict: in a commit GitHub verified,
+// or by approving the pull request that merged it.
 const OWNER_LOGIN = "cgwalters";
 // Where check remembers the last REMOTE_BRANCH it accepted, per remote.
 const STATE_DIR = path.join(
@@ -115,10 +116,11 @@ A record counts only when it is committed and is what ${REMOTE}/${REMOTE_BRANCH}
 has (check fetches it first), as a regular file (no symlinks). Its
 verdict may be no looser than the strictest it held, across deletions
 and moves of the record, since ${OWNER_LOGIN} last loosened it (human-text to
-bot-ok, say) in a commit GitHub reports as verified and authored by him:
-the policy-check subagent creates records and may tighten them, but only
-he loosens one, and anyone else's loosening counts until the verdict is
-tightened back. ${REMOTE}/${REMOTE_BRANCH} must also
+bot-ok, say) in a commit GitHub reports as verified and authored by him,
+or merged from a pull request whose merged head he approved (his last
+review verdict on it): the policy-check subagent creates records and may
+tighten them, but only he loosens one, and anyone else's loosening
+counts until the verdict is tightened back. ${REMOTE}/${REMOTE_BRANCH} must also
 descend from the one the last check accepted (kept in ${STATE_DIR}),
 so that rewritten history can't hide a loosening. A renamed
 repository's record must move to its new name.
@@ -379,21 +381,63 @@ function history(top, rel) {
     .map((e) => ({ commit: e.commit, verdict: verdictAt(top, e.commit, e.paths[e.paths.length - 1]) }));
 }
 
-// vouched(commit): whether GitHub reports COMMIT of homegit as verified
-// and authored by OWNER_LOGIN, and what it says.
-function vouched(commit) {
+// vouched(top, commit): whether OWNER_LOGIN vouches for COMMIT of
+// homegit, and what GitHub says. Either GitHub reports it as verified and
+// authored by him, or it came from a pull request into REMOTE_BRANCH
+// whose merged head he approved (see approvedPull).
+function vouched(top, commit) {
   const info = gh([`repos/${HOMEGIT_REPO}/commits/${commit}`]);
   const verified = Boolean(info && info.commit && info.commit.verification && info.commit.verification.verified === true);
   const login = (info && info.author && info.author.login) || "unknown";
-  return { ok: verified && login === OWNER_LOGIN, why: `verified: ${verified}, author: ${login}` };
+  if (verified && login === OWNER_LOGIN) return { ok: true, why: `verified: ${verified}, author: ${login}` };
+  const pull = approvedPull(top, commit);
+  return { ok: pull.ok, why: `verified: ${verified}, author: ${login}; ${pull.why}` };
+}
+
+// The review states that are a verdict on a pull request: a later change
+// request or a dismissal withdraws an approval.
+const REVIEW_VERDICTS = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
+
+// approvedPull(top, commit): whether COMMIT came from a merged pull
+// request into REMOTE_BRANCH whose last review verdict by OWNER_LOGIN
+// approved the head that was merged, and why not. Main takes changes only
+// through pull requests that are rebase-merged, which re-commits them as
+// the merger, unsigned, so his approval of that exact head is what
+// vouches for them (he can't approve his own pull requests: a loosening
+// of his goes through one the bot opens). Rebased onto an up-to-date
+// main, the merged tip has the approved head's tree; if it doesn't, more
+// was merged than he approved.
+function approvedPull(top, commit) {
+  const pulls = gh([`repos/${HOMEGIT_REPO}/commits/${commit}/pulls`]);
+  const pr = (Array.isArray(pulls) ? pulls : []).find(
+    (p) => p && p.merged_at && p.base && p.base.ref === REMOTE_BRANCH && p.base.repo && p.base.repo.full_name === HOMEGIT_REPO,
+  );
+  if (!pr) return { ok: false, why: "not merged from a pull request" };
+  const name = `pull request #${pr.number}`;
+  const head = (pr.head && pr.head.sha) || "";
+  const tip = pr.merge_commit_sha || "";
+  if (!SHA_RE.test(head) || !SHA_RE.test(tip)) return { ok: false, why: `GitHub gave no head or merged commit for ${name}` };
+  const reviews = gh([`repos/${HOMEGIT_REPO}/pulls/${pr.number}/reviews?per_page=100`]);
+  const his = (Array.isArray(reviews) ? reviews : []).filter(
+    (r) => r && r.user && r.user.login === OWNER_LOGIN && REVIEW_VERDICTS.includes(r.state),
+  );
+  const last = his[his.length - 1];
+  if (!last || last.state !== "APPROVED" || last.commit_id !== head) {
+    return { ok: false, why: `${name} is not approved by ${OWNER_LOGIN} at its merged head ${head.slice(0, 12)}` };
+  }
+  const approved = gh([`repos/${HOMEGIT_REPO}/git/commits/${head}`]);
+  const merged = gitMaybe(top, ["rev-parse", "--verify", `${tip}^{tree}`]);
+  if (!approved || !approved.tree || !merged || merged.trim() !== approved.tree.sha) {
+    return { ok: false, why: `${name} merged ${tip.slice(0, 12)}, whose tree is not that of the head ${OWNER_LOGIN} approved` };
+  }
+  return { ok: true, why: `${name} approved by ${OWNER_LOGIN}` };
 }
 
 // checkLoosening(top, rel): REL's verdict may be no looser than the
 // strictest one it held since cgwalters last loosened it (or since it was
 // created), across deletions and moves (see history). He loosens by
-// changing the verdict in a commit GitHub reports as verified and
-// authored by OWNER_LOGIN (merely touching an already loosened record
-// doesn't vouch for it). Anyone else's loosening doesn't count, but
+// changing the verdict in a commit he vouches for (see vouched; merely
+// touching an already loosened record doesn't vouch for it). Anyone else's loosening doesn't count, but
 // tightening the verdict again undoes it. The policy-check subagent
 // creates and tightens.
 function checkLoosening(top, rel) {
@@ -405,7 +449,7 @@ function checkLoosening(top, rel) {
       baseline = verdict;
       unvouched = null;
     } else if (verdict !== previous) {
-      const v = vouched(commit);
+      const v = vouched(top, commit);
       if (v.ok) {
         baseline = verdict;
         unvouched = null;
@@ -418,7 +462,7 @@ function checkLoosening(top, rel) {
   if (unvouched) {
     throw new Exit(
       EX_INVALID,
-      `${rel}'s verdict went from ${unvouched.from || "none"} to ${previous || "none"} in ${unvouched.commit.slice(0, 12)}, which is not a commit by ${OWNER_LOGIN} that GitHub verified (${unvouched.why}), and it is still looser than ${baseline || "none"}; only he loosens a verdict, or set it back`,
+      `${rel}'s verdict went from ${unvouched.from || "none"} to ${previous || "none"} in ${unvouched.commit.slice(0, 12)}, which is not a commit by ${OWNER_LOGIN} that GitHub verified, nor from a pull request he approved (${unvouched.why}), and it is still looser than ${baseline || "none"}; only he loosens a verdict, or set it back`,
     );
   }
 }

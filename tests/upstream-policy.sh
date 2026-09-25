@@ -110,10 +110,31 @@ readonly SOURCES="sources:
     sha: \"${HACKING}\""
 
 # vouch [VERIFIED LOGIN [COMMIT]]: what GitHub says of homegit's COMMIT
-# (default: HEAD; verified, by cgwalters).
+# (default: HEAD; verified, by cgwalters), pushed directly: no pull
+# request.
 vouch() {
+    local commit
+    commit=$(git -C "${HOMEGIT}" rev-parse "${3:-HEAD}")
     jq -n --argjson v "${1:-true}" --arg l "${2:-cgwalters}" '{commit: {verification: {verified: $v}}, author: {login: $l}}' |
-        fixture "repos/cgwalters-bot/homegit/commits/$(git -C "${HOMEGIT}" rev-parse "${3:-HEAD}")"
+        fixture "repos/cgwalters-bot/homegit/commits/${commit}"
+    echo '[]' | fixture "repos/cgwalters-bot/homegit/commits/${commit}/pulls"
+}
+
+# pulled COMMIT MERGED BASE HEAD TREE REVIEWS: homegit's COMMIT came from
+# pull request #7 into BASE (merged if MERGED), whose HEAD has TREE and
+# was merged as COMMIT, with REVIEWS as "LOGIN:STATE:COMMIT_ID ...".
+pulled() {
+    local r login state id reviews=()
+    jq -n --arg c "$1" --argjson m "$2" --arg b "$3" --arg h "$4" \
+        '[{number: 7, merged_at: (if $m then "2026-09-25T00:00:00Z" else null end),
+           base: {ref: $b, repo: {full_name: "cgwalters-bot/homegit"}}, head: {sha: $h}, merge_commit_sha: $c}]' |
+        fixture "repos/cgwalters-bot/homegit/commits/$1/pulls"
+    jq -n --arg t "$5" '{tree: {sha: $t}}' | fixture "repos/cgwalters-bot/homegit/git/commits/$4"
+    for r in $6; do
+        IFS=: read -r login state id <<<"${r}"
+        reviews+=("$(jq -n --arg l "${login}" --arg s "${state}" --arg i "${id}" '{user: {login: $l}, state: $s, commit_id: $i}')")
+    done
+    printf '%s\n' "${reviews[@]}" | jq -s . | fixture "repos/cgwalters-bot/homegit/pulls/7/reviews?per_page=100"
 }
 
 # publish MESSAGE: commit all of homegit, push it and vouch for it.
@@ -319,6 +340,34 @@ vouch false cgwalters-bot
 run "bot loosened past his baseline" "${EX_INVALID}" 'still looser than human-text' check acme/proj
 vouch true cgwalters
 run "his baseline" 0 '^bot-ok$' check acme/proj
+
+# Main takes changes through rebase-merged pull requests, unsigned: his
+# approval vouches for a loosening in one, only as his last verdict and
+# only on exactly what was merged. STATUS is 0, or the exit status and
+# the pattern; '=' is the merged tree, '@' the merged head.
+record human-text
+record bot-ok "" unvouched
+vouch false cgwalters-bot
+LOOSENED=$(git -C "${HOMEGIT}" rev-parse HEAD)
+TREE=$(git -C "${HOMEGIT}" rev-parse "HEAD^{tree}")
+HEAD_SHA=$(sha 50)
+while read -r status merged base tree reviews; do
+    test "${tree}" != = || tree=${TREE}
+    pulled "${LOOSENED}" "${merged}" "${base}" "${HEAD_SHA}" "${tree}" "${reviews//@/${HEAD_SHA}}"
+    run "pull: ${merged} ${base} ${reviews}" "${status%%:*}" "$(test "${status}" = 0 && echo '^bot-ok$' || echo "${status#*:}")" \
+        check acme/proj
+done <<EOF
+0 true main = cgwalters:APPROVED:@
+0 true main = cgwalters:CHANGES_REQUESTED:@ cgwalters:APPROVED:@ cgwalters:COMMENTED:@
+${EX_INVALID}:not.approved.by.cgwalters.at.its.merged.head true main = cgwalters:APPROVED:$(sha 51)
+${EX_INVALID}:not.approved.by.cgwalters.at.its.merged.head true main = cgwalters:APPROVED:@ cgwalters:CHANGES_REQUESTED:@
+${EX_INVALID}:not.approved.by.cgwalters.at.its.merged.head true main = cgwalters:APPROVED:@ cgwalters:DISMISSED:@
+${EX_INVALID}:not.approved.by.cgwalters.at.its.merged.head true main = someone:APPROVED:@ cgwalters-bot:APPROVED:@
+${EX_INVALID}:whose.tree.is.not.that.of.the.head.cgwalters.approved true main $(sha 52) cgwalters:APPROVED:@
+${EX_INVALID}:not.merged.from.a.pull.request false main = cgwalters:APPROVED:@
+${EX_INVALID}:not.merged.from.a.pull.request true other = cgwalters:APPROVED:@
+EOF
+record human-text
 
 # A record must be a regular file, in git too: a symlink would make
 # another file's history the record's.
