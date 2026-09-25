@@ -40,6 +40,11 @@ readonly READY_COMMAND=/ready
 # approves the head the fork PR had when he wrote the comment, like an
 # approving review of that commit.
 readonly PROMOTE_COMMAND=/promote
+# This line approves like '${PROMOTE_COMMAND}' (in a comment, or in an approving
+# review's body), and also says that REVIEWER wrote the PR's title, body
+# and commit messages himself, which a repository whose policy is
+# human-text needs (see policy_gate).
+readonly HUMAN_TEXT_COMMAND="${PROMOTE_COMMAND} --human-text"
 # Comments by REVIEWER matching this (case-insensitively) read like a
 # go-ahead. They approve nothing, but inbox and promote point them out so
 # that he can be asked for a '/promote' line or an approval.
@@ -95,6 +100,13 @@ readonly SIGNOFF_RECORD_RE='<!-- bot-pr signoff approved=(?<approved>[0-9a-f]{40
 readonly EX_OTHERS=11
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
+# The contribution policy gate that promote and signoff pass first; the
+# override is for tests.
+UPSTREAM_POLICY=${BOT_PR_UPSTREAM_POLICY:-$(dirname "$(readlink -f "$0")")/upstream-policy}
+readonly UPSTREAM_POLICY
+# upstream-policy's exit statuses for a missing record, a stale one, and
+# a human-text verdict.
+readonly EX_POLICY_MISSING=3 EX_POLICY_STALE=4 EX_POLICY_HUMAN_TEXT=5
 
 usage() {
     cat <<EOF
@@ -148,9 +160,18 @@ Commands:
         a '${PROMOTE_COMMAND}' line, which approves the head the PR had
         when he wrote it (per the fork's push log and the PR's timeline;
         if that can't be told, it approves nothing). Other comments never
-        approve, but one that reads like a go-ahead is pointed out. Then:
-        rebase onto the upstream base if it moved (on conflicts, dismiss
-        the approval and stop). If the repository wants DCO (the base
+        approve, but one that reads like a go-ahead is pointed out. Then
+        the contribution policy gate: 'upstream-policy check' must find a
+        record of the upstream repository's policy in homegit
+        (upstream-policy/OWNER/REPO.md) whose sources are unchanged
+        upstream and whose verdict is bot-ok (a missing or stale record
+        needs a policy-check subagent first). For a human-text verdict,
+        ${REVIEWER} writes the title, body and commit messages himself and
+        approves with a '${HUMAN_TEXT_COMMAND}' line (in a comment, or in
+        an approving review's body); promote then checks that the body
+        lost the bot's trailer line and adds none of its own notes to it.
+        Then: rebase onto the upstream base if it moved (on conflicts,
+        dismiss the approval and stop). If the repository wants DCO (the base
         branch's rules require a DCO check, one ran on the base branch,
         or the DCO app's ran on a recent PR there), his approval also
         signs off: add '${SIGNOFF_TRAILER}'
@@ -181,8 +202,9 @@ Commands:
         head promote opened it with (or of what a sign-off record there
         says it is, checked in git; a head promote rebased needs his new
         approval). It refuses if the upstream PR's head moved since
-        promote, if any of its commits isn't ${BOT_LOGIN}'s, or if the
-        repository wants no DCO. It rewrites and force-pushes the branch
+        promote, if any of its commits isn't ${BOT_LOGIN}'s, if the
+        repository wants no DCO, or if the policy gate (as in promote)
+        refuses. It rewrites and force-pushes the branch
         as promote does, with a lease on the checked head, records that on
         the fork PR, and posts nothing upstream. Prints the new head.
   set-item FORK_PR_URL PVTI_... [--force]
@@ -1345,16 +1367,21 @@ reviewer_activity() {
 # the comment, but it writes what it's told). A '${PROMOTE_COMMAND}' comment
 # names no commit, so after that push he needs to comment again. A conversation comment
 # with a '${PROMOTE_COMMAND}' line approves the head it was written on:
-# the current one if written after \$pushed, else an older one. Also:
+# the current one if written after \$pushed, else an older one; a
+# '${HUMAN_TEXT_COMMAND}' line does too, and it, in that comment or in the
+# approving review's body, sets the approval's human_text. Also:
 # whether the latest '${DRAFT_COMMAND}' or '${READY_COMMAND}' line in a comment or review
 # body asks for a draft, and the URL of the latest comment since \$pushed
 # that reads like a go-ahead (\$go_ahead) without a '${PROMOTE_COMMAND}' line.
 readonly VERDICT_JQ="
 def has_line(\$cmd): (.body // \"\") | gsub(\"\\r\"; \"\") | split(\"\\n\") | any(gsub(\"^[ \\t]+|[ \\t]+\$\"; \"\") == \$cmd);
-def promotions: [.[] | select(.kind == \"comment\" and has_line(\"${PROMOTE_COMMAND}\"))
-    | {kind: \"review\", state: \"APPROVED\", at: .created, url, id: null, via: \"${PROMOTE_COMMAND}\",
+def human_text: has_line(\"${HUMAN_TEXT_COMMAND}\");
+def promote_line: has_line(\"${PROMOTE_COMMAND}\") or human_text;
+def promotions: [.[] | select(.kind == \"comment\" and promote_line)
+    | {kind: \"review\", state: \"APPROVED\", at: .created, url, id: null, via: \"${PROMOTE_COMMAND}\", human_text: human_text,
        commit_id: (if \$pushed != \"\" and .created > \$pushed then \$head else null end)}];
-def approval: [(.[] | select(.kind == \"review\" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\")))),
+def approval: [(.[] | select(.kind == \"review\" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\")))
+            | . + {human_text: human_text}),
         promotions[]]
     | sort_by(.at) | last;
 def approved_any: approval.state == \"APPROVED\";
@@ -1365,7 +1392,7 @@ def wants_draft: [.[] | {at, cmd: ((.body // \"\") | gsub(\"\\r\"; \"\")
         | [scan(\"(?:^|\\n)[ \\t]*(${DRAFT_COMMAND}|${READY_COMMAND})[ \\t]*(?=\\n|\$)\")[0]] | last)}
     | select(.cmd != null)] | sort_by(.at) | last | .cmd == \"${DRAFT_COMMAND}\";
 def go_aheads: [.[] | select(.kind != \"review comment\" and (.state // \"\" | IN(\"APPROVED\", \"CHANGES_REQUESTED\") | not)
-        and (has_line(\"${PROMOTE_COMMAND}\") | not) and ((.body // \"\") | test(\$go_ahead; \"i\")))];
+        and (promote_line | not) and ((.body // \"\") | test(\$go_ahead; \"i\")))];
 def needs_push_time: (promotions | length > 0) or (go_aheads | length > 0);
 def go_ahead: [go_aheads[] | select(\$pushed == \"\" or .created > \$pushed)] | sort_by(.created) | last | .url // empty;
 "
@@ -1396,6 +1423,33 @@ dco_note() {
         test "${rc}" -eq "${EX_NOTFOUND}" || warn "cannot tell whether ${repo} has ${SIGNOFF_WORKFLOW}; describing the manual signoff"
         echo "Maintainers: this repository requires DCO, and these commits have no \`Signed-off-by\`. To add yours, run \`git rebase --signoff <upstream>/${base}\` on this branch and force-push it."
     fi
+}
+
+# policy_gate UPSTREAM HUMAN_TEXT FORK_PR_URL: sets POLICY_VERDICT to
+# UPSTREAM's contribution policy verdict per 'upstream-policy check'
+# (which says what's wrong on stderr), and POLICY_REFUSAL to why the
+# bot's work may not go there, or to nothing if it may: bot-ok, or
+# human-text when HUMAN_TEXT is true (REVIEWER's approval says he wrote
+# the text). Exits with EX_RATELIMIT when rate limited.
+policy_gate() {
+    local args=(check "$1") rc=0
+    ! $2 || args+=(--allow-human-text)
+    POLICY_REFUSAL=""
+    POLICY_VERDICT=$("${UPSTREAM_POLICY}" "${args[@]}") || rc=$?
+    case "${rc}" in
+        0) ;;
+        "${EX_RATELIMIT}") exit "${EX_RATELIMIT}" ;;
+        "${EX_POLICY_MISSING}") POLICY_REFUSAL="$1 has no contribution policy record yet; a policy-check subagent writes it (see above)" ;;
+        "${EX_POLICY_STALE}") POLICY_REFUSAL="$1's contribution policy record is stale; re-check the policy (see above)" ;;
+        "${EX_POLICY_HUMAN_TEXT}") POLICY_REFUSAL="$1's contribution policy is human-text: $(human_text_howto "$3")" ;;
+        *) POLICY_REFUSAL="$1's contribution policy doesn't allow this (see above)" ;;
+    esac
+}
+
+# human_text_howto FORK_PR_URL: how REVIEWER takes over the text of a
+# fork PR for a human-text repository.
+human_text_howto() {
+    echo "the PR title and body and the commit messages must be ${REVIEWER}'s own: he edits the title and body of $1 (dropping the bot's '${LLMS_TRAILER}' line), rewords the commits and pushes them to its branch, then comments '${HUMAN_TEXT_COMMAND}' on a line of its own (or puts it in an approving review); or he opens the upstream PR himself"
 }
 
 # signoff_note APPROVAL_URL: the line for an upstream PR's body that says
@@ -1790,7 +1844,6 @@ cmd_promote() {
     body=$(jq -r "${BODY_JQ} .body | strip_meta" <<<"${pr}")
     ! grep -qF 'bot-meta' <<<"${body}" || fatal "${url}'s body still mentions bot-meta after stripping the section; fix its markers"
     test -n "${body}" || fatal "${url}'s body is empty without the bot-meta section"
-    grep -qxF "${LLMS_TRAILER}" <<<"${body}" || warn "${url}'s body has no '${LLMS_TRAILER}' line"
     local dco
     dco=$(dco_required "${upstream}" "${base}")
     if ${dco} && grep -qF "${DCO_CHECK}" <<<"${body}"; then
@@ -1817,6 +1870,22 @@ cmd_promote() {
             why_not+=". His comment ${go_ahead} reads like a go-ahead, but isn't one without a '${PROMOTE_COMMAND}' line: ask him to reply '${PROMOTE_COMMAND}' or approve"
         ${dry_run} || fatal "${url} ${why_not}"
         warn "${url} ${why_not}; a real promote would stop here"
+    fi
+    # The contribution policy gate. With human-text, the text is
+    # REVIEWER's, so promote adds none of its own to the body.
+    local human_text
+    human_text=$(verdict 'approved and approval.human_text == true')
+    policy_gate "${upstream}" "${human_text}" "${url}"
+    if test -n "${POLICY_REFUSAL}"; then
+        :
+    elif ${human_text} && grep -qxF "${LLMS_TRAILER}" <<<"${body}"; then
+        POLICY_REFUSAL="${REVIEWER} approved with '${HUMAN_TEXT_COMMAND}', but the body still has the bot's '${LLMS_TRAILER}' line; $(human_text_howto "${url}")"
+    elif ! ${human_text}; then
+        grep -qxF "${LLMS_TRAILER}" <<<"${body}" || warn "${url}'s body has no '${LLMS_TRAILER}' line"
+    fi
+    if test -n "${POLICY_REFUSAL}"; then
+        ${dry_run} || fatal "not promoting ${url}: ${POLICY_REFUSAL}"
+        warn "${POLICY_REFUSAL}; a real promote would stop here"
     fi
     local approval_url approved_head
     approval_url=$(verdict 'approval.url // empty')
@@ -1854,6 +1923,7 @@ cmd_promote() {
 Fork PR:   ${url} (${REVIEWER}: $(verdict 'approval | if . == null then "no verdict" elif .via then "\(.state) by \(.via) \(.url)" else .state end'))
 Upstream:  ${upstream}, base ${base}, from ${owner}:${head} (${ahead} ahead, ${behind} behind)
 Board:     ${item:-(none)}
+Policy:    ${POLICY_VERDICT:-refused}$(! ${human_text} || echo ", text by ${REVIEWER} (${HUMAN_TEXT_COMMAND})")
 
 Would:
 EOF
@@ -1871,6 +1941,7 @@ EOF
         if ${dco} && ${signoff}; then
             dco_line=$(signoff_note "${approval_url:-<approval>}")
         fi
+        ! ${human_text} || dco_line=""
         printf '\nTitle: %s\n\n%s\n' "${title}" "$(with_note "${body}" "${dco_line}")"
         return 0
     fi
@@ -1927,6 +1998,10 @@ EOF
         if test "${count}" -gt 0 || ${via_record}; then
             dco_line=$(signoff_note "${approval_url}")
         fi
+    fi
+    if ${human_text} && test -n "${dco_line}"; then
+        info "Not adding to ${REVIEWER}'s text of the upstream PR: ${dco_line}"
+        dco_line=""
     fi
     body=$(with_note "${body}" "${dco_line}")
     # Nothing unreviewed may go upstream: fail if anything was pushed since.
@@ -2027,6 +2102,9 @@ cmd_signoff() {
             why_not+=" (his approval ${approval_url} is of ${approved_head:0:12}, which promote rebased)"
         fatal "${fork_url} ${why_not}; his approving review or '${PROMOTE_COMMAND}' there of the head that went upstream is what signs off"
     fi
+    # The contribution policy gate, as in promote.
+    policy_gate "${upstream}" "$(verdict 'approval.human_text == true')" "${fork_url}"
+    test -z "${POLICY_REFUSAL}" || fatal "not signing off ${url}: ${POLICY_REFUSAL}"
     if test "${head_sha}" != "${approved_head}"; then
         info "${head_sha:0:12} is ${REVIEWER}'s approved ${approved_head:0:12} plus his sign-off, per the bot's record; checking that"
         local rc=0
@@ -2163,7 +2241,8 @@ cmd_inbox() {
         push_time "${repo}" "${number}" "$(jq -r .head.ref <<<"${pr}")"
         verdict=$(verdict '
             [if approved then "APPROVED" elif approved_any then "APPROVED earlier; new commits since" else empty end,
-             if wants_draft then "'"${DRAFT_COMMAND}"'" else empty end] | join(", ")')
+             if wants_draft then "'"${DRAFT_COMMAND}"'" else empty end,
+             if approved and approval.human_text then "text by '"${REVIEWER}"'" else empty end] | join(", ")')
         test -n "${lines}" || test -n "${verdict}" || continue
         echo "${url}${verdict:+  [${verdict}]}  $(jq -r .title <<<"${pr}")"
         test -z "${lines}" || echo "${lines}"

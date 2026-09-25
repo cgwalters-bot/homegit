@@ -156,6 +156,25 @@ run `bot-pr inbox` at the start of every session. What inbox has already
 reported is kept in the archived `bot-state: pr-inbox` board item, so it
 doesn't matter which machine runs it.
 
+### Contribution policy gate
+
+Some projects accept AI-assisted code but want the PR text to be a
+human's, and some want no AI contributions at all. So `promote` and
+`signoff` first run `upstream-policy check OWNER/REPO`, which reads the
+record in `upstream-policy/OWNER/REPO.md` here: a verdict (`bot-ok`,
+`human-text`, `human-only` or `no-go`), the AI trailer and DCO
+expectations, and the blob ids of every policy file it was based on
+(CONTRIBUTING, AGENTS.md, PR templates, AI policies, the org's `.github`
+defaults), with the quotes and rationale in its body. They refuse
+unless the record is committed, every source is unchanged on upstream's
+default branch, no new policy file has appeared, and the verdict is
+`bot-ok`. A separate read-only subagent writes the records
+(`dotfiles/.claude/skills/coordinator/policy-check.md`); to overrule
+one, I edit its verdict. For `human-text`, I rewrite the fork PR's title,
+body and commit messages myself and approve with a `/promote
+--human-text` line (promote then adds nothing to the body), or open the
+upstream PR myself. `tests/upstream-policy.sh` tests the check offline.
+
 ### Signing off the bot's PRs (DCO)
 
 The bot never adds `Signed-off-by` itself. When I approve a fork PR (or

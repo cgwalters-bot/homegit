@@ -277,7 +277,11 @@ requests), and remembers what it showed. Then, per PR:
   `/promote` or approve; don't promote on your own reading of it.
 - **`[APPROVED]`**: run the command inbox prints,
   `bot-pr promote <fork-pr-url>` (with `--draft` if he commented
-  `/draft`, which a later `/ready` takes back). It rebases onto the current upstream base, opens the
+  `/draft`, which a later `/ready` takes back). It refuses unless the
+  upstream repository's policy record allows it (the policy gate in the
+  `coordinator` skill: a missing or stale record needs a policy-check
+  subagent first, and a human-text one needs cgwalters' own text and his
+  `/promote --human-text`). It rebases onto the current upstream base, opens the
   upstream PR from `cgwalters-forge:bot/<slug>` with the fork PR's current
   title and body (minus the bot-meta section), links and closes the fork
   PR, and sets the item In Review with Branch = the upstream PR. If the

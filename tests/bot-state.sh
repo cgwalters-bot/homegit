@@ -486,6 +486,36 @@ test_pr_promote_dco() {
     test "$(grep -c 'requires DCO' <<<"${out}")" -eq 1 || fail "expected one DCO note: ${out}"
 }
 
+test_pr_promote_policy() {
+    local cmd='[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "/promote"}]'
+    local human='[{"login": "cgwalters", "at": "2026-09-24T10:05:00Z", "body": "My text.\r\n/promote --human-text"}]'
+    local dco_rules='[{"type": "required_status_checks", "parameters": {"required_status_checks": [{"context": "DCO"}]}}]'
+    local out
+    promote_world "${cmd}" '[]' "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "bot-ok" yes '^Policy: +bot-ok$'
+    local verdict
+    for verdict in stale:'re-check the policy' human-only:'policy is human-only' no-go:'policy is no-go'; do
+        echo "${verdict%%:*}" >"${WORK}/policy"
+        expect_promote "${verdict%%:*}" no "${verdict#*:}"
+    done
+    echo human-text >"${WORK}/policy"
+    expect_promote "human-text, /promote" no \
+        "contribution policy is human-text: the PR title and body and the commit messages must be cgwalters's own.*'/promote --human-text'"
+    # His '/promote --human-text' approves like '/promote', but the body
+    # must be his: the bot's trailer line gone.
+    promote_world "${human}" '[]' "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "human-text, the bot's trailer left" no "still has the bot's 'Generated-by: .*' line"
+    sed -i 's,\\n\\nGenerated-by: [^\\]*,,' "${FAKE_GH}/rest/repos/${PR_FORK}/pulls/1.json"
+    rest "repos/up/demo/rules/branches/main" "${dco_rules}"
+    expect_promote "human-text, his text" yes '^Policy: +human-text, text by cgwalters'
+    # promote adds nothing to his body, not even the DCO approval note.
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
+    ! grep -q 'on these commits was added' <<<"${out}" || fail "a note added to his text: ${out}"
+    # On a bot-ok repository, it's an ordinary approval.
+    echo bot-ok >"${WORK}/policy"
+    expect_promote "bot-ok, /promote --human-text" yes '^Policy: +bot-ok, text by cgwalters'
+}
+
 # --- bot-notify -------------------------------------------------------------
 
 # request URL THREAD_ID: a pending request record.
@@ -639,6 +669,25 @@ test_lease() {
     done
 }
 
+# write_fake_policy DIR: a fake 'upstream-policy check' (tested on its
+# own in tests/upstream-policy.sh) whose verdict is in $WORK/policy
+# (default bot-ok), with its exit statuses; 'stale' is a stale record.
+write_fake_policy() {
+    cat >"$1/upstream-policy" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test "$1" = check || exit 1
+verdict=$(cat "${WORK}/policy" 2>/dev/null || echo bot-ok)
+case "${verdict} ${3:-}" in
+    "bot-ok "* | "human-text --allow-human-text") echo "${verdict}" ;;
+    "human-text "*) echo "error: $2's policy is human-text" 1>&2; exit 5 ;;
+    "stale "*) echo "error: $2's policy record is stale; re-check the policy" 1>&2; exit 4 ;;
+    *) echo "error: $2's policy is ${verdict}" 1>&2; exit 6 ;;
+esac
+EOF
+    chmod +x "$1/upstream-policy"
+}
+
 # --- runner -----------------------------------------------------------------
 
 all_tests() {
@@ -653,7 +702,8 @@ run_test() {
     FAKE_GH=${WORK}/gh-store
     mkdir -p "${FAKE_GH}/items" "${WORK}/bin" "${WORK}/home/run"
     write_fake_gh "${WORK}/bin"
-    export FAKE_GH WORK
+    write_fake_policy "${WORK}/bin"
+    export FAKE_GH WORK BOT_PR_UPSTREAM_POLICY=${WORK}/bin/upstream-policy
     export PATH=${WORK}/bin:${PATH}
     export HOME=${WORK}/home XDG_STATE_HOME=${WORK}/home/state XDG_CACHE_HOME=${WORK}/home/cache
     export XDG_RUNTIME_DIR=${WORK}/home/run

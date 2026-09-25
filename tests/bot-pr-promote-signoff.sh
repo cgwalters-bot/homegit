@@ -378,6 +378,27 @@ jq -n '[{type: "required_status_checks", parameters: {required_status_checks: [{
 jq -n '{check_runs: [{name: "ci"}, {name: "DCO", app: {slug: "dco-2"}}]}' | fixture repos/acme/dcoapp/commits/main/check-runs
 echo '{"path": ".github/workflows/signoff.yml"}' | fixture repos/acme/proj/contents/.github/workflows/signoff.yml
 
+# The contribution policy records (see tests/upstream-policy.sh), checked
+# by the real upstream-policy against a CONTRIBUTING.md in each upstream.
+export UPSTREAM_POLICY_DIR=${WORK}/homegit/upstream-policy
+readonly CONTRIB_SHA=cccccccccccccccccccccccccccccccccccccccc
+git init -q "${WORK}/homegit"
+# policy REPO VERDICT: commit acme/REPO's record with VERDICT, and a
+# CONTRIBUTING.md on GitHub that matches it.
+policy() {
+    echo '{"default_branch": "main"}' | fixture "repos/acme/$1"
+    jq -n --arg s "${CONTRIB_SHA}" '{truncated: false, tree: [{path: "CONTRIBUTING.md", type: "blob", sha: $s}]}' |
+        fixture "repos/acme/$1/git/trees/main"
+    mkdir -p "${UPSTREAM_POLICY_DIR}/acme"
+    printf -- '---\nverdict: %s\nai-trailer: Generated-by\ndco: yes (test)\nsources:\n  - path: CONTRIBUTING.md\n    sha: %s\nchecked: today by the test\n---\n\nRationale.\n' \
+        "$2" "${CONTRIB_SHA}" >"${UPSTREAM_POLICY_DIR}/acme/$1.md"
+    git -C "${WORK}/homegit" add -A
+    git -C "${WORK}/homegit" -c core.hooksPath=/dev/null -c commit.gpgSign=false commit -q --allow-empty -m "$1: $2"
+}
+for r in proj nodco dcoapp; do
+    policy "${r}" bot-ok
+done
+
 # run NAME EXPECTED_STATUS ARGS...: run bot-pr with the failing hooks and
 # signing configured, output in $OUT; fail NAME if the exit status isn't
 # as expected.
@@ -501,6 +522,24 @@ grep -qFx "The \`${SOB}\` on these commits was added on cgwalters's approval of 
     fail "rerun #1: the body doesn't name the approval:"$'\n'"${body}"
 grep -qF '/signoff' <<<"${body}" && fail "rerun #1: the body still asks maintainers for /signoff"
 test -e "${FAKE_GH}/closed_repos_${FORGE//\//_}_pulls_1" || fail "rerun #1: the fork PR wasn't closed"
+
+# --- The policy gate: nothing moves unless the record says bot-ok ---
+REFS_BEFORE=$(all_refs)
+for v in human-text:"policy is human-text: the PR title and body and the commit messages must be cgwalters's own" \
+    no-go:'policy is no-go.*does not contribute'; do
+    policy nodco "${v%%:*}"
+    if run "policy ${v%%:*}" fail promote "${URL}/nodco/pull/2"; then
+        expect "policy ${v%%:*}" "${v#*:}"
+    fi
+done
+policy nodco bot-ok
+echo '{"truncated": false, "tree": []}' | fixture repos/acme/nodco/git/trees/main
+if run "policy stale" fail promote "${URL}/nodco/pull/2"; then
+    expect "policy stale" 'acme/nodco:CONTRIBUTING.md is gone' 're-check the policy'
+fi
+policy nodco bot-ok
+test "$(all_refs)" = "${REFS_BEFORE}" || fail "policy: the remotes changed"
+test -z "$(opened bot/plain)" || fail "policy: an upstream PR was opened"
 
 # --- No DCO: nothing to sign off ---
 if run "no DCO" ok promote "${URL}/nodco/pull/2"; then
@@ -638,6 +677,10 @@ signoff_refused "signoff, unapproved" "has no approval by cgwalters of ${U1:0:12
 signoff_refused "signoff, others" "commits that aren't cgwalters-bot's" "$(upstream_url bot/others)"
 test "$(opened bot/plain | jq -r .head_sha)" = "${N1}" || fail "no DCO: the spoofed check isn't on the upstream PR's head"
 signoff_refused "signoff, no DCO" "neither requires nor runs a DCO check" "$(upstream_url bot/plain)"
+echo '{"truncated": false, "tree": [{"path": "CONTRIBUTING.md", "type": "blob", "sha": "dddddddddddddddddddddddddddddddddddddddd"}]}' |
+    fixture repos/acme/dcoapp/git/trees/main
+signoff_refused "signoff, stale policy" "not signing off ${LATE}: acme/dcoapp's contribution policy record is stale; re-check the policy" "${LATE}"
+policy dcoapp bot-ok
 
 # upstream_pr N LOGIN BRANCH: make up acme/dcoapp#N, opened by LOGIN from
 # cgwalters-forge:BRANCH without promote.
@@ -656,4 +699,4 @@ upstream_pr 91 someone bot/unpromoted
 signoff_refused "signoff, not the bot's PR" "was opened by someone, not cgwalters-bot" https://github.com/acme/dcoapp/pull/91
 
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: promote signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases; signoff signs off promoted PRs only on that approval, with the same refusals"
+echo "ok: promote passes the policy gate only with a current bot-ok record, signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases; signoff signs off promoted PRs only on that approval, with the same refusals"

@@ -20,7 +20,8 @@ to this one, by path in the homegit checkout
 
 - `worker-preamble.md` for a worker (implementing an item, answering an
   ask, turning Drafts into forge PRs);
-- `reviewer-preamble.md` for a reviewer.
+- `reviewer-preamble.md` for a reviewer;
+- `policy-check.md` for a policy check (see "Promote" below).
 
 Then comes the task itself: the board item or ask, the repository and
 base branch, the worker's scratch dir (e.g. a per-task directory under
@@ -60,6 +61,23 @@ instead of piping it through `tail` and losing lines for good.
   never promote on your own reading. For a DCO repository, promote adds
   his sign-off; if it stops over someone else's commits, ask him, and pass
   `--include-others` only if he says so.
+- **Policy gate.** Promote and `bot-pr signoff` first run
+  `upstream-policy check OWNER/REPO`, which needs a record of the upstream
+  repository's contribution policy in homegit
+  (`upstream-policy/OWNER/REPO.md`) whose sources are unchanged upstream
+  and whose verdict is bot-ok. Before promoting, run that check yourself;
+  if the record is missing or stale, dispatch a separate policy-check
+  subagent (brief it with `policy-check.md` and OWNER/REPO; it only reads
+  upstream, and pushes the record to homegit main), never the worker who
+  wrote the change. Once it's pushed, `git -C
+  ~/src/github/cgwalters-bot/homegit pull --ff-only` so the gate sees it,
+  then promote. For a human-text verdict, tell cgwalters the text must be
+  his: he edits the fork PR's title and body (dropping the bot's
+  `Generated-by` line), rewords and pushes the commits, and comments a
+  `/promote --human-text` line (or opens the upstream PR himself); inbox
+  then shows `[APPROVED, text by cgwalters]`. For human-only or no-go,
+  set the item Needs human with the record's link. Never edit a record's
+  verdict to get past the gate; only cgwalters does that.
 - **Review feedback** on a fork PR goes to a worker, preferably the one
   that wrote it if it's still around.
 - **Dispatch** workers for Todo items (by priority, per `workstream`) and

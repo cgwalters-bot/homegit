@@ -71,6 +71,18 @@ everything below. Whether DCO is required is the exception: check that as
 described under Commits, not from the docs. If the project forbids AI-generated
 contributions, stop and set the item to Needs human.
 
+These reads guide the work; what gates the result is the policy record.
+Before any promote, a separate, read-only policy-check subagent
+(`coordinator/policy-check.md`) quotes the project's policy files, its
+org's `.github` defaults included, into `upstream-policy/OWNER/REPO.md`
+in homegit, with a verdict: `bot-ok`, `human-text` (code by the bot is
+fine, but the PR text, commit messages and comments must be cgwalters'
+own), `human-only` or `no-go`. `bot-pr promote` and `bot-pr signoff`
+refuse unless that record exists, every source's blob id still matches
+upstream's default branch, and the verdict is `bot-ok`, or `human-text`
+with his `/promote --human-text` (see "Open the upstream PR"). Don't
+write or edit records while working on a change.
+
 ## Setup
 
 ```bash
@@ -277,7 +289,14 @@ Only two ways, never anything else:
   `/promote` comment line; never other wording),
   `bot-pr promote <fork-pr-url>` opens the upstream PR (ready for review,
   or a draft if he commented `/draft`), closes the fork PR and updates the
-  board; see "Review loop" in `workstream`.
+  board; see "Review loop" in `workstream`. It first passes the policy
+  gate (see "Project policy wins"). For a `human-text` repository, he
+  takes over the text: he edits the fork PR's title and body (removing
+  the bot's `Generated-by` line), rewords the commits and pushes them to
+  the branch, then approves with a comment line that is exactly
+  `/promote --human-text` (or puts it in an approving review's body).
+  Promote then checks the bot's line is gone and adds nothing to his body,
+  not even the DCO approval note. Or he opens the upstream PR himself.
 - **Workflow `pr`**, set by a human: open a draft PR directly, then set
   the item In Review with the PR URL in Branch:
 
