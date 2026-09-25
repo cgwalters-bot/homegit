@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# git as cgwalters-bot: the one place that defines the git identity of the
+# bot's commits, a git wrapper that commits and rebases with it, and a
+# pre-push check of a branch's commits; see --help. bot-pr and dco-signoff
+# source this file for the identity constants.
+
+# The git identity of the bot's commits. The email is what marks a commit
+# as the bot's rather than cgwalters' own; the bot's commits from before
+# it was named after him have BOT_GIT_LEGACY_NAME.
+readonly BOT_GIT_NAME="Colin Walters"
+readonly BOT_GIT_EMAIL=walters+llm@verbum.org
+readonly BOT_GIT_LEGACY_NAME=cgwalters-bot
+# cgwalters' own identity: 'bot-pr promote' adds his sign-off, as him, on
+# his approval.
+readonly HUMAN_GIT_NAME="Colin Walters"
+readonly HUMAN_GIT_EMAIL=walters@verbum.org
+
+# Sourced: only the constants.
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
+
+set -euo pipefail
+shopt -s inherit_errexit
+
+readonly PROG=${0##*/}
+readonly AI_TRAILER_KEYS=(Generated-by Assisted-by)
+# Subjects of commits meant to be squashed before pushing.
+readonly SQUASH_SUBJECT_RE='^(fixup|squash|amend)! '
+# git commands for which -s means --signoff (for rebase and merge it
+# picks a strategy).
+readonly SIGNOFF_SHORT_CMDS=(am cherry-pick commit format-patch revert)
+# Short options of those commands that take a value: any letters after
+# them in a cluster are that value, and if there are none, the next
+# argument is (except for those in SHORT_ATTACHED_OPTS, whose value is
+# optional and only ever attached).
+readonly SHORT_VALUE_OPTS=CFmSctvou
+readonly SHORT_ATTACHED_OPTS=Su
+
+usage() {
+    cat <<EOF
+Usage: ${PROG} GIT-ARGS...
+       ${PROG} check [--no-ai-trailer] [RANGE]
+
+The git identity of cgwalters-bot's commits is
+'${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'. The email is what marks a commit as the
+bot's; the bot's older commits are named '${BOT_GIT_LEGACY_NAME}'.
+
+${PROG} GIT-ARGS... runs git with that identity as author and committer,
+for every git command that creates or rewrites commits: commit, rebase,
+cherry-pick, am, merge. Rebases and amends keep each commit's original
+author. It refuses to add a Signed-off-by (-s/--signoff, or a
+Signed-off-by --trailer): the bot never signs off; only 'bot-pr promote'
+adds cgwalters' own on his approval.
+
+${PROG} check [RANGE] checks the commits in RANGE (default:
+@{upstream}..HEAD, else origin/HEAD..HEAD) before pushing, and lists what's
+wrong with them:
+  - fixup!/squash!/amend! commits, which belong squashed;
+  - bot commits (by the email) whose author or committer isn't the bot
+    (by either name), and others' commits committed by the bot's email
+    under another name;
+  - bot commits with a Signed-off-by (unless committed by cgwalters, as
+    'bot-pr promote' does);
+  - bot commits without a ${AI_TRAILER_KEYS[0]} or ${AI_TRAILER_KEYS[1]} trailer
+    (--no-ai-trailer skips this, for projects that say not to add one).
+It exits 1 if it found any.
+EOF
+}
+
+die() {
+    echo "${PROG}: error: $*" 1>&2
+    exit 1
+}
+
+# refuse_signoff GIT-ARGS...: exits if the git command would add a
+# Signed-off-by.
+refuse_signoff() {
+    local cmd="" a short_signoff=false
+    # The global options before the command, some with a separate value.
+    while test $# -gt 0; do
+        case "$1" in
+            -C|-c|--git-dir|--work-tree|--namespace|--config-env) shift 2 || break ;;
+            -*) shift ;;
+            *) cmd=$1; shift; break ;;
+        esac
+    done
+    local c
+    for c in "${SIGNOFF_SHORT_CMDS[@]}"; do
+        test "${c}" != "${cmd}" || short_signoff=true
+    done
+    while test $# -gt 0; do
+        a=$1
+        shift
+        case "${a}" in
+            --) break ;;
+            # git takes unambiguous prefixes of long options too.
+            --si*)
+                [[ "--signoff" == "${a%%=*}"* ]] || continue
+                die "refusing '${a}': the bot never adds a Signed-off-by; only 'bot-pr promote' adds cgwalters' own on his approval" ;;
+            --tr*)
+                [[ "--trailer" == "${a%%=*}"* ]] || continue
+                local t=${1:-}
+                test "${a}" = "${a#*=}" || t=${a#*=}
+                if [[ "${t,,}" == signed-off-by* ]]; then
+                    die "refusing a Signed-off-by trailer: the bot never adds one; only 'bot-pr promote' adds cgwalters' own on his approval"
+                fi ;;
+            --*) ;;
+            -?*)
+                ${short_signoff} || continue
+                # A cluster like -as or -sm MSG: its letters up to the
+                # first that takes a value.
+                local i ch
+                for ((i = 1; i < ${#a}; i++)); do
+                    ch=${a:i:1}
+                    test "${ch}" != s ||
+                        die "refusing '-s' (--signoff) for 'git ${cmd}': the bot never adds a Signed-off-by; only 'bot-pr promote' adds cgwalters' own on his approval"
+                    [[ "${SHORT_VALUE_OPTS}" == *"${ch}"* ]] || continue
+                    if test "$((i + 1))" -eq "${#a}" && [[ "${SHORT_ATTACHED_OPTS}" != *"${ch}"* ]]; then
+                        shift || true
+                    fi
+                    break
+                done ;;
+        esac
+    done
+}
+
+# default_range: @{upstream}..HEAD, else origin/HEAD..HEAD.
+default_range() {
+    local base
+    for base in '@{upstream}' origin/HEAD; do
+        if git rev-parse -q --verify "${base}^{commit}" >/dev/null 2>&1; then
+            printf '%s..HEAD\n' "${base}"
+            return 0
+        fi
+    done
+    die "HEAD has no upstream and there is no origin/HEAD; pass the RANGE to check, e.g. origin/main..HEAD"
+}
+
+# is_bot_name NAME: succeeds for the bot's name, current or old.
+is_bot_name() {
+    test "$1" = "${BOT_GIT_NAME}" || test "$1" = "${BOT_GIT_LEGACY_NAME}"
+}
+
+# problems COMMIT CHECK_TRAILER: prints one line per problem with COMMIT.
+problems() {
+    local c=$1 check_trailer=$2 an ae cn ce subject sobs trailers key
+    local -a f
+    mapfile -t f < <(git show -s --format='%an%n%ae%n%cn%n%ce%n%s' "${c}")
+    an=${f[0]} ae=${f[1]} cn=${f[2]} ce=${f[3]} subject=${f[4]}
+    if [[ "${subject}" =~ ${SQUASH_SUBJECT_RE} ]]; then
+        echo "a '${subject%% *}' commit: squash it into the commit it fixes"
+    fi
+    if test "${ae,,}" != "${BOT_GIT_EMAIL,,}"; then
+        # Someone else's commit, rebased by the bot.
+        if test "${ce,,}" = "${BOT_GIT_EMAIL,,}" && ! is_bot_name "${cn}"; then
+            echo "committed as '${cn} <${ce}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>': rebase with ${PROG}"
+        fi
+        return 0
+    fi
+    is_bot_name "${an}" || echo "authored as '${an} <${ae}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'"
+    # What 'bot-pr promote' makes of a bot commit on cgwalters' approval:
+    # committed by him, with his sign-off.
+    local promoted=false
+    sobs=$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "${c}")
+    if test "${cn} <${ce,,}>" = "${HUMAN_GIT_NAME} <${HUMAN_GIT_EMAIL}>" &&
+        grep -qxF "${HUMAN_GIT_NAME} <${HUMAN_GIT_EMAIL}>" <<<"${sobs}"; then
+        promoted=true
+    fi
+    if ! ${promoted} && ! { test "${ce,,}" = "${BOT_GIT_EMAIL,,}" && is_bot_name "${cn}"; }; then
+        echo "committed as '${cn} <${ce}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>': commit and rebase with ${PROG}"
+    fi
+    if test -n "${sobs}" && ! ${promoted}; then
+        echo "has Signed-off-by: $(paste -sd, - <<<"${sobs}" | sed 's/,/, /g'); the bot never adds one (only 'bot-pr promote' adds cgwalters', as committer)"
+    fi
+    if ${check_trailer}; then
+        trailers=""
+        for key in "${AI_TRAILER_KEYS[@]}"; do
+            trailers+=$(git show -s --format="%(trailers:key=${key})" "${c}")
+        done
+        test -n "${trailers}" || echo "no ${AI_TRAILER_KEYS[0]}: AI (or ${AI_TRAILER_KEYS[1]}) trailer"
+    fi
+}
+
+cmd_check() {
+    local range="" check_trailer=true
+    while test $# -gt 0; do
+        case "$1" in
+            --no-ai-trailer) check_trailer=false; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "unknown option for check: $1 (see --help)" ;;
+            *) test -z "${range}" || die "check takes one RANGE"; range=$1; shift ;;
+        esac
+    done
+    test -n "${range}" || range=$(default_range)
+    local commits c n=0 bad=0 p=()
+    commits=$(git rev-list --reverse "${range}") || die "cannot list the commits in '${range}'"
+    for c in ${commits}; do
+        n=$((n + 1))
+        mapfile -t p < <(problems "${c}" "${check_trailer}")
+        test "${#p[@]}" -gt 0 || continue
+        bad=$((bad + 1))
+        git show -s --format='%h %s (%an <%ae> / %cn <%ce>)' "${c}"
+        printf '    %s\n' "${p[@]}"
+    done
+    if test "${bad}" -gt 0; then
+        echo "${PROG}: ${bad} of ${n} commits in ${range} need fixing before pushing" 1>&2
+        exit 1
+    fi
+    echo "ok: ${n} commits in ${range}"
+}
+
+main() {
+    case "${1:-}" in
+        ""|-h|--help) usage; test $# -gt 0 ;;
+        check) shift; cmd_check "$@" ;;
+        *)
+            refuse_signoff "$@"
+            export GIT_AUTHOR_NAME=${BOT_GIT_NAME} GIT_AUTHOR_EMAIL=${BOT_GIT_EMAIL} \
+                GIT_COMMITTER_NAME=${BOT_GIT_NAME} GIT_COMMITTER_EMAIL=${BOT_GIT_EMAIL}
+            exec git "$@" ;;
+    esac
+}
+
+main "$@"

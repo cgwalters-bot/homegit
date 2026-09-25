@@ -124,14 +124,19 @@ topic branch per change.
   a `Generated-by: AI` trailer (`Assisted-by: AI` only when a human wrote
   a substantial part of the change).
 - Keep commits well-scoped; prep commits are welcome.
-- **Identity.** Every commit the bot creates or rewrites must say so. On a
-  machine whose global git identity is a human's (not a devspace with the
-  bot's dotfiles), run git with
-  `GIT_AUTHOR_NAME="Colin Walters" GIT_AUTHOR_EMAIL=walters+llm@verbum.org
-  GIT_COMMITTER_NAME="Colin Walters" GIT_COMMITTER_EMAIL=walters+llm@verbum.org`
-  for new commits, and at least the two `GIT_COMMITTER_*` variables for
-  rebases, which keep each commit's original author. Check with
-  `git log --format='%an <%ae> / %cn <%ce>'` before pushing.
+- **Identity.** Every commit the bot creates or rewrites must say so:
+  author and committer `Colin Walters <walters+llm@verbum.org>`, where the
+  `+llm` email is what marks it as the bot's (older ones are named
+  `cgwalters-bot`). On a machine whose global git identity is cgwalters'
+  own (not a devspace with the bot's dotfiles), run every git command that
+  creates or rewrites commits through homegit's `bin/bot-git`
+  (`bot-git commit ...`, `bot-git rebase ...`), which sets that identity,
+  keeps each commit's original author on rebases and amends, and refuses
+  to sign off. Before pushing, run `bot-git check` (default range
+  `@{upstream}..HEAD`, or pass one such as `origin/main..HEAD`): it lists
+  wrong identities, `fixup!`/`squash!` commits, sign-offs the bot added
+  and missing AI trailers (`--no-ai-trailer` where the project says not
+  to add one).
 - **Fixes go into the commit they belong to**, per "Fixes and review
   feedback" in the shared AGENTS.md; pushed history never has `fixup!` or
   `squash!` commits. Commits by cgwalters are the one exception to the

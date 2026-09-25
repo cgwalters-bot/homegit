@@ -5,6 +5,9 @@ set -euo pipefail
 shopt -s inherit_errexit
 
 readonly BOT_LOGIN=cgwalters-bot
+# The bot's git identity (BOT_GIT_*) and cgwalters' (HUMAN_GIT_*).
+# shellcheck source=bin/bot-git disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/bot-git"
 # The only login whose reviews and comments on a fork PR are acted on.
 readonly REVIEWER=cgwalters
 # The organization holding the forks where fork PRs are opened. Its forks
@@ -53,10 +56,6 @@ readonly SEARCH_SCOPES=("org:${FORGE_ORG}" "user:${BOT_LOGIN}")
 readonly FORK_READY_TIMEOUT=300
 readonly FORK_READY_POLL=5
 readonly EXCERPT_LEN=120
-# The git identity of the bot's commits. The email is what tells them apart
-# from cgwalters' own; older ones have the name cgwalters-bot.
-readonly BOT_GIT_NAME="Colin Walters"
-readonly BOT_GIT_EMAIL=walters+llm@verbum.org
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
 # Returned by ghapi() when GitHub says the resource does not exist.
@@ -73,8 +72,8 @@ readonly SIGNOFF_WORKFLOW=.github/workflows/signoff.yml
 # PR's head lets promote add it to the bot's commits (and, with
 # --include-others, to anyone else's) when the upstream repository
 # requires DCO; see add_signoff. Nothing else ever adds it.
-readonly SIGNOFF_NAME="Colin Walters"
-readonly SIGNOFF_EMAIL=walters@verbum.org
+readonly SIGNOFF_NAME=${HUMAN_GIT_NAME}
+readonly SIGNOFF_EMAIL=${HUMAN_GIT_EMAIL}
 readonly SIGNOFF_TRAILER="Signed-off-by: ${SIGNOFF_NAME} <${SIGNOFF_EMAIL}>"
 # The start of the hidden last line of the bot's fork PR comment that
 # records a sign-off push: the approved head, the head it pushed, and the

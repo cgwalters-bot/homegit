@@ -7,7 +7,9 @@ set -euo pipefail
 shopt -s inherit_errexit
 
 readonly BOT_LOGIN=cgwalters-bot
-readonly BOT_EMAIL=walters+llm@verbum.org
+# The bot's git identity; its commits are recognized by BOT_GIT_EMAIL.
+# shellcheck source=bin/bot-git disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/bot-git"
 # The organization holding the forks that 'bot-pr promote' opens upstream
 # PRs from, as FORGE_ORG:bot/SLUG.
 readonly FORGE_ORG=${DCO_SIGNOFF_FORGE:-cgwalters-forge}
@@ -67,7 +69,7 @@ Options:
   -h, --help        Show this help.
 
 It refuses to run when gh is logged in as ${BOT_LOGIN}, or git's identity
-is the bot's (${BOT_EMAIL}): the bot must never sign off. Pushing needs
+is the bot's (${BOT_GIT_EMAIL}): the bot must never sign off. Pushing needs
 push access to the PR's head repository (e.g. ${FORGE_ORG}) or, when the
 PR allows maintainer edits, to its base repository.
 
@@ -162,8 +164,8 @@ identify() {
     "${LIST_ONLY}" && return 0
     test "${ME_LOGIN}" != "${BOT_LOGIN}" ||
         die "gh is logged in as ${BOT_LOGIN}, and the bot must never sign off: only a human can make the DCO statement"
-    test "${ME_EMAIL,,}" != "${BOT_EMAIL,,}" ||
-        die "git user.email is the bot's (${BOT_EMAIL}), and the bot must never sign off; run this with your own git identity"
+    test "${ME_EMAIL,,}" != "${BOT_GIT_EMAIL,,}" ||
+        die "git user.email is the bot's (${BOT_GIT_EMAIL}), and the bot must never sign off; run this with your own git identity"
     # 'git rebase --signoff' signs off as the committer, and the DCO check
     # accepts a sign-off by the commit's author or committer; so the
     # committer must be you, not e.g. GIT_COMMITTER_* left over from the bot.
@@ -247,7 +249,7 @@ pr_record() {
             --jq '.[] | {sha, parents: (.parents | length), name: .commit.author.name,
                          email: .commit.author.email, login: (.author.login // ""), message: .commit.message}' |
             jq -sc --arg sob "${SOB}" --arg me "${ME_LOGIN}" --arg myemail "${ME_EMAIL}" \
-                --arg bot "${BOT_LOGIN}" --arg botemail "${BOT_EMAIL}" '
+                --arg bot "${BOT_LOGIN}" --arg botemail "${BOT_GIT_EMAIL}" '
                 map(. + {signed: (.message | split("\n") | map(rtrimstr("\r") | rtrimstr(" ")) | index([$sob]) != null),
                          who: (if (.email | ascii_downcase) == ($myemail | ascii_downcase) or .login == $me then "self"
                                elif (.email | ascii_downcase) == ($botemail | ascii_downcase) or .login == $bot then "bot"
