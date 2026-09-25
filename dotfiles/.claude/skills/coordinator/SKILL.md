@@ -68,10 +68,11 @@ instead of piping it through `tail` and losing lines for good.
   and whose verdict is bot-ok. Before promoting, run that check yourself;
   if the record is missing or stale, dispatch a separate policy-check
   subagent (brief it with `policy-check.md` and OWNER/REPO; it only reads
-  upstream, and pushes the record to homegit main), never the worker who
-  wrote the change. Once it's pushed, `git -C
-  ~/src/github/cgwalters-bot/homegit pull --ff-only` so the gate sees it,
-  then promote. For a human-text verdict, tell cgwalters the text must be
+  upstream, and lands the record on homegit main with `bot-land`), never
+  the worker who wrote the change. Once it's merged (bot-land
+  fast-forwards the shared clone; otherwise `git -C
+  ~/src/github/cgwalters-bot/homegit pull --ff-only`) so the gate sees
+  it, promote. For a human-text verdict, tell cgwalters the text must be
   his: he retitles the fork PR, edits its body (dropping the bot's
   `Generated-by` line), rewords the commits and pushes them himself, then
   comments a `/promote --human-text` line (or opens the upstream PR
@@ -80,7 +81,14 @@ instead of piping it through `tail` and losing lines for good.
   body last and who set the title, so the bot must not push to or edit
   that fork PR after he does. For human-only or no-go,
   set the item Needs human with the record's link. Never edit a record's
-  verdict to get past the gate; only cgwalters does that.
+  verdict to get past the gate; only cgwalters loosens one: when he asks
+  for that, open the pull request with `bot-land --no-auto`, and enable
+  auto-merge (`gh pr merge N --auto --rebase`) only once he approved it,
+  since the gate counts his approval of the merged head.
+- **Own repositories take pull requests only.** homegit and the bot's
+  other own repositories (listed in `worker-preamble.md`) require a pull
+  request with a green `ci` check on main, rebase-merged; workers land
+  there with `bin/bot-land`, never with a push to main.
 - **Review feedback** on a fork PR goes to a worker, preferably the one
   that wrote it if it's still around.
 - **Dispatch** workers for Todo items (by priority, per `workstream`) and

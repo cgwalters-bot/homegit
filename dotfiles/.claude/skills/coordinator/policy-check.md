@@ -70,11 +70,10 @@ In your worktree:
 ```bash
 git add upstream-policy/OWNER/REPO.md
 bin/bot-git commit -m "upstream-policy: Record OWNER/REPO as VERDICT" -m "<why: what decided it>" -m "Generated-by: AI"
-bin/bot-git check origin/main..HEAD
+bin/bot-land  # pull request, auto-merged on green ci; it waits, and rebases if main moved on
 bin/upstream-policy check OWNER/REPO --allow-human-text  # must not say stale or invalid
-git push origin HEAD:main  # on a rejection: git fetch, bin/bot-git rebase origin/main, push again
 ```
 
-`check` refuses an uncommitted record, so it runs after the commit. With `--allow-human-text` it passes a current bot-ok or human-text record; for human-only and no-go it exits 6 by design, and only a stale (4) or invalid (7) result means the record needs fixing.
+homegit's main takes changes only through pull requests, and `check` reads a record only as main has it, so it runs once `bot-land` has merged. With `--allow-human-text` it passes a current bot-ok or human-text record; for human-only and no-go it exits 6 by design, and only a stale (4) or invalid (7) result means the record needs fixing.
 
-Report: the verdict, the decisive quote, the commit id pushed to homegit main, and anything you were unsure of. Then remove your worktree.
+Report: the verdict, the decisive quote, the merged pull request, and anything you were unsure of. Then remove your worktree.

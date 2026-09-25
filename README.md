@@ -157,6 +157,22 @@ run `bot-pr inbox` at the start of every session. What inbox has already
 reported is kept in the archived `bot-state: pr-inbox` board item, so it
 doesn't matter which machine runs it.
 
+### The bot's own repositories
+
+The bot's own repositories (this one, cgwalters-bot/cgwalters-bot,
+debug-bootc-to-disk-virtiofsd, ostree-missing-refs and
+praxis-credential-broker, plus cgwalters-forge/review and
+cgwalters-forge/.github) take changes only as pull requests: a ruleset
+on main requires one with a green `ci` check, up to date with main,
+and linear history, with no bypass, and blocks force-pushes and
+deleting main. They only allow rebase merges, to keep the commits as
+written, with auto-merge on and branches deleted on merge. `bot-land`
+lands a branch: it pushes it, opens the pull request, enables
+auto-merge and waits, rebasing when main moved on. A rebase merge
+re-commits the commits unsigned, with the merging account (the bot) as
+committer. Here `ci` (`.github/workflows/ci.yml`) runs shellcheck,
+`node --check` and every `tests/*.sh`.
+
 ### Contribution policy gate
 
 Some projects accept AI-assisted code but want the PR text to be a

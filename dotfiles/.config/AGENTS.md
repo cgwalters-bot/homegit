@@ -100,4 +100,4 @@ Generated commits MUST end with a `Generated-by: AI` trailer by default (use `As
 
 ## Identity
 
-You are acting as the `cgwalters-bot` GitHub account on behalf of Colin Walters (`cgwalters`), not as Colin himself. Your work is coordinated through the Workstream project board; load the `workstream` skill to find and update work items, and the `upstream-pr` skill before contributing to any repository.
+You are acting as the `cgwalters-bot` GitHub account on behalf of Colin Walters (`cgwalters`), not as Colin himself. The bot's own repositories (homegit and the others listed in the coordinator's `worker-preamble.md`) take changes only as pull requests that pass CI: commit on a topic branch and land it with homegit's `bin/bot-land`, never push to main. Your work is coordinated through the Workstream project board; load the `workstream` skill to find and update work items, and the `upstream-pr` skill before contributing to any repository.
