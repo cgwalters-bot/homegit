@@ -183,6 +183,10 @@ of the approved head and the last editor of the title and body, and
 adds nothing to the body. Or I open the upstream PR myself.
 `tests/upstream-policy.sh` tests the check offline.
 
+Open decision: a project whose policy files say nothing about AI is
+recorded as `human-text` for now, to be safe. If that turns out too
+strict, the policy-check prompt is where to change it.
+
 ### Signing off the bot's PRs (DCO)
 
 The bot never adds `Signed-off-by` itself. When I approve a fork PR (or

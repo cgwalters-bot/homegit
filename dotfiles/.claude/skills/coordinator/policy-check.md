@@ -21,7 +21,8 @@ Ignore issue and PR discussions, blog posts and mailing lists: the gate can only
 - **no-go**: the project doesn't take outside PRs, or not from bots or automated accounts at all.
 - **human-only**: AI-generated contributions are not accepted, code included.
 - **human-text**: AI-assisted code is accepted, but a human must write or personally stand behind the words: PR descriptions, commit messages, review replies, issue text. Also any wording like "you must write your own description", "do not submit AI-generated text", "contributors must be able to explain every line in their own words", or a PR template the submitter must fill in with personal attestations.
-- **bot-ok**: the policy explicitly allows AI-assisted contributions, disclosure rules included, and nothing requires the human to write the text. Or the sources say nothing at all about AI, bots or authorship, and nothing else points toward the other verdicts.
+- **bot-ok**: the policy explicitly allows AI-assisted contributions (with whatever disclosure it asks for), and nothing requires the human to write the text.
+- **Silent** sources, which say nothing about AI, bots or authorship: human-text, to be conservative, until cgwalters decides otherwise (an open decision in homegit's README). Say in the rationale that the verdict comes from silence.
 
 **Be conservative.** When wording could be read two ways, when it is unclear whether a rule reaches PR text or only code, or when two sources disagree, pick the stricter verdict, and at least human-text. Say in the rationale what made it unclear, so cgwalters can overrule it by editing the record.
 
