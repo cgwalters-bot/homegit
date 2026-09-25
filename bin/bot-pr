@@ -1660,8 +1660,11 @@ add_signoff() {
             committer=(GIT_COMMITTER_NAME="${SIGNOFF_NAME}" GIT_COMMITTER_EMAIL="${SIGNOFF_EMAIL}")
         fi
         # The header ends at the first empty line; the rest is the message,
-        # byte for byte. commit-tree can't keep an encoding header.
-        ! sgit -C "${dir}" cat-file commit "${c}" | sed -n '/^$/q;p' | grep -q '^encoding ' ||
+        # byte for byte. commit-tree can't keep an encoding header. Read to
+        # the end: quitting early kills cat-file on a long message, which
+        # pipefail makes a failure.
+        ! sgit -C "${dir}" cat-file commit "${c}" |
+            awk '/^$/ { in_body = 1 } !in_body && /^encoding / { found = 1 } END { exit !found }' ||
             { rm -f "${msg}"; fatal "${c:0:12} has a non-UTF-8 message encoding; add the sign-off by hand"; }
         sgit -C "${dir}" cat-file commit "${c}" | sed '1,/^$/d' >"${msg}" ||
             { rm -f "${msg}"; fatal "cannot read the message of ${c:0:12}"; }

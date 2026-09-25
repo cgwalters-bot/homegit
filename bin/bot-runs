@@ -785,8 +785,10 @@ cmd_transcript() {
             fatal "the ${TRANSCRIPT_ARTIFACT} artifact of run ${run_id} has neither ${TRANSCRIPT_NAME}.age nor ${TRANSCRIPT_NAME}"
         fi
         # Only plain files and directories: a link could point outside DIR.
+        # awk reads to the end: exiting early would kill tar, and make a
+        # bad entry look like a bad archive.
         bad=$(tar --zstd -tvf "${tarball}" |
-            awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { print; if (++n == 3) exit }') ||
+            awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" && n++ < 3') ||
             fatal "the transcript of run ${run_id} is not a zstd tar"
         test -z "${bad}" || fatal "the transcript of run ${run_id} holds entries other than files and directories: ${bad}"
         mkdir -p "$(dirname "${dir}")"
