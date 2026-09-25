@@ -1,0 +1,338 @@
+#!/usr/bin/env node
+// Contribution policy records for upstream repositories, and the gate
+// that 'bot-pr promote' and 'bot-pr signoff' run before anything of the
+// bot's goes upstream; see --help. Node's standard library only, and
+// 'gh api' for GitHub, like the bash tools next to it.
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1]);
+// The records live in homegit's upstream-policy/OWNER/REPO.md, next to
+// this script's bin/ (through the ~/.local/bin symlink).
+const POLICY_DIR =
+  process.env.UPSTREAM_POLICY_DIR ||
+  path.join(path.dirname(fs.realpathSync(process.argv[1])), "..", "upstream-policy");
+const VERDICTS = {
+  "bot-ok": "the bot may write the code and the text, with the AI trailer",
+  "human-text": "code by the bot is fine, but the PR title and body, commit messages and comments must be cgwalters' own",
+  "human-only": "no AI-generated contributions at all",
+  "no-go": "the bot does not contribute here",
+};
+const REQUIRED_KEYS = ["verdict", "ai-trailer", "dco", "sources", "checked"];
+const SOURCE_KEYS = ["repo", "path", "sha"];
+const SHA_RE = /^[0-9a-f]{40}$/;
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+// The directories scanned for policy files, in the repository and in its
+// owner's '.github' repository (which holds the org-wide defaults).
+const SCAN_DIRS = ["", ".github", "docs"];
+const ORG_REPO = ".github";
+// A file or directory in SCAN_DIRS is a policy source if its name, up to
+// the first dot, matches this (case-insensitively): contribution guides,
+// agent instructions, PR templates, DCO texts, and anything named for AI.
+const SOURCE_NAME_RE =
+  /^(contributing.*|agents|claude|gemini|copilot-instructions|pull_request_template|dco|developer[-_]certificate[-_]of[-_]origin|(.*[^a-z0-9])?(ai|llms?|genai)([^a-z0-9].*)?)$/i;
+
+// Exit statuses; bot-pr tells EX_HUMAN_TEXT apart, and EX_RATELIMIT is
+// EX_TEMPFAIL, as in the bash tools.
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+const EX_MISSING = 3;
+const EX_STALE = 4;
+const EX_HUMAN_TEXT = 5;
+const EX_REFUSED = 6;
+const EX_INVALID = 7;
+const EX_RATELIMIT = 75;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} COMMAND OWNER/REPO [OPTIONS]
+
+Contribution policy records for upstream repositories: git and markdown,
+in homegit's upstream-policy/OWNER/REPO.md (now ${POLICY_DIR}).
+Each record starts with a front matter:
+
+  ---
+  verdict: bot-ok | human-text | human-only | no-go
+  ai-trailer: the AI trailer or policy (Assisted-by, Generated-by, none, ...)
+  dco: yes|no, and how that was detected
+  sources:
+    - repo: OWNER/REPO (or OWNER/.github, for org-wide files)
+      path: CONTRIBUTING.md
+      sha: the blob (or tree) id read, on the default branch
+  checked: DATE by WHO
+  ---
+
+and its body quotes what the verdict rests on, with a one-paragraph
+rationale. The verdicts: ${Object.entries(VERDICTS).map(([v, d]) => `${v}: ${d}`).join("; ")}.
+
+Commands:
+  check OWNER/REPO [--allow-human-text]
+        The promote gate: print the verdict and succeed only if the record
+        exists, is committed to git and valid, is current, and its verdict
+        is bot-ok (or human-text, with --allow-human-text, for when
+        cgwalters wrote the text himself). Current means that every
+        source still has its recorded id on the default branch of its
+        repository, and that the scan below finds no source missing from
+        the record (e.g. a newly added AI policy). Exit status: ${EX_MISSING}
+        no record, ${EX_STALE} stale (re-check the policy), ${EX_HUMAN_TEXT} human-text,
+        ${EX_REFUSED} human-only or no-go, ${EX_INVALID} an invalid or uncommitted record,
+        ${EX_RATELIMIT} rate limited, ${EX_ERROR} any other failure.
+  scan OWNER/REPO
+        Print the policy sources found on the default branches of
+        OWNER/REPO and OWNER/${ORG_REPO}, as the 'sources:' block of a
+        record: the files and directories in ${SCAN_DIRS.map((d) => d || "the top").join(", ")}
+        named like CONTRIBUTING*, AGENTS, CLAUDE, GEMINI,
+        copilot-instructions, PULL_REQUEST_TEMPLATE, DCO, or with AI or
+        LLM as a word in their name. A record may list more sources
+        (anywhere in those repositories); it must list all of these.
+
+UPSTREAM_POLICY_DIR overrides the records' directory. REST only: a few
+calls per repository.
+`;
+}
+
+// gh(args): the parsed JSON 'gh api ARGS' prints, or null for a 404.
+function gh(args) {
+  try {
+    const out = execFileSync("gh", ["api", ...args], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    return JSON.parse(out);
+  } catch (e) {
+    const err = String(e.stderr || e.message);
+    if (/HTTP 404/.test(err)) return null;
+    if (/rate limit|abuse/i.test(err)) {
+      throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot: ${err.trim()}`);
+    }
+    // An empty repository has no tree.
+    if (/HTTP 409/.test(err)) return null;
+    throw new Exit(EX_ERROR, `'gh api ${args.join(" ")}' failed: ${err.trim()}`);
+  }
+}
+
+// A repository's default branch, read once per run, with its trees by
+// directory; null (for OWNER/.github) if the repository doesn't exist.
+class Repo {
+  static cache = new Map();
+
+  static get(name, required) {
+    if (!Repo.cache.has(name)) {
+      const info = gh([`repos/${name}`]);
+      Repo.cache.set(name, info && new Repo(name, info.default_branch));
+    }
+    const repo = Repo.cache.get(name);
+    if (!repo && required) throw new Exit(EX_ERROR, `cannot find the repository ${name}`);
+    return repo;
+  }
+
+  constructor(name, branch) {
+    this.name = name;
+    this.branch = branch;
+    this.trees = new Map();
+  }
+
+  // entries(dir): the entries of directory DIR ("" for the top) on the
+  // default branch, as a Map of name to {sha, type}; empty if it doesn't
+  // exist.
+  entries(dir) {
+    if (!this.trees.has(dir)) {
+      let entries = new Map();
+      let sha = this.branch;
+      if (dir !== "") {
+        const parent = this.entries(path.posix.dirname(dir) === "." ? "" : path.posix.dirname(dir));
+        const e = parent.get(path.posix.basename(dir));
+        sha = e && e.type === "tree" ? e.sha : null;
+      }
+      const tree = sha && gh([`repos/${this.name}/git/trees/${encodeURIComponent(sha)}`]);
+      if (tree) {
+        if (tree.truncated) throw new Exit(EX_ERROR, `the tree of ${dir || "/"} in ${this.name} is truncated`);
+        entries = new Map(tree.tree.map((e) => [e.path, { sha: e.sha, type: e.type }]));
+      }
+      this.trees.set(dir, entries);
+    }
+    return this.trees.get(dir);
+  }
+
+  // sha(file): the id of FILE (a blob or a tree) on the default branch,
+  // or null.
+  sha(file) {
+    const clean = file.replace(/\/+$/, "");
+    const dir = path.posix.dirname(clean);
+    const e = this.entries(dir === "." ? "" : dir).get(path.posix.basename(clean));
+    return e ? e.sha : null;
+  }
+}
+
+// scan(name): the policy sources in NAME and its owner's .github
+// repository, as [{repo, path, sha}], sorted.
+function scan(name) {
+  const repos = [Repo.get(name, true)];
+  const org = `${name.split("/")[0]}/${ORG_REPO}`;
+  if (org !== name) {
+    const r = Repo.get(org, false);
+    if (r) repos.push(r);
+  }
+  const found = [];
+  for (const repo of repos) {
+    for (const dir of SCAN_DIRS) {
+      for (const [entry, { sha, type }] of repo.entries(dir)) {
+        if (type !== "blob" && type !== "tree") continue;
+        if (!SOURCE_NAME_RE.test(entry.replace(/^\./, "").split(".")[0])) continue;
+        found.push({ repo: repo.name, path: dir ? `${dir}/${entry}` : entry, sha });
+      }
+    }
+  }
+  return found;
+}
+
+// parseRecord(text, file): the front matter of a record as an object.
+// Only the subset of YAML the records use: 'key: value' lines, and the
+// 'sources:' list of 'key: value' mappings (or '[]').
+function parseRecord(text, file) {
+  const lines = text.split(/\r?\n/);
+  const bad = (n, why) => new Exit(EX_INVALID, `${file}:${n + 1}: ${why}`);
+  if (lines[0] !== "---") throw bad(0, "a record starts with a '---' front matter line");
+  const end = lines.indexOf("---", 1);
+  if (end < 0) throw bad(0, "the front matter has no closing '---' line");
+  const fields = {};
+  let sources = null;
+  for (let n = 1; n < end; n++) {
+    const line = lines[n];
+    if (/^\s*(#.*)?$/.test(line)) continue;
+    let m;
+    if (sources && (m = line.match(/^\s+(- )?\s*([a-z-]+):\s*(.*)$/))) {
+      if (m[1]) sources.push({ line: n });
+      const current = sources[sources.length - 1];
+      if (!current) throw bad(n, "a source starts with '- '");
+      if (!SOURCE_KEYS.includes(m[2])) throw bad(n, `unknown source key '${m[2]}' (expected ${SOURCE_KEYS.join(", ")})`);
+      current[m[2]] = unquote(m[3]);
+    } else if ((m = line.match(/^([a-z-]+):\s*(.*)$/))) {
+      if (m[1] in fields) throw bad(n, `'${m[1]}' is set twice`);
+      sources = null;
+      if (m[1] === "sources") {
+        if (m[2] !== "" && m[2] !== "[]") throw bad(n, "'sources:' is followed by a list, or is '[]'");
+        sources = [];
+        fields.sources = sources;
+      } else {
+        fields[m[1]] = unquote(m[2]);
+      }
+    } else {
+      throw bad(n, `cannot parse '${line}'`);
+    }
+  }
+  for (const key of REQUIRED_KEYS) {
+    if (!(key in fields) || fields[key] === "") throw bad(0, `the front matter has no '${key}'`);
+  }
+  if (!(fields.verdict in VERDICTS)) {
+    throw bad(0, `unknown verdict '${fields.verdict}' (expected one of ${Object.keys(VERDICTS).join(", ")})`);
+  }
+  if (!/^(yes|no)\b/.test(fields.dco)) throw bad(0, "'dco' starts with yes or no");
+  for (const s of fields.sources) {
+    if (!s.path) throw bad(s.line, "a source has no 'path'");
+    if (!SHA_RE.test(s.sha || "")) throw bad(s.line, `the source ${s.path} has no 40-hex 'sha'`);
+    if (s.repo && !REPO_RE.test(s.repo)) throw bad(s.line, `invalid repo '${s.repo}'`);
+  }
+  if (!lines.slice(end + 1).some((l) => l.trim() !== "")) throw bad(end, "the record has no body (quotes and rationale)");
+  return fields;
+}
+
+function unquote(v) {
+  const m = v.trim().match(/^(["'])(.*)\1$/);
+  return m ? m[2] : v.trim();
+}
+
+// readRecord(name): the path and parsed record of NAME, which must be
+// committed as it is: git is the source of truth.
+function readRecord(name) {
+  const file = path.join(POLICY_DIR, `${name}.md`);
+  if (!fs.existsSync(file)) {
+    throw new Exit(
+      EX_MISSING,
+      `${name} has no policy record (${file}); have a policy-check subagent write one (see homegit's dotfiles/.claude/skills/coordinator/policy-check.md)`,
+    );
+  }
+  let status;
+  try {
+    status = execFileSync("git", ["-C", path.dirname(file), "status", "--porcelain", "--", path.basename(file)], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (e) {
+    throw new Exit(EX_INVALID, `cannot tell whether ${file} is committed: ${String(e.stderr || e.message).trim()}`);
+  }
+  if (status.trim() !== "") throw new Exit(EX_INVALID, `${file} has uncommitted changes; commit and push it first`);
+  return { file, record: parseRecord(fs.readFileSync(file, "utf8"), file) };
+}
+
+// staleness(name, record): what changed upstream since the record was
+// written, one line per source.
+function staleness(name, record) {
+  const changes = [];
+  const key = (s) => `${s.repo || name}:${s.path.replace(/\/+$/, "")}`;
+  const recorded = new Set(record.sources.map(key));
+  for (const s of record.sources) {
+    const repo = Repo.get(s.repo || name, false);
+    const now = repo && repo.sha(s.path);
+    if (!now) changes.push(`${key(s)} is gone`);
+    else if (now !== s.sha) changes.push(`${key(s)} changed (${s.sha.slice(0, 12)} -> ${now.slice(0, 12)})`);
+  }
+  for (const s of scan(name)) {
+    if (!recorded.has(key(s))) changes.push(`${key(s)} is not in the record`);
+  }
+  return changes;
+}
+
+function check(name, allowHumanText) {
+  const { file, record } = readRecord(name);
+  const changes = staleness(name, record);
+  if (changes.length) {
+    throw new Exit(
+      EX_STALE,
+      `${name}'s policy record is stale; re-check the policy (a policy-check subagent updates ${file}):\n${changes.map((c) => `  ${c}`).join("\n")}`,
+    );
+  }
+  const verdict = record.verdict;
+  const why = `${name}'s policy is ${verdict} (${file}, checked ${record.checked}): ${VERDICTS[verdict]}`;
+  if (verdict === "human-text" && !allowHumanText) throw new Exit(EX_HUMAN_TEXT, why);
+  if (verdict === "human-only" || verdict === "no-go") throw new Exit(EX_REFUSED, why);
+  return verdict;
+}
+
+function main(argv) {
+  if (argv.includes("-h") || argv.includes("--help")) {
+    process.stdout.write(usage());
+    return;
+  }
+  const [command, name, ...rest] = argv;
+  if (!command || !name || !REPO_RE.test(name)) throw new Exit(EX_USAGE, `usage: ${PROG} check|scan OWNER/REPO (see --help)`);
+  if (command === "check") {
+    const allow = rest.length === 1 && rest[0] === "--allow-human-text";
+    if (rest.length > (allow ? 1 : 0)) throw new Exit(EX_USAGE, `unknown arguments for check: ${rest.join(" ")}`);
+    console.log(check(name, allow));
+  } else if (command === "scan") {
+    if (rest.length) throw new Exit(EX_USAGE, `unknown arguments for scan: ${rest.join(" ")}`);
+    const found = scan(name);
+    console.log(found.length ? "sources:" : "sources: []");
+    for (const s of found) console.log(`  - repo: ${s.repo}\n    path: ${s.path}\n    sha: ${s.sha}`);
+  } else {
+    throw new Exit(EX_USAGE, `unknown command '${command}' (see --help)`);
+  }
+}
+
+try {
+  main(process.argv.slice(2));
+} catch (e) {
+  if (!(e instanceof Exit)) throw e;
+  console.error(`error: ${e.message}`);
+  process.exit(e.status);
+}
