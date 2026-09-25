@@ -13,21 +13,41 @@ readonly TITLE_WIDTH=70
 readonly SET_OPTIONS=(--status --priority --workflow --org --why --branch --gist)
 # Free-text fields; the rest of SET_OPTIONS are single-selects.
 readonly TEXT_FIELDS=(Why Branch Gist)
-# The Org field groups items by upstream organization. The fork PRs in
-# FORGE_OWNER's forks belong to the fork's parent. (The bot's own forks
-# don't show up that way: its compare URLs name the upstream repository,
-# and its non-fork repositories like homegit stay cgwalters-bot.)
-readonly FORGE_OWNER=cgwalters-forge
+# The Org field says which organization an item's work targets, so the
+# board can be filtered to the bot's own infrastructure (the
+# cgwalters-forge and cgwalters-bot options) or to work going outbound.
+# A fork owned by one of FORK_OWNERS counts as its upstream's: fork PRs
+# in cgwalters-forge target their upstream, as do branches in cgwalters'
+# and the bot's personal forks. Their other repositories are their own:
+# cgwalters-forge/review is cgwalters-forge.
+readonly FORK_OWNERS=(cgwalters-forge cgwalters-bot cgwalters)
+# Owners with an Org other than their name.
+readonly -A OWNER_ORGS=([cgwalters]=cgwalters-bot)
+# Repositories with an Org other than their owner's, lowercase.
+readonly -A REPO_ORGS=(
+    # The bot's runner setup; it lives in bootc-dev for its runners.
+    [bootc-dev/cgwalters-devspace-sandbox]=cgwalters-bot
+)
+# First path components of github.com URLs that aren't repositories.
+readonly NON_REPO_PATHS=(users orgs settings notifications sponsors marketplace apps)
+# Fork lookups are REST calls (outside the GraphQL quota), cached this long.
+readonly REPO_TTL=86400
 # Org for owners with no Org option of their own.
 readonly ORG_OTHER=other
 # Org by the first word of a title, for draft items without a repository
 # link; the word is lowercased, with a trailing ':' removed.
 readonly -A TITLE_ORGS=(
-    [bootc]=bootc-dev [bcvk]=bootc-dev [infra]=bootc-dev [devspace]=bootc-dev
+    [bootc]=bootc-dev [bcvk]=bootc-dev [infra]=bootc-dev
     [composefs]=composefs [composefs-rs]=composefs
-    [ostree]=ostreedev [bootupd]=coreos [zlink]=z-galaxy [podman]=containers
+    [ostree]=ostreedev [bootupd]=coreos [rpm-ostree]=coreos
+    [cargo-vendor-filterer]=coreos [zlink]=z-galaxy [podman]=containers
+    [image-builder]=osbuild [bootc-image-builder]=osbuild [osbuild]=osbuild
+    [rhel-bootc-examples]=redhat-cop
+    [review]=cgwalters-forge
     [bot-board]=cgwalters-bot [bot-notify]=cgwalters-bot [bot-pr]=cgwalters-bot
-    [bot-watch]=cgwalters-bot [homegit]=cgwalters-bot
+    [bot-watch]=cgwalters-bot [bot-work]=cgwalters-bot [bot-runs]=cgwalters-bot
+    [homegit]=cgwalters-bot [devspace]=cgwalters-bot [coordinator]=cgwalters-bot
+    [board]=cgwalters-bot
 )
 # Org edits sent per GraphQL request by fill-org.
 readonly ORG_BATCH=20
@@ -96,8 +116,9 @@ Commands:
                               '--org none' items without an Org.
   show ITEM                   Show all fields of one item
   add URL                     Add an issue or PR and set its Org from the
-                              URL's owner (a ${FORGE_OWNER} fork's
-                              parent); prints the new item id
+                              URL's repository (a fork's upstream, for
+                              forks in cgwalters-forge); prints the new
+                              item id
   draft TITLE BODY            Create a draft item; prints the new item id
   set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT]
            [--branch URL...] [--gist URL...]
@@ -107,10 +128,12 @@ Commands:
                               separate several with spaces.
                               An empty value clears a text field.
   fill-org [--all] [--dry-run]
-                              Set Org on items that have none (--all: on
-                              every item), from the content URL, else the
-                              first Branch URL, else the title's first
-                              word; '${ORG_OTHER}' when nothing matches
+                              Set Org on items that have none (--all:
+                              also correct every other item), from the
+                              Branch URLs, else the content URL, else the
+                              title's first word, else a draft's body
+                              links; '${ORG_OTHER}' when nothing matches
+                              and the item has no Org yet
   state-get [--track] NAME    Print the JSON state kept in the archived
                               draft item '${STATE_PREFIX}NAME' ({} if it
                               doesn't exist yet). --track records it as
@@ -460,35 +483,53 @@ org_option() {
 }
 
 # org_of_url URL: the Org of a github.com repository URL (issue, PR,
-# compare, blob, ...), or nothing for other URLs; requires load_fields.
-# Resolving a fork's parent is a REST call, outside the GraphQL quota.
+# compare, blob, ...), or nothing for other URLs; fails if looking up
+# whether it is a fork failed. Requires load_fields.
 org_of_url() {
     [[ "$1" =~ ^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+) ]] || return 0
-    local owner=${BASH_REMATCH[1]} repo=${BASH_REMATCH[2]} parent
-    if test "${owner,,}" = "${FORGE_OWNER}"; then
-        parent=$(gh api "repos/${owner}/${repo}" --jq '.parent.owner.login // empty') ||
-            fatal "looking up the parent of ${owner}/${repo} failed"
-        test -z "${parent}" || owner=${parent}
+    local owner=${BASH_REMATCH[1],,} repo=${BASH_REMATCH[2],,} source
+    ! one_of "${owner}" "${NON_REPO_PATHS[@]}" || return 0
+    repo=${owner}/${repo%.git}
+    if one_of "${owner}" "${FORK_OWNERS[@]}"; then
+        source=$(cached "source-${owner}_${repo#*/}" "${REPO_TTL}" \
+            gh api "repos/${repo}" --jq '.source.full_name // empty') || {
+            echo "error: cannot tell whether ${repo} is a fork: looking it up failed" 1>&2
+            return 1
+        }
+        test -z "${source}" || repo=${source,,}
     fi
-    org_option "${owner}"
+    owner=${repo%%/*}
+    if test -n "${REPO_ORGS[${repo}]:-}"; then
+        echo "${REPO_ORGS[${repo}]}"
+    else
+        org_option "${OWNER_ORGS[${owner}]:-${owner}}"
+    fi
 }
 
-# item_org ITEM_JSON: the Org derived from an item's content URL, else its
-# first Branch URL, else its title's first word, else nothing; requires
-# load_fields.
+# item_org ITEM_JSON: the Org derived from an item's Branch URLs (where
+# its work lands), else its content URL, else its title's first word,
+# else the links in a draft's body, else nothing; requires load_fields.
 item_org() {
-    local url branch title word org
-    { read -r url; read -r branch; read -r title; } < <(jq -r '
-        .content.url // "", ((.branch // "") | split(" ") | map(select(. != "")) | first // ""),
-        (.title // "" | gsub("[\n\t]"; " "))' <<<"$1")
-    for url in "${url}" "${branch}"; do
+    local urls=() body_urls=() url title word org
+    mapfile -t urls < <(jq -r '((.branch // "") | split(" ") | map(select(. != ""))[]), (.content.url // empty)' <<<"$1")
+    mapfile -t body_urls < <(jq -r '.content.body // "" | scan("https://github\\.com/[A-Za-z0-9_./-]+")' <<<"$1")
+    title=$(jq -r '.title // "" | gsub("[\n\t]"; " ")' <<<"$1")
+    for url in "${urls[@]}"; do
         # Command substitutions don't inherit set -e, so pass failures on.
         org=$(org_of_url "${url}") || exit
         test -z "${org}" || { echo "${org}"; return 0; }
     done
     read -r word _ <<<"${title,,}"
     word=${word%:}
-    test -z "${word}" || echo "${TITLE_ORGS[${word}]:-}"
+    if test -n "${word}" && test -n "${TITLE_ORGS[${word}]:-}"; then
+        echo "${TITLE_ORGS[${word}]}"
+        return 0
+    fi
+    # Body text is loose, so a link that can't be resolved is skipped.
+    for url in "${body_urls[@]}"; do
+        org=$(org_of_url "${url}") || continue
+        test -z "${org}" || { echo "${org}"; return 0; }
+    done
 }
 
 # set_org ITEM ORG: sets one item's Org; requires load_fields.
@@ -513,18 +554,21 @@ cmd_fill_org() {
     done
     load_fields
     load_items
-    local field item id org title updates=() leftovers=()
+    local field item id org current title updates=() leftovers=()
     field=$(field_json Org | jq -r .id)
     while IFS= read -r item; do
         id=$(jq -r .id <<<"${item}")
         [[ "${id}" =~ ^PVTI_[A-Za-z0-9_-]+$ ]] || fatal "unexpected item id '${id}'"
         title=$(jq -r .title <<<"${item}")
         org=$(item_org "${item}")
+        current=$(jq -r '.org // ""' <<<"${item}")
         if test -z "${org}"; then
+            # Keep an Org someone chose for an item nothing links anywhere.
+            test -z "${current}" || continue
             org=${ORG_OTHER}
             leftovers+=("${id}  ${title}")
         fi
-        test "$(jq -r '.org // ""' <<<"${item}")" = "${org}" && continue
+        test "${current}" = "${org}" && continue
         printf '%s\t%s\t%s\n' "${id}" "${org}" "${title:0:${TITLE_WIDTH}}"
         updates+=("${id} $(option_id Org "${org}")")
     done < <(jq -c --argjson all "${all}" '.items[] | select($all or .org == null)' <<<"${ITEMS_JSON}")

@@ -68,12 +68,25 @@ fields hold result links: the fork PR URL while Draft, the upstream PR URL
 once In Review (or compare URLs, for follow-up branches on cgwalters' PRs),
 and secret gist write-up URLs. **Priority** ranks the work
 (below), and **Workflow** says what kind of output the item wants.
-**Org** groups items by upstream organization (`bootc-dev`, `composefs`,
-`ostreedev`, `coreos`, `cgwalters-bot`, `z-galaxy`, `containers`, or
-`other`): the owner of the item's repository, where a fork PR in
-cgwalters-forge counts as its upstream's. `bot-board add` sets it; set it
-yourself on draft items (`--org`), and `bot-board fill-org` fills in any
-item that lacks one.
+**Org** is the organization the item's work targets, so cgwalters can
+filter the board to the bot's own infrastructure or to outbound work.
+Outbound orgs are `bootc-dev`, `composefs`, `ostreedev`, `coreos`,
+`containers`, `podman-container-tools`, `osbuild`, `redhat-cop`,
+`z-galaxy`, and `other` for any owner without an option. Own infrastructure
+is `cgwalters-forge` (the forge's own repositories, such as
+cgwalters-forge/review) and `cgwalters-bot` (the bot itself: homegit,
+cgwalters-bot/*, bot tooling, cgwalters' profile, and the devspace runner
+setup in bootc-dev/cgwalters-devspace-sandbox). A fork PR in
+cgwalters-forge targets its upstream, so a forge bootc PR is `bootc-dev`.
+`bot-board add` sets Org; `bot-board fill-org` fills in items that lack
+one, from Branch (where the work lands), else the item's URL, else the
+title's first word (`image-builder: ...`), else a draft's body links. Set
+`--org` yourself on a draft none of those place, and when a new
+organization turns up, add its option to the board's Org field (the
+GraphQL `updateProjectV2Field` replaces the whole option list, so pass
+every existing option with its `id`) and run `bot-board fill-org --all`.
+Board filters for these views: `org:cgwalters-forge,cgwalters-bot` (own
+infra) and `-org:cgwalters-forge,cgwalters-bot` (outbound).
 
 ## Workflow
 
