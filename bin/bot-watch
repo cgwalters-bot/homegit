@@ -63,12 +63,15 @@ sweep saw and report:
     who made them; other new commits with their committer (GitHub
     doesn't say who pushed them), unless that is ${BOT_LOGIN};
   - CI turning red (or green again), flagged on the bot's own branches.
-    Failures of workflows disabled since (as 'bot-pr fork-setup' does
-    with ones that can't work on a fork) don't count.
+    Runs of workflows disabled since don't count, failed or still
+    queued: 'bot-pr fork-setup' disables every workflow on the forks in
+    cgwalters-forge, where devspace testing is the CI, so the runs
+    cancelled then (whose summary jobs fail) aren't news.
 
 On the bot's fork PRs (its PRs in ${FORK_OWNERS}) only pushes and CI
-are reported; 'bot-pr inbox' covers cgwalters' review there. A URL seen for
-the first time is only recorded, unless CI on the bot's branch fails.
+are reported; 'bot-pr inbox' covers cgwalters' review there. Most have
+no CI at all, which is expected and not reported. A URL seen for the
+first time is only recorded, unless CI on the bot's branch fails.
 
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
@@ -288,9 +291,9 @@ readonly EXCERPT_JQ='def excerpt:
 
 # disabled_suites REPO SHA: prints the ids of the check suites of SHA's
 # Actions runs whose workflow is disabled now, as a JSON array. Their
-# failures are not news: 'bot-pr fork-setup' disables workflows that
-# can't work on a fork (upstream's PR bots, which fail for lack of its
-# secrets), usually after they already failed on some fork PR.
+# results are not news: 'bot-pr fork-setup' disables every workflow on a
+# forge fork (devspace testing is the CI of fork PRs), cancelling runs
+# whose summary jobs then fail, and leaving others to finish.
 disabled_suites() {
     local runs workflows
     runs=$(rest_get "repos/$1/actions/runs?head_sha=$2&per_page=${PER_PAGE}") || return
@@ -303,9 +306,10 @@ disabled_suites() {
 # checks_state REPO SHA: prints failure, pending, success or none for the
 # check runs and commit statuses of SHA, plus the failing names:
 # {checks, failing}. Check runs of disabled workflows (see
-# disabled_suites) don't count. A workflow left enabled that fails only
-# for want of upstream's secrets does: telling that apart would take its
-# logs, but 'bot-pr fork-setup' names such workflows in the fork PR.
+# disabled_suites) don't count, so a fork PR whose CI is off is "none".
+# A workflow opted in on a fork that fails only for want of upstream's
+# secrets does count: telling that apart would take its logs, but 'bot-pr
+# fork-setup' names such workflows in the fork PR.
 checks_state() {
     local runs='' page=1 body total status ignored='[]'
     while :; do
@@ -315,8 +319,8 @@ checks_state() {
         test $((page * CHECKS_PER_PAGE)) -lt "${total}" || break
         page=$((page + 1))
     done
-    # Only worth two more requests when something failed.
-    if jq -se --argjson failed "${FAILED_CONCLUSIONS}" 'any(.[]; .conclusion | IN($failed[]))' >/dev/null <<<"${runs}"; then
+    # Only worth two more requests when something failed or is pending.
+    if jq -se --argjson failed "${FAILED_CONCLUSIONS}" 'any(.[]; (.conclusion | IN($failed[])) or .status != "completed")' >/dev/null <<<"${runs}"; then
         ignored=$(disabled_suites "$1" "$2") ||
             { warn "cannot list the Actions runs of $1@$2; counting failures of disabled workflows too"; ignored='[]'; }
     fi
