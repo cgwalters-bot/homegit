@@ -339,14 +339,18 @@ for i in 0 1 2; do
     n=$(git -C "${FORGE}" rev-parse "${new}~${i}")
     test "$(git -C "${FORGE}" rev-parse "${o}^{tree}")" = "$(git -C "${FORGE}" rev-parse "${n}^{tree}")" ||
         fail "sign #1: tree of ${new}~${i} changed"
-    fmt='%an <%ae> %ad'
-    test "$(git -C "${FORGE}" show -s --format="${fmt}" --date=raw "${o}")" = \
-        "$(git -C "${FORGE}" show -s --format="${fmt}" --date=raw "${n}")" || fail "sign #1: author of ${new}~${i} changed"
+    # The bot's old name becomes its current one; nothing else changes.
+    oa=$(git -C "${FORGE}" show -s --format='%an <%ae> %ad' --date=raw "${o}")
+    test "${oa}" = "${oa#"${BOT_LEGACY_NAME} "}" || oa="${BOT_NAME} ${oa#"${BOT_LEGACY_NAME} "}"
+    test "$(git -C "${FORGE}" show -s --format='%an <%ae> %ad' --date=raw "${n}")" = "${oa}" ||
+        fail "sign #1: author of ${new}~${i} changed"
     test "$(git -C "${FORGE}" show -s --format='%cn <%ce>' "${n}")" = "${HUMAN_NAME} <${HUMAN_EMAIL}>" ||
         fail "sign #1: ${new}~${i} not committed by the human"
     test "$(git -C "${FORGE}" show -s --format=%B "${n}")" = "$(git -C "${FORGE}" show -s --format=%B "${o}")"$'\n\n'"${SOB}" ||
         fail "sign #1: message of ${new}~${i}: $(git -C "${FORGE}" show -s --format=%B "${n}")"
 done
+test "$(git -C "${FORGE}" show -s --format='%an <%ae>' "${new}~2")" = "${BOT_NAME} <${BOT_EMAIL}>" ||
+    fail "sign #1: the bot's commit under its old name wasn't renamed"
 test -e "${WORK}/hook-ran" && fail "a git hook ran"
 
 # --- Rerunning is a no-op once the PR is signed ---

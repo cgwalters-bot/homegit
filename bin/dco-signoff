@@ -53,8 +53,10 @@ ${CACHE_DIR}, shows its commits, rebases them with
 onto the base's current tip, so nothing but the trailers changes), with
 hooks disabled, verifies that each rewritten commit has the original tree,
 author and message plus your sign-off, asks, and force-pushes the PR's
-branch with a lease on the head it fetched. Commits that already carry
-your sign-off are kept as they are, and a PR whose commits all do is
+branch with a lease on the head it fetched. The bot's rewritten commits
+named '${BOT_GIT_LEGACY_NAME}' get its current name, '${BOT_GIT_NAME}', as
+'bot-pr promote' does. Commits that already carry your sign-off are kept
+as they are, and a PR whose commits all do is
 skipped, so it is safe to rerun.
 
 PR arguments (https://github.com/OWNER/REPO/pull/N or OWNER/REPO#N) limit
@@ -323,9 +325,31 @@ message_sans_sob() {
     sgit -C "$1" show -s --format=%B "$2" | sed -e 's/[[:space:]]*$//' | grep -Fxv -- "${SOB}" || true
 }
 
+# The bot's commits from before its rename, as '%an <%ae>' in lower case.
+LEGACY_IDENT="${BOT_GIT_LEGACY_NAME,,} <${BOT_GIT_EMAIL,,}>"
+readonly LEGACY_IDENT
+# Run by the rebase after each commit it rewrites: give the bot's commits
+# from before its rename its current name, as 'bot-pr promote' does, so
+# the PR shows one name for them. The author email and date stay.
+RENAME_EXEC="test \"\$(git log -1 --format='%an <%ae>' | tr '[:upper:]' '[:lower:]')\" != '${LEGACY_IDENT}' || \
+git commit -q --amend --no-edit --no-verify --allow-empty --cleanup=verbatim --author='${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'"
+readonly RENAME_EXEC
+
+# author_of REPO COMMIT: its '%an <%ae> %ad' (raw date), with the bot's
+# old name replaced by its current one, as RENAME_EXEC does.
+author_of() {
+    local a
+    a=$(sgit -C "$1" show -s --format='%an <%ae> %ad' --date=raw "$2")
+    if [[ "${a,,}" == "${LEGACY_IDENT} "* ]]; then
+        a="${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>${a:${#LEGACY_IDENT}}"
+    fi
+    printf '%s\n' "${a}"
+}
+
 # verify REPO BASE OLD NEW: NEW must be OLD with SOB added to each commit
-# after BASE lacking it, and nothing else changed: same trees, authors and
-# messages otherwise, and still based on BASE.
+# after BASE lacking it, and nothing else changed: same trees, authors (but
+# for the bot's old name, see author_of) and messages otherwise, and still
+# based on BASE.
 verify() {
     local git=$1 base=$2 old new i
     mapfile -t old < <(sgit -C "${git}" rev-list --reverse "${base}..$3")
@@ -335,8 +359,7 @@ verify() {
         local o=${old[i]} n=${new[i]} os ns
         test "$(sgit -C "${git}" rev-parse "${o}^{tree}")" = "$(sgit -C "${git}" rev-parse "${n}^{tree}")" ||
             { info "  ${n:0:12}'s tree differs from ${o:0:12}'s"; return 1; }
-        test "$(sgit -C "${git}" show -s --format='%an <%ae> %ad' --date=raw "${o}")" = \
-            "$(sgit -C "${git}" show -s --format='%an <%ae> %ad' --date=raw "${n}")" ||
+        test "$(author_of "${git}" "${o}")" = "$(author_of "${git}" "${n}")" ||
             { info "  ${n:0:12}'s author differs from ${o:0:12}'s"; return 1; }
         test "$(message_sans_sob "${git}" "${o}")" = "$(message_sans_sob "${git}" "${n}")" ||
             { info "  ${n:0:12}'s message differs from ${o:0:12}'s by more than the sign-off"; return 1; }
@@ -423,7 +446,7 @@ reconcile() {
     WORKTREE=$(mktemp -d "${TMPDIR:-/tmp}/dco-signoff.XXXXXX")
     sgit -C "${CLONE}" worktree add -q --detach "${WORKTREE}" "${head_sha}"
     if ! sgit -C "${WORKTREE}" rebase -q --signoff --force-rebase --no-autosquash \
-        --keep-empty --empty=keep "${upstream}" >&2; then
+        --keep-empty --empty=keep --exec "${RENAME_EXEC}" "${upstream}" >&2; then
         info "  the rebase failed"
         cleanup
         return 1
