@@ -75,13 +75,16 @@ credentials, and borrow compute for building and testing. `bot-devspace`
 (installed by `make install` like the rest of `bin/`) dispatches an
 ephemeral RHEL 10 runner from
 [bootc-dev/cgwalters-devspace-sandbox](https://github.com/bootc-dev/cgwalters-devspace-sandbox),
-waits for it to be reachable over the tailnet, installs a toolchain
-(podman, gcc, Rust, ...) and hands out an ssh_config, so an agent edits
+waits for it to be reachable over the tailnet and hands out an
+ssh_config for its unprivileged `agent` user (the workflow installs the
+toolchain: podman, gcc, Rust, bcvk, ...), so an agent edits
 locally, pushes its branch to the devspace with plain git over SSH, runs
 the project's tests there (KVM is available for VM tests), and pushes the
 tested branch to the forge fork from the local machine. No credentials are
-ever copied to a devspace; see the `devspace-work` skill. `bot-devspace
-stop` cancels the runner, since they're billed while they run.
+ever copied to a devspace, and the SSH user can't reach the runner's
+own (see the `devspace-work` skill); `tests/bot-devspace.sh` tests which
+user `bot-devspace` picks. `bot-devspace stop` cancels the runner, since
+they're billed while they run.
 
 The next step moves the agents themselves onto devspaces: an `agent.yml`
 workflow runs an agent on one board item, with its condensed transcript

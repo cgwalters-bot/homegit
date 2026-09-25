@@ -7,10 +7,16 @@ description: Build and test the bot's changes on an ephemeral devspace runner (R
 
 Devspaces are ephemeral GitHub Actions runners from
 `bootc-dev/cgwalters-devspace-sandbox`, reachable over the tailnet. They
-have passwordless sudo, `/dev/kvm`, ~150G of disk, and after provisioning
-podman, buildah, skopeo, gcc, make, Rust (rustc, cargo, rustfmt, clippy),
-python3, git, just, jq and tmux. `bin/bot-devspace` manages them; run
-`bot-devspace --help` for the details.
+have `/dev/kvm`, ~150G of disk, and podman, buildah, skopeo, gcc, make,
+Rust (rustc, cargo, rustfmt, clippy), bcvk, python3, git, just, jq and
+tmux. You log in as `agent`, which has **no sudo**: the workflow's own
+`runner` user holds the job's credentials (it can mint the OIDC tokens
+the tailnet login trusts), so nothing run over SSH may become it. (A
+devspace from a workflow revision that predates `agent` logs you in as
+`runner`, with sudo; `bot-devspace start` says so. Work as if you had no
+sudo there too.)
+`bin/bot-devspace` manages them; run `bot-devspace --help` for the
+details.
 
 The division of labor is strict:
 
@@ -55,7 +61,7 @@ bot-devspace start --cores 16 --duration 120 "$NAME"
 ```
 
 `start` dispatches the workflow, waits for SSH (usually 1-3 minutes),
-installs the toolchain (`bot-devspace provision`, idempotent) and prints
+checks the toolchain is there (`bot-devspace provision`) and prints
 the host; give the command a 15-minute tool timeout or run it in the
 background. If it fails or is interrupted after dispatching, it cancels
 the runner itself (unless `--keep-on-failure`), so just retry.
@@ -109,10 +115,13 @@ recording a result, check that the build really came from the branch's head
 commit.
 
 Containers and VMs: when a project's CI builds or tests in containers, run
-those same steps with podman on the devspace (rootless works; use `sudo
-podman` where CI runs privileged). `/dev/kvm` is available, so VM-based
-tests (e.g. bcvk, or a project's `just test-integration` that boots a disk
-image) can run there too, unlike on most machines.
+those same steps with rootless podman on the devspace. `/dev/kvm` is
+available, so VM-based tests (e.g. `bcvk ephemeral`, or a project's
+`just test-integration` that boots a disk image) can run there too, unlike
+on most machines. Anything that needs root (privileged containers, `bootc
+install to-disk` on loop devices) runs inside such a VM, never on the
+host. A missing package can't be installed from the session: add it to
+the workflow's `packages.txt` instead.
 
 ## Bring results back
 
