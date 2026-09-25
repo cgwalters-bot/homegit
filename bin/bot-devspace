@@ -48,10 +48,18 @@ readonly PROVISION_PACKAGES=(
     # Build deps shared by bootc, ostree-ext and composefs-rs
     libzstd-devel clang-devel ostree-devel glib2-devel
     rust cargo rustfmt clippy
-    python3 git
-    # VM stack for bcvk-based integration tests
-    bcvk qemu-kvm libvirt virtiofsd
+    python3 python3-pip git
+    # VM stack for bcvk-based integration tests. virt-fw-vars (from
+    # python3-virt-firmware) is what bcvk enrolls Secure Boot keys with,
+    # which sealed UKI tests need.
+    bcvk qemu-kvm libvirt virtiofsd python3-virt-firmware
 )
+# EPEL's bcvk and tmt are too old for bootc's tmt tests, so provision also
+# installs these into ~/.local/bin (ahead of /usr/bin in PATH), matching
+# bootc CI: bcvk from bootc-dev/actions' bootc-ubuntu-setup, tmt from
+# bootc's .github/actions/install-tmt. Keep them in sync with those.
+readonly BCVK_VERSION=0.19.0
+readonly TMT_VERSION=1.78.0
 
 usage() {
     cat <<EOF
@@ -392,10 +400,39 @@ cmd_provision() {
     fi
     # Only call dnf for what is missing, so re-running is quick and quiet.
     if ! ssh -F "$(state_dir "${name}")/ssh_config" "${ALIAS_PREFIX}${name}" \
-        bash -s -- "${mode}" "${PROVISION_PACKAGES[@]}" <<'EOF'; then
+        bash -s -- "${mode}" "${BCVK_VERSION}" "${TMT_VERSION}" "${PROVISION_PACKAGES[@]}" <<'EOF'; then
 set -euo pipefail
-mode=$1
-shift
+# The runner image is built with umask 000.
+umask 022
+mode=$1 bcvk_version=$2 tmt_version=$3
+shift 3
+
+# bcvk and tmt, per user and without sudo; this runs after the packages
+# are there, since it needs python3-pip.
+install_user_tools() {
+    local bindir=${HOME}/.local/bin
+    mkdir -p "${bindir}"
+    if ! "${bindir}/bcvk" --version 2>/dev/null | grep -qFw "${bcvk_version}"; then
+        local target tmp url
+        target=bcvk-$(uname -m)-unknown-linux-gnu
+        url=https://github.com/bootc-dev/bcvk/releases/download/v${bcvk_version}/${target}.tar.gz
+        tmp=$(mktemp -d)
+        curl -fsSL --retry 5 -o "${tmp}/${target}.tar.gz" "${url}"
+        curl -fsSL --retry 5 -o "${tmp}/${target}.tar.gz.sha256" "${url}.sha256"
+        (cd "${tmp}" && sha256sum --quiet -c "${target}.tar.gz.sha256")
+        tar -C "${tmp}" -xzf "${tmp}/${target}.tar.gz"
+        install -m 0755 -T "${tmp}/${target}" "${bindir}/bcvk"
+        rm -rf "${tmp}"
+        echo "Installed bcvk ${bcvk_version} in ${bindir}"
+    fi
+    # bootc's tmt runs use the connect provisioner, so the
+    # provision-virtual extra (and building libvirt-python) is not needed.
+    if ! "${bindir}/tmt" --version 2>/dev/null | grep -qFw "${tmt_version}"; then
+        python3 -m pip install -q --user --disable-pip-version-check "tmt==${tmt_version}"
+        echo "Installed tmt ${tmt_version} in ${bindir}"
+    fi
+}
+
 missing=()
 for pkg in "$@"; do
     rpm -q --whatprovides "${pkg}" >/dev/null 2>&1 || missing+=("${pkg}")
@@ -406,6 +443,7 @@ if test "${mode}" = check; then
         exit 1
     fi
     echo "All packages installed"
+    install_user_tools
     exit 0
 fi
 # Legacy devspaces, whose SSH user has sudo. The runner image is built
@@ -427,6 +465,7 @@ for group in kvm libvirt; do
         sudo usermod -aG "${group}" "$(id -un)"
     fi
 done
+install_user_tools
 EOF
         test "${mode}" = install ||
             fatal "devspace ${name} lacks part of the toolchain, and ${SSH_USER} has no sudo to install it: add the packages to packages.txt in ${REPO}"

@@ -8,8 +8,8 @@ description: Build and test the bot's changes on an ephemeral devspace runner (R
 Devspaces are ephemeral GitHub Actions runners from
 `bootc-dev/cgwalters-devspace-sandbox`, reachable over the tailnet. They
 have `/dev/kvm`, ~150G of disk, and podman, buildah, skopeo, gcc, make,
-Rust (rustc, cargo, rustfmt, clippy), bcvk, python3, git, just, jq and
-tmux. You log in as `agent`, which has **no sudo**: the workflow's own
+Rust (rustc, cargo, rustfmt, clippy), bcvk, tmt, python3, git, just, jq
+and tmux. You log in as `agent`, which has **no sudo**: the workflow's own
 `runner` user holds the job's credentials (it can mint the OIDC tokens
 the tailnet login trusts), so nothing run over SSH may become it. (A
 devspace from a workflow revision that predates `agent` logs you in as
@@ -122,6 +122,21 @@ on most machines. Anything that needs root (privileged containers, `bootc
 install to-disk` on loop devices) runs inside such a VM, never on the
 host. A missing package can't be installed from the session: add it to
 the workflow's `packages.txt` instead.
+
+bootc's tmt tests (`just test-tmt`, `just test-composefs ...`) need the
+bcvk and tmt versions bootc CI pins, which are newer than EPEL's;
+`bot-devspace provision` puts those in `~/.local/bin`. Sealed UKI runs
+(`just test-composefs systemd ext4 uki sealed`) also need `virt-fw-vars`
+(python3-virt-firmware), with which bcvk enrolls the test Secure Boot
+keys. Export the matching `BOOTC_variant`, `BOOTC_bootloader`,
+`BOOTC_filesystem`, `BOOTC_boot_type` and `BOOTC_seal_state` like CI
+does, since nested `just` calls in `test-tmt` drop command-line
+overrides. On sealed UKI, a test can only boot into an image built and
+signed on the host (image-upgrade-reboot gets one through bind storage):
+an image built inside the VM with `tap make_uki_containerfile` (e.g. by
+plan-36-rollback) has an unsigned UKI, which the firmware refuses
+("Access denied" in the plan's `console.txt`), so tmt times out waiting
+for the reboot. CI runs only readonly and image-upgrade-reboot there.
 
 ## Bring results back
 
