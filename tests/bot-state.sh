@@ -87,6 +87,14 @@ case "$1 $2" in
                     '{updateProjectV2DraftIssue: {draftIssue: {id: $id, title: ($t | rtrimstr("\n"))}}}'
                 ;;
             *archiveProjectV2Item*) echo '{}' ;;
+            # A PR body's edits: $FAKE_GH/body-edits.json (as
+            # [{at, by}], newest first), or none.
+            *userContentEdits*)
+                jq -c '{data: {repository: {pullRequest: {userContentEdits: {totalCount: length,
+                        nodes: [.[] | {editedAt: .at, editor: {login: .by}}]}}}}}' \
+                    "$(test -e "${store}/body-edits.json" && echo "${store}/body-edits.json" || echo /dev/stdin)" <<<'[]' |
+                    jq -rc "${filter:-.}"
+                ;;
             *"node(id:"*)
                 item=$(arg id "$@")
                 draft=$(draft_of "${item}")
@@ -361,7 +369,7 @@ rest() {
 
 # promote_world COMMENTS REVIEWS LOGGED_PUSH TIMELINE: a fork PR whose head
 # PR_HEAD the fork's activity log last shows pushed as LOGGED_PUSH
-# ({at, after}), with the issue COMMENTS and REVIEWS as [{login, at, body}]
+# ({at, after, by}, by defaulting to the bot), with the issue COMMENTS and REVIEWS as [{login, at, body}]
 # and [{login, at, state, commit}], and the PR's TIMELINE events.
 promote_world() {
     local body
@@ -375,7 +383,7 @@ promote_world() {
     rest "repos/${PR_FORK}/pulls/1/reviews" "$(jq -c '[.[] | {user: {login}, submitted_at: .at, state, body: "",
         id: 7, commit_id: .commit, html_url: "https://github.com/x/review"}]' <<<"$2")"
     rest "repos/${PR_FORK}/pulls/1/comments" '[]'
-    rest "repos/${PR_FORK}/activity" "$(jq -c '[{timestamp: .at, after, activity_type: "push"}]' <<<"$3")"
+    rest "repos/${PR_FORK}/activity" "$(jq -c '[{timestamp: .at, after, activity_type: "push", actor: {login: (.by // "cgwalters-bot")}}]' <<<"$3")"
     rest "repos/${PR_FORK}/issues/1/timeline" "$4"
     rest "repos/up/demo/pulls" '[]'
     rest "repos/up/demo/compare/main...cgwalters-forge:${PR_BRANCH}" '{"ahead_by": 1, "behind_by": 0}'
@@ -501,19 +509,40 @@ test_pr_promote_policy() {
     echo human-text >"${WORK}/policy"
     expect_promote "human-text, /promote" no \
         "contribution policy is human-text: the PR title and body and the commit messages must be cgwalters's own.*'/promote --human-text'"
-    # His '/promote --human-text' approves like '/promote', but the body
-    # must be his: the bot's trailer line gone.
+    # From anyone else, '/promote --human-text' approves nothing.
+    promote_world '[{"login": "someone", "at": "2026-09-24T10:05:00Z", "body": "/promote --human-text"}]' '[]' \
+        "${PUSHED_10}" "${COMMITTED_0950}"
+    expect_promote "human-text, by another login" no 'is not approved'
+
+    # His '/promote --human-text' approves like '/promote', but GitHub must
+    # show the text is his: he pushed the approved head, made the body's
+    # last edit and set the title, and the bot's trailer line is gone.
+    local his_push his_title
+    his_push=$(jq -c '. + {by: "cgwalters"}' <<<"${PUSHED_10}")
+    his_title=$(jq -c '. + [{event: "renamed", actor: {login: "cgwalters"}, rename: {from: "Bot title", to: "Demo"}}]' <<<"${COMMITTED_0950}")
     promote_world "${human}" '[]' "${PUSHED_10}" "${COMMITTED_0950}"
-    expect_promote "human-text, the bot's trailer left" no "still has the bot's 'Generated-by: .*' line"
+    expect_promote "human-text, all the bot's" no \
+        "pushed by cgwalters-bot, not cgwalters; the body was last edited by no one since it was opened, not cgwalters; the title was not last set by cgwalters; the body still has the bot's 'Generated-by: .*' line"
     sed -i 's,\\n\\nGenerated-by: [^\\]*,,' "${FAKE_GH}/rest/repos/${PR_FORK}/pulls/1.json"
+    echo '[{"at": "2026-09-24T10:03:00Z", "by": "cgwalters"}, {"at": "2026-09-24T09:00:00Z", "by": "cgwalters-bot"}]' \
+        >"${FAKE_GH}/body-edits.json"
+    rest "repos/${PR_FORK}/activity" "$(jq -c '[{timestamp: .at, after, activity_type: "push", actor: {login: .by}}]' <<<"${his_push}")"
+    expect_promote "human-text, the bot's title" no "but the title was not last set by cgwalters;"
+    rest "repos/${PR_FORK}/issues/1/timeline" "$(jq -c '. + [{event: "renamed", actor: {login: "cgwalters"}, rename: {from: "Bot", to: "Other"}}]' <<<"${COMMITTED_0950}")"
+    expect_promote "human-text, retitled since" no "but the title was not last set by cgwalters;"
+    rest "repos/${PR_FORK}/issues/1/timeline" "${his_title}"
     rest "repos/up/demo/rules/branches/main" "${dco_rules}"
     expect_promote "human-text, his text" yes '^Policy: +human-text, text by cgwalters'
     # promote adds nothing to his body, not even the DCO approval note.
     out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
     ! grep -q 'on these commits was added' <<<"${out}" || fail "a note added to his text: ${out}"
-    # On a bot-ok repository, it's an ordinary approval.
+    # A later body edit by the bot takes it back.
+    echo '[{"at": "2026-09-24T10:04:00Z", "by": "cgwalters-bot"}, {"at": "2026-09-24T10:03:00Z", "by": "cgwalters"}]' \
+        >"${FAKE_GH}/body-edits.json"
+    expect_promote "human-text, the bot edited last" no "the body was last edited by cgwalters-bot, not cgwalters"
+    # On a bot-ok repository, it still says the text is his, so it's checked.
     echo bot-ok >"${WORK}/policy"
-    expect_promote "bot-ok, /promote --human-text" yes '^Policy: +bot-ok, text by cgwalters'
+    expect_promote "bot-ok, /promote --human-text" no "the body was last edited by cgwalters-bot"
 }
 
 # --- bot-notify -------------------------------------------------------------

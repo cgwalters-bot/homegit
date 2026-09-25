@@ -11,10 +11,19 @@ const path = require("node:path");
 
 const PROG = path.basename(process.argv[1]);
 // The records live in homegit's upstream-policy/OWNER/REPO.md, next to
-// this script's bin/ (through the ~/.local/bin symlink).
+// this script's bin/ (through the ~/.local/bin symlink). The override is
+// only for tests: the gate is the records in homegit.
 const POLICY_DIR =
   process.env.UPSTREAM_POLICY_DIR ||
   path.join(path.dirname(fs.realpathSync(process.argv[1])), "..", "upstream-policy");
+// A record counts only as pushed: it must be what this remote's branch
+// has, and GitHub vouches for whoever loosened a verdict there.
+const REMOTE = "origin";
+const REMOTE_BRANCH = "main";
+const HOMEGIT_REPO = "cgwalters-bot/homegit";
+// The only login that may loosen a verdict, in a commit GitHub verified.
+const OWNER_LOGIN = "cgwalters";
+// Verdicts from the loosest to the strictest.
 const VERDICTS = {
   "bot-ok": "the bot may write the code and the text, with the AI trailer",
   "human-text": "code by the bot is fine, but the PR title and body, commit messages and comments must be cgwalters' own",
@@ -24,10 +33,11 @@ const VERDICTS = {
 const REQUIRED_KEYS = ["verdict", "ai-trailer", "dco", "sources", "checked"];
 const SOURCE_KEYS = ["repo", "path", "sha"];
 const SHA_RE = /^[0-9a-f]{40}$/;
-const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+// OWNER/REPO, neither of them all dots ('..' would leave the records).
+const REPO_RE = /^(?!\.+\/)[A-Za-z0-9_.-]+\/(?!\.+$)[A-Za-z0-9_.-]+$/;
 // The directories scanned for policy files, in the repository and in its
 // owner's '.github' repository (which holds the org-wide defaults).
-const SCAN_DIRS = ["", ".github", "docs"];
+const SCAN_DIRS = ["", ".github", "docs", "doc"];
 const ORG_REPO = ".github";
 // A file or directory in SCAN_DIRS is a policy source if its name, up to
 // the first dot, matches this (case-insensitively): contribution guides,
@@ -95,13 +105,23 @@ Commands:
         LLM as a word in their name. A record may list more sources
         (anywhere in those repositories); it must list all of these.
 
-UPSTREAM_POLICY_DIR overrides the records' directory. REST only: a few
-calls per repository.
+A record counts only when it is committed and is what ${REMOTE}/${REMOTE_BRANCH}
+has (check fetches it first). When the commit there that last changed
+its verdict made it looser than before (human-text to bot-ok, say),
+GitHub must report that commit as verified and authored by
+${OWNER_LOGIN}: the policy-check subagent creates records and may
+tighten them, but only he loosens one. A renamed repository's record
+must move to its new name.
+
+UPSTREAM_POLICY_DIR overrides the records' directory, for tests only.
+REST only: a few calls per repository.
 `;
 }
 
-// gh(args): the parsed JSON 'gh api ARGS' prints, or null for a 404.
-function gh(args) {
+// gh(args, allow404): the parsed JSON 'gh api ARGS' prints; null for a
+// 404 if ALLOW404, which only the optional OWNER/.github repository is:
+// anything else missing fails, rather than looking like no policy.
+function gh(args, allow404 = false) {
   try {
     const out = execFileSync("gh", ["api", ...args], {
       encoding: "utf8",
@@ -110,29 +130,42 @@ function gh(args) {
     return JSON.parse(out);
   } catch (e) {
     const err = String(e.stderr || e.message);
-    if (/HTTP 404/.test(err)) return null;
+    if (allow404 && /HTTP 404/.test(err)) return null;
     if (/rate limit|abuse/i.test(err)) {
       throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot: ${err.trim()}`);
     }
-    // An empty repository has no tree.
-    if (/HTTP 409/.test(err)) return null;
     throw new Exit(EX_ERROR, `'gh api ${args.join(" ")}' failed: ${err.trim()}`);
   }
 }
 
 // A repository's default branch, read once per run, with its trees by
-// directory; null (for OWNER/.github) if the repository doesn't exist.
+// directory. get() returns null only for an OPTIONAL one (OWNER/.github)
+// that doesn't exist.
 class Repo {
   static cache = new Map();
 
-  static get(name, required) {
-    if (!Repo.cache.has(name)) {
-      const info = gh([`repos/${name}`]);
-      Repo.cache.set(name, info && new Repo(name, info.default_branch));
+  static get(name, optional = false) {
+    const key = name.toLowerCase();
+    if (!Repo.cache.has(key)) {
+      const info = gh([`repos/${name}`], optional);
+      let repo = null;
+      if (info) {
+        if (typeof info.full_name !== "string" || !info.default_branch) {
+          throw new Exit(EX_ERROR, `GitHub gave no name or default branch for ${name}`);
+        }
+        // GitHub redirects a renamed repository, and a record under the
+        // old name would then vouch for another one's policy.
+        if (info.full_name.toLowerCase() !== key) {
+          throw new Exit(
+            EX_ERROR,
+            `${name} was renamed to ${info.full_name}; the record belongs in upstream-policy/${info.full_name}.md`,
+          );
+        }
+        repo = new Repo(info.full_name, info.default_branch);
+      }
+      Repo.cache.set(key, repo);
     }
-    const repo = Repo.cache.get(name);
-    if (!repo && required) throw new Exit(EX_ERROR, `cannot find the repository ${name}`);
-    return repo;
+    return Repo.cache.get(key);
   }
 
   constructor(name, branch) {
@@ -153,9 +186,12 @@ class Repo {
         const e = parent.get(path.posix.basename(dir));
         sha = e && e.type === "tree" ? e.sha : null;
       }
-      const tree = sha && gh([`repos/${this.name}/git/trees/${encodeURIComponent(sha)}`]);
-      if (tree) {
-        if (tree.truncated) throw new Exit(EX_ERROR, `the tree of ${dir || "/"} in ${this.name} is truncated`);
+      if (sha) {
+        const tree = gh([`repos/${this.name}/git/trees/${encodeURIComponent(sha)}`]);
+        if (!tree || !Array.isArray(tree.tree)) {
+          throw new Exit(EX_ERROR, `GitHub gave no tree for ${dir || "the top"} of ${this.name}`);
+        }
+        if (tree.truncated) throw new Exit(EX_ERROR, `the tree of ${dir || "the top"} in ${this.name} is truncated`);
         entries = new Map(tree.tree.map((e) => [e.path, { sha: e.sha, type: e.type }]));
       }
       this.trees.set(dir, entries);
@@ -176,10 +212,10 @@ class Repo {
 // scan(name): the policy sources in NAME and its owner's .github
 // repository, as [{repo, path, sha}], sorted.
 function scan(name) {
-  const repos = [Repo.get(name, true)];
+  const repos = [Repo.get(name)];
   const org = `${name.split("/")[0]}/${ORG_REPO}`;
-  if (org !== name) {
-    const r = Repo.get(org, false);
+  if (org.toLowerCase() !== name.toLowerCase()) {
+    const r = Repo.get(org, true);
     if (r) repos.push(r);
   }
   const found = [];
@@ -215,6 +251,7 @@ function parseRecord(text, file) {
       const current = sources[sources.length - 1];
       if (!current) throw bad(n, "a source starts with '- '");
       if (!SOURCE_KEYS.includes(m[2])) throw bad(n, `unknown source key '${m[2]}' (expected ${SOURCE_KEYS.join(", ")})`);
+      if (m[2] in current) throw bad(n, `the source's '${m[2]}' is set twice`);
       current[m[2]] = unquote(m[3]);
     } else if ((m = line.match(/^([a-z-]+):\s*(.*)$/))) {
       if (m[1] in fields) throw bad(n, `'${m[1]}' is set twice`);
@@ -251,8 +288,79 @@ function unquote(v) {
   return m ? m[2] : v.trim();
 }
 
-// readRecord(name): the path and parsed record of NAME, which must be
-// committed as it is: git is the source of truth.
+// The records' checkout is only read (and fetched into): no hooks.
+const GIT_ARGS = ["-c", "core.hooksPath=/dev/null"];
+
+// git(dir, args, what): git's output in DIR, or an EX_INVALID failure
+// saying it couldn't WHAT.
+function git(dir, args, what) {
+  try {
+    return execFileSync("git", [...GIT_ARGS, "-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  } catch (e) {
+    throw new Exit(EX_INVALID, `cannot ${what}: ${String(e.stderr || e.message).trim()}`);
+  }
+}
+
+// gitMaybe(dir, args): git's output in DIR, or null if it fails.
+function gitMaybe(dir, args) {
+  try {
+    return execFileSync("git", [...GIT_ARGS, "-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+  } catch {
+    return null;
+  }
+}
+
+// verdictAt(dir, rev, rel): the verdict in REV:REL; null if REL doesn't
+// exist there, "" if it has none.
+function verdictAt(dir, rev, rel) {
+  const text = gitMaybe(dir, ["show", `${rev}:${rel}`]);
+  if (text === null) return null;
+  const m = text.match(/^verdict:[ \t]*(.*)$/m);
+  return m ? unquote(m[1]) : "";
+}
+
+// strictness(verdict): its rank, loosest first; anything unknown ranks as
+// the strictest, so that leaving it is a loosening.
+function strictness(verdict) {
+  const i = Object.keys(VERDICTS).indexOf(verdict);
+  return i < 0 ? Infinity : i;
+}
+
+// checkLoosening(top, rel, verdict): the commit on the remote branch that
+// last changed REL's verdict line may make it no looser than the record's
+// previous version had it, or create the record; otherwise GitHub must
+// report that commit as verified and authored by OWNER_LOGIN. The
+// policy-check subagent records and tightens verdicts; only he loosens.
+function checkLoosening(top, rel, verdict) {
+  const upstream = `${REMOTE}/${REMOTE_BRANCH}`;
+  const changed = git(top, ["log", "-m", "--first-parent", "-1", "--format=%H", "-G^verdict:", upstream, "--", rel], `find what set ${rel}'s verdict`);
+  if (!changed) return;
+  const parent = gitMaybe(top, ["rev-parse", "-q", "--verify", `${changed}^1`]);
+  if (parent === null) return;
+  // The version before: the file as the last commit before CHANGED that
+  // had it left it, skipping a deletion, which would hide a loosening.
+  let previous = null;
+  const earlier = git(top, ["rev-list", "--first-parent", parent.trim(), "--", rel], `read ${rel}'s history`);
+  for (const c of earlier.split("\n").filter(Boolean)) {
+    previous = verdictAt(top, c, rel);
+    if (previous !== null) break;
+  }
+  if (previous === null || strictness(verdict) >= strictness(previous)) return;
+  const commit = gh([`repos/${HOMEGIT_REPO}/commits/${changed}`]);
+  const verified = Boolean(commit && commit.commit && commit.commit.verification && commit.commit.verification.verified === true);
+  const login = commit && commit.author && commit.author.login;
+  if (!verified || login !== OWNER_LOGIN) {
+    throw new Exit(
+      EX_INVALID,
+      `${rel}'s verdict went from ${previous} to ${verdict} in ${changed.slice(0, 12)}, which is not a commit by ${OWNER_LOGIN} that GitHub verified (verified: ${verified}, author: ${login || "unknown"}); only he loosens a verdict`,
+    );
+  }
+}
+
+// readRecord(name): the path and parsed record of NAME. Git is the source
+// of truth: the record must be committed, and be what REMOTE's
+// REMOTE_BRANCH has, which it fetches first, so that a verdict tightened
+// there counts even before this checkout pulls it.
 function readRecord(name) {
   const file = path.join(POLICY_DIR, `${name}.md`);
   if (!fs.existsSync(file)) {
@@ -261,27 +369,38 @@ function readRecord(name) {
       `${name} has no policy record (${file}); have a policy-check subagent write one (see homegit's dotfiles/.claude/skills/coordinator/policy-check.md)`,
     );
   }
-  let status;
-  try {
-    status = execFileSync("git", ["-C", path.dirname(file), "status", "--porcelain", "--", path.basename(file)], {
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-  } catch (e) {
-    throw new Exit(EX_INVALID, `cannot tell whether ${file} is committed: ${String(e.stderr || e.message).trim()}`);
+  const top = git(path.dirname(file), ["rev-parse", "--show-toplevel"], `find the git repository of ${file}`);
+  const rel = path.relative(top, fs.realpathSync(file));
+  if (git(top, ["status", "--porcelain", "--", rel], `tell whether ${file} is committed`) !== "") {
+    throw new Exit(EX_INVALID, `${file} has uncommitted changes; commit and push it first`);
   }
-  if (status.trim() !== "") throw new Exit(EX_INVALID, `${file} has uncommitted changes; commit and push it first`);
-  return { file, record: parseRecord(fs.readFileSync(file, "utf8"), file) };
+  const upstream = `${REMOTE}/${REMOTE_BRANCH}`;
+  git(top, ["fetch", "-q", REMOTE, REMOTE_BRANCH], `fetch ${upstream} to check ${file} against it`);
+  const pushed = (gitMaybe(top, ["rev-parse", "-q", "--verify", `${upstream}:${rel}`]) || "").trim();
+  const local = git(top, ["rev-parse", `HEAD:${rel}`], `read ${rel} at HEAD`);
+  if (pushed !== local) {
+    throw new Exit(
+      EX_INVALID,
+      pushed
+        ? `${file} differs from ${upstream}'s; pull (git pull --ff-only) or push, so that the gate reads what ${upstream} has`
+        : `${file} is not on ${upstream}; push it first`,
+    );
+  }
+  const record = parseRecord(fs.readFileSync(file, "utf8"), file);
+  checkLoosening(top, rel, record.verdict);
+  return { file, record };
 }
 
 // staleness(name, record): what changed upstream since the record was
 // written, one line per source.
 function staleness(name, record) {
   const changes = [];
-  const key = (s) => `${s.repo || name}:${s.path.replace(/\/+$/, "")}`;
+  const key = (s) => `${(s.repo || name).toLowerCase()}:${s.path.replace(/\/+$/, "")}`;
   const recorded = new Set(record.sources.map(key));
+  const org = `${name.split("/")[0]}/${ORG_REPO}`.toLowerCase();
   for (const s of record.sources) {
-    const repo = Repo.get(s.repo || name, false);
+    const r = s.repo || name;
+    const repo = Repo.get(r, r.toLowerCase() === org);
     const now = repo && repo.sha(s.path);
     if (!now) changes.push(`${key(s)} is gone`);
     else if (now !== s.sha) changes.push(`${key(s)} changed (${s.sha.slice(0, 12)} -> ${now.slice(0, 12)})`);
@@ -292,7 +411,9 @@ function staleness(name, record) {
   return changes;
 }
 
-function check(name, allowHumanText) {
+function check(requested, allowHumanText) {
+  // The record is under the repository's canonical name (see Repo.get).
+  const name = Repo.get(requested).name;
   const { file, record } = readRecord(name);
   const changes = staleness(name, record);
   if (changes.length) {

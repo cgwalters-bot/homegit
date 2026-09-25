@@ -171,10 +171,17 @@ unless the record is committed, every source is unchanged on upstream's
 default branch, no new policy file has appeared, and the verdict is
 `bot-ok`. A separate read-only subagent writes the records
 (`dotfiles/.claude/skills/coordinator/policy-check.md`); to overrule
-one, I edit its verdict. For `human-text`, I rewrite the fork PR's title,
-body and commit messages myself and approve with a `/promote
---human-text` line (promote then adds nothing to the body), or open the
-upstream PR myself. `tests/upstream-policy.sh` tests the check offline.
+one, I edit its verdict. Records count only as pushed to homegit's
+main, and a commit there that loosens a verdict (say human-text to
+bot-ok) must be one of mine that GitHub shows as verified, so the bot
+can record and tighten verdicts but not loosen them.
+
+For `human-text`, I retitle the fork PR, rewrite its body and reword
+the commits myself, push them myself, and approve with a `/promote
+--human-text` line; promote checks that GitHub shows me as the pusher
+of the approved head and the last editor of the title and body, and
+adds nothing to the body. Or I open the upstream PR myself.
+`tests/upstream-policy.sh` tests the check offline.
 
 ### Signing off the bot's PRs (DCO)
 

@@ -291,12 +291,15 @@ Only two ways, never anything else:
   or a draft if he commented `/draft`), closes the fork PR and updates the
   board; see "Review loop" in `workstream`. It first passes the policy
   gate (see "Project policy wins"). For a `human-text` repository, he
-  takes over the text: he edits the fork PR's title and body (removing
+  takes over the text: he retitles the fork PR, edits its body (removing
   the bot's `Generated-by` line), rewords the commits and pushes them to
-  the branch, then approves with a comment line that is exactly
+  the branch himself, then approves with a comment line that is exactly
   `/promote --human-text` (or puts it in an approving review's body).
-  Promote then checks the bot's line is gone and adds nothing to his body,
-  not even the DCO approval note. Or he opens the upstream PR himself.
+  Promote and signoff check that GitHub shows him as the pusher of the
+  approved head, the body's last editor and the title's last setter,
+  and that the bot's line is gone; promote adds nothing to his body, not
+  even the DCO approval note. So never push to or edit such a fork PR
+  after he took it over. Or he opens the upstream PR himself.
 - **Workflow `pr`**, set by a human: open a draft PR directly, then set
   the item In Review with the PR URL in Branch:
 

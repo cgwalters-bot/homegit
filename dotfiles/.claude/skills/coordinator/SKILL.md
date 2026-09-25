@@ -72,10 +72,13 @@ instead of piping it through `tail` and losing lines for good.
   wrote the change. Once it's pushed, `git -C
   ~/src/github/cgwalters-bot/homegit pull --ff-only` so the gate sees it,
   then promote. For a human-text verdict, tell cgwalters the text must be
-  his: he edits the fork PR's title and body (dropping the bot's
-  `Generated-by` line), rewords and pushes the commits, and comments a
-  `/promote --human-text` line (or opens the upstream PR himself); inbox
-  then shows `[APPROVED, text by cgwalters]`. For human-only or no-go,
+  his: he retitles the fork PR, edits its body (dropping the bot's
+  `Generated-by` line), rewords the commits and pushes them himself, then
+  comments a `/promote --human-text` line (or opens the upstream PR
+  himself); inbox then shows `[APPROVED, text by cgwalters]`. Promote
+  checks GitHub's record of who pushed the approved head, who edited the
+  body last and who set the title, so the bot must not push to or edit
+  that fork PR after he does. For human-only or no-go,
   set the item Needs human with the record's link. Never edit a record's
   verdict to get past the gate; only cgwalters does that.
 - **Review feedback** on a fork PR goes to a worker, preferably the one

@@ -100,8 +100,8 @@ readonly SIGNOFF_RECORD_RE='<!-- bot-pr signoff approved=(?<approved>[0-9a-f]{40
 readonly EX_OTHERS=11
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
-# The contribution policy gate that promote and signoff pass first; the
-# override is for tests.
+# The contribution policy gate that promote and signoff pass first. The
+# override is for tests only: the gate is homegit's upstream-policy.
 UPSTREAM_POLICY=${BOT_PR_UPSTREAM_POLICY:-$(dirname "$(readlink -f "$0")")/upstream-policy}
 readonly UPSTREAM_POLICY
 # upstream-policy's exit statuses for a missing record, a stale one, and
@@ -168,8 +168,11 @@ Commands:
         needs a policy-check subagent first). For a human-text verdict,
         ${REVIEWER} writes the title, body and commit messages himself and
         approves with a '${HUMAN_TEXT_COMMAND}' line (in a comment, or in
-        an approving review's body); promote then checks that the body
-        lost the bot's trailer line and adds none of its own notes to it.
+        an approving review's body); promote then checks that GitHub shows
+        him pushing the approved head, making the body's last edit and
+        setting the title last, and that the body lost the bot's trailer
+        line, and it adds none of its own notes to the body. signoff
+        checks the same.
         Then: rebase onto the upstream base if it moved (on conflicts,
         dismiss the approval and stop). If the repository wants DCO (the base
         branch's rules require a DCO check, one ran on the base branch,
@@ -1561,7 +1564,31 @@ policy_gate() {
 # human_text_howto FORK_PR_URL: how REVIEWER takes over the text of a
 # fork PR for a human-text repository.
 human_text_howto() {
-    echo "the PR title and body and the commit messages must be ${REVIEWER}'s own: he edits the title and body of $1 (dropping the bot's '${LLMS_TRAILER}' line), rewords the commits and pushes them to its branch, then comments '${HUMAN_TEXT_COMMAND}' on a line of its own (or puts it in an approving review); or he opens the upstream PR himself"
+    echo "the PR title and body and the commit messages must be ${REVIEWER}'s own: he retitles $1 and edits its body (dropping the bot's '${LLMS_TRAILER}' line), rewords the commits and pushes them to its branch himself, then comments '${HUMAN_TEXT_COMMAND}' on a line of its own (or puts it in an approving review); or he opens the upstream PR himself"
+}
+
+# human_text_problems FORK NUMBER BRANCH APPROVED_HEAD TITLE: prints, one
+# per line, what shows that the text of FORK#NUMBER (on BRANCH, with
+# TITLE) isn't REVIEWER's own, as his '${HUMAN_TEXT_COMMAND}' says it is;
+# nothing if it all is. He must have pushed APPROVED_HEAD (having
+# reworded the commits), made the body's last edit, and set the title
+# last. GitHub records who did each, which is what's checked; how much he
+# changed isn't.
+human_text_problems() {
+    local fork=$1 number=$2 branch=$3 approved=$4 title=$5 pusher editor renamer
+    pusher=$(ghapi -X GET "repos/${fork}/activity" -f ref="refs/heads/${branch}" -f direction=desc -f per_page=100 \
+        --jq "[.[] | select(.after == \"${approved}\")][0].actor.login // empty") ||
+        fatal "cannot read the activity log of ${fork}"
+    test "${pusher}" = "${REVIEWER}" ||
+        echo "the approved head ${approved:0:12} was pushed by ${pusher:-no one in the activity log}, not ${REVIEWER}"
+    editor=$(body_edits "${fork}" "${number}" | jq -r '.nodes[0].by // empty') ||
+        fatal "cannot read who edited the body of ${fork}#${number}"
+    test "${editor}" = "${REVIEWER}" || echo "the body was last edited by ${editor:-no one since it was opened}, not ${REVIEWER}"
+    renamer=$(ghapi --paginate "repos/${fork}/issues/${number}/timeline?per_page=100" \
+        --jq '.[] | select(.event == "renamed") | {by: .actor.login, to: .rename.to}' | jq -rs --arg t "${title}" \
+        'last // {} | if .to == $t then .by else "" end') ||
+        fatal "cannot read the timeline of ${fork}#${number}"
+    test "${renamer}" = "${REVIEWER}" || echo "the title was not last set by ${REVIEWER}"
 }
 
 # signoff_note APPROVAL_URL: the line for an upstream PR's body that says
@@ -1982,9 +2009,13 @@ cmd_promote() {
     policy_gate "${upstream}" "${human_text}" "${url}"
     if test -n "${POLICY_REFUSAL}"; then
         :
-    elif ${human_text} && grep -qxF "${LLMS_TRAILER}" <<<"${body}"; then
-        POLICY_REFUSAL="${REVIEWER} approved with '${HUMAN_TEXT_COMMAND}', but the body still has the bot's '${LLMS_TRAILER}' line; $(human_text_howto "${url}")"
-    elif ! ${human_text}; then
+    elif ${human_text}; then
+        local problems
+        problems=$(human_text_problems "${FORK}" "${NUMBER}" "${head}" "$(verdict 'approval.commit_id // empty')" "${title}")
+        ! grep -qxF "${LLMS_TRAILER}" <<<"${body}" || problems+=${problems:+$'\n'}"the body still has the bot's '${LLMS_TRAILER}' line"
+        test -z "${problems}" ||
+            POLICY_REFUSAL="${REVIEWER} approved with '${HUMAN_TEXT_COMMAND}', but ${problems//$'\n'/; }; $(human_text_howto "${url}")"
+    else
         grep -qxF "${LLMS_TRAILER}" <<<"${body}" || warn "${url}'s body has no '${LLMS_TRAILER}' line"
     fi
     if test -n "${POLICY_REFUSAL}"; then
@@ -2151,8 +2182,10 @@ cmd_signoff() {
 
     local pr author state head head_repo head_sha base
     pr=$(ghapi "repos/${upstream}/pulls/${upstream_number}") || fatal "cannot read ${url}"
-    read -r author state head head_repo head_sha base < <(jq -r \
-        '"\(.user.login) \(.state) \(.head.ref) \(.head.repo.full_name) \(.head.sha) \(.base.ref)"' <<<"${pr}")
+    # GitHub's name for it, not the URL's, which may be an old name it
+    # redirects (and the policy gate needs the current one).
+    read -r author state head head_repo head_sha base upstream < <(jq -r \
+        '"\(.user.login) \(.state) \(.head.ref) \(.head.repo.full_name) \(.head.sha) \(.base.ref) \(.base.repo.full_name)"' <<<"${pr}")
     test "${author}" = "${BOT_LOGIN}" || fatal "${url} was opened by ${author}, not ${BOT_LOGIN}"
     test "${state}" = open || fatal "${url} is ${state}"
     [[ "${head_repo}" =~ ^(${FORGE_ORG}|${BOT_LOGIN})/ ]] || fatal "${url}'s head is in ${head_repo}, not in a fork in ${FORGE_ORG}"
@@ -2182,8 +2215,10 @@ cmd_signoff() {
         NUMBER=${n}
     done
     test -n "${NUMBER}" || fatal "no PR in ${FORK} says 'bot-pr promote' opened ${url} from it; only a promoted PR's approval can sign it off"
-    local fork_url=https://github.com/${FORK}/pull/${NUMBER} promoted_head
-    promoted_head=$(ghapi "repos/${FORK}/pulls/${NUMBER}" --jq .head.sha) || fatal "cannot read ${fork_url}"
+    local fork_url=https://github.com/${FORK}/pull/${NUMBER} promoted_head fork_title
+    { read -r promoted_head; read -r fork_title; } < <(ghapi "repos/${FORK}/pulls/${NUMBER}" --jq '.head.sha, .title') ||
+        fatal "cannot read ${fork_url}"
+    test -n "${promoted_head}" || fatal "cannot read ${fork_url}"
 
     test "$(dco_required "${upstream}" "${base}")" = true ||
         fatal "${upstream}:${base} neither requires nor runs a ${DCO_CHECK} check; nothing to sign off"
@@ -2207,7 +2242,14 @@ cmd_signoff() {
         fatal "${fork_url} ${why_not}; his approving review or '${PROMOTE_COMMAND}' there of the head that went upstream is what signs off"
     fi
     # The contribution policy gate, as in promote.
-    policy_gate "${upstream}" "$(verdict 'approval.human_text == true')" "${fork_url}"
+    local human_text problems
+    human_text=$(verdict 'approval.human_text == true')
+    policy_gate "${upstream}" "${human_text}" "${fork_url}"
+    if test -z "${POLICY_REFUSAL}" && ${human_text}; then
+        problems=$(human_text_problems "${FORK}" "${NUMBER}" "${head}" "${approved_head}" "${fork_title}")
+        test -z "${problems}" ||
+            POLICY_REFUSAL="${REVIEWER} approved with '${HUMAN_TEXT_COMMAND}', but ${problems//$'\n'/; }; $(human_text_howto "${fork_url}")"
+    fi
     test -z "${POLICY_REFUSAL}" || fatal "not signing off ${url}: ${POLICY_REFUSAL}"
     if test "${head_sha}" != "${approved_head}"; then
         info "${head_sha:0:12} is ${REVIEWER}'s approved ${approved_head:0:12} plus his sign-off, per the bot's record; checking that"

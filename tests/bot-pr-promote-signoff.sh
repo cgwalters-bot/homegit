@@ -147,7 +147,7 @@ case "${method} ${path}" in
         head=$(jq -r .head <<<"${req}")
         fork=${head%%:*}/$(jq -r '.repo | sub(".*/"; "")' <<<"${req}")
         json=$(jq --arg s "$(sha "${fork}" "${head#*:}")" --arg fork "${fork}" '
-            {user: {login: (.user // "cgwalters-bot")}, state: "open", html_url, base: {ref: .base},
+            {user: {login: (.user // "cgwalters-bot")}, state: "open", html_url, base: {ref: .base, repo: {full_name: .repo}},
              head: {ref: (.head | sub("^[^:]*:"; "")), sha: $s, repo: {full_name: $fork}}}' <<<"${req}") ;;
     PATCH\ repos/*/pulls/*)
         f=${store}/rest/${path}.json
@@ -337,9 +337,12 @@ O2=$(commit_as bot others "by the bot")
 # below.
 new_branch bot/unpromoted
 P1=$(commit_as bot unpromoted "unpromoted")
+# #17 is for a human-text acme/dcoapp: cgwalters pushed its head.
+new_branch bot/human
+H1=$(commit_as bot human "human")
 git -C "${SRC}" push -q forge bot/sign bot/signed bot/mixed bot/lease bot/stale bot/rebased bot/forged bot/legacy
 git -C "${SRC}" push -q nodco bot/plain
-git -C "${SRC}" push -q app bot/app bot/late bot/moved bot/unapproved bot/others bot/unpromoted
+git -C "${SRC}" push -q app bot/app bot/late bot/moved bot/unapproved bot/others bot/unpromoted bot/human
 
 fork_pr proj 1 bot/sign "${S3}"
 fork_pr nodco 2 bot/plain "${N1}"
@@ -356,6 +359,7 @@ fork_pr dcoapp 13 bot/moved "${MV1}"
 fork_pr dcoapp 14 bot/unapproved "${U1}"
 fork_pr dcoapp 15 bot/others "${O2}"
 fork_pr dcoapp 16 bot/unpromoted "${P1}"
+fork_pr dcoapp 17 bot/human "${H1}"
 jq -n --arg a "${F1}" --arg s "${F2}" --arg u "https://github.com/cgwalters-forge/proj/pull/8#pullrequestreview-800" '
     [{user: {login: "cgwalters-bot"}, created_at: "2026-09-25T12:00:00Z", html_url: "https://github.com/cgwalters-forge/proj/pull/8#c0",
       body: "Signed off 1 commit(s)\n\n<!-- bot-pr signoff approved=\($a) signed=\($s) approval=\($u) review=800 -->"}]' \
@@ -382,11 +386,14 @@ echo '{"path": ".github/workflows/signoff.yml"}' | fixture repos/acme/proj/conte
 # by the real upstream-policy against a CONTRIBUTING.md in each upstream.
 export UPSTREAM_POLICY_DIR=${WORK}/homegit/upstream-policy
 readonly CONTRIB_SHA=cccccccccccccccccccccccccccccccccccccccc
+git init -q --bare "${WORK}/homegit.git"
 git init -q "${WORK}/homegit"
-# policy REPO VERDICT: commit acme/REPO's record with VERDICT, and a
-# CONTRIBUTING.md on GitHub that matches it.
+git -C "${WORK}/homegit" remote add origin "${WORK}/homegit.git"
+# policy REPO VERDICT: commit and push acme/REPO's record with VERDICT,
+# vouched for as cgwalters' (so it may loosen one), and a CONTRIBUTING.md
+# on GitHub that matches it.
 policy() {
-    echo '{"default_branch": "main"}' | fixture "repos/acme/$1"
+    jq -n --arg r "acme/$1" '{full_name: $r, default_branch: "main"}' | fixture "repos/acme/$1"
     jq -n --arg s "${CONTRIB_SHA}" '{truncated: false, tree: [{path: "CONTRIBUTING.md", type: "blob", sha: $s}]}' |
         fixture "repos/acme/$1/git/trees/main"
     mkdir -p "${UPSTREAM_POLICY_DIR}/acme"
@@ -394,6 +401,9 @@ policy() {
         "$2" "${CONTRIB_SHA}" >"${UPSTREAM_POLICY_DIR}/acme/$1.md"
     git -C "${WORK}/homegit" add -A
     git -C "${WORK}/homegit" -c core.hooksPath=/dev/null -c commit.gpgSign=false commit -q --allow-empty -m "$1: $2"
+    "${REAL_GIT}" -C "${WORK}/homegit" -c core.hooksPath=/dev/null push -q origin HEAD:main
+    echo '{"commit": {"verification": {"verified": true}}, "author": {"login": "cgwalters"}}' |
+        fixture "repos/cgwalters-bot/homegit/commits/$(git -C "${WORK}/homegit" rev-parse HEAD)"
 }
 for r in proj nodco dcoapp; do
     policy "${r}" bot-ok
@@ -680,6 +690,36 @@ signoff_refused "signoff, no DCO" "neither requires nor runs a DCO check" "$(ups
 echo '{"truncated": false, "tree": [{"path": "CONTRIBUTING.md", "type": "blob", "sha": "dddddddddddddddddddddddddddddddddddddddd"}]}' |
     fixture repos/acme/dcoapp/git/trees/main
 signoff_refused "signoff, stale policy" "not signing off ${LATE}: acme/dcoapp's contribution policy record is stale; re-check the policy" "${LATE}"
+policy dcoapp bot-ok
+
+# --- A human-text repository: his text, and his '/promote --human-text' ---
+policy dcoapp human-text
+readonly HUMAN_PR=repos/${APP}/pulls/17
+jq '.body |= sub("\n\n'"${TRAILER}"'"; "")' "${FAKE_GH}/rest/${HUMAN_PR}.json" >"${WORK}/pr17" && mv "${WORK}/pr17" "${FAKE_GH}/rest/${HUMAN_PR}.json"
+jq '.[1].body = "My text.\n/promote --human-text"' "${FAKE_GH}/rest/${HUMAN_PR}/reviews.json" >"${WORK}/r17" &&
+    mv "${WORK}/r17" "${FAKE_GH}/rest/${HUMAN_PR}/reviews.json"
+# pushed_by LOGIN: the activity log shows LOGIN pushing #17's head.
+pushed_by() {
+    jq -n --arg s "${H1}" --arg l "$1" '[{timestamp: "2026-09-25T09:00:00Z", after: $s, activity_type: "push", actor: {login: $l}}]' |
+        fixture "repos/${APP}/activity"
+}
+pushed_by cgwalters
+echo '{"data": {"repository": {"pullRequest": {"userContentEdits": {"totalCount": 1, "nodes": [{"editedAt": "2026-09-25T09:30:00Z", "editor": {"login": "cgwalters"}}]}}}}}' |
+    fixture graphql
+echo '[{"event": "renamed", "actor": {"login": "cgwalters"}, "rename": {"from": "x", "to": "Change 17"}}]' |
+    fixture "repos/${APP}/issues/17/timeline"
+if run "promote, human-text" ok promote "${URL}/dcoapp/pull/17" --no-signoff; then
+    body=$(opened bot/human | jq -r .body)
+    test -n "${body}" || fail "promote, human-text: no upstream PR"
+    grep -qE 'Generated-by|Signed-off-by|/signoff' <<<"${body}" && fail "promote, human-text: the bot added to his body:"$'\n'"${body}"
+fi
+HUMAN=$(upstream_url bot/human)
+pushed_by cgwalters-bot
+signoff_refused "signoff, human-text, the bot's push" "the approved head ${H1:0:12} was pushed by cgwalters-bot, not cgwalters" "${HUMAN}"
+pushed_by cgwalters
+if run "signoff, human-text" ok signoff "${HUMAN}"; then
+    same_but_signed "signoff, human-text" "${H1}" "$(remote_ref "${APP}" bot/human)" "${APP}"
+fi
 policy dcoapp bot-ok
 
 # upstream_pr N LOGIN BRANCH: make up acme/dcoapp#N, opened by LOGIN from

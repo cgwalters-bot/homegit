@@ -59,7 +59,7 @@ verdict is not the next looser one.
 - **dco**: `yes` or `no`, then how you know, from what GitHub enforces or runs as upstream-pr/SKILL.md ("Whether DCO is required") describes: the default branch's required checks, DCO check runs on its head, or the DCO app's check runs on recent PRs. Never from CONTRIBUTING prose alone. It is informational: promote decides DCO live.
 - **sources**: every file you read, with the blob id (a tree id for a directory) you read it at. `repo` may be left out for OWNER/REPO itself.
 - **Quotes**: verbatim, in blockquotes, each naming the repository, path, short blob id and section. Quote every sentence the verdict rests on, and anything about AI, bots, authorship, sign-off or PR descriptions, even when it doesn't change the verdict. Don't paraphrase inside quotes; if nothing bears on AI, say so plainly instead of quoting.
-- Updating a stale record: re-read everything, not only what changed, rewrite the record, and say in the commit message what changed upstream and whether the verdict moved.
+- Updating a stale record: re-read everything, not only what changed, rewrite the record, and say in the commit message what changed upstream and whether the verdict moved. You may create a record and tighten a verdict, never loosen one (say human-text to bot-ok): `check` refuses a loosening unless cgwalters made it in a commit GitHub verified. If the policy now reads looser, keep the old verdict, update the rest, and put the case for loosening in your report for him.
 
 ## Landing it
 
