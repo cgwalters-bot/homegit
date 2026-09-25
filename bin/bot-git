@@ -10,8 +10,8 @@
 readonly BOT_GIT_NAME="Colin Walters"
 readonly BOT_GIT_EMAIL=walters+llm@verbum.org
 readonly BOT_GIT_LEGACY_NAME=cgwalters-bot
-# cgwalters' own identity: 'bot-pr promote' adds his sign-off, as him, on
-# his approval.
+# cgwalters' own identity: 'bot-pr promote' and 'bot-pr signoff' add his
+# sign-off, as him, on his approval.
 readonly HUMAN_GIT_NAME="Colin Walters"
 readonly HUMAN_GIT_EMAIL=walters@verbum.org
 
@@ -40,7 +40,7 @@ declare -rA SIGNOFF_SHORT_VALUE_OPTS=(
     [format-patch]="ov -"
     [revert]="m S"
 )
-readonly SIGNOFF_REFUSAL="the bot never adds a Signed-off-by; only 'bot-pr promote' adds cgwalters' own on his approval"
+readonly SIGNOFF_REFUSAL="the bot never adds a Signed-off-by; only 'bot-pr promote' and 'bot-pr signoff' add cgwalters' own on his approval"
 
 usage() {
     cat <<EOF
@@ -56,7 +56,7 @@ for every git command that creates or rewrites commits: commit, rebase,
 cherry-pick, am, merge. Rebases and amends keep each commit's original
 author. It refuses to add a Signed-off-by (-s/--signoff, or a
 Signed-off-by --trailer): the bot never signs off; only 'bot-pr promote'
-adds cgwalters' own on his approval.
+and 'bot-pr signoff' add cgwalters' own on his approval.
 
 ${PROG} check [RANGE] checks the commits in RANGE (default:
 @{upstream}..HEAD, else origin/HEAD..HEAD, which must not be empty) before
