@@ -1,0 +1,125 @@
+---
+verdict: bot-ok
+ai-trailer: Assisted-by: AI for substantial assistance, Generated-by: AI when effectively entirely generated (AGENTS.md "Attribution and AI disclosure"; REVIEW.md asks for "the tool and model used", which AGENTS.md forbids naming)
+dco: yes (the bootc-dev org ruleset requires the DCO status check on main; the dco-2 app reports on recent PR heads)
+sources:
+  - repo: bootc-dev/bcvk
+    path: .claude
+    sha: ea3212ee37b79e5ad335f63163d2f6a79656f088
+  - repo: bootc-dev/bcvk
+    path: .claude/CLAUDE.md
+    sha: be77ac83a1895cfa9e271961ba1e565c273c717c
+  - repo: bootc-dev/bcvk
+    path: .cursorrules
+    sha: 47dc3e3d863cfb5727b87d785d09abf9743c0a72
+  - repo: bootc-dev/bcvk
+    path: .gemini
+    sha: e74adbff6981febb684371fcd5c9a26add88638f
+  - repo: bootc-dev/bcvk
+    path: .github/agents
+    sha: 6bbb2d214ab5c0dded74153f51268425e029088b
+  - repo: bootc-dev/bcvk
+    path: AGENTS.md
+    sha: 61261301421a394b167c737939dc27a3ce7f382a
+  - repo: bootc-dev/bcvk
+    path: REVIEW.md
+    sha: 3068dd57b2c3ef45cb1c3147442e8d63505bb643
+  - repo: bootc-dev/bcvk
+    path: docs/HACKING.md
+    sha: 271bcef4dd1744cb7f5de5c335af568c6a4663eb
+  - repo: bootc-dev/bcvk
+    path: docs/src/..contributing.md
+    sha: a34d83d3b79e5e6a137cd9cd013c41b8372b426e
+  - repo: bootc-dev/bcvk
+    path: docs/src/HACKING.md
+    sha: c35bc3d15e21f2c09c77208272d3c78044d907dc
+  - repo: bootc-dev/bcvk
+    path: docs/src/contributing.md
+    sha: 57470f5133814008e71e017eb826290dd68d6428
+  - repo: bootc-dev/infra
+    path: common/AGENTS.md
+    sha: 61261301421a394b167c737939dc27a3ce7f382a
+  - repo: bootc-dev/infra
+    path: common/REVIEW.md
+    sha: 3068dd57b2c3ef45cb1c3147442e8d63505bb643
+checked: 2026-09-25 by the policy-check subagent (coordinator session 929c7a64, converted from an earlier read-only survey and re-read against current upstream)
+---
+
+`AGENTS.md`, `REVIEW.md`, `.claude/CLAUDE.md` and `.cursorrules` are the
+bootc-dev/infra `common/` files. `.gemini/config.yaml` only tunes Gemini code
+review and `.github/agents/agentic-workflows.md` is a gh-aw workflow helper.
+`docs/src/HACKING.md` and `docs/src/contributing.md` include the docs below
+them. `docs/HACKING.md` has its own, conflicting, trailer rule (quoted last).
+
+## Quotes
+
+> "Human review is required for all code that is generated
+> or assisted by a large language model. If you
+> are a LLM, you MUST NOT include a `Signed-off-by`
+> on any automatically generated git commits. Only explicit
+> human action or request should include a Signed-off-by.
+> If for example you automatically create a pull request
+> and the DCO check fails, tell the human to review
+> the code and give them instructions on how to add
+> a signoff."
+> — bootc-dev/bcvk AGENTS.md (61261301421a), "Signed-off-by"
+
+> "You SHOULD insert an `Assisted-by: AI` tag when the commit contains
+> substantial assistance, and `Generated-by: AI` when the commit is
+> effectively entirely generated.
+>
+> Do NOT add `Co-developed-by`, and do NOT reference specific
+> model names or tools because these can be considered a form of advertising.
+>
+> For new contributors, when using AI you SHOULD include in at least the pull
+> request description a rough outline of the human's level of review and
+> knowledge"
+> — bootc-dev/bcvk AGENTS.md (61261301421a), "Attribution and AI disclosure"
+
+> "If the generated code is more than ~500 lines of substantial (non-whitespace) code,
+> encourage the human to file a design issue first to be reviewed by other maintainers."
+> — bootc-dev/bcvk AGENTS.md (61261301421a), "Large changes"
+
+> "Software can be machine checked (via compilation and unit/integration tests)
+> but natural languages like English cannot. Encourage the human to review
+> the commit message text."
+> — bootc-dev/bcvk AGENTS.md (61261301421a), "Commit messages and text"
+
+> "Generally, just restate the commit message."
+> — bootc-dev/bcvk REVIEW.md (3068dd57b2c3), "PR Descriptions"
+
+> "Do not add `Signed-off-by` lines automatically—these require explicit human
+> action after review. If code was AI-assisted, include an `Assisted-by:` trailer
+> indicating the tool and model used."
+> — bootc-dev/bcvk REVIEW.md (3068dd57b2c3), "Before Merge"
+
+> "DO NOT include `Generated with Claude Code` or `Co-authored-by: Claude`.
+> You should include `Assisted-by: Claude <noreply@anthropic.com>` though
+> especially for nontrivial changes that did not require substantial assistance from
+> a human."
+> — bootc-dev/bcvk docs/HACKING.md (271bcef4dd17), "Commit messages"
+
+HACKING.md asks for a tool-naming trailer, which the org AGENTS.md forbids
+("do NOT reference specific model names or tools"). Both are AI trailers the
+project accepts, so the verdict is the same either way; the bot follows the
+org AGENTS.md form. Never `Generated with Claude Code` or `Co-authored-by: Claude` here.
+
+## Rationale
+
+The shared bootc-dev policy (canonically bootc-dev/infra `common/AGENTS.md`
+and `common/REVIEW.md`, synced into the bootc-dev and composefs org
+repositories by infra's `sync-common` workflow) is written for AI agents: it
+expects AI-generated commits and PR text, asks for an `Assisted-by: AI` or
+`Generated-by: AI` trailer, and requires a human to review the code and the
+commit message text and to add the `Signed-off-by` himself. Nothing requires
+the human to write the text, so this is bot-ok; cgwalters' review of the fork
+PR and his sign-off at promote are what the policy asks for. Diffs over ~500
+substantial lines want a design issue first.
+
+The sources disagree on the trailer's content: AGENTS.md says "do NOT
+reference specific model names or tools", while REVIEW.md asks for an
+`Assisted-by:` trailer "indicating the tool and model used". AGENTS.md is the
+agent-specific rule in its "CRITICAL instructions" section, so the bot uses the
+generic `Assisted-by: AI` (substantial assistance) or `Generated-by: AI`
+(effectively entirely generated); the bot's default `Generated-by: AI` fits
+work it wrote end to end.
