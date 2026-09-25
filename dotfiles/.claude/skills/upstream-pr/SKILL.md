@@ -127,8 +127,8 @@ topic branch per change.
 - **Identity.** Every commit the bot creates or rewrites must say so. On a
   machine whose global git identity is a human's (not a devspace with the
   bot's dotfiles), run git with
-  `GIT_AUTHOR_NAME=cgwalters-bot GIT_AUTHOR_EMAIL=walters+llm@verbum.org
-  GIT_COMMITTER_NAME=cgwalters-bot GIT_COMMITTER_EMAIL=walters+llm@verbum.org`
+  `GIT_AUTHOR_NAME="Colin Walters" GIT_AUTHOR_EMAIL=walters+llm@verbum.org
+  GIT_COMMITTER_NAME="Colin Walters" GIT_COMMITTER_EMAIL=walters+llm@verbum.org`
   for new commits, and at least the two `GIT_COMMITTER_*` variables for
   rebases, which keep each commit's original author. Check with
   `git log --format='%an <%ae> / %cn <%ce>'` before pushing.

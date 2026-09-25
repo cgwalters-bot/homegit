@@ -10,7 +10,9 @@ set -euo pipefail
 TESTS=$(cd "$(dirname "$0")" && pwd)
 readonly TESTS
 readonly DCO_SIGNOFF=${TESTS}/../bin/dco-signoff
-readonly BOT_NAME=cgwalters-bot BOT_EMAIL=walters+llm@verbum.org
+readonly BOT_NAME="Colin Walters" BOT_EMAIL=walters+llm@verbum.org
+# The name of the bot's older commits; they are recognized by the email.
+readonly BOT_LEGACY_NAME=cgwalters-bot
 readonly HUMAN_NAME="Test Human" HUMAN_EMAIL=human@example.com HUMAN_LOGIN=cgwalters
 readonly OTHER_NAME="Other Person" OTHER_EMAIL=other@example.com
 readonly SOB="Signed-off-by: ${HUMAN_NAME} <${HUMAN_EMAIL}>"
@@ -97,12 +99,14 @@ fixture() {
     cat >"${FAKE_GH}/rest/$1.json"
 }
 
-# commit_as bot|human|other FILE MESSAGE: commit a change to FILE in SRC,
-# authored and committed by that person, and print its id.
+# commit_as bot|bot-legacy|human|other FILE MESSAGE: commit a change to
+# FILE in SRC, authored and committed by that person (bot-legacy: the bot
+# under its old name), and print its id.
 commit_as() {
     local name email
     case "$1" in
         bot) name=${BOT_NAME} email=${BOT_EMAIL} ;;
+        bot-legacy) name=${BOT_LEGACY_NAME} email=${BOT_EMAIL} ;;
         human) name=${HUMAN_NAME} email=${HUMAN_EMAIL} ;;
         other) name=${OTHER_NAME} email=${OTHER_EMAIL} ;;
     esac
@@ -166,9 +170,10 @@ new_branch() {
     git -C "${SRC}" switch -q -c "$1" "${BASE_A}"
 }
 
-# #1: three bot commits; main then moves ahead of their base.
+# #1: three bot commits, one from before its rename; main then moves ahead
+# of their base.
 new_branch bot/three
-commit_as bot one "one" >/dev/null
+commit_as bot-legacy one "one" >/dev/null
 commit_as bot one "fixup! one" >/dev/null
 PR1_OLD=$(commit_as bot three "three")
 git -C "${SRC}" push -q forge bot/three
@@ -274,7 +279,7 @@ if GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.email GIT_CONFIG_VALUE_0=${BOT_EMAIL
     expect "guard: git email" "user.email is the bot's"
 fi
 if GIT_COMMITTER_NAME=${BOT_NAME} GIT_COMMITTER_EMAIL=${BOT_EMAIL} run "guard: committer" fail --yes; then
-    expect "guard: committer" "git would commit as 'cgwalters-bot"
+    expect "guard: committer" "git would commit as '${BOT_NAME} <${BOT_EMAIL//+/[+]}>'"
 fi
 
 # --- --dry-run changes nothing, and #4 is refused ---
@@ -314,7 +319,7 @@ fi
 
 # --- Three commits, base moved ahead ---
 if run "sign #1" ok --yes https://github.com/acme/proj/pull/1; then
-    expect "sign #1" '^ \* [0-9a-f]+ fixup! one \(cgwalters-bot' 'main is at' '^ pushed: https://github.com/acme/proj/pull/1'
+    expect "sign #1" '^ \* [0-9a-f]+ fixup! one \(Colin Walters <walters\+llm@' 'main is at' '^ pushed: https://github.com/acme/proj/pull/1'
 fi
 readonly FORGE=${REMOTES}/cgwalters-forge/proj.git
 new=$(remote_ref cgwalters-forge/proj bot/three)

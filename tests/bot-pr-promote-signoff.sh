@@ -11,7 +11,7 @@ set -euo pipefail
 TESTS=$(cd "$(dirname "$0")" && pwd)
 readonly TESTS
 readonly BOT_PR=${TESTS}/../bin/bot-pr
-readonly BOT_NAME=cgwalters-bot BOT_EMAIL=walters+llm@verbum.org
+readonly BOT_NAME="Colin Walters" BOT_EMAIL=walters+llm@verbum.org
 readonly HUMAN_NAME="Colin Walters" HUMAN_EMAIL=walters@verbum.org
 readonly OTHER_NAME="Other Person" OTHER_EMAIL=other@example.com
 readonly SOB="Signed-off-by: ${HUMAN_NAME} <${HUMAN_EMAIL}>"

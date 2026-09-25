@@ -53,7 +53,9 @@ readonly SEARCH_SCOPES=("org:${FORGE_ORG}" "user:${BOT_LOGIN}")
 readonly FORK_READY_TIMEOUT=300
 readonly FORK_READY_POLL=5
 readonly EXCERPT_LEN=120
-readonly BOT_GIT_NAME=cgwalters-bot
+# The git identity of the bot's commits. The email is what tells them apart
+# from cgwalters' own; older ones have the name cgwalters-bot.
+readonly BOT_GIT_NAME="Colin Walters"
 readonly BOT_GIT_EMAIL=walters+llm@verbum.org
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
