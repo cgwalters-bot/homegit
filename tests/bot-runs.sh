@@ -165,6 +165,15 @@ case "${method} ${path%%\?*}" in
         cat "${store}/dispatch-response.json"
         ;;
     "GET repos/${repo}/actions/workflows/"*) fail_http 404 "Not Found" ;;
+    # A target repository: private-org's are private, gone's don't exist.
+    "GET repos/"*/*)
+        [[ "${path}" =~ ^repos/[^/]+/[^/]+$ ]] || { echo "fake gh: unexpected call: ${method} ${path}" 1>&2; exit 1; }
+        case "${path}" in
+            repos/private-org/*) reply '{"private": true, "visibility": "private"}' ;;
+            repos/gone/*) fail_http 404 "Not Found" ;;
+            *) reply '{"private": false, "visibility": "public"}' ;;
+        esac
+        ;;
     *) echo "fake gh: unexpected call: ${method} ${path}" 1>&2; exit 1 ;;
 esac
 EOF
@@ -596,6 +605,8 @@ test_dispatch_invalid() {
         "BRIEF=${WORK}/long.md|over GitHub's 65535; shorten the brief"
         "BRIEF=${WORK}/empty.md|the brief is empty"
         "BRIEF=${WORK}/missing.md|cannot read"
+        "--repo private-org/secret|private-org/secret is not public (private)"
+        "--repo gone/away|cannot confirm that gone/away is public"
     )
     local c args want brief out
     for c in "${cases[@]}"; do

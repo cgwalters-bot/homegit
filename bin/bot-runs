@@ -499,6 +499,20 @@ load_record() {
 
 # --- dispatch ----------------------------------------------------------------
 
+# require_public_repo OWNER/REPO: fails unless GitHub confirms the
+# repository is public. Agent runs' logs and transcripts are public, so
+# they're for public repositories only; any doubt (an error, a 404, an
+# internal repository) refuses.
+require_public_repo() {
+    local visibility rc=0
+    visibility=$(ghapi "repos/$1" --jq 'if .private == false then .visibility else "private" end') || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 ||
+        fatal "cannot confirm that $1 is public; agent runs are for public repositories only"
+    test "${visibility}" = public ||
+        fatal "$1 is not public (${visibility}); agent runs are for public repositories only"
+}
+
 cmd_dispatch() {
     local item="" repo="" base=main agent=claude model="" cores=4 timeout=${DEFAULT_TIMEOUT}
     local budget=${DEFAULT_BUDGET} workflow=branch brief_file="" dry_run=false json=false inputs body len resp rc=0
@@ -552,6 +566,8 @@ cmd_dispatch() {
         jq . <<<"${body}"
         return 0
     fi
+    # After the dry run, which makes no API calls; the workflow checks too.
+    require_public_repo "${repo}"
     resp=$(ghapi -X POST "repos/${RUNS_REPO}/actions/workflows/${RUNS_WORKFLOW}/dispatches" --input - <<<"${body}") || rc=$?
     pass_ratelimit "${rc}"
     test "${rc}" -eq 0 || fatal "dispatching ${RUNS_WORKFLOW} in ${RUNS_REPO} failed"

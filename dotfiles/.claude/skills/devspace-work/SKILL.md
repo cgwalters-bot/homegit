@@ -18,6 +18,13 @@ sudo there too.)
 `bin/bot-devspace` manages them; run `bot-devspace --help` for the
 details.
 
+Devspaces are for public repositories only (CNCF-adjacent work): they
+run on bootc-dev's runners, and agent runs there publish their logs.
+Never push a private repository's code to one; if the work is in a
+private repository, set Needs human. `bot-runs dispatch` and the
+`agent.yml` workflow refuse non-public targets themselves; `bot-devspace`
+doesn't know what you push, so this rule is yours to keep.
+
 The division of labor is strict:
 
 - **This machine** holds the clones, the credentials and the GitHub

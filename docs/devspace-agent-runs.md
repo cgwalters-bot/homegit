@@ -38,6 +38,13 @@ so no polling is needed to find the run. The inputs are all strings:
 
 Dispatch inputs are public in a public repository and capped at 65,535
 characters in total, so a brief follows the board's no-private-data rule.
+
+**Public repositories only.** An agent run's logs and transcripts are
+public, so `repo` must be a public repository (devspaces are for
+CNCF-adjacent work, never private code). `bot-runs dispatch` refuses a
+repository that GitHub doesn't confirm is public, and so does the workflow,
+before it clones anything and again before it uploads anything; any error
+or doubt refuses.
 The workflow sets `run-name: agent ${{ inputs.item }} ${{ inputs.repo }}`:
 `bot-runs` reads the item and repository from a run's `display_title`
 when nothing else is left of the run.
@@ -60,14 +67,14 @@ maximum), holds small, unencrypted files at its root:
   `outputs/v1`, which travels in a separate `agent-out` artifact.
 
 **`agent-transcript`**, with `retention-days: 30`, holds one file,
-`transcript.tar.zst.age`: a zstd-compressed tar, encrypted with `age` to
-the recipients committed in the workflow repository. The tar holds
+`transcript.tar.zst`: a zstd-compressed tar, public like the rest, since the
+target repository is public and redaction takes care of credentials. The
+tar holds
 `raw.jsonl` (the agent CLI's stream-json output), `sessions/` (the
 agent's session files, subagent transcripts included), `token-usage.jsonl`
 (the inference shim's per-request log), `access.log` (the egress proxy's)
-and `test-logs/` (tails of the agent's test logs). Until the recipients
-exist, a run with mock inference may upload `transcript.tar.zst`
-unencrypted instead; a run with real inference never does.
+and `test-logs/` (tails of the agent's test logs). Readers also accept
+`transcript.tar.zst.age`, encrypted with `age`, should a run ever need it.
 
 **In the job log**, the condensed lines are printed between
 `::group::agent (condensed)` and `::endgroup::`. That group is what
@@ -136,20 +143,22 @@ have no searchable home until the plan's notes repository exists.
 
 ## Redaction
 
-Before anything is printed to the log or uploaded, including the
-transcript before encryption, the supervisor replaces with `[REDACTED]`:
+Before anything is printed to the log or uploaded, the supervisor
+replaces with `[REDACTED]`:
 
 - the literal value of every token or secret the job minted or read
   (also masked with `::add-mask::`);
 - matches of `gh[posu]_[A-Za-z0-9_]{20,}`, `github_pat_[A-Za-z0-9_]{20,}`,
   `sk-ant-[A-Za-z0-9_-]{20,}`, `sk-[A-Za-z0-9_-]{20,}`,
-  `tskey-[A-Za-z0-9-]{10,}`, and whole
+  `tskey-[A-Za-z0-9-]{10,}`, JWTs (`eyJ....eyJ....`), and whole
   `-----BEGIN ... PRIVATE KEY-----` blocks.
 
 It deletes symlinks from the tree it uploads, and never collects
-environment dumps. Redaction is a safety net, not the defense: the agent's
+environment dumps. Nothing is uploaded unless a final check finds no
+secret-shaped string left in the artifacts and the target is still
+confirmed public. Redaction is a safety net, not the defense: the agent's
 environment holds no secret worth leaking in the first place. `bot-runs`
 adds no redaction of its own and never uploads anything; it keeps what it
 downloads under `~/.local/state/bot-runs/` (summaries) and
-`~/.cache/bot-runs/` (HTTP caches, and decrypted transcripts, removed
+`~/.cache/bot-runs/` (HTTP caches, and unpacked transcripts, removed
 after 30 days).
