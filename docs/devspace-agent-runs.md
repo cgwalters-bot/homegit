@@ -116,19 +116,23 @@ example.
 
 Artifacts expire; the footer is the durable record. When the apply step
 proposes a run's result, it adds one footer per run to the forge PR's
-bot-meta section (or the end of an analysis write-up): a human-readable
-line, then the same data as JSON in an HTML comment:
+bot-meta section (between `<!-- bot-meta -->` and `<!-- /bot-meta -->`,
+where only the apply step writes), or the end of an analysis write-up: a
+human-readable line, then the same data as JSON in an HTML comment:
 
 ```
 Agent run [123456789](https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/123456789): claude/claude-sonnet-4-5, 1.2M in / 40k out tokens, ~123 AIC (est.), 42m, success
-<!-- agent-run-summary/v1 {"run_id":123456789,"run_url":"...","item":"PVTI_...","repo":"...","agent":"claude","model":"...","result":"success","duration_s":2520,"turns":37,"tokens":{...},"aic":123.4,"aic_budget":500,"outcome":{"status":"Draft","url":"..."}} -->
+<!-- agent-run-summary/v1 {"run_id":123456789,"run_attempt":1,"run_url":"...","item":"PVTI_...","repo":"...","agent":"claude","model":"...","result":"success","duration_s":2520,"turns":37,"tokens":{...},"aic":123.4,"aic_budget":500,"outcome":{"status":"Draft","url":"..."}} -->
 ```
 
 The JSON is a subset of `summary.json`: exactly the fields shown, and no
 free text, so an HTML comment can't be broken by it; a writer still
-escapes any `--` in it as `--`. `bot-runs` finds the footer by
-searching the pull requests of `cgwalters-forge` for the run id, and
-marks what it read from there as partial.
+escapes any `--` in it as `-\u002d`. `bot-runs` finds the footer by
+searching the bot's pull requests in `cgwalters-forge` for the run id,
+reads it only from the bot-meta section (the agent writes the rest of
+the body), takes the last one for the run and attempt, and marks what it
+read from there as partial. Analysis write-ups aren't searched yet: they
+have no searchable home until the plan's notes repository exists.
 
 ## Redaction
 
@@ -147,4 +151,5 @@ environment dumps. Redaction is a safety net, not the defense: the agent's
 environment holds no secret worth leaking in the first place. `bot-runs`
 adds no redaction of its own and never uploads anything; it keeps what it
 downloads under `~/.local/state/bot-runs/` (summaries) and
-`~/.cache/bot-runs/` (HTTP caches and decrypted transcripts).
+`~/.cache/bot-runs/` (HTTP caches, and decrypted transcripts, removed
+after 30 days).
