@@ -6,8 +6,13 @@ shopt -s inherit_errexit
 
 readonly BOT_LOGIN=cgwalters-bot
 # The bot's git identity (BOT_GIT_*) and cgwalters' (HUMAN_GIT_*).
+BOT_GIT=$(dirname "$(readlink -f "$0")")/bot-git
+test -r "${BOT_GIT}" || {
+    echo "error: ${BOT_GIT} not found; ${0##*/} needs bot-git from homegit's bin/ next to it" 1>&2
+    exit 1
+}
 # shellcheck source=bin/bot-git disable=SC1091 # followed with shellcheck -x
-source "$(dirname "$(readlink -f "$0")")/bot-git"
+source "${BOT_GIT}"
 # The only login whose reviews and comments on a fork PR are acted on.
 readonly REVIEWER=cgwalters
 # The organization holding the forks where fork PRs are opened. Its forks

@@ -270,6 +270,14 @@ if run "list-only, explicit PRs" ok --list-only https://github.com/acme/proj/pul
     expect "list-only, explicit PRs" '^2 open PRs need DCO' '^acme/proj#6 ' '^acme/proj#2 ' '!#1 '
 fi
 
+# --- Without bot-git next to it, which holds the bot's identity ---
+mkdir -p "${WORK}/lone"
+cp "${DCO_SIGNOFF}" "${WORK}/lone/"
+if OUT=$("${WORK}/lone/dco-signoff" --list-only 2>&1); then
+    fail "without bot-git: ran anyway"
+fi
+expect "without bot-git" 'bot-git not found; dco-signoff needs bot-git'
+
 # --- The bot must never sign off ---
 REFS_BEFORE=$(all_refs)
 if FAKE_GH_LOGIN=cgwalters-bot run "guard: gh login" fail --dry-run; then
