@@ -52,7 +52,9 @@ instead of piping it through `tail` and losing lines for good.
 - **Promote** a fork PR when inbox shows `[APPROVED]` (an approving
   review, or a `/promote` line): run the `bot-pr promote` command it
   prints. A go-ahead in other words only gets its `-> hint:` passed on;
-  never promote on your own reading.
+  never promote on your own reading. For a DCO repository, promote adds
+  his sign-off; if it stops over someone else's commits, ask him, and pass
+  `--include-others` only if he says so.
 - **Review feedback** on a fork PR goes to a worker, preferably the one
   that wrote it if it's still around.
 - **Dispatch** workers for Todo items (by priority, per `workstream`) and

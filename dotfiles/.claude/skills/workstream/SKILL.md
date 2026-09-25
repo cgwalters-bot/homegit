@@ -280,7 +280,14 @@ requests), and remembers what it showed. Then, per PR:
   `/draft`, which a later `/ready` takes back). It rebases onto the current upstream base, opens the
   upstream PR from `cgwalters-forge:bot/<slug>` with the fork PR's current
   title and body (minus the bot-meta section), links and closes the fork
-  PR, and sets the item In Review with Branch = the upstream PR. Pass
+  PR, and sets the item In Review with Branch = the upstream PR. If the
+  upstream repository requires DCO, his approval is also his sign-off:
+  promote adds his `Signed-off-by` to the commits lacking it and
+  force-pushes them (if promote fails after that, a rerun still counts his
+  approving review, but a `/promote` needs repeating), and stops if a
+  commit is by someone other than the bot or him; pass `--include-others`
+  only if he asked for their sign-off too, or `--no-signoff` to leave it to
+  the maintainers. Pass
   `--why "<short rationale>. Result: ..."` to refresh Why in the same
   board call. If the rebase conflicts, promote dismisses the approval,
   comments, and sets the item back to Draft: resolve the conflicts on the
@@ -340,8 +347,8 @@ below.
 
 - **branch**: push the tested branch to the forge fork and open the fork
   PR, both with `bot-pr fork-pr`, run in the clone that has the branch. Write its title and body as the upstream PR they will become (see
-  `upstream-pr`): why, what was tested and where, caveats (e.g. a missing
-  DCO sign-off), `Fixes OWNER/REPO#N` or `Related: <url>`, and the
+  `upstream-pr`): why, what was tested and where, caveats (e.g. someone
+  else's commit without their DCO sign-off), `Fixes OWNER/REPO#N` or `Related: <url>`, and the
   `Generated-by: https://github.com/cgwalters/#llms` line last. `fork-pr`
   appends the bot-meta section (upstream target, board item, and how to
   approve) and prints the fork PR URL. It creates the fork the first time,

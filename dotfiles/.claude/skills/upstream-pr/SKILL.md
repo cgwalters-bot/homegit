@@ -89,16 +89,21 @@ topic branch per change.
 - Follow the project's commit style; otherwise Linux kernel style subjects
   with a body explaining why (see the shared AGENTS.md guidance).
 - **Never add `Signed-off-by`.** That is for a human to add. If the project
-  requires DCO sign-off, leave it out anyway: `bot-pr promote` then adds a
-  line for the maintainers to the upstream PR body, telling them to comment
-  `/signoff` where the repository has that command (bootc-dev/actions'
-  pr-signoff workflow, `.github/workflows/signoff.yml`), and how to sign off
-  by hand otherwise. So fork PR bodies don't need a DCO note; only an
-  upstream PR opened without promote (Workflow `pr`) needs that line
-  written by hand. If DCO isn't required, don't mention it. For the bot's
-  PRs, cgwalters can also sign off with `bin/dco-signoff`, which refuses to
-  run as the bot; `dco-signoff --list-only` shows which open PRs still wait
-  on it.
+  requires DCO sign-off, leave it out anyway: cgwalters' approval of the
+  fork PR is his sign-off, and `bot-pr promote` adds his
+  `Signed-off-by: Colin Walters <walters@verbum.org>` to the commits (with
+  him as committer, which the DCO check wants) and names that approval in
+  the upstream PR body. That tool is the only way his sign-off gets added;
+  never add it by hand. Commits by anyone else get it only if he asks
+  (`promote --include-others`); with `--no-signoff`, promote instead
+  tells the maintainers to comment `/signoff` where the repository has
+  that command (bootc-dev/actions' pr-signoff workflow,
+  `.github/workflows/signoff.yml`), or how to sign off by hand. So fork PR
+  bodies don't need a DCO note; only an upstream PR opened without promote
+  (Workflow `pr`) needs one written by hand. If DCO isn't required, don't
+  mention it. For the bot's PRs opened without promote, cgwalters can sign
+  off with `bin/dco-signoff`, which refuses to run as the bot;
+  `dco-signoff --list-only` shows which open PRs still wait on it.
 - **Whether DCO is required** comes from what GitHub enforces, never from
   CONTRIBUTING or other prose, which is easy to misread. It is required if
   the default branch's rules require a status check named like DCO:
@@ -243,7 +248,7 @@ a brief what and why, how it was tested, the
 `<!-- cgwalters: context/rationale -->` placeholder for a nontrivial
 change, the issue link
 (`Fixes OWNER/REPO#N` when it fully resolves it) and caveats (such as
-commits that still need a human's DCO sign-off). It follows any PR
+someone else's commits that still need their DCO sign-off). It follows any PR
 template and ends with:
 
 ```

@@ -157,10 +157,16 @@ doesn't matter which machine runs it.
 
 ### Signing off the bot's PRs (DCO)
 
-The bot never adds `Signed-off-by`, so its upstream PRs to projects that
-require DCO (bootc-dev, among others) sit with a failing DCO check until a
-human signs off. `bin/dco-signoff`, run by me with my own git identity and
-gh login, finds them and fixes that:
+The bot never adds `Signed-off-by` itself. When I approve a fork PR (or
+comment `/promote`) for a project that requires DCO (bootc-dev, among
+others), that approval is my sign-off: `bot-pr promote` adds my
+`Signed-off-by` to the bot's commits, with me as committer, before opening
+the upstream PR, and names the approval in its body. Others' commits get it
+only with `--include-others`.
+
+Upstream PRs that didn't go through promote still sit with a failing DCO
+check until a human signs off. `bin/dco-signoff`, run by me with my own git
+identity and gh login, finds them and fixes that:
 
 ```
 dco-signoff --dry-run      # list them and prepare the rewrite, push nothing

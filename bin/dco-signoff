@@ -31,8 +31,9 @@ Usage: $(basename "$0") [OPTIONS] [PR...]
 
 Sign off (DCO) the commits of ${BOT_LOGIN}'s open PRs, as you.
 
-The bot never adds Signed-off-by, so its PRs to repositories that require
-DCO stay blocked until a human signs off. This finds the open PRs authored
+The bot never adds Signed-off-by by itself ('bot-pr promote' adds yours
+only on your approval of the fork PR), so its other PRs to repositories
+that require DCO stay blocked until a human signs off. This finds the open PRs authored
 by ${BOT_LOGIN}, plus open PRs from ${FORGE_ORG} branches (where
 'bot-pr promote' opens them from), keeps those whose base branch requires a
 DCO status check (per the repository's rules), and prints a table of them:

@@ -60,7 +60,7 @@ Specifically avoid in the body:
 
 Trailers to check:
 - AI trailer present: `Generated-by: AI` by default, `Assisted-by: AI` if a human wrote a substantial part (unless the project says otherwise)
-- No `Signed-off-by:` (that's for the human to add manually before push)
+- No `Signed-off-by:` (that's for the human to add manually before push; the only exception is cgwalters' own, added by `bot-pr promote` after his approval)
 - `Closes: #N` if the commit resolves a tracked issue
 
 ### Commit Organization
