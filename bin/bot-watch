@@ -48,6 +48,11 @@ readonly EX_RATELIMIT=75
 readonly EX_NOTFOUND=66
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
+# shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
+    echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
+    exit 1
+}
 
 usage() {
     cat <<EOF
@@ -208,9 +213,7 @@ rest_get() {
         args+=(-H "If-None-Match: $(<"${etag_file}")")
     fi
     gh api "${args[@]}" >"${scratch}/raw" 2>"${scratch}/err" || rc=$?
-    # Not sed's q: tr would die of SIGPIPE on a body over a pipe's size,
-    # which pipefail makes a failure.
-    tr -d '\r' <"${scratch}/raw" | sed -n '1,/^$/p' >"${scratch}/headers"
+    split_http_response "${scratch}/raw" "${scratch}/headers" "${scratch}/body"
     status=$(awk 'NR == 1 { print $2 }' "${scratch}/headers")
     case "${status}" in
         304)
@@ -219,7 +222,6 @@ rest_get() {
             cat "${body_file}"
             ;;
         200)
-            tr -d '\r' <"${scratch}/raw" | sed '1,/^$/d' >"${scratch}/body"
             etag=$(awk 'tolower($0) ~ /^etag:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "${scratch}/headers")
             if test -n "${etag}"; then
                 mkdir -p "${ETAG_DIR}"
