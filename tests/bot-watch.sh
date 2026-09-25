@@ -44,8 +44,9 @@ fail() {
 mkdir -p "${WORK}/bin" "${REST}"
 # The fake gh: 'gh api [-i] PATH' answers GETs with $FAKE_GH/rest/PATH.json
 # (query string ignored), with its checksum as the ETag, and 304 for a
-# matching If-None-Match. Each answer is logged as "STATUS PATH" to
-# $FAKE_GH/calls.
+# matching If-None-Match. With $FAKE_GH/rest/PATH.fail, it fails with
+# that file's first line as the HTTP status and its second as gh's error.
+# Each answer is logged as "STATUS PATH" to $FAKE_GH/calls.
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -66,6 +67,13 @@ if test "${path}" = user; then
     exit 0
 fi
 fixture=${FAKE_GH}/rest/${path}.json
+if test -e "${FAKE_GH}/rest/${path}.fail"; then
+    { read -r status; read -r message; } <"${FAKE_GH}/rest/${path}.fail"
+    echo "${status%% *} ${path}" >>"${FAKE_GH}/calls"
+    ! ${include} || printf 'HTTP/2.0 %s\r\n\r\n' "${status}"
+    echo "gh: ${message}" 1>&2
+    exit 1
+fi
 if ! test -e "${fixture}"; then
     echo "404 ${path}" >>"${FAKE_GH}/calls"
     ! ${include} || printf 'HTTP/2.0 404 Not Found\r\n\r\n'
@@ -216,13 +224,15 @@ expect() {
 # opened is news, their own comments aren't. (b) First sight of someone
 # else's issue: only cgwalters' comment since the last sweep is news.
 # Nothing is from the fork PR.
-sweep watch 2026-09-25T14:00:00Z "${EARLIER}"
-expect watch "first-sight news" --arg pr "${PR}" --arg issue "${ISSUE}" --arg bot_issue "${BOT_ISSUE}" '
+readonly FIRST_SIGHT_JQ='
     [.items[].changes[] | [.url, .type, .author, .at]] | sort == ([
         [$pr, "review", "cgwalters", "2026-09-25T13:29:02Z"],
         [$issue, "comment", "cgwalters", "2026-09-25T13:05:00Z"],
         [$bot_issue, "comment", "cgwalters", "2026-09-25T12:30:00Z"],
         [$bot_issue, "comment", "someone", "2026-09-25T12:40:00Z"]] | sort)'
+first_sight_args=(--arg pr "${PR}" --arg issue "${ISSUE}" --arg bot_issue "${BOT_ISSUE}")
+sweep watch 2026-09-25T14:00:00Z "${EARLIER}"
+expect watch "first-sight news" "${first_sight_args[@]}" "${FIRST_SIGHT_JQ}"
 expect watch "all URLs are newly tracked" '.new_urls | length == 4'
 grep -q "review CHANGES_REQUESTED by @cgwalters (operator): Please split this commit." "${WORK}/watch.txt" ||
     fail "watch: the text report lacks the review: $(cat "${WORK}/watch.txt")"
@@ -273,6 +283,33 @@ expect away "only the news since it left" --arg pr "${PR}" '
 jq -e --arg pr "${PR}" '.dropped | has($pr) | not' "${WORK}/away.state" >/dev/null ||
     fail "away: the returned PR is still dropped: $(cat "${WORK}/away.state")"
 values PROMOTED | comments "${PR_ISSUE_API}"
+
+# A state from before swept_at and dropped: its updated_at is when the
+# last sweep ran, and the URL no longer on the board becomes dropped.
+sweep legacy 2026-09-25T14:00:00Z "$(jq -c 'del(.swept_at) | .updated_at = "2026-09-25T13:00:00Z"' <<<"${EARLIER}")"
+expect legacy "first-sight news from an old state" "${first_sight_args[@]}" "${FIRST_SIGHT_JQ}"
+jq -e '.swept_at == "2026-09-25T14:00:00Z"
+       and .dropped == {"https://github.com/example/proj/issues/1": "2026-09-25T13:00:00Z"}' "${WORK}/legacy.state" >/dev/null ||
+    fail "legacy: the new state lacks swept_at or dropped: $(cat "${WORK}/legacy.state")"
+
+# The search failing, generically or rate limited, costs only the PR off
+# the board: the sweep still reports and writes its state, and exits 1.
+for failure in "502 Bad Gateway|HTTP 502: Bad Gateway" "403 Forbidden|API rate limit exceeded for user (HTTP 403)"; do
+    printf '%s\n' "${failure%%|*}" "${failure#*|}" >"${REST}/search/issues.fail"
+    printf '%s\n' "${EARLIER}" >"${WORK}/search.state"
+    rc=0
+    "${BOT_WATCH}" --json --now 2026-09-25T14:00:00Z --board-file "${WORK}/board.json" --state-file "${WORK}/search.state" \
+        >"${WORK}/search.json" 2>"${WORK}/search.err" || rc=$?
+    test "${rc}" -eq 1 || fail "search ${failure%%|*}: exit status ${rc}, not 1: $(cat "${WORK}/search.err")"
+    expect search "search ${failure%%|*}: the board's news and outstanding review" "${first_sight_args[@]}" \
+        --arg link "${REVIEW_LINK}" "(${FIRST_SIGHT_JQ})"' and .search_failed and .state_advanced
+        and ([.outstanding_reviews[].link] == [$link])'
+    jq -e .swept_at "${WORK}/search.state" >/dev/null ||
+        fail "search ${failure%%|*}: the state wasn't written: $(cat "${WORK}/search.state")"
+    grep -q "only the board's PRs were checked" "${WORK}/search.err" ||
+        fail "search ${failure%%|*}: no warning: $(cat "${WORK}/search.err")"
+done
+rm "${REST}/search/issues.fail"
 
 # What answers his review, or doesn't. After a push, answering needs the
 # head commit's committer to be the bot or him.

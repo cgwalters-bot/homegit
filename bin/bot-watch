@@ -417,6 +417,8 @@ outstanding_review() {
            | select(.type == "review" or ([$his_reviews[] | select(.at <= $x.at)] | last | .review_state) != "APPROVED"
                     or (.body | test("@" + $bot + "(?![A-Za-z0-9-])"; "i")))
            | select(if .review_state == "CHANGES_REQUESTED"
+                    # Any later review of his replaces it, even one that
+                    # only comments: he said what he still wants there.
                     then ($push > $x.at or any($his_reviews[]; .at > $x.at)) | not
                     else [$push, $bot_reply] | max <= $x.at end)]
         | sort_by(.at) as $open
@@ -678,38 +680,51 @@ outstanding=$(jq -c --slurpfile results "${scratch}/results.json" '
     $results[0] as $results
     | [.[] | select($results[.url].outstanding != null)
        | {url, items: [.items[] | {id, title}]} + $results[.url].outstanding]' <<<"${watch}")
-# The bot's open upstream PRs that aren't on the board (any more) get
-# the same safety net: one search, which has no ETags.
-search_failed=false
-search_q="is:pr+is:open+author:${BOT_LOGIN}$(jq -r 'map("+-user:" + .) | join("")' <<<"${FORK_OWNERS}")"
-rc=0
-rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}" >"${scratch}/search.json" || rc=$?
-if test "${rc}" -eq 0; then
-    if test "$(jq .total_count "${scratch}/search.json")" -gt "${PER_PAGE}"; then
+# off_board_outstanding: prints the outstanding reviews on the bot's
+# open upstream PRs that the sweep doesn't probe (not on the board, or
+# not any more), as JSON lines: one search, which has no ETags, then
+# their reviews. Fails if any of it does.
+off_board_outstanding() {
+    local search_q search extra url o
+    search_q="is:pr+is:open+author:${BOT_LOGIN}$(jq -r 'map("+-user:" + .) | join("")' <<<"${FORK_OWNERS}")"
+    search=$(rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}")
+    if test "$(jq .total_count <<<"${search}")" -gt "${PER_PAGE}"; then
         warn "the bot has over ${PER_PAGE} open upstream PRs; only the first ${PER_PAGE} have their reviews checked"
     fi
     extra=$(jq -r --argjson watch "${watch}" --argjson forks "${FORK_OWNERS}" '
         [$watch[].url] as $swept
         | .items[] | .html_url
         | select(IN($swept[]) | not)
-        | select(capture("^https://github\\.com/(?<o>[^/]+)/").o as $o | $forks | index($o) | not)' "${scratch}/search.json")
+        | select(capture("^https://github\\.com/(?<o>[^/]+)/").o as $o | $forks | index($o) | not)' <<<"${search}")
     while IFS= read -r url; do
         test -n "${url}" || continue
-        rc=0
-        pr_outstanding "${url}" >"${scratch}/extra.json" &
-        wait "$!" || rc=$?
-        case "${rc}" in
-            0) outstanding=$(jq -c --arg u "${url}" --slurpfile o "${scratch}/extra.json" \
-                   'if $o[0] == null then . else . + [{url: $u, items: []} + $o[0]] end' <<<"${outstanding}") ;;
-            "${EX_RATELIMIT}") exit "${EX_RATELIMIT}" ;;
-            *) warn "checking ${url} for outstanding reviews failed"; search_failed=true ;;
-        esac
+        o=$(pr_outstanding "${url}")
+        test "${o}" = null || jq -c --arg u "${url}" '{url: $u, items: []} + .' <<<"${o}"
     done <<<"${extra}"
-else
-    test "${rc}" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
-    warn "searching the bot's open PRs failed; only the board's are checked for outstanding reviews"
-    search_failed=true
-fi
+}
+
+# The safety net doesn't depend on the board, but a failure there (even
+# the search quota running out) mustn't cost the sweep its report or
+# state: only a warning, and a nonzero exit.
+search_failed=false
+rc=0
+off_board_outstanding >"${scratch}/extra.json" 2>"${scratch}/extra.err" &
+wait "$!" || rc=$?
+case "${rc}" in
+    0)
+        cat "${scratch}/extra.err" 1>&2
+        outstanding=$(jq -sc --argjson o "${outstanding}" '$o + .' "${scratch}/extra.json")
+        ;;
+    "${EX_RATELIMIT}")
+        warn "GitHub is rate limiting the bot's search (or its reads of PRs off the board); only the board's PRs were checked for outstanding reviews"
+        search_failed=true
+        ;;
+    *)
+        cat "${scratch}/extra.err" 1>&2
+        warn "checking the bot's open PRs off the board failed; only the board's PRs were checked for outstanding reviews"
+        search_failed=true
+        ;;
+esac
 report=$(jq -c 'map(select((.changes | length) > 0 or (.actions | length) > 0) | del(.retry))' <<<"${report}")
 
 # keep_last_seen ITEM: puts the URLs of ITEM back to their last-seen
