@@ -1,0 +1,915 @@
+#!/usr/bin/env node
+// Retro over agent logs: scan the devspace agent runs (through bot-runs)
+// and this machine's local subagent transcripts for a time window, pull
+// out problem signals mechanically, and render a report; see --help and
+// docs/retro.md. Node's standard library only, plus gh, bot-runs and
+// bot-board for the optional steps.
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1] || "bot-retro");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const SCHEMA = "bot-retro-summary/v1";
+const DEFAULT_SINCE = "24h";
+const HOME = os.homedir();
+// Where Claude Code keeps the transcripts of sessions started in the
+// directory holding the bot's clones.
+const DEFAULT_PROJECTS = path.join(HOME, ".claude", "projects", path.join(HOME, "src/github/cgwalters-bot").replace(/[/.]/g, "-"));
+// The shared clones: git work that changes a checkout belongs in a worktree.
+const SHARED_CLONES = path.join(HOME, "src/github/cgwalters-bot");
+const QUOTE_MAX = 120;
+const EXAMPLES_MAX = 5;
+const LONG_TOOL_S = 10 * 60;
+const IDLE_GAP_S = 30 * 60;
+// A transcript quiet this long that ends inside a tool call is unfinished.
+const UNFINISHED_AFTER_S = 60 * 60;
+// The same command this many times in one agent is a polling loop.
+const POLL_LOOP_MIN = 5;
+// A command template run by at least this many agents is a candidate for tooling.
+const MANUAL_MIN_AGENTS = 5;
+const MANUAL_MAX = 12;
+const DRAFTS_MAX = 5;
+const NARRATE_CMD = process.env.BOT_RETRO_AGENT || "claude -p";
+const BOT_RUNS = process.env.BOT_RETRO_BOT_RUNS || path.join(BIN_DIR, "bot-runs");
+const BOT_BOARD = process.env.BOT_RETRO_BOT_BOARD || path.join(BIN_DIR, "bot-board");
+const RUNS_LIMIT = 200;
+
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} [--since AGE] [--until DATE] [--projects DIR] [--no-local]
+                 [--no-runs] [--run-transcripts] [--json]
+                 [--from-summary FILE] [--narrate] [--gist] [--drafts N]
+
+Scans agent logs for problems and prints a Markdown retro report (with
+--json, the structured summary it is rendered from). Sources:
+
+  local  subagent and coordinator transcripts under --projects DIR
+         (default ${DEFAULT_PROJECTS.replace(HOME, "~")}), the files changed since AGE;
+  runs   devspace agent runs, through 'bot-runs list/show' (and with
+         --run-transcripts, their unpacked transcripts too).
+
+Signals: tool errors by category, policy violations (local builds, fixup
+pushes, Signed-off-by, git work in a shared clone, injection-shaped
+text), waste (blocked sleeps, retries, polling loops, long tools, idle
+gaps), stopped agents, reviewer verdicts and their findings, repeated
+commands, and success claims without a test run. Quotes are short and
+token-shaped strings are redacted, but the report still describes
+private work: keep it in a secret gist.
+
+AGE is like 12h, 7d or 2w, or a date (default ${DEFAULT_SINCE}); DATE is a date
+(default now).
+
+  --from-summary FILE  render a summary saved with --json instead of scanning
+  --narrate            add a narrative written by '${NARRATE_CMD}' (BOT_RETRO_AGENT)
+                       from the summary, never from the raw logs
+  --gist               post the report as a secret gist and print its URL
+  --drafts N           add the top N (at most ${DRAFTS_MAX}) proposals to the board as
+                       drafts with no Status (P1, Org cgwalters-bot)
+`;
+}
+
+function parseArgs(argv) {
+  const opts = {
+    since: DEFAULT_SINCE, until: null, projects: process.env.BOT_RETRO_PROJECTS || DEFAULT_PROJECTS,
+    local: true, runs: true, runTranscripts: false, json: false, fromSummary: null,
+    narrate: false, gist: false, drafts: 0,
+  };
+  const value = (i, name) => {
+    if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
+    return argv[i + 1];
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "-h":
+      case "--help":
+        process.stdout.write(usage());
+        process.exit(0);
+      case "--since": opts.since = value(i++, a); break;
+      case "--until": opts.until = value(i++, a); break;
+      case "--projects": opts.projects = value(i++, a); break;
+      case "--no-local": opts.local = false; break;
+      case "--no-runs": opts.runs = false; break;
+      case "--run-transcripts": opts.runTranscripts = true; break;
+      case "--json": opts.json = true; break;
+      case "--from-summary": opts.fromSummary = value(i++, a); break;
+      case "--narrate": opts.narrate = true; break;
+      case "--gist": opts.gist = true; break;
+      case "--drafts":
+        opts.drafts = Number(value(i++, a));
+        if (!Number.isInteger(opts.drafts) || opts.drafts < 0 || opts.drafts > DRAFTS_MAX) {
+          throw new Exit(EX_USAGE, `--drafts takes a number from 0 to ${DRAFTS_MAX}`);
+        }
+        break;
+      default:
+        throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    }
+  }
+  return opts;
+}
+
+// parseTime(s, now): the Date that AGE (12h, 7d, 2w: before NOW) or a date names.
+function parseTime(s, now) {
+  const m = /^(\d+)([mhdw])$/.exec(s);
+  if (m) {
+    const unit = { m: 60, h: 3600, d: 86400, w: 7 * 86400 }[m[2]];
+    return new Date(now.getTime() - Number(m[1]) * unit * 1000);
+  }
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) throw new Exit(EX_USAGE, `not an age (12h, 7d, 2w) or a date: '${s}'`);
+  return d;
+}
+
+// --- redaction ---------------------------------------------------------------
+
+// The patterns of docs/devspace-agent-runs.md, plus anything else long and
+// token-shaped. Hex strings (commit ids, digests) are kept.
+const SECRET_RES = [
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(-----END [A-Z ]*PRIVATE KEY-----|$)/g,
+  /gh[posu]_[A-Za-z0-9_]{20,}/g,
+  /github_pat_[A-Za-z0-9_]{20,}/g,
+  /sk-ant-[A-Za-z0-9_-]{20,}/g,
+  /sk-[A-Za-z0-9_-]{20,}/g,
+  /tskey-[A-Za-z0-9-]{10,}/g,
+  /eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+(\.[A-Za-z0-9_-]*)?/g,
+  /\b(authorization:\s*(bearer|token|basic)\s+)\S+/gi,
+];
+const LONG_TOKEN_RE = /[A-Za-z0-9+/_=-]{32,}/g;
+const REDACTED = "[REDACTED]";
+
+function redact(s) {
+  let out = String(s);
+  for (const re of SECRET_RES) out = out.replace(re, (_, keep) => (typeof keep === "string" && /^authorization/i.test(keep) ? keep : "") + REDACTED);
+  // Paths are long but not secret; only unbroken runs are tokens.
+  return out.replace(LONG_TOKEN_RE, (t) => (!/\d/.test(t) || /^[0-9a-f-]+$/i.test(t) || isPath(t) ? t : REDACTED));
+}
+
+// isPath(t): T looks like a path (short components), not base64.
+function isPath(t) {
+  return t.includes("/") && !/[+=]/.test(t) && t.split("/").every((p) => p.length < 24);
+}
+
+// quote(s): a one-line, redacted, shortened excerpt.
+function quote(s, max = QUOTE_MAX) {
+  let q = String(s).replace(/\s+/g, " ").trim().replaceAll(HOME, "~");
+  q = redact(q.replace(/\/tmp\/claude-\d+\/[^/\s]+\/[0-9a-f-]{36}\/(scratchpad|tasks)/g, "$$SCRATCH"));
+  return q.length > max ? `${q.slice(0, max - 1)}…` : q;
+}
+
+// --- command parsing ---------------------------------------------------------
+
+// stripQuotes(cmd): CMD without heredoc bodies and quoted strings, so text
+// inside commit messages or grep patterns is not read as a command.
+function stripQuotes(cmd) {
+  let out = "";
+  const lines = cmd.split("\n");
+  let heredoc = null;
+  for (const line of lines) {
+    if (heredoc !== null) {
+      if (line.trim() === heredoc) heredoc = null;
+      continue;
+    }
+    const m = /<<-?\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1/.exec(line);
+    if (m) heredoc = m[2];
+    out += `${line}\n`;
+  }
+  // Quoted text goes, in one pass so an apostrophe inside "..." (or a
+  // double quote inside '...') doesn't start a string of its own.
+  let res = "";
+  let q = null;
+  for (let i = 0; i < out.length; i++) {
+    const ch = out[i];
+    if (q === null) {
+      if (ch === "\\") {
+        res += ch + (out[i + 1] || "");
+        i++;
+      } else if (ch === "'" || ch === '"') {
+        q = ch;
+        res += ch;
+      } else res += ch;
+    } else if (ch === q) {
+      q = null;
+      res += ch;
+    } else if (q === '"' && ch === "\\") i++;
+  }
+  return res;
+}
+
+const ENV_ASSIGN_RE = /^[A-Za-z_][A-Za-z0-9_]*=\S*$/;
+const WRAPPERS = new Set(["timeout", "nice", "env", "time", "sudo", "exec", "command", "nohup"]);
+
+// segments(cmd): the simple commands of CMD as word arrays, the program
+// reduced to its basename, leading variable assignments and wrappers
+// dropped. A program called through a variable set in CMD
+// (B=~/.../bot-git; $B commit) is resolved.
+function segments(cmd) {
+  const out = [];
+  const vars = new Map();
+  for (const part of stripQuotes(cmd).split(/&&|\|\||[;|\n&]|\$\(|`|\(|\)/)) {
+    let words = part.trim().split(/\s+/).filter(Boolean);
+    while (words.length && (ENV_ASSIGN_RE.test(words[0]) || WRAPPERS.has(words[0]))) {
+      const assign = /^([A-Za-z_]\w*)=(\S+)$/.exec(words[0]);
+      if (assign) vars.set(assign[1], assign[2]);
+      const wrapper = words.shift();
+      // timeout's options and duration, env's and nice's options.
+      while (words.length && /^-/.test(words[0])) {
+        const opt = words.shift();
+        if (wrapper === "timeout" && ["-k", "-s", "--kill-after", "--signal"].includes(opt)) words.shift();
+      }
+      if (wrapper === "timeout" && words.length) words.shift();
+    }
+    if (!words.length) continue;
+    const ref = /^\$\{?(\w+)\}?$/.exec(words[0]);
+    if (ref && vars.has(ref[1])) words[0] = vars.get(ref[1]);
+    words[0] = path.basename(words[0]);
+    out.push(words);
+  }
+  return out;
+}
+
+// gitSub(words): for a git/bot-git command, its subcommand and the -C
+// directory; null otherwise.
+function gitSub(words) {
+  if (words[0] !== "git" && words[0] !== "bot-git") return null;
+  let dir = null;
+  let i = 1;
+  for (; i < words.length && words[i].startsWith("-"); i++) {
+    if (words[i] === "-C") dir = words[++i];
+    else if (words[i] === "-c") i++;
+  }
+  return { sub: words[i] || "", args: words.slice(i + 1), dir };
+}
+
+const BUILD_RE = /^(cargo (build|check|test|clippy|nextest|run|install|bench)|make( |$)|just( |$)|podman build|buildah (bud|build)|qemu-system\S*|virt-install|bcvk |tmt run|go (build|test)|rpmbuild)/;
+const WAIT_RE = /\b(until|while|for)\b[\s\S]*\bsleep\b|\bgh (run|pr checks) watch\b|\bbot-land\b/;
+const REMOTE_PROGS = new Set(["ssh", "bot-devspace", "scp", "rsync"]);
+const TEST_RE = /(cargo (test|nextest)|just (test|validate|check)\S*|make (check|test)|tests\/[\w.-]+\.(sh|js)|node --test|tmt run|pytest|go test|bats|actionlint|shellcheck|bcvk-integration|integration-tests?)/;
+const SUCCESS_CLAIM_RE = /\b(all tests pass(ed)?|tests? (pass(ed|es)?|are green|succeeded)|verified (that|it|the fix)|ci (is |was )?green|builds? clean(ly)?)\b/i;
+const INJECTION_RE = /\b(ignore (all )?(previous|prior|above) instructions|disregard (all |the )?(previous|prior|above)|you are now (a|an|in)\b|new instructions:|<\/?system>)/i;
+const HARNESS_FLAG_RE = /\[harness: subagent output matched instruction-shaped pattern\(s\): ([^.\]]+)/;
+// Commands that bring in text from outside: where injection attempts come from.
+const EXTERNAL_RE = /\b(gh (api|pr|issue|search|run|release)|curl|wget|bot-notify|bot-pr|bot-watch|bot-feedback)\b/;
+const TRIVIAL_PROGS = new Set([
+  "cd", "cat", "ls", "echo", "printf", "head", "tail", "sed", "awk", "rg", "grep", "jq", "wc", "sort", "uniq",
+  "find", "mkdir", "rm", "cp", "mv", "sleep", "test", "true", "false", "[", "tr", "cut", "xargs", "tee", "date",
+  "diff", "set", "export", "read", "for", "do", "done", "if", "then", "else", "fi", "while", "wait", "exit",
+  "source", ".", "local", "return", "column", "base64", "basename", "dirname", "realpath", "readlink", "touch",
+  "stat", "du", "df", "file", "less", "bash", "sh", "nu", "python3", "node", "case", "esac", "{", "}", "chmod", "ln", "which",
+]);
+const TRIVIAL_GIT = new Set([
+  "status", "log", "diff", "show", "fetch", "rev-parse", "branch", "remote", "config", "ls-files", "grep", "merge-base",
+  "rev-list", "cat-file", "describe", "add", "commit", "push", "checkout", "switch", "rebase", "reset", "stash",
+]);
+
+// template(words): a command with its specifics generalized, for counting
+// repeated steps; null for trivial ones.
+function template(words) {
+  if (TRIVIAL_PROGS.has(words[0]) || REMOTE_PROGS.has(words[0]) || !/^[a-z][\w.-]*$/.test(words[0])) return null;
+  const g = gitSub(words);
+  if (g && (TRIVIAL_GIT.has(g.sub) || g.sub === "")) return null;
+  const general = (w) => w
+    .replace(/^https?:\/\/github\.com\/[^/\s]+\/[^/\s]+/, "https://github.com/O/R")
+    .replace(/^repos\/[^/\s]+\/[^/\s?]+/, "repos/O/R")
+    .replace(/\b\d+\b/g, "N")
+    .replace(/\b[0-9a-f]{7,64}\b/g, "SHA")
+    .replace(/PVTI_\w+/g, "ITEM");
+  // Options, variables and (stripped) quoted strings say little about the step.
+  const t = words.filter((w) => !/^(-|\$|''|"")/.test(w)).slice(0, 3).map(general);
+  return t.join(" ");
+}
+
+// --- tool errors ----------------------------------------------------------------
+
+const ERROR_CLASSES = [
+  ["blocked_sleep", /^<tool_use_error>Blocked: sleep/],
+  ["user_rejected", /doesn't want to proceed with this tool use|The user rejected/],
+  ["report_file_blocked", /return findings as text, not write report/],
+  ["rate_limit", /rate limit|secondary rate|API rate/i],
+  ["shell_syntax", /syntax error|unexpected (token|EOF)|unterminated quoted|bad substitution/],
+  ["cli_misuse", /unknown (flag|option|command|shorthand)|invalid option|unrecognized option|^Exit code \d+\s+Usage:|accepts \d+ arg/i],
+  ["missing_file", /No such file or directory|cannot access|File does not exist|not found/i],
+  ["python_error", /Traceback \(most recent call last\)/],
+  ["edit_error", /String to replace not found|File has not been read yet|has been modified since/],
+  ["git_error", /^Exit code 128\b|fatal: |error: failed to push|! \[rejected\]/],
+  ["timeout", /^Exit code 124\b|timed out|Command timed out/i],
+  ["harness_error", /^<tool_use_error>/],
+];
+
+function classifyError(text) {
+  for (const [cls, re] of ERROR_CLASSES) if (re.test(text)) return cls;
+  const m = /^Exit code (\d+)/.exec(text);
+  return m ? `exit_${m[1]}` : "other";
+}
+
+// Where each class goes in the report.
+const CLASS_CATEGORY = { blocked_sleep: "waste", user_rejected: "stop" };
+
+// --- transcript scanning ---------------------------------------------------------
+
+function resultText(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) return content.map((c) => (typeof c === "string" ? c : c.text || "")).join(" ");
+  return content == null ? "" : JSON.stringify(content);
+}
+
+function newAgent(id, source, meta) {
+  return {
+    id, source, session: meta.session || null, description: meta.description || null, type: meta.type || null,
+    start: null, end: null, calls: 0, errors: 0, finalText: "", prompt: null, testRuns: 0, remote: source !== "local",
+    lastKind: null,
+  };
+}
+
+// scanLines(lines, agent, window, out): collect AGENT's signals from the
+// parsed JSONL records LINES into OUT.
+function scanLines(records, agent, window, out) {
+  const pending = new Map();
+  const commands = new Map();
+  let fixupPending = false;
+  let lastTs = null;
+  const sig = (category, kind, detail, extra = {}) => out.signals.push({ category, kind, agent: agent.id, ts: extra.ts || lastTs, detail: quote(detail), ...extra });
+  for (const rec of records) {
+    const ts = rec.timestamp ? new Date(rec.timestamp) : null;
+    if (ts && (ts < window.since || ts > window.until)) continue;
+    if (ts) {
+      // Time spent inside a tool call is the tool's (long_tool), not idle.
+      if (lastTs && pending.size === 0 && (ts - new Date(lastTs)) / 1000 > IDLE_GAP_S) {
+        sig("waste", "idle_gap", `${Math.round((ts - new Date(lastTs)) / 60000)} min without activity`, { seconds: Math.round((ts - new Date(lastTs)) / 1000) });
+      }
+      lastTs = rec.timestamp;
+      agent.start = agent.start || rec.timestamp;
+      agent.end = rec.timestamp;
+    }
+    const content = rec.message && rec.message.content;
+    if (rec.type === "assistant" && Array.isArray(content)) {
+      for (const c of content) {
+        if (c.type === "tool_use") {
+          pending.set(c.id, { name: c.name, input: c.input || {}, ts: rec.timestamp });
+          agent.calls++;
+          agent.lastKind = "tool_use";
+          agent.finalText = "";
+        } else if (c.type === "text" && c.text) {
+          agent.finalText += `${c.text}\n`;
+          agent.lastKind = "text";
+        }
+      }
+    } else if (rec.type === "user") {
+      if (typeof content === "string" || (Array.isArray(content) && content.some((c) => c.type === "text"))) {
+        const text = typeof content === "string" ? content : content.filter((c) => c.type === "text").map((c) => c.text).join(" ");
+        if (agent.prompt === null) agent.prompt = quote(text, 200);
+        if (/^\[Request interrupted by user/.test(text)) sig("stop", "interrupted", text);
+        continue;
+      }
+      if (!Array.isArray(content)) continue;
+      for (const c of content) {
+        if (c.type !== "tool_result") continue;
+        const call = pending.get(c.tool_use_id) || { name: "?", input: {}, ts: null };
+        pending.delete(c.tool_use_id);
+        const text = resultText(c.content);
+        const tur = rec.toolUseResult && typeof rec.toolUseResult === "object" ? rec.toolUseResult : {};
+        onResult(agent, call, text, c.is_error === true, tur, rec, sig, commands, out);
+      }
+    } else if (rec.type === "attachment" && rec.attachment && rec.attachment.type === "queued_command") {
+      const p = resultText(rec.attachment.prompt);
+      const stopped = /(\d+ )?background agents? (was|were) stopped by the user: (.*)/.exec(p);
+      if (stopped) {
+        // The harness repeats the notice; count each agent once.
+        for (const name of stopped[3].match(/"[^"]+"/g) || []) {
+          if (!out.stopped.has(name)) sig("stop", "stopped_by_user", name.slice(1, -1));
+          out.stopped.add(name);
+        }
+      }
+      const status = /<status>([^<]+)<\/status>/.exec(p);
+      if (status && status[1] !== "completed") {
+        const summary = (/<summary>([^<]*)<\/summary>/.exec(p) || [])[1] || "";
+        // Background shell commands notify too; only agents' ends are stops.
+        if (/^Background command/.test(summary)) sig("error", "background_failed", summary);
+        else sig("stop", `task_${status[1]}`, summary);
+      }
+      const flag = HARNESS_FLAG_RE.exec(p);
+      if (flag) sig("policy", "injection_flagged", `harness flagged subagent output: ${flag[1]}`, { patterns: flag[1].split(/,\s*/) });
+    }
+    // Fixup state follows the commands in order, across tool calls.
+    if (rec.type === "assistant" && Array.isArray(content)) {
+      for (const c of content) {
+        if (c.type !== "tool_use" || c.name !== "Bash" || typeof (c.input || {}).command !== "string") continue;
+        const cmd = c.input.command;
+        if (/\bcommit\b[^\n]*-m\s*["']?(fixup|squash)!/.test(cmd)) fixupPending = true;
+        for (const w of segments(cmd)) {
+          const g = gitSub(w);
+          if (g && g.sub === "commit" && g.args.some((a) => /^--(fixup|squash)\b/.test(a))) fixupPending = true;
+          if (g && g.sub === "rebase" && g.args.some((a) => a === "--autosquash" || a === "-i" || a === "--interactive")) fixupPending = false;
+          if (fixupPending && ((g && g.sub === "push" && !devspacePush(g.args)) || w[0] === "bot-land" || (w[0] === "bot-pr" && w[1] === "fork-pr"))) {
+            sig("policy", "fixup_push", cmd);
+            fixupPending = false;
+          }
+        }
+      }
+    }
+  }
+  for (const [cmd, n] of commands) {
+    if (n.count >= POLL_LOOP_MIN) sig("waste", "poll_loop", `${n.count}× ${cmd}`, { count: n.count });
+  }
+  // One still running (the retro's own, say) is not unfinished yet.
+  if (agent.lastKind === "tool_use" && agent.source === "local" && agent.type !== "coordinator" && lastTs && window.until - new Date(lastTs) > UNFINISHED_AFTER_S * 1000) {
+    sig("stop", "unfinished", "transcript ends inside a tool call");
+  }
+}
+
+function onResult(agent, call, text, isError, tur, rec, sig, commands, out) {
+  const cmd = call.name === "Bash" && typeof call.input.command === "string" ? call.input.command : null;
+  if (call.ts && rec.timestamp) {
+    const secs = (new Date(rec.timestamp) - new Date(call.ts)) / 1000;
+    if (secs > LONG_TOOL_S && !call.input.run_in_background) {
+      // A loop waiting on something else is a wait, not a slow tool.
+      const kind = cmd && WAIT_RE.test(cmd) ? "long_wait" : "long_tool";
+      sig("waste", kind, `${Math.round(secs / 60)} min: ${cmd || call.name}`, { seconds: Math.round(secs) });
+    }
+  }
+  if (tur.interrupted === true) sig("stop", "interrupted", cmd || call.name);
+  if (call.name === "SendMessage" && /was stopped by the user and was not resumed/.test(text)) sig("waste", "message_to_stopped", text);
+  if (isError) {
+    agent.errors++;
+    const cls = classifyError(text);
+    sig(CLASS_CATEGORY[cls] || "error", cls, `${cmd ? `$ ${cmd.split("\n")[0]} → ` : `${call.name}: `}${text}`, { tool: call.name });
+  }
+  if (cmd) {
+    const key = cmd.replace(/\s+/g, " ").trim();
+    const seen = commands.get(key) || { count: 0, failed: false };
+    if (seen.failed && isError) sig("waste", "retry", `failed again: ${key}`);
+    seen.count++;
+    seen.failed = isError;
+    commands.set(key, seen);
+    if (!isError && TEST_RE.test(cmd)) agent.testRuns++;
+    scanCommand(agent, cmd, rec.cwd || "", sig, out);
+  }
+  if (!isError && call.name !== "Read" && (call.name === "WebFetch" || (cmd && EXTERNAL_RE.test(cmd)))) {
+    const m = INJECTION_RE.exec(text);
+    // A quoted mention ("ignore previous instructions") is documentation.
+    if (m && !/["'`“]$/.test(text.slice(0, m.index))) sig("policy", "injection_text", text.slice(Math.max(0, m.index - 40), m.index + 80));
+  }
+}
+
+// devspacePush(args): a push to a devspace checkout (for testing), not to GitHub.
+function devspacePush(args) {
+  const remote = args.find((a) => !a.startsWith("-"));
+  return remote !== undefined && /^(devspace-|[\w.-]+@|''$|""$)|^[\w.-]+:(?!\/\/)/.test(remote);
+}
+
+function sharedClone(dir) {
+  const d = path.resolve(dir.replace(/^~(?=\/|$)/, HOME));
+  return path.dirname(d) === SHARED_CLONES ? d : null;
+}
+
+const CLONE_CHANGING = new Set(["checkout", "switch", "commit", "rebase", "reset", "cherry-pick", "am", "merge", "stash", "revert"]);
+
+function scanCommand(agent, cmd, cwd, sig, out) {
+  const segs = segments(cmd);
+  // bot-devspace is often called through a variable: B=.../bot-devspace; $B ssh.
+  const remote = segs.some((w) => REMOTE_PROGS.has(w[0]) || (/^\$/.test(w[0]) && w[1] === "ssh" && cmd.includes("bot-devspace")));
+  // Tests of git tooling run in throwaway repositories: not the bot's commits.
+  const sandbox = /\bmktemp\b|GIT_CONFIG_GLOBAL=/.test(cmd);
+  let dir = cwd;
+  for (const w of segs) {
+    // A directory from a variable is unknown (null).
+    if (w[0] === "cd" && w[1]) dir = /^\$/.test(w[1]) ? null : w[1].startsWith("/") || w[1].startsWith("~") ? w[1] : dir && path.join(dir, w[1]);
+    const line = w.join(" ");
+    if (!agent.remote && !remote && BUILD_RE.test(line) && !w.some((a) => a === "--dry-run" || a === "-n" || a === "--help")) sig("policy", "local_build", line);
+    const g = gitSub(w);
+    if (g && !sandbox) {
+      // -s is --signoff for these; for rebase and merge it is --strategy.
+      const shortS = ["commit", "am", "cherry-pick", "revert"].includes(g.sub);
+      if (["commit", "rebase", "am", "cherry-pick", "merge", "revert"].includes(g.sub) && g.args.some((a) => a === "--signoff" || (shortS && /^-[a-zA-Z]*s[a-zA-Z]*$/.test(a)))) {
+        sig("policy", "signoff", line);
+      }
+      const gdir = g.dir ? (/^\$/.test(g.dir) ? null : g.dir.startsWith("/") || g.dir.startsWith("~") ? g.dir : dir && path.join(dir, g.dir)) : dir;
+      const clone = gdir && sharedClone(gdir);
+      if (clone && !agent.remote && CLONE_CHANGING.has(g.sub) && !(g.sub === "checkout" && g.args[0] === "--") && !g.args.includes("--ff-only")) {
+        sig("policy", "shared_clone", `${line} (in ${clone.replace(HOME, "~")})`);
+      }
+    }
+    if (w[0] === "gh" && w[1] === "api" && w[2] === "graphql") out.graphql[agent.id] = (out.graphql[agent.id] || 0) + 1;
+    const t = template(w);
+    if (t && !t.startsWith("bot-")) {
+      const s = out.templates.get(t) || new Set();
+      s.add(agent.id);
+      out.templates.set(t, s);
+    }
+  }
+  // A trailer written into a commit message by hand; commands that also
+  // filter or write files (sed '/^Signed-off-by/d', cat > notes <<EOF) are
+  // too ambiguous to call.
+  const commits = segs.some((w) => {
+    const g = gitSub(w);
+    return g && (g.sub === "commit" || g.sub === "interpret-trailers");
+  });
+  if (commits && !sandbox && /Signed-off-by:/.test(cmd) && !segs.some((w) => ["bot-pr", "rg", "grep", "sed", "awk", "cat", "python3", "node"].includes(w[0]))) {
+    sig("policy", "signoff", cmd.split("\n")[0]);
+  }
+}
+
+// --- reviewer verdicts ---------------------------------------------------------
+
+const REVIEWER_RE = /^(security |code |independent )?re-?review|^review\b/i;
+const VERDICT_RE = /verdict:?\**:?\s*\**\s*(approve[d]?|changes(?: requested| needed)?|request(?:ed)? changes|needs[ -]work|reject(?:ed)?|block(?:ed)?)/i;
+const FINDING_RE = /^\s*\d+\.\s+\*\*([^*]{3,160})\*\*/gm;
+const FINDING_CATEGORIES = [
+  ["security", /secur|inject|token|secret|spoof|trust|permission|credential|leak|bypass|forged?\b/i],
+  ["claims", /claim|untrue|imprecis|doesn't back|not backed|overstat/i],
+  ["cleanup", /unused|duplicat|inconsisten|simplif|dead code/i],
+  ["tests", /\btest|coverage|fixture|reproduc/i],
+  ["ci", /\bci\b|workflow|github action|renovate|runner/i],
+  ["commit-message", /commit (message|body|subject)|trailer|wording|typo|reword/i],
+  ["docs", /\bdoc|readme|man ?page|help text|comment|changelog/i],
+  ["error-handling", /error|fail|robust|retry|quota|rate limit|exit (code|status)|timeout/i],
+  ["correctness", /bug|race|wrong|incorrect|regression|collid|broken|missing|off-by|leak|crash|breaks?/i],
+];
+
+function categorizeFinding(title) {
+  for (const [cat, re] of FINDING_CATEGORIES) if (re.test(title)) return cat;
+  return "other";
+}
+
+function reviewOf(agent) {
+  if (!agent.description || !REVIEWER_RE.test(agent.description) || !agent.finalText) return null;
+  const v = VERDICT_RE.exec(agent.finalText);
+  let verdict = v ? v[1].toLowerCase() : null;
+  if (verdict) verdict = /approve/.test(verdict) ? "approve" : "changes";
+  const findings = [...agent.finalText.matchAll(FINDING_RE)]
+    .map((m) => m[1].replace(/[:.]\s*$/, "").trim())
+    .filter((t) => !/^(verdict|findings|what i ran|commit hygiene)\b/i.test(t))
+    .map((t) => ({ title: quote(t, 100), category: categorizeFinding(t) }));
+  return { agent: agent.id, description: agent.description, verdict, findings };
+}
+
+// --- sources --------------------------------------------------------------------
+
+function readJSONL(file) {
+  const out = [];
+  let bad = 0;
+  for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+    if (!line) continue;
+    try {
+      out.push(JSON.parse(line));
+    } catch {
+      bad++;
+    }
+  }
+  return { records: out, bad };
+}
+
+function readMeta(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file.replace(/\.jsonl$/, ".meta.json"), "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+// localFiles(dir, since): the transcripts under DIR changed since SINCE:
+// SESSION.jsonl (coordinators) and SESSION/subagents/*.jsonl.
+function localFiles(dir, since) {
+  if (!fs.existsSync(dir)) throw new Exit(EX_ERROR, `no transcripts at ${dir} (pass --projects, or --no-local)`);
+  const out = [];
+  const fresh = (f) => fs.statSync(f).mtime >= since;
+  for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, e.name);
+    if (e.isFile() && e.name.endsWith(".jsonl") && fresh(p)) out.push({ file: p, session: e.name.slice(0, -6), coordinator: true });
+    const sub = path.join(p, "subagents");
+    if (e.isDirectory() && fs.existsSync(sub)) {
+      for (const f of fs.readdirSync(sub)) {
+        const fp = path.join(sub, f);
+        if (f.endsWith(".jsonl") && fresh(fp)) out.push({ file: fp, session: e.name, coordinator: false });
+      }
+    }
+  }
+  return out.sort((a, b) => a.file.localeCompare(b.file));
+}
+
+function scanLocal(opts, window, out) {
+  for (const { file, session, coordinator } of localFiles(opts.projects, window.since)) {
+    const meta = readMeta(file);
+    const id = coordinator ? `coordinator-${session.slice(0, 8)}` : path.basename(file, ".jsonl").replace(/^agent-/, "");
+    const agent = newAgent(id, "local", { session, description: coordinator ? "coordinator session" : meta.description, type: coordinator ? "coordinator" : meta.agentType });
+    const { records, bad } = readJSONL(file);
+    out.badLines += bad;
+    scanLines(records, agent, window, out);
+    if (agent.start) out.agents.push(agent);
+  }
+}
+
+function botRuns(args) {
+  try {
+    return JSON.parse(execFileSync(BOT_RUNS, [...args, "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 << 20 }));
+  } catch (e) {
+    throw new Exit(EX_ERROR, `bot-runs ${args[0]} failed (pass --no-runs to skip the devspace runs): ${String(e.stderr || e.message).trim()}`);
+  }
+}
+
+function scanRuns(opts, window, out) {
+  let list;
+  try {
+    list = botRuns(["list", "--since", window.since.toISOString(), "--limit", String(RUNS_LIMIT)]);
+  } catch (e) {
+    // The local transcripts are still worth a report.
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: warning: skipping the devspace runs: ${e.message}\n`);
+    out.runsError = e.message;
+    return;
+  }
+  for (const flat of list) {
+    if (flat.created_at && new Date(flat.created_at) > window.until) continue;
+    const rec = botRuns(["show", String(flat.run_id)]);
+    const s = rec.summary || {};
+    const id = `run-${flat.run_id}`;
+    const run = {
+      id, url: flat.url, item: flat.item, repo: flat.repo, agent: flat.agent, model: flat.model, result: flat.result,
+      duration_s: flat.duration_s, aic: flat.aic, aic_budget: flat.aic_budget, source: flat.source, tests: (s.tests || []).length,
+      outcome: flat.outcome ? flat.outcome.status : null,
+    };
+    out.runs.push(run);
+    const sig = (category, kind, detail, extra = {}) => out.signals.push({ category, kind, agent: id, ts: flat.created_at, detail: quote(detail), ...extra });
+    if (flat.result && !["success", "noop"].includes(flat.result)) sig("stop", `run_${flat.result}`, `${flat.repo || "?"}: ${flat.result}`);
+    for (const f of (s.failures || []).filter((f) => f.kind !== flat.result)) sig(f.kind === "tool_error" ? "error" : "stop", `run_${f.kind}`, f.message || "");
+    for (const e of s.egress_denied || []) sig("policy", "egress_denied", `${e.domain} (${e.count}×)`);
+    if (flat.aic != null && flat.aic_budget && flat.aic >= 0.9 * flat.aic_budget) sig("waste", "budget_near", `${flat.aic} of ${flat.aic_budget} AIC`);
+    for (const t of s.slowest || []) if (t.duration_s > LONG_TOOL_S) sig("waste", "long_tool", `${Math.round(t.duration_s / 60)} min: ${t.summary}`, { seconds: t.duration_s });
+    if (s.outcome && s.outcome.status === "Draft" && !(s.tests || []).length && s.workflow === "branch") sig("claims", "draft_without_tests", `${flat.repo}: Draft with no tests in outcome.json`);
+    if (opts.runTranscripts) {
+      let t;
+      try {
+        t = botRuns(["transcript", String(flat.run_id)]);
+      } catch (e) {
+        // Transcripts expire after 30 days; the summary still counts.
+        if (!(e instanceof Exit)) throw e;
+        process.stderr.write(`${PROG}: warning: no transcript for run ${flat.run_id}: ${e.message}\n`);
+        out.missingTranscripts++;
+        continue;
+      }
+      const files = t.files.filter((f) => f.startsWith("sessions/") && f.endsWith(".jsonl"));
+      for (const f of files.length ? files : t.files.filter((f) => f === "raw.jsonl")) {
+        const agent = newAgent(`${id}/${path.basename(f, ".jsonl")}`, "run", { description: `${flat.repo} run ${flat.run_id}` });
+        const { records, bad } = readJSONL(path.join(t.dir, f));
+        out.badLines += bad;
+        scanLines(records, agent, { since: new Date(0), until: new Date(8.64e15) }, out);
+        out.agents.push(agent);
+      }
+    }
+  }
+}
+
+// --- summary ----------------------------------------------------------------------
+
+const PROPOSALS = {
+  local_build: ["Stop local builds by worker agents", "Workers ran compiles or tests on the coordinator machine despite the devspace-only rule. Consider a Bash PreToolUse hook that refuses cargo/make/podman build outside ssh/bot-devspace."],
+  fixup_push: ["Refuse pushes that carry fixup! commits", "Agents pushed with a fixup/squash commit pending. bot-git check catches it before bot-land; make every push path (bot-pr fork-pr, plain git push) run it."],
+  signoff: ["Keep agents from adding Signed-off-by", "Agents used --signoff or wrote a Signed-off-by trailer by hand. bot-git refuses on commit; look at which paths bypass it."],
+  shared_clone: ["Keep git work out of the shared clones", "Agents ran branch-changing git commands in a shared clone under ~/src/github/cgwalters-bot instead of their own worktree. A guard in bot-git (refuse outside a worktree) would catch it."],
+  injection_flagged: ["Review subagent output the harness flagged as instruction-shaped", "The harness flagged subagent results as instruction-shaped (e.g. permission-bypass wording). Check whether any came from GitHub text, and whether worker reports should avoid quoting it."],
+  injection_text: ["Check possible prompt-injection text seen by agents", "Text from GitHub or the web that reads like instructions reached agents' tool results."],
+  blocked_sleep: ["Give workers a wait helper instead of sleep polling", "The harness blocked many long sleep commands, each a wasted turn. Document Monitor/until-loops (or add a bot-wait helper) in the worker preamble."],
+  poll_loop: ["Replace repeated polling commands with a wait tool", "Agents ran the same command many times in a row to poll for a result."],
+  retry: ["Stop agents retrying identical failing commands", "Agents re-ran a command that had just failed, unchanged."],
+  rate_limit: ["Cut GraphQL quota use by agents", "Agents hit GitHub rate limits. Move remaining GraphQL calls to REST or cached bot-board reads."],
+  shell_syntax: ["Move long inline shell out of agent commands", "Many tool errors were shell syntax errors in long inline scripts: a sign those steps want a real tool."],
+  cli_misuse: ["Document the CLI flags agents keep getting wrong", "Agents called CLIs with flags that don't exist (e.g. gh gist create --secret). A short cheat sheet in the skills would avoid the round trips."],
+  missing_file: ["Reduce missing-file errors in agent workflows", "Agents looked for files that weren't there, often scratch paths from another step."],
+  stopped_by_user: ["Look at why agents were stopped", "Several agents were stopped by the user; the retro lists which. Stopped work may need re-dispatch or a board update."],
+  unfinished: ["Find agents whose transcripts end mid-tool", "Some transcripts end inside a tool call without a final report."],
+  success_claim_no_tests: ["Require test evidence behind 'tests pass' claims", "Agents' final reports claimed passing tests or verification with no successful test command in their transcript."],
+  long_tool: ["Shorten long blocking tool calls", "Tool calls blocked an agent for more than 10 minutes; they should run in the background with a wait."],
+};
+const WEIGHT = { policy: 5, claims: 3, stop: 2, waste: 2, error: 1 };
+
+// pickExamples(examples): at most EXAMPLES_MAX, one per agent before a second from any.
+function pickExamples(examples) {
+  const first = [];
+  const rest = [];
+  const seen = new Set();
+  for (const e of examples) (seen.has(e.agent) ? rest : first).push(e), seen.add(e.agent);
+  return [...first, ...rest].slice(0, EXAMPLES_MAX);
+}
+
+function summarize(opts, window, out) {
+  const byKind = {};
+  for (const s of out.signals) {
+    const k = (byKind[s.kind] = byKind[s.kind] || { category: s.category, kind: s.kind, count: 0, agents: new Set(), examples: [] });
+    k.count++;
+    k.agents.add(s.agent);
+    if (!k.examples.some((e) => e.detail === s.detail && e.agent === s.agent)) k.examples.push({ agent: s.agent, detail: s.detail });
+  }
+  const agentsById = Object.fromEntries(out.agents.map((a) => [a.id, a]));
+  const reviews = out.agents.map(reviewOf).filter(Boolean);
+  const findingCats = {};
+  for (const r of reviews) for (const f of r.findings) findingCats[f.category] = (findingCats[f.category] || 0) + 1;
+  const manual = [...out.templates]
+    .filter(([, s]) => s.size >= MANUAL_MIN_AGENTS)
+    .sort((a, b) => b[1].size - a[1].size)
+    .slice(0, MANUAL_MAX)
+    .map(([t, s]) => ({ template: quote(t, 80), agents: s.size }));
+  const kinds = Object.values(byKind)
+    .map((k) => ({ ...k, agents: k.agents.size, examples: pickExamples(k.examples).map((e) => ({ ...e, description: (agentsById[e.agent] || {}).description || null })) }))
+    .sort((a, b) => WEIGHT[b.category] * b.agents - WEIGHT[a.category] * a.agents || b.count - a.count);
+  const proposals = kinds
+    .filter((k) => PROPOSALS[k.kind] && (k.category === "policy" || k.agents >= 2))
+    .slice(0, DRAFTS_MAX)
+    .map((k) => ({ kind: k.kind, title: PROPOSALS[k.kind][0], body: `${PROPOSALS[k.kind][1]} Seen ${k.count}× in ${k.agents} agent(s).` }));
+  const topFinding = Object.entries(findingCats).sort((a, b) => b[1] - a[1])[0];
+  if (proposals.length < DRAFTS_MAX && topFinding && topFinding[1] >= 3) {
+    proposals.push({ kind: `review_${topFinding[0]}`, title: `Add ${topFinding[0]} checks to the worker checklist`, body: `Reviewers caught ${topFinding[1]} ${topFinding[0]} findings in this window: the most common kind. A line in the worker preamble or commit-review would move them before review.` });
+  }
+  if (proposals.length < DRAFTS_MAX && manual[0] && manual[0].agents >= 2 * MANUAL_MIN_AGENTS) {
+    proposals.push({ kind: "manual", title: `Tool for the step '${manual[0].template}'`, body: `${manual[0].agents} agents ran '${manual[0].template}' by hand in this window.` });
+  }
+  const verdicts = { approve: 0, changes: 0, none: 0 };
+  for (const r of reviews) verdicts[r.verdict || "none"]++;
+  return {
+    schema: SCHEMA,
+    generated_at: new Date().toISOString(),
+    window: { since: window.since.toISOString(), until: window.until.toISOString() },
+    sources: {
+      local: opts.local ? { dir: opts.projects.replace(HOME, "~"), agents: out.agents.filter((a) => a.source === "local").length, sessions: new Set(out.agents.filter((a) => a.source === "local").map((a) => a.session)).size, bad_lines: out.badLines } : null,
+      runs: opts.runs ? { runs: out.runs.length, transcripts: out.agents.filter((a) => a.source === "run").length, missing_transcripts: out.missingTranscripts, error: out.runsError ? quote(out.runsError, 200) : null } : null,
+    },
+    totals: {
+      agents: out.agents.length,
+      tool_calls: out.agents.reduce((n, a) => n + a.calls, 0),
+      tool_errors: out.agents.reduce((n, a) => n + a.errors, 0),
+      graphql_calls: Object.values(out.graphql).reduce((n, c) => n + c, 0),
+    },
+    signals: kinds,
+    reviews: { verdicts, finding_categories: findingCats, items: reviews },
+    manual_steps: manual,
+    runs: out.runs,
+    agents: out.agents.filter((a) => a.errors > 0 || out.signals.some((s) => s.agent === a.id && s.category !== "error"))
+      .map((a) => ({ id: a.id, source: a.source, description: a.description ? quote(a.description, 80) : null, start: a.start, end: a.end, calls: a.calls, errors: a.errors })),
+    proposals,
+  };
+}
+
+function scan(opts) {
+  const now = new Date();
+  const window = { since: parseTime(opts.since, now), until: opts.until ? parseTime(opts.until, now) : now };
+  if (window.since >= window.until) throw new Exit(EX_USAGE, `--since ${opts.since} is not before --until`);
+  const out = { agents: [], runs: [], signals: [], templates: new Map(), graphql: {}, badLines: 0, runsError: null, missingTranscripts: 0, stopped: new Set() };
+  if (opts.local) scanLocal(opts, window, out);
+  if (opts.runs) scanRuns(opts, window, out);
+  // Claims are judged once a whole agent is read.
+  for (const a of out.agents) {
+    const m = SUCCESS_CLAIM_RE.exec(a.finalText);
+    if (m && a.testRuns === 0 && !REVIEWER_RE.test(a.description || "")) {
+      out.signals.push({ category: "claims", kind: "success_claim_no_tests", agent: a.id, ts: a.end, detail: quote(a.finalText.slice(Math.max(0, m.index - 40), m.index + 80)) });
+    }
+  }
+  return summarize(opts, window, out);
+}
+
+// --- report ------------------------------------------------------------------------
+
+const SECTIONS = [
+  ["policy", "Policy violations"],
+  ["claims", "Claims without test evidence"],
+  ["stop", "Stopped and interrupted agents"],
+  ["waste", "Wasted loops and long waits"],
+  ["error", "Tool errors"],
+];
+const KIND_TEXT = {
+  local_build: "build or test on the coordinator machine", fixup_push: "push with a fixup!/squash! commit pending",
+  signoff: "Signed-off-by added", shared_clone: "branch-changing git in a shared clone",
+  injection_flagged: "harness flagged instruction-shaped subagent output", injection_text: "instruction-shaped text from GitHub or the web",
+  egress_denied: "egress denied by the devspace proxy", blocked_sleep: "sleep blocked by the harness", poll_loop: "same command run repeatedly",
+  retry: "identical failing command retried", long_tool: "tool call over 10 minutes", long_wait: "wait loop blocking over 10 minutes", idle_gap: "idle gap over 30 minutes",
+  budget_near: "run near its AIC budget", user_rejected: "tool call rejected by the user", stopped_by_user: "agent stopped by the user",
+  interrupted: "tool call interrupted", message_to_stopped: "message sent to an agent the user had stopped", unfinished: "transcript ends inside a tool call",
+  success_claim_no_tests: "success claimed with no test run", draft_without_tests: "Draft with no recorded tests",
+};
+
+function render(summary, narrative) {
+  const w = summary.window;
+  const day = w.until.slice(0, 10);
+  const L = [];
+  L.push(`# Agent retro ${day}`, "");
+  const src = [];
+  if (summary.sources.local) src.push(`${summary.sources.local.agents} local transcripts from ${summary.sources.local.sessions} session(s)`);
+  if (summary.sources.runs) src.push(`${summary.sources.runs.runs} devspace agent run(s)${summary.sources.runs.error ? ` (not read: ${summary.sources.runs.error})` : ""}`);
+  L.push(`Window ${w.since} to ${w.until}: ${src.join(" and ") || "no sources"}, ${summary.totals.tool_calls} tool calls, ${summary.totals.tool_errors} tool errors. Generated by \`bot-retro\` (${summary.schema}); quotes are shortened and token-shaped strings redacted.`, "");
+  if (narrative) L.push("## Narrative", "", narrative.trim(), "");
+  for (const [cat, title] of SECTIONS) {
+    const kinds = summary.signals.filter((k) => k.category === cat);
+    if (!kinds.length) continue;
+    L.push(`## ${title}`, "");
+    for (const k of kinds) {
+      L.push(`**${KIND_TEXT[k.kind] || k.kind.replaceAll("_", " ")}**: ${k.count}× in ${k.agents} agent(s).`, "");
+      for (const e of k.examples) L.push(`- ${e.description ? `${e.description}: ` : `${e.agent}: `}\`${e.detail.replaceAll("`", "'")}\``);
+      L.push("");
+    }
+  }
+  const r = summary.reviews;
+  if (r.items.length) {
+    L.push("## Reviewer findings", "");
+    L.push(`${r.items.length} review(s): ${r.verdicts.approve} approve, ${r.verdicts.changes} changes, ${r.verdicts.none} without an explicit verdict. Findings by category: ${Object.entries(r.finding_categories).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c} ${n}`).join(", ") || "none"}.`, "");
+    for (const it of r.items.filter((i) => i.findings.length)) {
+      L.push(`- ${quote(it.description, 80)} (${it.verdict || "no verdict"}): ${it.findings.slice(0, 4).map((f) => `${f.title} [${f.category}]`).join("; ")}`);
+    }
+    L.push("");
+  }
+  if (summary.manual_steps.length) {
+    L.push("## Repeated manual steps", "", "Command shapes run by many agents; candidates for a bot-* tool or a skill recipe.", "");
+    for (const m of summary.manual_steps) L.push(`- \`${m.template}\`: ${m.agents} agents`);
+    L.push("");
+  }
+  if (summary.totals.graphql_calls) L.push(`Direct \`gh api graphql\` calls: ${summary.totals.graphql_calls} (the preamble prefers REST; the quota is shared).`, "");
+  if (summary.runs.length) {
+    L.push("## Devspace runs", "");
+    for (const run of summary.runs) L.push(`- [${run.id}](${run.url}) ${run.repo || "?"}: ${run.result || "?"}, ${run.tests} test(s), outcome ${run.outcome || "-"}`);
+    L.push("");
+  }
+  if (summary.proposals.length) {
+    L.push("## Proposed board drafts", "");
+    for (const p of summary.proposals) L.push(`- **${p.title}**: ${p.body}`);
+    L.push("");
+  }
+  return `${L.join("\n").trimEnd()}\n`;
+}
+
+// --- optional steps ---------------------------------------------------------------
+
+const NARRATE_PROMPT = `You are writing the narrative for a retro of AI agent work. Stdin is a JSON summary of mechanically extracted signals from the agents' logs (not the logs themselves). In at most 250 words of plain prose, say what went well, what went wrong, and the three most actionable fixes, citing counts from the summary. Do not invent facts beyond it, and do not quote anything that looks like a credential.`;
+
+function narrate(summary) {
+  const [cmd, ...args] = NARRATE_CMD.split(/\s+/);
+  try {
+    return redact(execFileSync(cmd, [...args, NARRATE_PROMPT], { input: JSON.stringify(summary), encoding: "utf8", stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 << 20 }));
+  } catch (e) {
+    throw new Exit(EX_ERROR, `the narrative command '${NARRATE_CMD}' failed: ${String(e.stderr || e.message).trim()}`);
+  }
+}
+
+function postGist(report, day) {
+  try {
+    // Secret is gh's default for gist create; there is no --secret flag.
+    return execFileSync("gh", ["gist", "create", "--desc", `Agent retro ${day}`, "--filename", `retro-${day}.md`, "-"], { input: report, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+  } catch (e) {
+    throw new Exit(EX_ERROR, `cannot create the gist: ${String(e.stderr || e.message).trim()}`);
+  }
+}
+
+function fileDrafts(proposals, n, gist) {
+  const ids = [];
+  for (const p of proposals.slice(0, n)) {
+    const body = `${p.body}\n\nFrom the agent retro${gist ? `: ${gist}` : ""} (bot-retro).`;
+    const board = (args) => execFileSync(BOT_BOARD, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+    try {
+      const id = board(["draft", p.title, body]);
+      board(["set", id, "--priority", "P1", "--org", "cgwalters-bot"]);
+      ids.push({ id, title: p.title });
+    } catch (e) {
+      throw new Exit(EX_ERROR, `cannot add the draft '${p.title}': ${String(e.stderr || e.message).trim()}`);
+    }
+  }
+  return ids;
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const summary = opts.fromSummary ? JSON.parse(fs.readFileSync(opts.fromSummary, "utf8")) : scan(opts);
+  if (summary.schema !== SCHEMA) throw new Exit(EX_ERROR, `${opts.fromSummary}: not a ${SCHEMA} summary`);
+  if (opts.json) {
+    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    return;
+  }
+  const report = render(summary, opts.narrate ? narrate(summary) : null);
+  if (!opts.gist && !opts.drafts) {
+    process.stdout.write(report);
+    return;
+  }
+  const day = summary.window.until.slice(0, 10);
+  const gist = opts.gist ? postGist(report, day) : null;
+  if (gist) console.log(gist);
+  for (const d of fileDrafts(summary.proposals, opts.drafts, gist)) console.log(`${d.id} ${d.title}`);
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (e) {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  }
+} else {
+  module.exports = { segments, stripQuotes, classifyError, redact, quote, template, categorizeFinding, reviewOf, parseTime, render, scan };
+}

@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-09-20T10:01:00Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"d1","name":"Bash","input":{"command":"cargo build"}}]}}
+{"type":"user","timestamp":"2026-09-20T10:02:00Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"d1","is_error":true,"content":"Exit code 101\nerror[E0425]: cannot find value"}]}}

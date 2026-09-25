@@ -1,0 +1,1 @@
+{"summary": {"schema": "agent-run-summary/v1", "workflow": "branch", "tests": [{"command": "cargo test", "exit_code": 0, "duration_s": 100}], "failures": [{"kind": "timeout", "message": "agent step timed out"}], "outcome": {"status": null, "url": null, "why": null}}}
