@@ -1,0 +1,40 @@
+{
+  "schema": "agent-run-summary/v1",
+  "run_id": 1002,
+  "run_attempt": 1,
+  "run_url": "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1002",
+  "item": "PVTI_item1",
+  "repo": "composefs/composefs-rs",
+  "base": "main",
+  "workflow": "branch",
+  "agent": "opencode",
+  "model": "gpt-5-codex",
+  "cores": 16,
+  "started_at": "2026-09-20T14:01:00Z",
+  "finished_at": "2026-09-20T14:31:00Z",
+  "duration_s": 1800,
+  "result": "failure",
+  "turns": 50,
+  "tokens": {"input": 2000000, "output": 60000, "cache_read": 0, "cache_write": 0},
+  "aic": 200,
+  "aic_budget": 500,
+  "aic_pricing": "mock",
+  "tools": {
+    "Bash": {"calls": 20, "errors": 3, "duration_s": 1500},
+    "Edit": {"calls": 5, "errors": 0, "duration_s": 2},
+    "Grep": {"calls": 4, "errors": 0, "duration_s": 1}
+  },
+  "slowest": [{"tool": "Bash", "summary": "cargo test -p composefs", "duration_s": 1200}],
+  "failures": [
+    {"kind": "tool_error", "message": "cargo clippy: exit 101"},
+    {"kind": "timeout", "message": "cargo test exceeded 20m"}
+  ],
+  "tests": [
+    {"command": "cargo test -p composefs", "exit_code": 101, "duration_s": 1200},
+    {"command": "cargo clippy", "exit_code": 0, "duration_s": 55}
+  ],
+  "files": ["src/fsck.rs", "src/repo.rs"],
+  "egress_denied": [],
+  "outcome": {"status": "Needs human", "url": null, "why": "cargo test times out in fsck::tests"},
+  "redactions": 1
+}

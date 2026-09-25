@@ -1,0 +1,6 @@
+turn 1, 12k in / 1k out
+▶ Read: src/fsck.rs
+✎ Edit src/fsck.rs
+▶ Bash: cargo clippy (exit 101, 58s)
+⚠ tool error: cargo clippy: exit 101
+▶ Bash: cargo test -p composefs (exit 0, 212s)

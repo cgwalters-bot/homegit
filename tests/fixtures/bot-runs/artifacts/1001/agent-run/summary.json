@@ -1,0 +1,40 @@
+{
+  "schema": "agent-run-summary/v1",
+  "run_id": 1001,
+  "run_attempt": 1,
+  "run_url": "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1001",
+  "item": "PVTI_item1",
+  "repo": "composefs/composefs-rs",
+  "base": "main",
+  "workflow": "branch",
+  "agent": "claude",
+  "model": "claude-sonnet-4-5",
+  "cores": 16,
+  "started_at": "2026-09-20T10:01:00Z",
+  "finished_at": "2026-09-20T10:43:00Z",
+  "duration_s": 2520,
+  "result": "success",
+  "turns": 37,
+  "tokens": {"input": 1200000, "output": 40000, "cache_read": 900000, "cache_write": 50000},
+  "aic": 123.5,
+  "aic_budget": 500,
+  "aic_pricing": "mock",
+  "tools": {
+    "Bash": {"calls": 12, "errors": 1, "duration_s": 900},
+    "Edit": {"calls": 5, "errors": 0, "duration_s": 2},
+    "Read": {"calls": 20, "errors": 0, "duration_s": 5}
+  },
+  "slowest": [
+    {"tool": "Bash", "summary": "cargo test -p composefs", "duration_s": 212},
+    {"tool": "Bash", "summary": "cargo clippy", "duration_s": 60}
+  ],
+  "failures": [{"kind": "tool_error", "message": "cargo clippy: exit 101"}],
+  "tests": [
+    {"command": "cargo test -p composefs", "exit_code": 0, "duration_s": 212},
+    {"command": "cargo clippy", "exit_code": 0, "duration_s": 60}
+  ],
+  "files": ["src/fsck.rs", "src/lib.rs"],
+  "egress_denied": [{"domain": "example.com", "count": 2}],
+  "outcome": {"status": "Draft", "url": "https://github.com/cgwalters-forge/composefs-rs/pull/7", "why": "fsck: check object sizes. Result: cargo test passed"},
+  "redactions": 0
+}

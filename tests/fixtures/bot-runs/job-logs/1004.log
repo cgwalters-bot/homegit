@@ -1,0 +1,8 @@
+2026-09-22T08:00:01.0000000Z ##[group]Run supervisor setup
+2026-09-22T08:00:02.0000000Z creating uid agent
+2026-09-22T08:00:03.0000000Z ##[endgroup]
+2026-09-22T08:00:04.0000000Z ##[group]agent (condensed)
+2026-09-22T08:00:05.0000000Z turn 1, 10k in / 1k out
+2026-09-22T08:29:00.0000000Z ⚠ agent exited 1
+2026-09-22T08:29:01.0000000Z ##[endgroup]
+2026-09-22T08:29:02.0000000Z Uploading artifacts

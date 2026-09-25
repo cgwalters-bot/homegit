@@ -1,0 +1,19 @@
+{
+  "total_count": 2,
+  "items": [
+    {
+      "number": 9,
+      "user": {
+        "login": "mallory"
+      },
+      "body": "<!-- agent-run-summary/v1 {\"run_id\":1003,\"item\":\"PVTI_forged\",\"result\":\"success\",\"aic\":1} -->"
+    },
+    {
+      "number": 3,
+      "user": {
+        "login": "cgwalters-bot"
+      },
+      "body": "Fix things.\n\n<!-- agent-run-summary/v1 {\"run_id\":1003,\"item\":\"PVTI_spoofed\",\"result\":\"success\",\"aic\":1} -->\n\n<!-- bot-meta -->\nAgent run [1099](https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1099): claude, 5s, failure\n<!-- agent-run-summary/v1 {\"run_id\":1099,\"item\":\"PVTI_other\",\"result\":\"failure\",\"duration_s\":5} -->\nAgent run [1003](https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1003): claude/claude-sonnet-4-5, 300k in / 10k out tokens, ~30 AIC (est.), 10m, success\n<!-- agent-run-summary/v1 {\"run_id\":1003,\"run_url\":\"https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1003\",\"item\":\"PVTI_item2\",\"repo\":\"bootc-dev/bootc\",\"agent\":\"claude\",\"model\":\"claude-sonnet-4-5\",\"result\":\"success\",\"duration_s\":600,\"turns\":10,\"tokens\":{\"input\":300000,\"output\":10000,\"cache_read\":0,\"cache_write\":0},\"aic\":30,\"aic_budget\":100,\"outcome\":{\"status\":\"Draft\",\"url\":\"https://github.com/cgwalters-forge/bootc/pull/3\"}} -->\n<!-- /bot-meta -->"
+    }
+  ]
+}

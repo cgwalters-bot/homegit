@@ -1,0 +1,1 @@
+{"tests": [{"command": "cargo test -p composefs", "exit_code": 0}]}

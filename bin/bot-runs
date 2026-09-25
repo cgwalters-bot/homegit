@@ -1,0 +1,986 @@
+#!/usr/bin/env bash
+# Dispatch and analyze devspace agent runs: runs of the agent.yml
+# workflow, which write the artifacts and summary.json that
+# docs/devspace-agent-runs.md describes. Modeled on 'gh aw logs' and
+# 'gh aw audit'. REST only, so it spends no GraphQL quota.
+# jq programs hold literal $variables.
+# shellcheck disable=SC2016
+set -euo pipefail
+shopt -s inherit_errexit
+
+readonly SUMMARY_SCHEMA=agent-run-summary/v1
+readonly RUNS_REPO=${BOT_RUNS_REPO:-bootc-dev/cgwalters-devspace-sandbox}
+readonly RUNS_WORKFLOW=${BOT_RUNS_WORKFLOW:-agent.yml}
+readonly RUNS_REF=${BOT_RUNS_REF:-main}
+readonly SUMMARY_ARTIFACT=agent-run
+readonly TRANSCRIPT_ARTIFACT=agent-transcript
+# The files of the summary artifact that are kept; anything else in it is
+# ignored.
+readonly SUMMARY_FILES=(summary.json summary.md condensed.log outcome.json)
+readonly TRANSCRIPT_NAME=transcript.tar.zst
+# The job log group holding the condensed transcript.
+readonly LOG_GROUP='agent (condensed)'
+# Run footers are in the bot's PRs in this organization.
+readonly FOOTER_OWNER=cgwalters-forge
+readonly BOT_LOGIN=cgwalters-bot
+# A run whose summary could not be found at all is looked up again after
+# this many minutes (its footer may be written after the run).
+readonly NONE_RETRY_MINUTES=1440
+readonly AGENTS='["claude", "opencode"]'
+readonly CORES='["4", "16", "64"]'
+readonly WORKFLOWS='["branch", "analysis"]'
+readonly MAX_TIMEOUT=330
+readonly DEFAULT_TIMEOUT=120
+readonly DEFAULT_BUDGET=500
+readonly MAX_INPUTS_LEN=65535
+readonly DEFAULT_LIST_LIMIT=20
+readonly DEFAULT_STATS_LIMIT=200
+readonly DEFAULT_STATS_SINCE=30d
+readonly PER_PAGE=100
+# Summaries of finished runs don't change: they are kept for good.
+readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-runs
+readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-runs
+readonly ETAG_DIR=${CACHE_DIR}/etags
+readonly ETAG_KEEP_DAYS=14
+readonly TRANSCRIPT_DIR=${CACHE_DIR}/transcripts
+readonly TRANSCRIPT_KEEP_DAYS=30
+# list --item reads at most this many runs to find LIMIT of the item's.
+readonly ITEM_SCAN_MAX=500
+# Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
+readonly EX_RATELIMIT=75
+# Returned when GitHub says a resource doesn't exist (any more): EX_NOINPUT.
+readonly EX_NOTFOUND=66
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") COMMAND [OPTIONS]
+
+Dispatch and analyze devspace agent runs: runs of ${RUNS_WORKFLOW} in
+${RUNS_REPO}. Their artifacts and summary.json follow
+docs/devspace-agent-runs.md in homegit.
+
+Commands:
+  dispatch --item ITEM --repo OWNER/REPO [--base REF] [--agent AGENT]
+           [--model MODEL] [--cores N] [--timeout MIN] [--budget AIC]
+           [--workflow branch|analysis] [--dry-run] BRIEF
+      Start a run on BRIEF (a file, or - for stdin) and print its id and
+      URL. Defaults: base main, agent claude, 4 cores, ${DEFAULT_TIMEOUT} minutes,
+      budget ${DEFAULT_BUDGET} AIC, workflow branch. --dry-run prints the request.
+  list [--item ITEM] [--since AGE] [--status STATUS] [--limit N]
+      Recent runs, newest first (at most ${DEFAULT_LIST_LIMIT} by default): item, target
+      repository, agent, result, duration, tokens (in/out), estimated AIC
+      and outcome. STATUS is an Actions status or conclusion
+      (in_progress, completed, success, failure, ...).
+  show RUN
+      A run's metadata and its step summary.
+  log RUN
+      A run's condensed transcript.
+  transcript RUN [--dir DIR] [--force]
+      Download and unpack a run's full transcript (default directory:
+      ${TRANSCRIPT_DIR}/RUN-ATTEMPT, removed after ${TRANSCRIPT_KEEP_DAYS} days) and
+      list its files. An existing DIR must be empty or hold a transcript.
+  diff RUN1 RUN2
+      Compare two runs: result, duration, turns, tokens, AIC, tool
+      calls, failures, files touched, tests and outcome.
+  stats [--since AGE] [--limit N] [--by agent|model|repo|item|result]
+      Aggregate the finished runs (the last ${DEFAULT_STATS_SINCE}, at most ${DEFAULT_STATS_LIMIT} by
+      default): success rate, failures by kind, duration, tokens and
+      AIC, and whether failed runs used more tokens than successful ones.
+
+Every command takes --json, to print JSON for agents instead. AGE is like 12h, 7d or 2w, or a date. RUN is a run id or URL.
+
+A finished run's summary comes from its ${SUMMARY_ARTIFACT} artifact, kept 90 days.
+Once that expired, from the run footer in its forge PR (partial: no
+tools, failures, files or tests), else only the run's own metadata is
+left (duration then is the whole run's). What was found is kept in
+${STATE_DIR}; run listings are fetched with ETags, so an unchanged
+listing costs no quota. A rerun of a run is its latest attempt.
+Transcript artifacts expire after 30 days.
+
+Environment: BOT_RUNS_REPO, BOT_RUNS_WORKFLOW and BOT_RUNS_REF choose
+the workflow; BOT_RUNS_AGE_IDENTITY is the age identity file that
+decrypts transcripts.
+EOF
+}
+
+fatal() {
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+warn() {
+    echo "warning: $*" 1>&2
+}
+
+require_cmd() {
+    command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
+}
+
+rate_limited() {
+    echo "error: GitHub is rate limiting the bot ($1); retry after $(gh api rate_limit --jq '.resources.core.reset | todate' 2>/dev/null || echo "the reset")" 1>&2
+    exit "${EX_RATELIMIT}"
+}
+
+# check_rate_limit ERRFILE: exits if ERRFILE reports rate limiting.
+check_rate_limit() {
+    local reason
+    if reason=$(grep -iE -m1 'rate limit|abuse' "$1"); then
+        rate_limited "${reason}"
+    fi
+}
+
+# Formatting and derived fields, shared by the jq programs below. A
+# record is {run: {id, url, title, status, conclusion, created_at,
+# started_at, updated_at}, summary: SUMMARY or null, source}; 'flat'
+# gives the fields every command shows.
+readonly JQ_LIB='
+def pad2: tostring | if length < 2 then "0" + . else . end;
+def fmt_dur: if type != "number" then "-"
+    else round as $s
+    | if $s < 60 then "\($s)s"
+      elif $s < 3600 then "\($s / 60 | floor)m"
+      else "\($s / 3600 | floor)h\(($s % 3600) / 60 | floor | pad2)m" end end;
+def fmt_num: if type != "number" then "-"
+    elif . >= 1000000 then "\((. / 100000 | round) / 10)M"
+    elif . >= 10000 then "\(. / 1000 | round)k"
+    elif . >= 1000 then "\((. / 100 | round) / 10)k"
+    else "\(round)" end;
+def fmt_aic: if type != "number" then "-"
+    elif . >= 100 then "\(round)" else "\((. * 10 | round) / 10)" end;
+# signed(f): a delta with its sign, the magnitude formatted by f.
+def signed(f): if type != "number" then "-"
+    elif . < 0 then "-" + (-. | f) elif . > 0 then "+" + (. | f) else "0" end;
+def fmt_pct: if type != "number" then "" else " (\(signed(tostring))%)" end;
+def orblank: if . == null or . == "" then "-" else tostring end;
+def title_parts: (.run.title // "") | (capture("^agent (?<item>\\S+) (?<repo>\\S+)") // {});
+def run_duration: if .run.status == "completed" and .run.started_at and .run.updated_at
+    then (.run.updated_at | fromdate) - (.run.started_at | fromdate) else null end;
+def conclusion_result: {success: "success", failure: "failure", timed_out: "timeout",
+    cancelled: "cancelled"}[.run.conclusion // ""] // .run.conclusion;
+def flat: (.summary // {}) as $s | title_parts as $t | {
+    run_id: .run.id, url: .run.url, status: .run.status, conclusion: .run.conclusion,
+    created_at: .run.created_at,
+    item: ($s.item // $t.item), repo: ($s.repo // $t.repo), base: $s.base,
+    workflow: $s.workflow, agent: $s.agent, model: $s.model, cores: $s.cores,
+    result: ($s.result // (if .run.status == "completed" then conclusion_result else null end)),
+    duration_s: ($s.duration_s // run_duration), turns: $s.turns, tokens: $s.tokens,
+    aic: $s.aic, aic_budget: $s.aic_budget, aic_pricing: $s.aic_pricing,
+    outcome: $s.outcome, source: .source};
+def io_tokens: if .tokens then (.tokens.input // 0) + (.tokens.output // 0) else null end;
+def fmt_tokens: if .tokens then "\(.tokens.input | fmt_num)/\(.tokens.output | fmt_num)" else "-" end;
+def fmt_outcome: if .outcome == null then (if .status != "completed" then .status else "-" end)
+    else [.outcome.status, .outcome.url] | map(select(. != null)) | join(" ") | orblank end;
+def agent_model: [.agent, .model] | map(select(. != null)) | join("/") | orblank;
+def source_note: {artifact: "", footer: " (from the PR footer; partial)",
+    none: " (no summary: artifact expired, no footer)", pending: ""}[.source] // "";
+'
+
+# jqlib ARGS... PROGRAM: jq with JQ_LIB before PROGRAM (the last argument).
+jqlib() {
+    local prog=${*: -1}
+    jq "${@:1:$#-1}" "${JQ_LIB} ${prog}"
+}
+
+scratch=$(mktemp -d)
+trap 'rm -rf "${scratch}"' EXIT
+
+# ghapi ARGS...: 'gh api', turning rate limiting into a clear exit and a
+# 404 or 410 into EX_NOTFOUND.
+ghapi() {
+    local rc=0
+    gh api "$@" 2>"${scratch}/err" || rc=$?
+    if test "${rc}" -ne 0; then
+        check_rate_limit "${scratch}/err"
+        grep -qE 'HTTP (404|410)' "${scratch}/err" && return "${EX_NOTFOUND}"
+        cat "${scratch}/err" 1>&2
+    fi
+    return "${rc}"
+}
+
+# rest_get PATH: prints the JSON at PATH, sending the ETag of the cached
+# copy so that an unchanged resource costs no quota. The ETag and the body
+# are kept in one file (the ETag on its first line), replaced atomically,
+# so concurrent runs can't pair one's ETag with another's body.
+rest_get() {
+    local path=$1 key cache_file args rc=0 status etag
+    key=$(printf '%s' "${path}" | sha256sum | cut -c1-32)
+    cache_file=${ETAG_DIR}/${key}
+    args=(-i "${path}")
+    if test -s "${cache_file}"; then
+        args+=(-H "If-None-Match: $(head -n1 "${cache_file}")")
+    fi
+    gh api "${args[@]}" >"${scratch}/raw" 2>"${scratch}/err" || rc=$?
+    tr -d '\r' <"${scratch}/raw" | sed '/^$/q' >"${scratch}/headers"
+    status=$(awk 'NR == 1 { print $2 }' "${scratch}/headers")
+    case "${status}" in
+        304)
+            # Still in use: see prune_caches.
+            touch "${cache_file}"
+            tail -n +2 "${cache_file}"
+            ;;
+        200)
+            tr -d '\r' <"${scratch}/raw" | sed '1,/^$/d' >"${scratch}/body"
+            etag=$(awk 'tolower($0) ~ /^etag:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "${scratch}/headers")
+            if test -n "${etag}"; then
+                mkdir -p "${ETAG_DIR}"
+                { printf '%s\n' "${etag}"; cat "${scratch}/body"; } >"${cache_file}.tmp.$$"
+                mv -f "${cache_file}.tmp.$$" "${cache_file}"
+            fi
+            cat "${scratch}/body"
+            ;;
+        404|410) return "${EX_NOTFOUND}" ;;
+        *)
+            check_rate_limit "${scratch}/err"
+            cat "${scratch}/err" 1>&2
+            test "${rc}" -ne 0 || rc=1
+            return "${rc}"
+            ;;
+    esac
+}
+
+# prune_caches: drops HTTP cache entries not used for a while, and
+# decrypted transcripts once their artifact would have expired too.
+prune_caches() {
+    if test -d "${ETAG_DIR}"; then
+        find "${ETAG_DIR}" -type f -mtime "+${ETAG_KEEP_DAYS}" -delete || warn "pruning ${ETAG_DIR} failed"
+    fi
+    if test -d "${TRANSCRIPT_DIR}"; then
+        find "${TRANSCRIPT_DIR}" -mindepth 1 -maxdepth 1 -type d -mtime "+${TRANSCRIPT_KEEP_DAYS}" \
+            -exec rm -rf {} + || warn "pruning ${TRANSCRIPT_DIR} failed"
+    fi
+}
+
+# pass_ratelimit STATUS: exits with STATUS if it is EX_RATELIMIT, which a
+# rate-limited call in a command substitution returns.
+pass_ratelimit() {
+    test "$1" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
+}
+
+# parse_run RUN: the run id of RUN, an id or a run URL.
+parse_run() {
+    local id
+    id=$(sed -E 's,^https://github\.com/[^/]+/[^/]+/actions/runs/([0-9]+)(/.*)?$,\1,' <<<"$1")
+    [[ "${id}" =~ ^[0-9]+$ ]] || fatal "not a run id or run URL: $1"
+    echo "${id}"
+}
+
+# since_date AGE: AGE (12h, 7d, 2w or a date) as an ISO 8601 UTC time.
+since_date() {
+    local n unit
+    if [[ "$1" =~ ^([0-9]+)([hdw])$ ]]; then
+        n=${BASH_REMATCH[1]}
+        case "${BASH_REMATCH[2]}" in
+            h) unit=hours ;;
+            d) unit=days ;;
+            w) unit=weeks ;;
+        esac
+        date -u -d "-${n} ${unit}" +%Y-%m-%dT%H:%M:%SZ
+    else
+        date -u -d "$1" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null ||
+            fatal "not an age (like 12h, 7d, 2w) or a date: $1"
+    fi
+}
+
+# run_meta: the fields a record keeps of a workflow run object, on stdin.
+# started_at is the start of the latest attempt.
+readonly RUN_META='{id, attempt: (.run_attempt // 1), url: .html_url, title: .display_title,
+    status, conclusion, created_at, started_at: .run_started_at, updated_at}'
+
+# fetch_runs LIMIT QUERY: prints up to LIMIT runs of the workflow (the
+# record's run part), newest first, one per line. QUERY is extra query
+# parameters, like '&status=completed'.
+fetch_runs() {
+    local limit=$1 query=$2 page=1 n=0 body count rc per=${PER_PAGE}
+    test "${limit}" -ge "${per}" || per=${limit}
+    while test "${n}" -lt "${limit}"; do
+        rc=0
+        body=$(rest_get "repos/${RUNS_REPO}/actions/workflows/${RUNS_WORKFLOW}/runs?per_page=${per}&page=${page}${query}") || rc=$?
+        pass_ratelimit "${rc}"
+        test "${rc}" -ne "${EX_NOTFOUND}" ||
+            fatal "workflow ${RUNS_WORKFLOW} not found in ${RUNS_REPO} (set BOT_RUNS_REPO or BOT_RUNS_WORKFLOW)"
+        test "${rc}" -eq 0 || fatal "listing the runs of ${RUNS_WORKFLOW} failed"
+        jq -c --argjson max "$((limit - n))" ".workflow_runs[:\$max][] | ${RUN_META}" <<<"${body}"
+        count=$(jq '.workflow_runs | length' <<<"${body}")
+        n=$((n + count))
+        test "${count}" -ge "${per}" || break
+        page=$((page + 1))
+    done
+}
+
+# fetch_run ID: the record's run part of run ID.
+fetch_run() {
+    local body rc=0
+    body=$(rest_get "repos/${RUNS_REPO}/actions/runs/$1") || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -ne "${EX_NOTFOUND}" || fatal "run $1 not found in ${RUNS_REPO}"
+    test "${rc}" -eq 0 || fatal "reading run $1 failed"
+    jq -c "${RUN_META}" <<<"${body}"
+}
+
+# run_dir RUN_META: where a finished run attempt's files are kept. A
+# rerun is a new attempt of the same run id, with its own summary.
+run_dir() {
+    jq -r --arg d "${STATE_DIR}/runs" '"\($d)/\(.id)/\(.attempt)"' <<<"$1"
+}
+
+# latest_artifact RUN_META NAME: the newest artifact NAME of the run's
+# latest attempt (created after it started), as JSON ({id, expired,
+# expires_at}), or nothing.
+latest_artifact() {
+    local body id started
+    read -r id started < <(jq -r '"\(.id) \(.started_at // "")"' <<<"$1")
+    body=$(rest_get "repos/${RUNS_REPO}/actions/runs/${id}/artifacts?per_page=${PER_PAGE}") || return
+    jq -c --arg n "$2" --arg t "${started}" '[.artifacts[] | select(.name == $n and (.created_at // "") >= $t)]
+        | sort_by(.created_at) | last | select(. != null) | {id, expired, expires_at}' <<<"${body}"
+}
+
+# download_artifact ID DIR: unpacks artifact ID into the empty DIR;
+# returns EX_NOTFOUND if it expired meanwhile.
+download_artifact() {
+    local rc=0
+    ghapi "repos/${RUNS_REPO}/actions/artifacts/$1/zip" >"${scratch}/artifact.zip" || rc=$?
+    test "${rc}" -eq 0 || return "${rc}"
+    # unzip drops absolute paths and ../ components; callers take only
+    # the regular files they expect from DIR.
+    unzip -q -o "${scratch}/artifact.zip" -d "$2" 2>"${scratch}/unzip-err" || {
+        cat "${scratch}/unzip-err" 1>&2
+        return 1
+    }
+}
+
+# Checks the types of a summary's fields, so that one malformed summary
+# can't break every listing: gives {summary, bad}, the summary with the
+# fields of the wrong type (listed in bad) set to null.
+readonly SANITIZE_JQ='
+def want: {run_id: "number", run_attempt: "number", cores: "number", duration_s: "number",
+    turns: "number", aic: "number", aic_budget: "number", redactions: "number",
+    run_url: "string", item: "string", repo: "string", base: "string", workflow: "string",
+    agent: "string", model: "string", result: "string", aic_pricing: "string",
+    started_at: "string", finished_at: "string",
+    tokens: "object", tools: "object", outcome: "object",
+    slowest: "array", failures: "array", tests: "array", files: "array", egress_denied: "array"};
+def str_or_null: type == "string" or type == "null";
+def num_or_null: type == "number" or type == "null";
+def deep_ok($f): if $f == "tokens" then all(.[]; num_or_null)
+    elif $f == "tools" then all(.[]; type == "object" and all(.[]; num_or_null))
+    elif $f == "outcome" then all(.[]; str_or_null)
+    elif $f == "failures" then all(.[]; type == "object" and (.kind | type) == "string" and (.message | str_or_null))
+    elif $f == "tests" then all(.[]; type == "object" and (.command | type) == "string" and (.exit_code | num_or_null) and (.duration_s | num_or_null))
+    elif $f == "files" then all(.[]; type == "string")
+    else true end;
+. as $s
+| [want | to_entries[] | .key as $f | .value as $t
+   | select($s[$f] != null and (($s[$f] | type) != $t or ($s[$f] | deep_ok($f) | not))) | $f] as $bad
+| {summary: (reduce $bad[] as $f ($s; .[$f] = null)), bad: $bad}'
+
+# sanitize_summary RUN FILE: rewrites FILE with SANITIZE_JQ, warning
+# about the fields it dropped.
+sanitize_summary() {
+    local out
+    out=$(jq -c "${SANITIZE_JQ}" "$2")
+    if test "$(jq '.bad | length' <<<"${out}")" -gt 0; then
+        warn "run $1: ignoring fields of the wrong type in its summary: $(jq -r '.bad | join(", ")' <<<"${out}")"
+    fi
+    jq -c .summary <<<"${out}" >"$2"
+}
+
+# find_footer RUN_META: the footer JSON of the run attempt from the bot's
+# forge PRs, or nothing; fails if the search did. Only the bot-meta
+# section counts: the agent writes the rest of a PR body.
+find_footer() {
+    local body id attempt
+    read -r id attempt < <(jq -r '"\(.id) \(.attempt)"' <<<"$1")
+    body=$(ghapi -X GET search/issues -f q="${id} in:body is:pr org:${FOOTER_OWNER} author:${BOT_LOGIN}" -f per_page=10) || return
+    jq -c --argjson id "${id}" --argjson att "${attempt}" --arg s "${SUMMARY_SCHEMA}" --arg bot "${BOT_LOGIN}" '
+        [.items[] | select(.user.login == $bot) | .body // ""
+         | match("<!-- bot-meta -->[\\s\\S]*?<!-- /bot-meta -->").string
+         | scan("<!-- " + $s + " (\\{.*?\\}) -->") | .[0] | fromjson?
+         | select(type == "object" and .run_id == $id and (.run_attempt // $att) == $att)]
+        | last // empty' <<<"${body}"
+}
+
+# Set once a footer search was rate limited: the search API allows 30
+# calls a minute, and the other runs can wait for a later listing.
+footer_search_limited=false
+
+# ensure_run_files RUN_META: makes sure run_dir holds what can be had of
+# a finished run attempt: the summary artifact's files (then a file
+# 'artifact'), else footer.json, else a file 'none' (retried after
+# NONE_RETRY_MINUTES).
+ensure_run_files() {
+    local meta=$1 id status dir tmp art rc=0 f footer
+    read -r id status < <(jq -r '"\(.id) \(.status)"' <<<"${meta}")
+    test "${status}" = completed || return 0
+    dir=$(run_dir "${meta}")
+    if test -e "${dir}/artifact" || test -e "${dir}/footer.json"; then
+        return 0
+    fi
+    if test -e "${dir}/none" && test -z "$(find "${dir}/none" -mmin "+${NONE_RETRY_MINUTES}")"; then
+        return 0
+    fi
+    mkdir -p "$(dirname "${dir}")"
+    tmp=$(mktemp -d "${dir}.tmp.XXXXXX")
+    art=$(latest_artifact "${meta}" "${SUMMARY_ARTIFACT}") || rc=$?
+    test "${rc}" -eq 0 || rm -rf "${tmp}"
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || { warn "listing the artifacts of run ${id} failed"; return 0; }
+    if test -n "${art}" && test "$(jq -r .expired <<<"${art}")" = false; then
+        mkdir "${tmp}/zip"
+        download_artifact "$(jq -r .id <<<"${art}")" "${tmp}/zip" || rc=$?
+        if test "${rc}" -eq 0; then
+            for f in "${SUMMARY_FILES[@]}"; do
+                if test -f "${tmp}/zip/${f}" && ! test -L "${tmp}/zip/${f}"; then
+                    cp "${tmp}/zip/${f}" "${tmp}/${f}"
+                fi
+            done
+            if test -e "${tmp}/summary.json" &&
+                ! jq -e --arg s "${SUMMARY_SCHEMA}" 'type == "object" and .schema == $s' "${tmp}/summary.json" >/dev/null 2>&1; then
+                warn "run ${id}: summary.json is not ${SUMMARY_SCHEMA} (schema: $(jq -r '.schema? // "none"' "${tmp}/summary.json" 2>/dev/null || echo "invalid JSON")); ignoring it"
+                rm "${tmp}/summary.json"
+            fi
+            test ! -e "${tmp}/summary.json" || sanitize_summary "${id}" "${tmp}/summary.json"
+            touch "${tmp}/artifact"
+        elif test "${rc}" -ne "${EX_NOTFOUND}"; then
+            rm -rf "${tmp}"
+            warn "downloading the ${SUMMARY_ARTIFACT} artifact of run ${id} failed"
+            return 0
+        fi
+        rm -rf "${tmp}/zip"
+    fi
+    if ! test -e "${tmp}/artifact"; then
+        ! ${footer_search_limited} || { rm -rf "${tmp}"; return 0; }
+        rc=0
+        footer=$(find_footer "${meta}") || rc=$?
+        if test "${rc}" -ne 0; then
+            rm -rf "${tmp}"
+            if test "${rc}" -eq "${EX_RATELIMIT}"; then
+                footer_search_limited=true
+                warn "the footer search is rate limited; runs with expired artifacts show no summary until a later run of $(basename "$0")"
+            else
+                warn "searching for the footer of run ${id} failed"
+            fi
+            return 0
+        fi
+        if test -n "${footer}"; then
+            printf '%s\n' "${footer}" >"${tmp}/footer.json"
+            sanitize_summary "${id}" "${tmp}/footer.json"
+        else
+            touch "${tmp}/none"
+        fi
+    fi
+    # Another bot-runs may have got there first; either copy is good.
+    rm -rf "${dir}"
+    mv -T "${tmp}" "${dir}" 2>/dev/null || rm -rf "${tmp}"
+}
+
+# record RUN_META: prints the record of a run (see JQ_LIB). Only a
+# finished run's kept files count: a rerun in progress has none yet.
+record() {
+    local meta=$1 dir summary=null source=pending
+    if test "$(jq -r .status <<<"${meta}")" = completed; then
+        dir=$(run_dir "${meta}")
+        source=none
+        if test -e "${dir}/artifact"; then
+            source=artifact
+            test ! -e "${dir}/summary.json" || summary=$(jq -c . "${dir}/summary.json")
+        elif test -e "${dir}/footer.json"; then
+            source=footer
+            summary=$(jq -c . "${dir}/footer.json")
+        fi
+    fi
+    jq -c --argjson s "${summary}" --arg src "${source}" '{run: ., summary: $s, source: $src}' <<<"${meta}"
+}
+
+# load_record RUN_META: ensure_run_files, then record.
+load_record() {
+    ensure_run_files "$1"
+    record "$1"
+}
+
+# --- dispatch ----------------------------------------------------------------
+
+cmd_dispatch() {
+    local item="" repo="" base=main agent=claude model="" cores=4 timeout=${DEFAULT_TIMEOUT}
+    local budget=${DEFAULT_BUDGET} workflow=branch brief_file="" dry_run=false json=false inputs body len resp rc=0
+    while test $# -gt 0; do
+        case "$1" in
+            --item|--repo|--base|--agent|--model|--cores|--timeout|--budget|--workflow)
+                test $# -ge 2 || fatal "$1 requires a value"
+                local opt=${1#--}
+                printf -v "${opt}" '%s' "$2"
+                shift 2
+                ;;
+            --dry-run) dry_run=true; shift ;;
+            --json) json=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) test "$1" = - || fatal "unknown dispatch option: $1 (see --help)"; brief_file=-; shift ;;
+            *) test -z "${brief_file}" || fatal "only one BRIEF file"; brief_file=$1; shift ;;
+        esac
+    done
+    [[ "${item}" == PVTI_* ]] || fatal "--item must be a board item id (PVTI_...)"
+    [[ "${repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fatal "--repo must be OWNER/REPO"
+    test -n "${base}" || fatal "--base must not be empty"
+    jq -e --arg v "${agent}" 'index($v)' <<<"${AGENTS}" >/dev/null || fatal "--agent must be one of ${AGENTS}"
+    jq -e --arg v "${cores}" 'index($v)' <<<"${CORES}" >/dev/null || fatal "--cores must be one of ${CORES}"
+    jq -e --arg v "${workflow}" 'index($v)' <<<"${WORKFLOWS}" >/dev/null || fatal "--workflow must be one of ${WORKFLOWS}"
+    if ! [[ "${timeout}" =~ ^[0-9]+$ ]] || test "${timeout}" -lt 1 || test "${timeout}" -gt "${MAX_TIMEOUT}"; then
+        fatal "--timeout must be 1 to ${MAX_TIMEOUT} minutes (the job's cap is 360)"
+    fi
+    if ! [[ "${budget}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! jq -e --argjson b "${budget}" -n '$b > 0' >/dev/null; then
+        fatal "--budget must be a positive number of AIC"
+    fi
+    test -n "${brief_file}" || fatal "missing BRIEF (a file, or - for stdin)"
+    # A file, not an argument: a long brief could pass the argument size limit.
+    if test "${brief_file}" = -; then
+        cat >"${scratch}/brief"
+    else
+        test -r "${brief_file}" || fatal "cannot read ${brief_file}"
+        cp "${brief_file}" "${scratch}/brief"
+    fi
+    grep -q '[^[:space:]]' "${scratch}/brief" || fatal "the brief is empty"
+    inputs=$(jq -nc --arg item "${item}" --arg repo "${repo}" --arg base "${base}" --arg agent "${agent}" \
+        --arg model "${model}" --arg cores "${cores}" --arg timeout "${timeout}" --arg budget "${budget}" \
+        --arg workflow "${workflow}" --rawfile brief "${scratch}/brief" \
+        '{item: $item, repo: $repo, base: $base, agent: $agent, model: $model, cores: $cores,
+          timeout: $timeout, budget: $budget, workflow: $workflow, brief: ($brief | rtrimstr("\n"))}')
+    len=$(jq 'tojson | length' <<<"${inputs}")
+    test "${len}" -le "${MAX_INPUTS_LEN}" ||
+        fatal "the dispatch inputs are ${len} characters, over GitHub's ${MAX_INPUTS_LEN}; shorten the brief"
+    body=$(jq -c --arg ref "${RUNS_REF}" '{ref: $ref, inputs: ., return_run_details: true}' <<<"${inputs}")
+    if ${dry_run}; then
+        echo "POST repos/${RUNS_REPO}/actions/workflows/${RUNS_WORKFLOW}/dispatches"
+        jq . <<<"${body}"
+        return 0
+    fi
+    resp=$(ghapi -X POST "repos/${RUNS_REPO}/actions/workflows/${RUNS_WORKFLOW}/dispatches" --input - <<<"${body}") || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || fatal "dispatching ${RUNS_WORKFLOW} in ${RUNS_REPO} failed"
+    # Without return_run_details support the answer is an empty 204: the
+    # run exists, but its id is unknown, so don't dispatch again.
+    jq -e '.workflow_run_id? | type == "number"' <<<"${resp:-null}" >/dev/null 2>&1 ||
+        fatal "the run was dispatched, but GitHub returned no run id; find it with '$(basename "$0") list --item ${item}' instead of dispatching again"
+    if ${json}; then
+        jq '{run_id: .workflow_run_id, url: .html_url, api_url: .run_url}' <<<"${resp}"
+    else
+        jq -r '"Dispatched run \(.workflow_run_id): \(.html_url)"' <<<"${resp}"
+    fi
+}
+
+# --- list --------------------------------------------------------------------
+
+cmd_list() {
+    local item="" since="" status="" limit=${DEFAULT_LIST_LIMIT} json=false query="" records meta
+    while test $# -gt 0; do
+        case "$1" in
+            --item) test $# -ge 2 || fatal "--item requires a value"; item=$2; shift 2 ;;
+            --since) test $# -ge 2 || fatal "--since requires a value"; since=$2; shift 2 ;;
+            --status) test $# -ge 2 || fatal "--status requires a value"; status=$2; shift 2 ;;
+            --limit) test $# -ge 2 || fatal "--limit requires a value"; limit=$2; shift 2 ;;
+            --json) json=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) fatal "unknown list argument: $1 (see --help)" ;;
+        esac
+    done
+    [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || fatal "--limit must be a positive number"
+    [[ -z "${status}" || "${status}" =~ ^[a-z_]+$ ]] || fatal "not an Actions status or conclusion: ${status}"
+    test -z "${status}" || query+="&status=${status}"
+    test -z "${since}" || query+="&created=%3E%3D$(since_date "${since}")"
+    # Not a process substitution: its failure must end the command. With
+    # --item, older runs are read until LIMIT of that item's are found.
+    fetch_runs "$(test -z "${item}" && echo "${limit}" || echo "${ITEM_SCAN_MAX}")" "${query}" >"${scratch}/runs"
+    records=${scratch}/records
+    : >"${records}"
+    local found=0
+    while IFS= read -r meta && test "${found}" -lt "${limit}"; do
+        # The run name has the item: skip other items' runs unread.
+        if test -n "${item}" &&
+            ! jqlib -e --arg i "${item}" '{run: .} | title_parts | .item == null or .item == $i' <<<"${meta}" >/dev/null; then
+            continue
+        fi
+        load_record "${meta}" >>"${records}"
+        if test -z "${item}" || tail -n1 "${records}" | jqlib -e --arg i "${item}" 'flat | .item == $i' >/dev/null; then
+            found=$((found + 1))
+        fi
+    done <"${scratch}/runs"
+    if ${json}; then
+        jqlib -s --arg i "${item}" 'map(flat) | map(select($i == "" or .item == $i))' <"${records}"
+        return 0
+    fi
+    jqlib -rs --arg i "${item}" '(["RUN", "ITEM", "REPO", "AGENT", "RESULT", "DURATION", "TOKENS", "AIC", "OUTCOME"] | @tsv),
+        (map(flat) | map(select($i == "" or .item == $i))[]
+         | [.run_id, (.item | orblank), (.repo | orblank), agent_model,
+            (.result // .status | orblank) + ({footer: "*", none: "?"}[.source] // ""),
+            (.duration_s | fmt_dur), fmt_tokens, (.aic | fmt_aic), fmt_outcome] | @tsv)' <"${records}" |
+        column -t -s $'\t'
+    if jq -se 'any(.source == "footer")' "${records}" >/dev/null; then
+        echo "* from the PR footer: the ${SUMMARY_ARTIFACT} artifact expired"
+    fi
+    if jq -se 'any(.source == "none")' "${records}" >/dev/null; then
+        echo "? no summary (artifact expired or never uploaded, no footer): from the run itself"
+    fi
+}
+
+# --- show, log, transcript ---------------------------------------------------
+
+# one_run_args NAME ARGS...: parses 'RUN [--json]' into run_id and json.
+one_run_args() {
+    local name=$1
+    shift
+    run_id="" json=false
+    while test $# -gt 0; do
+        case "$1" in
+            --json) json=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) fatal "unknown ${name} option: $1 (see --help)" ;;
+            *) test -z "${run_id}" || fatal "${name} takes one RUN"; run_id=$(parse_run "$1"); shift ;;
+        esac
+    done
+    test -n "${run_id}" || fatal "${name} requires a RUN"
+}
+
+cmd_show() {
+    local run_id json meta rec dir step_summary=""
+    one_run_args show "$@"
+    meta=$(fetch_run "${run_id}")
+    rec=$(load_record "${meta}")
+    dir=$(run_dir "${meta}")
+    test ! -f "${dir}/summary.md" || step_summary=$(<"${dir}/summary.md")
+    if ${json}; then
+        jqlib --arg md "${step_summary}" '. + {flat: flat, step_summary: (if $md == "" then null else $md end)}' <<<"${rec}"
+        return 0
+    fi
+    jqlib -r 'flat as $f | .summary as $s | "Run \($f.run_id): \($f.url)",
+        "Status:   \($f.status)\(if $f.conclusion then " (\($f.conclusion))" else "" end), created \($f.created_at)",
+        "Item:     \($f.item | orblank)",
+        "Repo:     \($f.repo | orblank)\(if $f.base then " (base \($f.base))" else "" end)\(if $f.workflow then ", workflow \($f.workflow)" else "" end)",
+        "Agent:    \($f | agent_model)\(if $f.cores then ", \($f.cores) cores" else "" end)",
+        "Result:   \($f.result | orblank), \($f.duration_s | fmt_dur)\(if $f.turns then ", \($f.turns) turns" else "" end)",
+        "Tokens:   \($f | fmt_tokens) in/out\(if ($f.tokens.cache_read // 0) > 0 then ", \($f.tokens.cache_read | fmt_num) cache read" else "" end)",
+        "AIC:      \($f.aic | fmt_aic)\(if $f.aic_budget then " of \($f.aic_budget | fmt_aic)" else "" end)\(if $f.aic_pricing then " (\($f.aic_pricing))" else "" end)",
+        "Outcome:  \($f | fmt_outcome)",
+        "Summary:  \($f.source)\(source_note)"' <<<"${rec}"
+    if test -n "${step_summary}"; then
+        printf '\n%s\n' "${step_summary}"
+    elif test "$(jq -r .source <<<"${rec}")" = artifact && test "$(jq -r '.summary != null' <<<"${rec}")" = true; then
+        # No summary.md: the essentials from summary.json.
+        jqlib -r '.summary | "",
+            "Tools: \(.tools // {} | to_entries | map("\(.key) \(.value.calls)\(if (.value.errors // 0) > 0 then " (\(.value.errors) errors)" else "" end)") | join(", ") | orblank)",
+            (.failures // [] | .[] | "Failure: \(.kind): \(.message)"),
+            (.tests // [] | .[] | "Test: \(.command): exit \(.exit_code), \(.duration_s | fmt_dur)")' <<<"${rec}"
+    fi
+}
+
+# condensed_from_job_log RUN: the condensed transcript from the jobs'
+# logs, or nothing.
+condensed_from_job_log() {
+    local job jobs rc=0
+    jobs=$(ghapi "repos/${RUNS_REPO}/actions/runs/$1/jobs?per_page=${PER_PAGE}" --jq '.jobs[].id') || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -ne "${EX_NOTFOUND}" || return 0
+    test "${rc}" -eq 0 || fatal "listing the jobs of run $1 failed"
+    for job in ${jobs}; do
+        ghapi "repos/${RUNS_REPO}/actions/jobs/${job}/logs" >"${scratch}/job.log" || rc=$?
+        # A job's log can be gone while the run's is not.
+        test "${rc}" -ne "${EX_NOTFOUND}" || continue
+        test "${rc}" -eq 0 || fatal "reading the log of job ${job} failed"
+        awk -v group="##[group]${LOG_GROUP}" '
+            { sub(/^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z /, "") }
+            $0 == group { inside = 1; next }
+            inside && $0 == "##[endgroup]" { inside = 0; next }
+            inside { print }' "${scratch}/job.log"
+    done
+}
+
+cmd_log() {
+    local run_id json meta dir source=artifact
+    one_run_args log "$@"
+    meta=$(fetch_run "${run_id}")
+    ensure_run_files "${meta}"
+    dir=$(run_dir "${meta}")
+    if ! test -f "${dir}/condensed.log"; then
+        condensed_from_job_log "${run_id}" >"${scratch}/condensed.log"
+        test -s "${scratch}/condensed.log" ||
+            fatal "no condensed log for run ${run_id}: its ${SUMMARY_ARTIFACT} artifact and job logs are gone (or it has not started yet)"
+        source="job-log"
+        # A finished run's log doesn't change: keep it.
+        if test "$(jq -r .status <<<"${meta}")" = completed && test -d "${dir}"; then
+            cp "${scratch}/condensed.log" "${dir}/condensed.log"
+        fi
+        dir=${scratch}
+    fi
+    if ${json}; then
+        jq -Rn --argjson id "${run_id}" --arg src "${source}" '{run_id: $id, source: $src, lines: [inputs]}' <"${dir}/condensed.log"
+    else
+        cat "${dir}/condensed.log"
+    fi
+}
+
+# decrypt_transcript IN OUT: decrypts the age-encrypted IN into OUT.
+# TODO: who the recipients are and where the identity lives is still
+# open (plan question 3); until that's settled, it takes the identity
+# file from BOT_RUNS_AGE_IDENTITY.
+decrypt_transcript() {
+    test -n "${BOT_RUNS_AGE_IDENTITY:-}" ||
+        fatal "the transcript is encrypted; set BOT_RUNS_AGE_IDENTITY to your age identity file (see docs/devspace-agent-runs.md)"
+    require_cmd age "install age to decrypt transcripts"
+    age --decrypt -i "${BOT_RUNS_AGE_IDENTITY}" -o "$2" "$1" || fatal "decrypting the transcript failed"
+}
+
+cmd_transcript() {
+    local run_id="" json=false dir="" force=false art rc=0 tarball bad meta tmp
+    while test $# -gt 0; do
+        case "$1" in
+            --json) json=true; shift ;;
+            --force) force=true; shift ;;
+            --dir) test $# -ge 2 || fatal "--dir requires a directory"; dir=$2; shift 2 ;;
+            -h|--help) usage; exit 0 ;;
+            -*) fatal "unknown transcript option: $1 (see --help)" ;;
+            *) test -z "${run_id}" || fatal "transcript takes one RUN"; run_id=$(parse_run "$1"); shift ;;
+        esac
+    done
+    test -n "${run_id}" || fatal "transcript requires a RUN"
+    meta=$(fetch_run "${run_id}")
+    test -n "${dir}" || dir=$(jq -r --arg d "${TRANSCRIPT_DIR}" '"\($d)/\(.id)-\(.attempt)"' <<<"${meta}")
+    dir=${dir%/}
+    # Only ever replace a transcript unpacked here, or an empty directory.
+    if test -e "${dir}" && ! test -e "${dir}/.complete" && test -n "$(ls -A "${dir}" 2>/dev/null || echo x)"; then
+        fatal "${dir} exists and doesn't hold an unpacked transcript; choose another --dir"
+    fi
+    if ${force} || ! test -e "${dir}/.complete"; then
+        art=$(latest_artifact "${meta}" "${TRANSCRIPT_ARTIFACT}") || rc=$?
+        pass_ratelimit "${rc}"
+        test "${rc}" -eq 0 || fatal "listing the artifacts of run ${run_id} failed"
+        test -n "${art}" || fatal "run ${run_id} has no ${TRANSCRIPT_ARTIFACT} artifact (still running, or it failed before uploading)"
+        test "$(jq -r .expired <<<"${art}")" = false ||
+            fatal "the transcript of run ${run_id} expired on $(jq -r '.expires_at // "?"' <<<"${art}") (transcripts are kept 30 days); '$(basename "$0") show ${run_id}' has what's left"
+        mkdir "${scratch}/transcript"
+        download_artifact "$(jq -r .id <<<"${art}")" "${scratch}/transcript" || rc=$?
+        test "${rc}" -ne "${EX_NOTFOUND}" || fatal "the transcript of run ${run_id} expired just now"
+        test "${rc}" -eq 0 || fatal "downloading the transcript of run ${run_id} failed"
+        tarball=${scratch}/transcript/${TRANSCRIPT_NAME}
+        if test -f "${tarball}.age" && ! test -L "${tarball}.age"; then
+            decrypt_transcript "${tarball}.age" "${scratch}/${TRANSCRIPT_NAME}"
+            tarball=${scratch}/${TRANSCRIPT_NAME}
+        elif ! test -f "${tarball}" || test -L "${tarball}"; then
+            fatal "the ${TRANSCRIPT_ARTIFACT} artifact of run ${run_id} has neither ${TRANSCRIPT_NAME}.age nor ${TRANSCRIPT_NAME}"
+        fi
+        # Only plain files and directories: a link could point outside DIR.
+        bad=$(tar --zstd -tvf "${tarball}" |
+            awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { print; if (++n == 3) exit }') ||
+            fatal "the transcript of run ${run_id} is not a zstd tar"
+        test -z "${bad}" || fatal "the transcript of run ${run_id} holds entries other than files and directories: ${bad}"
+        mkdir -p "$(dirname "${dir}")"
+        tmp=$(mktemp -d "${dir}.tmp.XXXXXX")
+        chmod 0700 "${tmp}"
+        # --no-overwrite-dir: the archive's root entry keeps the mode.
+        tar --zstd -xf "${tarball}" -C "${tmp}" --no-same-owner --no-same-permissions --no-overwrite-dir ||
+            { rm -rf "${tmp}"; fatal "unpacking the transcript of run ${run_id} failed"; }
+        touch "${tmp}/.complete"
+        rm -rf "${dir}"
+        mv -T "${tmp}" "${dir}"
+    fi
+    if ${json}; then
+        (cd "${dir}" && find . -type f ! -name .complete -printf '%P\n' | sort) |
+            jq -Rn --argjson id "${run_id}" --arg d "${dir}" '{run_id: $id, dir: $d, files: [inputs]}'
+    else
+        echo "Transcript of run ${run_id} in ${dir}:"
+        (cd "${dir}" && find . -type f ! -name .complete -printf '  %P\n' | sort)
+    fi
+}
+
+# --- diff ---------------------------------------------------------------------
+
+# Compares records A and B ($a, $b).
+readonly DIFF_JQ='
+def delta($x; $y): {a: $x, b: $y}
+    + if ($x | type) == "number" and ($y | type) == "number"
+      then {delta: ($y - $x), pct: (if $x != 0 then (($y - $x) / $x * 1000 | round) / 10 else null end)}
+      else {delta: null, pct: null} end;
+def fkey: "\(.kind): \(.message)";
+($a | flat) as $fa | ($b | flat) as $fb | ($a.summary // {}) as $sa | ($b.summary // {}) as $sb | {
+    a: $fa, b: $fb,
+    result: {a: $fa.result, b: $fb.result, changed: ($fa.result != $fb.result)},
+    metrics: {
+        duration_s: delta($fa.duration_s; $fb.duration_s),
+        turns: delta($fa.turns; $fb.turns),
+        tokens_input: delta($fa.tokens.input; $fb.tokens.input),
+        tokens_output: delta($fa.tokens.output; $fb.tokens.output),
+        tokens_cache_read: delta($fa.tokens.cache_read; $fb.tokens.cache_read),
+        tokens_cache_write: delta($fa.tokens.cache_write; $fb.tokens.cache_write),
+        aic: delta($fa.aic; $fb.aic)},
+    tools: (if $sa.tools and $sb.tools then
+        [($sa.tools | keys[]), ($sb.tools | keys[])] | unique
+        | map(. as $k | {tool: $k,
+            a_calls: ($sa.tools[$k].calls // 0), b_calls: ($sb.tools[$k].calls // 0),
+            a_errors: ($sa.tools[$k].errors // 0), b_errors: ($sb.tools[$k].errors // 0)}
+          | .delta_calls = .b_calls - .a_calls | .delta_errors = .b_errors - .a_errors)
+        else null end),
+    failures: (if $sa.failures and $sb.failures then
+        ($sa.failures | map(fkey)) as $x | ($sb.failures | map(fkey)) as $y
+        | {only_a: ($x - $y), only_b: ($y - $x)} else null end),
+    files: (if $sa.files and $sb.files then
+        {only_a: ($sa.files - $sb.files), only_b: ($sb.files - $sa.files),
+         common: ($sa.files - ($sa.files - $sb.files) | length)} else null end),
+    tests: (if $sa.tests and $sb.tests then
+        ($sa.tests | map({key: .command, value: .exit_code}) | from_entries) as $x
+        | ($sb.tests | map({key: .command, value: .exit_code}) | from_entries) as $y
+        | [($x | keys[]), ($y | keys[])] | unique
+        | map({command: ., a_exit: $x[.], b_exit: $y[.]}) | map(select(.a_exit != .b_exit))
+        else null end),
+    outcome: {a: $fa.outcome, b: $fb.outcome}}'
+
+readonly DIFF_TEXT_JQ='
+def row($label; $name; f): .metrics[$name] as $m
+    | [$label, ($m.a | f), ($m.b | f), (($m.delta | signed(f)) + ($m.pct | fmt_pct))] | @tsv;
+def missing($what): "\($what): not known for both runs (a summary is missing or partial)";
+"Run A \(.a.run_id): \(.a | agent_model), \(.a.result | orblank)\(.a | source_note)",
+"Run B \(.b.run_id): \(.b | agent_model), \(.b.result | orblank)\(.b | source_note)",
+"",
+(["", "A", "B", "DELTA"] | @tsv),
+row("duration"; "duration_s"; fmt_dur), row("turns"; "turns"; fmt_num),
+row("tokens in"; "tokens_input"; fmt_num), row("tokens out"; "tokens_output"; fmt_num),
+row("cache read"; "tokens_cache_read"; fmt_num), row("cache write"; "tokens_cache_write"; fmt_num),
+row("AIC"; "aic"; fmt_aic),
+"",
+(if .tools == null then missing("Tools")
+ else (.tools | map(select(.delta_calls != 0 or .delta_errors != 0))) as $t
+  | if $t == [] then "Tools: the same calls"
+    else "Tools (calls/errors, A -> B):",
+      ($t[] | "  \(.tool)\t\(.a_calls)/\(.a_errors) -> \(.b_calls)/\(.b_errors)\t\(.delta_calls | signed(tostring)) calls")
+    end end),
+(if .failures == null then missing("Failures")
+ else (.failures.only_a[] | "Failure only in A: \(.)"), (.failures.only_b[] | "Failure only in B: \(.)") end),
+(if .files == null then missing("Files")
+ else "Files: \(.files.common) in both, \(.files.only_a | length) only in A, \(.files.only_b | length) only in B",
+   (.files.only_a[] | "  A only: \(.)"), (.files.only_b[] | "  B only: \(.)") end),
+(if .tests == null then missing("Tests")
+ else (.tests[] | "Test \(.command): exit \(.a_exit // "-") -> \(.b_exit // "-")") end),
+"Outcome: \(.a | fmt_outcome) -> \(.b | fmt_outcome)"'
+
+cmd_diff() {
+    local runs=() json=false a b out
+    while test $# -gt 0; do
+        case "$1" in
+            --json) json=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) fatal "unknown diff option: $1 (see --help)" ;;
+            *) runs+=("$(parse_run "$1")"); shift ;;
+        esac
+    done
+    test "${#runs[@]}" -eq 2 || fatal "diff takes two RUNs"
+    a=$(fetch_run "${runs[0]}")
+    a=$(load_record "${a}")
+    b=$(fetch_run "${runs[1]}")
+    b=$(load_record "${b}")
+    out=$(jqlib -n --argjson a "${a}" --argjson b "${b}" "${DIFF_JQ}")
+    if ${json}; then
+        jq . <<<"${out}"
+    else
+        # The metrics table is aligned; the rest is prose.
+        jqlib -r "${DIFF_TEXT_JQ}" <<<"${out}" | awk -F'\t' '
+            NF == 4 { printf "%-20s %-10s %-10s %s\n", $1, $2, $3, $4; next }
+            { gsub(/\t/, "  "); print }'
+    fi
+}
+
+# --- stats --------------------------------------------------------------------
+
+# Aggregates an array of records; $by is a flat field, or "".
+readonly STATS_JQ='
+def mean: map(select(type == "number")) as $v | if $v == [] then null else ($v | add) / ($v | length) end;
+def total: map(select(type == "number")) as $v | if $v == [] then null else $v | add end;
+def failed: IN("failure", "timeout", "budget");
+def group_stats: map(. as $r | flat + {failures: ($r.summary.failures // null)}) as $f
+    | ($f | map(select(.result == "success"))) as $ok
+    | ($f | map(select(.result | failed))) as $bad
+    | {runs: ($f | length),
+       with_summary: ($f | map(select(.source == "artifact" or .source == "footer")) | length),
+       success: ($ok | length), failed: ($bad | length),
+       other: (($f | length) - ($ok | length) - ($bad | length)),
+       success_rate: (if ($ok | length) + ($bad | length) > 0
+           then (($ok | length) / (($ok | length) + ($bad | length)) * 1000 | round) / 10 else null end),
+       failure_kinds: ([$f[].failures // [] | .[].kind] | group_by(.) | map({key: .[0], value: length}) | from_entries),
+       duration_s: {total: ($f | map(.duration_s) | total), mean: ($f | map(.duration_s) | mean)},
+       tokens: {input: ($f | map(.tokens.input) | total), output: ($f | map(.tokens.output) | total),
+           cache_read: ($f | map(.tokens.cache_read) | total), cache_write: ($f | map(.tokens.cache_write) | total)},
+       aic: {total: ($f | map(.aic) | total), mean: ($f | map(.aic) | mean),
+           known: ($f | map(select(.aic | type == "number")) | length)},
+       divergence: (($bad | map(io_tokens) | mean) as $x | ($ok | map(io_tokens) | mean) as $y
+           | {failed_mean_tokens: $x, success_mean_tokens: $y,
+              flagged: ($x != null and $y != null and $x > $y)})};
+{total: group_stats,
+ groups: (if $by == "" then null
+     else group_by(flat | .[$by] // "-" | tostring) | map({key: (.[0] | flat | .[$by] // "-" | tostring)} + group_stats) end)}'
+
+readonly STATS_TABLE_JQ='
+def line($k): [$k, .runs, .success, .failed, .other, (if .success_rate then "\(.success_rate)%" else "-" end),
+    (.duration_s.mean | fmt_dur), "\(.tokens.input | fmt_num)/\(.tokens.output | fmt_num)",
+    (.aic.total | fmt_aic), (.aic.mean | fmt_aic)] | @tsv;
+(["", "RUNS", "OK", "FAILED", "OTHER", "SUCCESS", "MEAN TIME", "TOKENS IN/OUT", "AIC", "AIC/RUN"] | @tsv),
+(.total | line("all")),
+(.groups // [] | .[] | line(.key))'
+
+readonly STATS_NOTES_JQ='
+(.total.failure_kinds | if . == {} then "Failures by kind: none recorded"
+  else "Failures by kind: \(to_entries | sort_by(-.value) | map("\(.key) \(.value)") | join(", "))" end),
+(.total.divergence | if .flagged then "Resource divergence: failed runs used \(.failed_mean_tokens | fmt_num) tokens on average, successful ones \(.success_mean_tokens | fmt_num)" else empty end),
+"AIC known for \(.total.aic.known) of \(.total.runs) runs"'
+
+cmd_stats() {
+    local since=${DEFAULT_STATS_SINCE} limit=${DEFAULT_STATS_LIMIT} by="" json=false since_iso records meta out
+    while test $# -gt 0; do
+        case "$1" in
+            --since) test $# -ge 2 || fatal "--since requires a value"; since=$2; shift 2 ;;
+            --limit) test $# -ge 2 || fatal "--limit requires a value"; limit=$2; shift 2 ;;
+            --by) test $# -ge 2 || fatal "--by requires a field"; by=$2; shift 2 ;;
+            --json) json=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) fatal "unknown stats argument: $1 (see --help)" ;;
+        esac
+    done
+    [[ "${limit}" =~ ^[1-9][0-9]*$ ]] || fatal "--limit must be a positive number"
+    case "${by}" in
+        ""|agent|model|repo|item|result) ;;
+        *) fatal "--by must be agent, model, repo, item or result" ;;
+    esac
+    since_iso=$(since_date "${since}")
+    fetch_runs "${limit}" "&status=completed&created=%3E%3D${since_iso}" >"${scratch}/runs"
+    records=${scratch}/records
+    : >"${records}"
+    while IFS= read -r meta; do
+        load_record "${meta}" >>"${records}"
+    done <"${scratch}/runs"
+    out=$(jqlib -s --arg by "${by}" "${STATS_JQ}" <"${records}")
+    if ${json}; then
+        jq --arg since "${since_iso}" --arg by "${by}" '{since: $since, by: (if $by == "" then null else $by end)} + .' <<<"${out}"
+    else
+        jq -r --arg repo "${RUNS_REPO}" --arg wf "${RUNS_WORKFLOW}" --arg since "${since_iso}" \
+            '"Agent runs of \($repo) \($wf) since \($since): \(.total.runs) finished, \(.total.with_summary) with a summary\n"' <<<"${out}"
+        jqlib -r "${STATS_TABLE_JQ}" <<<"${out}" | column -t -s $'\t'
+        echo
+        jqlib -r "${STATS_NOTES_JQ}" <<<"${out}"
+    fi
+}
+
+# --- main ---------------------------------------------------------------------
+
+test $# -gt 0 || { usage 1>&2; exit 1; }
+cmd=$1
+shift
+case "${cmd}" in
+    -h|--help|help) usage; exit 0 ;;
+    dispatch|list|show|log|transcript|diff|stats) ;;
+    *) fatal "unknown command: ${cmd} (see --help)" ;;
+esac
+
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
+require_cmd jq "install jq"
+case "${cmd}" in
+    list|show|log|diff|stats) require_cmd unzip "install unzip" ;;
+    transcript)
+        require_cmd unzip "install unzip"
+        require_cmd zstd "install zstd"
+        ;;
+esac
+prune_caches
+"cmd_${cmd}" "$@"
