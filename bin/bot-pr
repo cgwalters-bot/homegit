@@ -67,6 +67,21 @@ readonly DCO_CHECK=DCO
 # Where a repository installs the /signoff command (bootc-dev/actions'
 # pr-signoff workflow; bootc-dev/infra syncs this stub to its org).
 readonly SIGNOFF_WORKFLOW=.github/workflows/signoff.yml
+# REVIEWER's DCO sign-off, as on his own commits. His approval of a fork
+# PR's head lets promote add it to the bot's commits (and, with
+# --include-others, to anyone else's) when the upstream repository
+# requires DCO; see add_signoff. Nothing else ever adds it.
+readonly SIGNOFF_NAME="Colin Walters"
+readonly SIGNOFF_EMAIL=walters@verbum.org
+readonly SIGNOFF_TRAILER="Signed-off-by: ${SIGNOFF_NAME} <${SIGNOFF_EMAIL}>"
+# The start of the hidden last line of the bot's fork PR comment that
+# records a sign-off push: the approved head, the head it pushed, and the
+# approval (its URL, and review id or "none" for a '/promote' comment).
+readonly SIGNOFF_RECORD='<!-- bot-pr signoff'
+# shellcheck disable=SC2016 # jq, not shell
+readonly SIGNOFF_RECORD_RE='<!-- bot-pr signoff approved=(?<approved>[0-9a-f]{40}) signed=(?<signed>[0-9a-f]{40}) approval=(?<approval>[^ ]+) review=(?<review>[^ ]+) -->[[:space:]]*$'
+# Returned by add_signoff() when commits by others lack the sign-off.
+readonly EX_OTHERS=11
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
 
@@ -114,21 +129,32 @@ Commands:
         labeled PRs, issues, workflow_run: PR bots, release jobs); a gh-aw
         coding agent; or one listed in WORKFLOW_OVERRIDES in this script.
         fork-pr does this on every run; safe to repeat.
-  promote FORK_PR_URL [--draft] [--why TEXT] [--dry-run]
+  promote FORK_PR_URL [--draft] [--why TEXT] [--include-others] [--no-signoff] [--dry-run]
         Open the upstream PR for a fork PR whose current head ${REVIEWER}
-        approved (commits pushed after his approval need a new one).
+        approved (commits pushed after his approval need a new one, except
+        promote's own sign-off push, below, after an approving review).
         Approving is an approving review, or a conversation comment with
         a '${PROMOTE_COMMAND}' line, which approves the head the PR had
         when he wrote it (per the fork's push log and the PR's timeline;
         if that can't be told, it approves nothing). Other comments never
         approve, but one that reads like a go-ahead is pointed out. Then:
         rebase onto the upstream base if it moved (on conflicts, dismiss
-        the approval and stop), open the PR from ${FORGE_ORG}:${BRANCH_PREFIX}SLUG
+        the approval and stop). If the base branch's rules require the
+        DCO check, his approval also signs off: add '${SIGNOFF_TRAILER}'
+        to each commit since the merge-base that lacks it, keeping its
+        tree, author and message and making him its committer (the DCO
+        check wants the author's or committer's sign-off), force-push
+        that with a lease on the approved head, and record it on the
+        fork PR, so that a rerun still counts his approving review once
+        it checked that in git (a '${PROMOTE_COMMAND}' needs repeating). Commits by
+        others than ${BOT_LOGIN} and ${REVIEWER} stop it, unless he asked
+        for their sign-off too (--include-others), or for none at all
+        (--no-signoff). Then open the PR from ${FORGE_ORG}:${BRANCH_PREFIX}SLUG
         with the fork PR's current title and body minus the bot-meta
-        section (plus, if the base branch's rules require the DCO check,
-        a line telling maintainers to comment '/signoff', or how to sign
-        off by hand where ${SIGNOFF_WORKFLOW} doesn't exist), link and
-        close the fork PR, and set the board item In
+        section, plus, for DCO, a line naming the approval behind his
+        sign-off (with --no-signoff, one telling maintainers to comment
+        '/signoff', or how to sign off by hand where ${SIGNOFF_WORKFLOW}
+        doesn't exist), link and close the fork PR, and set the board item In
         Review with Branch = the upstream PR (and Why = TEXT, if given).
         The upstream PR is a draft with --draft, or when ${REVIEWER}'s latest
         '${DRAFT_COMMAND}' or '${READY_COMMAND}' comment line is '${DRAFT_COMMAND}'. --dry-run checks
@@ -765,6 +791,7 @@ ${META_START}
 
 To review:
 - **Approve**, or comment \`${PROMOTE_COMMAND}\` on a line of its own, to open it upstream, ready for review. Either covers only the commits pushed so far.
+- If upstream requires DCO, approving also signs off: promote adds \`${SIGNOFF_TRAILER}\` to the commits lacking it (the bot's and yours; anyone else's only if you ask), with you as committer.
 - Add a \`${DRAFT_COMMAND}\` line (in the same comment or before) to open it upstream as a draft (\`${READY_COMMAND}\` undoes that).
 - **Close** to drop it.
 - Edit the title and description freely: they become the upstream PR's. Review comments are squashed into the commits they concern, with a reply here.
@@ -1257,7 +1284,8 @@ write_body() {
 }
 
 # The reviewer's comments, reviews and inline review comments on a fork
-# PR, as a JSON array of {kind, at, url, state, body, path}.
+# PR, as a JSON array of {kind, at, url, state, body, path}, plus the
+# bot's sign-off records (kind "signoff"; see SIGNOFF_RECORD).
 reviewer_activity() {
     local fork=$1 number=$2
     {
@@ -1270,8 +1298,12 @@ reviewer_activity() {
                   | {kind: \"review comment\", at: .updated_at, created: .created_at, url: .html_url, body, path}" ||
             fatal "cannot list the review comments of ${fork}#${number}"
         ghapi --paginate "repos/${fork}/issues/${number}/comments?per_page=100" \
-            --jq ".[] | select(.user.login == \"${REVIEWER}\")
-                  | {kind: \"comment\", at: .updated_at, created: .created_at, url: .html_url, body}" ||
+            --jq ".[] | if .user.login == \"${REVIEWER}\" then
+                      {kind: \"comment\", at: .updated_at, created: .created_at, url: .html_url, body}
+                  elif .user.login == \"${BOT_LOGIN}\" then
+                      (.body // \"\" | capture(\"${SIGNOFF_RECORD_RE}\"))
+                      + {kind: \"signoff\", at: .created_at, created: .created_at, url: .html_url}
+                  else empty end" ||
             fatal "cannot list the comments of ${fork}#${number}"
     } | jq -sc .
 }
@@ -1280,7 +1312,12 @@ reviewer_activity() {
 # \$pushed when it became the head (see push_time; empty if unknown or not
 # looked up): whether the latest approval or verdict approves (a later
 # dismissal or change request cancels it) and approved the current head,
-# since commits pushed after it are unreviewed. A conversation comment
+# since commits pushed after it are unreviewed; except the bot's own push
+# that added REVIEWER's sign-off to the head his review approved, as
+# recorded in a comment (see add_signoff), which leaves it approved (and
+# which promote checks in git, see verify_record: only the bot can write
+# the comment, but it writes what it's told). A '${PROMOTE_COMMAND}' comment
+# names no commit, so after that push he needs to comment again. A conversation comment
 # with a '${PROMOTE_COMMAND}' line approves the head it was written on:
 # the current one if written after \$pushed, else an older one. Also:
 # whether the latest '${DRAFT_COMMAND}' or '${READY_COMMAND}' line in a comment or review
@@ -1295,7 +1332,9 @@ def approval: [(.[] | select(.kind == \"review\" and (.state | IN(\"APPROVED\", 
         promotions[]]
     | sort_by(.at) | last;
 def approved_any: approval.state == \"APPROVED\";
-def approved: approved_any and approval.commit_id == \$head;
+def signed_off(\$a): any(.[]; .kind == \"signoff\" and .signed == \$head and .approval == \$a.url
+    and \$a.commit_id != null and \$a.commit_id == .approved);
+def approved: approved_any and (approval.commit_id == \$head or signed_off(approval));
 def wants_draft: [.[] | {at, cmd: ((.body // \"\") | gsub(\"\\r\"; \"\")
         | [scan(\"(?:^|\\n)[ \\t]*(${DRAFT_COMMAND}|${READY_COMMAND})[ \\t]*(?=\\n|\$)\")[0]] | last)}
     | select(.cmd != null)] | sort_by(.at) | last | .cmd == \"${DRAFT_COMMAND}\";
@@ -1312,18 +1351,25 @@ verdict() {
         "${VERDICT_JQ} $1" <<<"${activity}"
 }
 
-# dco_note REPO BASE: prints a line for an upstream PR body telling the
-# maintainers how to sign off its commits, if pushes to BASE in REPO
-# need the DCO check; nothing otherwise. Only the branch rules count, not
-# what CONTRIBUTING says. The bot never signs off itself.
-dco_note() {
-    local repo=$1 base=$2 checks rc=0
+# dco_required REPO BASE: prints true if pushes to BASE in REPO need the
+# DCO check, else false. Only the branch rules count, not what
+# CONTRIBUTING says.
+dco_required() {
+    local repo=$1 base=$2 checks
     checks=$(ghapi -X GET "repos/${repo}/rules/branches/${base}" \
         --jq '.[] | select(.type == "required_status_checks") | .parameters.required_status_checks[].context') || {
-        warn "cannot read the branch rules of ${repo}:${base}; add a DCO note to the PR by hand if it needs one"
+        warn "cannot read the branch rules of ${repo}:${base}; if it requires DCO, sign off or add a note to the PR by hand"
+        echo false
         return 0
     }
-    grep -qiF "${DCO_CHECK}" <<<"${checks}" || return 0
+    if grep -qiF "${DCO_CHECK}" <<<"${checks}"; then echo true; else echo false; fi
+}
+
+# dco_note REPO BASE: prints a line for the body of an upstream PR into a
+# repository that requires DCO, telling the maintainers how to sign off
+# its commits, for when promote didn't add REVIEWER's sign-off.
+dco_note() {
+    local repo=$1 base=$2 rc=0
     ghapi -X GET "repos/${repo}/contents/${SIGNOFF_WORKFLOW}" -f ref="${base}" --jq .path >/dev/null || rc=$?
     if test "${rc}" -eq 0; then
         # shellcheck disable=SC2016 # literal backticks
@@ -1332,6 +1378,12 @@ dco_note() {
         test "${rc}" -eq "${EX_NOTFOUND}" || warn "cannot tell whether ${repo} has ${SIGNOFF_WORKFLOW}; describing the manual signoff"
         echo "Maintainers: this repository requires DCO, and these commits have no \`Signed-off-by\`. To add yours, run \`git rebase --signoff <upstream>/${base}\` on this branch and force-push it."
     fi
+}
+
+# signoff_note APPROVAL_URL: the line for an upstream PR's body that says
+# which approval of REVIEWER's authorized his sign-off on its commits.
+signoff_note() {
+    echo "The \`${SIGNOFF_TRAILER}\` on these commits was added on ${REVIEWER}'s approval of the review draft: $1"
 }
 
 # with_note BODY NOTE: prints BODY with the paragraph NOTE added before
@@ -1391,6 +1443,12 @@ git_url() {
     printf '%s%s\n' "${GIT_URL_PREFIX}" "$1"
 }
 
+# sgit ARGS...: git on the bot-pr clones: no hooks, and no signing that
+# the user's configuration may ask for.
+sgit() {
+    git -c core.hooksPath=/dev/null -c commit.gpgSign=false "$@"
+}
+
 # open_clone FORK BRANCH OLD_SHA UPSTREAM BASE: sets CLONE to the cached
 # clone of FORK, locked until the calling (sub)shell exits, with BRANCH
 # fetched as refs/bot-pr/head and UPSTREAM's BASE as refs/bot-pr/base, and
@@ -1405,14 +1463,14 @@ open_clone() {
     flock "${clone_lock}" || fatal "cannot lock ${CLONE}.lock"
     if ! test -d "${CLONE}/.git"; then
         rm -rf "${CLONE}"
-        git clone -q --filter=blob:none --no-checkout "$(git_url "${fork}")" "${CLONE}" 1>&2 ||
+        sgit clone -q --filter=blob:none --no-checkout "$(git_url "${fork}")" "${CLONE}" 1>&2 ||
             fatal "cloning ${fork} into ${CLONE} failed"
     fi
-    git -C "${CLONE}" fetch -q --filter=blob:none "$(git_url "${fork}")" "+refs/heads/${branch}:refs/bot-pr/head" 1>&2 ||
+    sgit -C "${CLONE}" fetch -q --filter=blob:none "$(git_url "${fork}")" "+refs/heads/${branch}:refs/bot-pr/head" 1>&2 ||
         fatal "fetching ${fork}:${branch} into ${CLONE} failed"
-    git -C "${CLONE}" fetch -q --filter=blob:none "$(git_url "${upstream}")" "+refs/heads/${base}:refs/bot-pr/base" 1>&2 ||
+    sgit -C "${CLONE}" fetch -q --filter=blob:none "$(git_url "${upstream}")" "+refs/heads/${base}:refs/bot-pr/base" 1>&2 ||
         fatal "fetching ${upstream}:${base} into ${CLONE} failed"
-    test "$(git -C "${CLONE}" rev-parse refs/bot-pr/head)" = "${old_sha}" ||
+    test "$(sgit -C "${CLONE}" rev-parse refs/bot-pr/head)" = "${old_sha}" ||
         fatal "${fork}:${branch} moved while promoting; rerun promote"
 }
 
@@ -1425,39 +1483,219 @@ rebase_onto_upstream() {
     local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 dir conflicts new_sha CLONE
     open_clone "$@"
     dir=${CLONE}
-    git -C "${dir}" rebase --abort >/dev/null 2>&1 || true
-    git -C "${dir}" checkout -q --force --detach refs/bot-pr/head 1>&2 ||
+    sgit -C "${dir}" rebase --abort >/dev/null 2>&1 || true
+    sgit -C "${dir}" checkout -q --force --detach refs/bot-pr/head 1>&2 ||
         fatal "checking out ${branch} in ${dir} failed"
-    test "$(git -C "${dir}" rev-parse HEAD)" = "${old_sha}" || fatal "${dir} is not at ${branch} after checkout"
+    test "$(sgit -C "${dir}" rev-parse HEAD)" = "${old_sha}" || fatal "${dir} is not at ${branch} after checkout"
     if ! GIT_COMMITTER_NAME=${BOT_GIT_NAME} GIT_COMMITTER_EMAIL=${BOT_GIT_EMAIL} \
-        git -C "${dir}" rebase -q refs/bot-pr/base >/dev/null 2>&1; then
-        conflicts=$(git -C "${dir}" diff --name-only --diff-filter=U | paste -sd, -)
-        git -C "${dir}" rebase --abort >/dev/null 2>&1 || true
+        sgit -C "${dir}" rebase -q refs/bot-pr/base >/dev/null 2>&1; then
+        conflicts=$(sgit -C "${dir}" diff --name-only --diff-filter=U | paste -sd, -)
+        sgit -C "${dir}" rebase --abort >/dev/null 2>&1 || true
         test -n "${conflicts}" || fatal "rebasing ${branch} onto ${upstream}:${base} in ${dir} failed without conflicts; nothing was changed"
         echo "${conflicts}"
         return "${EX_CONFLICT}"
     fi
-    new_sha=$(git -C "${dir}" rev-parse HEAD) || fatal "cannot read the rebased head in ${dir}"
-    git -C "${dir}" merge-base --is-ancestor refs/bot-pr/base "${new_sha}" ||
+    new_sha=$(sgit -C "${dir}" rev-parse HEAD) || fatal "cannot read the rebased head in ${dir}"
+    sgit -C "${dir}" merge-base --is-ancestor refs/bot-pr/base "${new_sha}" ||
         fatal "the rebased ${branch} in ${dir} doesn't contain ${upstream}:${base}; not pushing it"
-    git -C "${dir}" push -q --force-with-lease="refs/heads/${branch}:${old_sha}" \
+    sgit -C "${dir}" push -q --force-with-lease="refs/heads/${branch}:${old_sha}" \
         "$(git_url "${fork}")" "${new_sha}:refs/heads/${branch}" 1>&2 ||
         fatal "pushing the rebased ${branch} to ${fork} failed"
     echo "${new_sha}"
 }
 
+# has_signoff DIR COMMIT: prints how many SIGNOFF_TRAILER lines COMMIT's
+# message has.
+has_signoff() {
+    sgit -C "$1" show -s --format=%B "$2" | sed -e 's/[[:space:]]*$//' | grep -Fxc -- "${SIGNOFF_TRAILER}" || true
+}
+
+# dco_ok DIR COMMIT: succeeds if COMMIT has SIGNOFF_TRAILER and REVIEWER
+# is its author or committer, as the DCO check wants. A rebase by the bot
+# keeps the trailer but makes the bot the committer, which fails it.
+dco_ok() {
+    test "$(has_signoff "$1" "$2")" -gt 0 || return 1
+    local who
+    who=$(sgit -C "$1" show -s --format='%ae%n%cn <%ce>' "$2")
+    grep -qixF -e "${SIGNOFF_EMAIL}" -e "${SIGNOFF_NAME} <${SIGNOFF_EMAIL}>" <<<"${who}"
+}
+
+# message_sans_signoff DIR COMMIT: COMMIT's message without its
+# SIGNOFF_TRAILER lines.
+message_sans_signoff() {
+    sgit -C "$1" show -s --format=%B "$2" | sed -e 's/[[:space:]]*$//' | grep -Fxv -- "${SIGNOFF_TRAILER}" || true
+}
+
+# ours DIR COMMIT FORK: succeeds if COMMIT's author is the bot or
+# REVIEWER, by email or, failing that, by the GitHub login FORK's copy of
+# the commit is attributed to.
+ours() {
+    local email login rc=0
+    email=$(sgit -C "$1" show -s --format=%ae "$2")
+    case "${email,,}" in
+        "${BOT_GIT_EMAIL,,}"|"${SIGNOFF_EMAIL,,}") return 0 ;;
+    esac
+    login=$(ghapi "repos/$3/commits/$2" --jq '.author.login // empty') || rc=$?
+    test "${rc}" -eq 0 || test "${rc}" -eq "${EX_NOTFOUND}" || fatal "cannot read commit $2 of $3"
+    test "${login}" = "${BOT_LOGIN}" || test "${login}" = "${REVIEWER}"
+}
+
+# verify_signoff DIR BASE OLD NEW: NEW must be OLD with SIGNOFF_TRAILER
+# added to every commit after BASE that lacked it, each commit passing
+# the DCO check (see dco_ok), and nothing else changed: the same trees,
+# authors, and messages otherwise, still on BASE. The same checks as
+# bin/dco-signoff's verify.
+verify_signoff() {
+    local dir=$1 base=$2 old new i
+    mapfile -t old < <(sgit -C "${dir}" rev-list --reverse "${base}..$3")
+    mapfile -t new < <(sgit -C "${dir}" rev-list --reverse "${base}..$4")
+    test "${#old[@]}" -gt 0 || { info "no commits after ${base:0:12}"; return 1; }
+    test "${#old[@]}" -eq "${#new[@]}" || { info "${#old[@]} commits became ${#new[@]}"; return 1; }
+    for i in "${!old[@]}"; do
+        local o=${old[i]} n=${new[i]} os ns
+        test "$(sgit -C "${dir}" rev-parse "${o}^{tree}")" = "$(sgit -C "${dir}" rev-parse "${n}^{tree}")" ||
+            { info "${n:0:12}'s tree differs from ${o:0:12}'s"; return 1; }
+        test "$(sgit -C "${dir}" show -s --format='%an <%ae> %ad' --date=raw "${o}")" = \
+            "$(sgit -C "${dir}" show -s --format='%an <%ae> %ad' --date=raw "${n}")" ||
+            { info "${n:0:12}'s author differs from ${o:0:12}'s"; return 1; }
+        test "$(message_sans_signoff "${dir}" "${o}")" = "$(message_sans_signoff "${dir}" "${n}")" ||
+            { info "${n:0:12}'s message differs from ${o:0:12}'s by more than the sign-off"; return 1; }
+        os=$(has_signoff "${dir}" "${o}")
+        ns=$(has_signoff "${dir}" "${n}")
+        test "${ns}" -eq "$((os > 0 ? os : 1))" ||
+            { info "${n:0:12} has ${ns} sign-offs by ${REVIEWER}, ${o:0:12} had ${os}"; return 1; }
+        dco_ok "${dir}" "${n}" ||
+            { info "${n:0:12} is neither authored nor committed by ${SIGNOFF_NAME} <${SIGNOFF_EMAIL}>"; return 1; }
+    done
+    test "$(sgit -C "${dir}" merge-base "${base}" "$4")" = "$(sgit -C "${dir}" rev-parse "${base}")" ||
+        { info "the rewritten commits are no longer based on ${base:0:12}"; return 1; }
+}
+
+# add_signoff FORK BRANCH OLD_SHA UPSTREAM BASE INCLUDE_OTHERS: add
+# REVIEWER's SIGNOFF_TRAILER to the commits from BRANCH's merge-base with
+# UPSTREAM:BASE up to OLD_SHA that lack it, and force-push BRANCH with a
+# lease on OLD_SHA. Only promote calls this, once REVIEWER approved
+# OLD_SHA (or the clean rebase of what he approved). The DCO check wants
+# the sign-off to be by the commit's author or committer, so the commits
+# it signs off are committed as him, as are those that have his trailer
+# but neither him as author nor as committer (after a rebase by the bot);
+# each keeps its tree, author and message bytes, plus the trailer. The
+# commits before the first one that needs this stay as they are, and
+# those after it keep their committer where they pass already. Commits
+# lacking the trailer by others than the bot and REVIEWER are refused
+# (returning EX_OTHERS) unless INCLUDE_OTHERS is true. Prints "HEAD
+# COUNT": the pushed head and how many commits it changed for DCO (OLD_SHA
+# and 0 if none needed it). Runs in a '||' list, like
+# rebase_onto_upstream.
+add_signoff() {
+    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 include_others=$6 CLONE
+    open_clone "$@"
+    local dir=${CLONE} mb commits c todo=0 others=()
+    mb=$(sgit -C "${dir}" merge-base refs/bot-pr/base "${old_sha}") ||
+        fatal "${branch} has no merge-base with ${upstream}:${base}"
+    test -z "$(sgit -C "${dir}" rev-list --merges "${mb}..${old_sha}")" ||
+        fatal "${branch} has merge commits; add the sign-off by hand"
+    mapfile -t commits < <(sgit -C "${dir}" rev-list --reverse "${mb}..${old_sha}")
+    test "${#commits[@]}" -gt 0 || fatal "cannot list the commits of ${branch} after ${mb:0:12}"
+    for c in "${commits[@]}"; do
+        dco_ok "${dir}" "${c}" && continue
+        todo=$((todo + 1))
+        test "$(has_signoff "${dir}" "${c}")" -eq 0 || continue
+        ours "${dir}" "${c}" "${fork}" || others+=("$(sgit -C "${dir}" show -s --format='%h %s (%an <%ae>)' "${c}")")
+    done
+    if test "${todo}" -eq 0; then
+        echo "${old_sha} 0"
+        return 0
+    fi
+    if test "${#others[@]}" -gt 0 && ! ${include_others}; then
+        info "Commits by others than ${BOT_LOGIN} and ${REVIEWER} that lack his sign-off:"
+        printf '  %s\n' "${others[@]}" 1>&2
+        return "${EX_OTHERS}"
+    fi
+
+    local msg parent=${mb} rewriting=false new author_date committer
+    msg=$(mktemp) || fatal "cannot create a temporary file"
+    for c in "${commits[@]}"; do
+        if dco_ok "${dir}" "${c}"; then
+            if ! ${rewriting}; then
+                parent=${c}
+                continue
+            fi
+            # Only its parent changes; it keeps its committer.
+            committer=(GIT_COMMITTER_NAME="$(sgit -C "${dir}" show -s --format=%cn "${c}")"
+                GIT_COMMITTER_EMAIL="$(sgit -C "${dir}" show -s --format=%ce "${c}")"
+                GIT_COMMITTER_DATE="$(sgit -C "${dir}" show -s --format=%cd --date=raw "${c}")")
+        else
+            committer=(GIT_COMMITTER_NAME="${SIGNOFF_NAME}" GIT_COMMITTER_EMAIL="${SIGNOFF_EMAIL}")
+        fi
+        # The header ends at the first empty line; the rest is the message,
+        # byte for byte. commit-tree can't keep an encoding header.
+        ! sgit -C "${dir}" cat-file commit "${c}" | sed -n '/^$/q;p' | grep -q '^encoding ' ||
+            { rm -f "${msg}"; fatal "${c:0:12} has a non-UTF-8 message encoding; add the sign-off by hand"; }
+        sgit -C "${dir}" cat-file commit "${c}" | sed '1,/^$/d' >"${msg}" ||
+            { rm -f "${msg}"; fatal "cannot read the message of ${c:0:12}"; }
+        if test "$(has_signoff "${dir}" "${c}")" -eq 0; then
+            # Without the user's trailer.* configuration.
+            GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+                sgit -C "${dir}" interpret-trailers --in-place --no-divider --where end --if-exists addIfDifferent \
+                --trailer "${SIGNOFF_TRAILER}" "${msg}" ||
+                { rm -f "${msg}"; fatal "adding the sign-off to the message of ${c:0:12} failed"; }
+        fi
+        author_date=$(sgit -C "${dir}" show -s --format=%ad --date=raw "${c}")
+        new=$(env -u GIT_COMMITTER_DATE \
+            GIT_AUTHOR_NAME="$(sgit -C "${dir}" show -s --format=%an "${c}")" \
+            GIT_AUTHOR_EMAIL="$(sgit -C "${dir}" show -s --format=%ae "${c}")" \
+            GIT_AUTHOR_DATE="${author_date}" "${committer[@]}" \
+            git -c core.hooksPath=/dev/null -c commit.gpgSign=false -c i18n.commitEncoding=UTF-8 -C "${dir}" \
+            commit-tree --no-gpg-sign "${c}^{tree}" -p "${parent}" -F "${msg}") ||
+            { rm -f "${msg}"; fatal "rewriting ${c:0:12} failed"; }
+        parent=${new}
+        rewriting=true
+    done
+    rm -f "${msg}"
+    verify_signoff "${dir}" "${mb}" "${old_sha}" "${new}" ||
+        fatal "the signed-off ${new:0:12} is not ${old_sha:0:12} plus the sign-off; not pushing it"
+    # For verify_record, should promote be rerun here.
+    sgit -C "${dir}" update-ref "refs/bot-pr/signed-from/${old_sha}" "${old_sha}" ||
+        fatal "cannot keep ${old_sha:0:12} in ${dir}"
+    sgit -C "${dir}" push -q --force-with-lease="refs/heads/${branch}:${old_sha}" \
+        "$(git_url "${fork}")" "${new}:refs/heads/${branch}" 1>&2 ||
+        fatal "pushing the signed-off ${branch} to ${fork} was refused: it is no longer at the approved ${old_sha:0:12}; not promoting"
+    echo "${new} ${todo}"
+}
+
+# verify_record FORK BRANCH HEAD UPSTREAM BASE APPROVED: exits unless HEAD
+# is exactly what add_signoff makes of APPROVED: a sign-off record in a
+# comment only claims that, and a comment by the bot can be made to say
+# anything. Runs in a '||' list, like rebase_onto_upstream.
+verify_record() {
+    local fork=$1 branch=$2 head=$3 approved=$6 CLONE
+    open_clone "$@"
+    if ! sgit -C "${CLONE}" cat-file -e "${approved}^{commit}" 2>/dev/null; then
+        sgit -C "${CLONE}" fetch -q "$(git_url "${fork}")" "${approved}" 1>&2 ||
+            fatal "cannot fetch ${approved:0:12}, the head ${REVIEWER} approved before the sign-off, to check that ${head:0:12} only adds his sign-off; he needs to approve ${head:0:12}"
+    fi
+    local mb
+    mb=$(sgit -C "${CLONE}" merge-base "${approved}" "${head}") ||
+        fatal "${head:0:12} shares no history with ${approved:0:12}, which ${REVIEWER} approved"
+    verify_signoff "${CLONE}" "${mb}" "${approved}" "${head}" ||
+        fatal "${branch} (${head:0:12}) is not ${approved:0:12}, which ${REVIEWER} approved, plus his sign-off; he needs to approve it"
+}
+
 cmd_promote() {
-    local url="" draft=false dry_run=false why="" have_why=false
+    local url="" draft=false dry_run=false why="" have_why=false include_others=false signoff=true
     while test $# -gt 0; do
         case "$1" in
             --draft) draft=true; shift ;;
             --dry-run) dry_run=true; shift ;;
+            --include-others) include_others=true; shift ;;
+            --no-signoff) signoff=false; shift ;;
             --why) test $# -ge 2 || fatal "--why requires an argument"; why=$2; have_why=true; shift 2 ;;
             -*) fatal "unknown argument for promote: $1 (see --help)" ;;
             *) test -z "${url}" || fatal "promote takes one fork PR URL"; url=$1; shift ;;
         esac
     done
-    test -n "${url}" || fatal "usage: $(basename "$0") promote FORK_PR_URL [--draft] [--why TEXT] [--dry-run]"
+    test -n "${url}" || fatal "usage: $(basename "$0") promote FORK_PR_URL [--draft] [--why TEXT] [--include-others] [--no-signoff] [--dry-run]"
     local FORK NUMBER
     parse_fork_pr_url "${url}"
     check_login
@@ -1503,11 +1741,10 @@ cmd_promote() {
     test -n "${body}" || fatal "${url}'s body is empty without the bot-meta section"
     grep -qxF "${LLMS_TRAILER}" <<<"${body}" || warn "${url}'s body has no '${LLMS_TRAILER}' line"
     local dco
-    dco=$(dco_note "${upstream}" "${base}")
-    if test -n "${dco}" && ! grep -qxF -- "${dco}" <<<"${body}" && grep -qF "${DCO_CHECK}" <<<"${body}"; then
+    dco=$(dco_required "${upstream}" "${base}")
+    if ${dco} && grep -qF "${DCO_CHECK}" <<<"${body}"; then
         warn "${url}'s body already mentions ${DCO_CHECK}; promote adds its own line too, so drop the old note from the fork PR body before promoting"
     fi
-    body=$(with_note "${body}" "${dco}")
 
     local activity approved wants_draft pushed
     activity=$(reviewer_activity "${FORK}" "${NUMBER}")
@@ -1530,9 +1767,27 @@ cmd_promote() {
         ${dry_run} || fatal "${url} ${why_not}"
         warn "${url} ${why_not}; a real promote would stop here"
     fi
+    local approval_url approved_head
+    approval_url=$(verdict 'approval.url // empty')
+    approved_head=$(verdict 'approval.commit_id // empty')
+    # The line about DCO that the upstream PR's body gets, if it needs one.
+    local dco_line=""
+    if ${dco} && ! ${signoff}; then
+        dco_line=$(dco_note "${upstream}" "${base}")
+    fi
     if test "${wants_draft}" = true && ! ${draft}; then
         info "${REVIEWER} asked for '${DRAFT_COMMAND}'; opening the upstream PR as a draft"
         draft=true
+    fi
+
+    # Approved through a sign-off record: check that record in git.
+    local via_record=false
+    if test "${approved}" = true && test "${approved_head}" != "${head_sha}"; then
+        via_record=true
+        info "${head_sha:0:12} is ${REVIEWER}'s approved ${approved_head:0:12} plus his sign-off, per the bot's record; checking that"
+        local rc=0
+        (verify_record "${FORK}" "${head}" "${head_sha}" "${upstream}" "${base}" "${approved_head}") || rc=$?
+        test "${rc}" -eq 0 || exit "${rc}"
     fi
 
     local existing ahead behind compare
@@ -1552,6 +1807,9 @@ Board:     ${item:-(none)}
 Would:
 EOF
         test "${behind}" -eq 0 || echo "- rebase ${head} onto ${upstream}:${base} and force-push it (on conflicts: dismiss the approval, comment, stop)"
+        if ${dco} && ${signoff}; then
+            echo "- add '${SIGNOFF_TRAILER}' to the commits lacking it (${upstream}:${base} requires DCO), committed as him, and force-push it$(${include_others} || echo "; stop if any of them is by someone else")"
+        fi
         if test -n "${existing}"; then
             echo "- reuse the already open ${existing}"
         else
@@ -1559,7 +1817,10 @@ EOF
         fi
         echo "- comment the upstream PR link on ${url} and close it"
         test -z "${item}" || echo "- bot-board set ${item} --status \"In Review\" --branch <upstream PR URL>$(${have_why} && echo " --why ...")"
-        printf '\nTitle: %s\n\n%s\n' "${title}" "${body}"
+        if ${dco} && ${signoff}; then
+            dco_line=$(signoff_note "${approval_url:-<approval>}")
+        fi
+        printf '\nTitle: %s\n\n%s\n' "${title}" "$(with_note "${body}" "${dco_line}")"
         return 0
     fi
 
@@ -1592,6 +1853,33 @@ EOF
         expected_head=${out}
         info "Rebased and pushed ${head} (${expected_head:0:12})"
     fi
+    if ${dco} && ${signoff}; then
+        # His approval of this head (or of what it was rebased from) is what
+        # lets the bot add his sign-off.
+        local out rc=0 signed count
+        out=$(add_signoff "${FORK}" "${head}" "${expected_head}" "${upstream}" "${base}" "${include_others}") || rc=$?
+        test "${rc}" -ne "${EX_OTHERS}" ||
+            fatal "${upstream}:${base} requires DCO, and ${head} has commits by others that lack ${REVIEWER}'s sign-off; if he asks for it, rerun with --include-others to sign those off too, or with --no-signoff to leave the sign-off to the maintainers"
+        test "${rc}" -eq 0 || exit "${rc}"
+        read -r signed count <<<"${out}"
+        if test "${count}" -gt 0; then
+            info "Added ${REVIEWER}'s sign-off to ${count} commit(s) of ${head} and pushed it (${signed:0:12})"
+            expected_head=${signed}
+            # The record that keeps his approval of the head it replaced
+            # valid for this head (see VERDICT_JQ), should promote need a
+            # rerun.
+            ghapi -X POST "repos/${FORK}/issues/${NUMBER}/comments" -f body="Signed off ${count} commit(s) with \`${SIGNOFF_TRAILER}\` for ${upstream}'s DCO check, on ${REVIEWER}'s approval ${approval_url} of \`${head_sha:0:12}\`. Same trees; the head is now \`${signed:0:12}\`.
+
+${SIGNOFF_RECORD} approved=${head_sha} signed=${signed} approval=${approval_url} review=$(verdict 'approval.id // "none"') -->" >/dev/null ||
+                warn "recording the sign-off on ${url} failed; should this promote not finish, ${REVIEWER} needs to approve ${signed:0:12}"
+        fi
+        # Name the approval only if it is what signed off; commits that
+        # already passed (his own, say) need no line at all.
+        if test "${count}" -gt 0 || ${via_record}; then
+            dco_line=$(signoff_note "${approval_url}")
+        fi
+    fi
+    body=$(with_note "${body}" "${dco_line}")
     # Nothing unreviewed may go upstream: fail if anything was pushed since.
     test "$(ref_sha "${FORK}" "${head}")" = "${expected_head}" ||
         fatal "${FORK}:${head} moved while promoting; not opening the upstream PR"
@@ -1725,7 +2013,7 @@ cmd_inbox() {
             .prs[$u] = ((.prs[$u] // {}) + {body: $h, seen: $now} | del(.reviewer_edit)
                 | if $e != "-" then .edits_seen = ($e | tonumber) else . end)' <<<"${state}")
         lines=$(jq -r --arg since "${pr_since}" --argjson n "${EXCERPT_LEN}" --argjson events "${events}" "${BODY_JQ}"'
-            [(.[] | select(.at >= $since)
+            [(.[] | select(.at >= $since and .kind != "signoff")
                   # the container of inline comments, which are listed anyway
                   | select(.kind != "review" or .state != "COMMENTED" or (.body // "") != "")),
              # body edits are selected already, by count where possible

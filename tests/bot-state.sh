@@ -386,11 +386,12 @@ promote_world() {
 readonly PUSHED_10='{"at": "2026-09-24T10:00:00Z", "after": "2222222222222222222222222222222222222222"}'
 readonly COMMITTED_0950='[{"event": "committed", "sha": "2222222222222222222222222222222222222222", "committer": {"date": "2026-09-24T09:50:00Z"}}]'
 
-# expect_promote WHAT APPROVED PATTERN: 'promote --dry-run' approves (yes)
-# or refuses (no), and its output matches the extended regex PATTERN.
+# expect_promote WHAT APPROVED PATTERN [ARGS...]: 'promote --dry-run
+# ARGS' approves (yes) or refuses (no), and its output matches the extended
+# regex PATTERN.
 expect_promote() {
     local out
-    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1) ||
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run "${@:4}" 2>&1) ||
         fail "$1: promote --dry-run failed: ${out}"
     if grep -q 'a real promote would stop here' <<<"${out}"; then
         test "$2" = no || fail "$1: expected an approval, got: ${out}"
@@ -458,20 +459,29 @@ test_pr_promote_dco() {
     ! grep -q 'DCO' <<<"${out}" || fail "a DCO note without a DCO rule: ${out}"
 
     rest "repos/up/demo/rules/branches/main" "${dco_rules}"
+    # By default, his approval signs off, and the body says which one.
+    expect_promote "DCO required" yes \
+        "add 'Signed-off-by: Colin Walters <walters@verbum.org>' to the commits lacking it"
+    expect_promote "DCO required, the approval named" yes \
+        '^The `Signed-off-by: Colin Walters <walters@verbum.org>` on these commits was added on cgwalters.s approval of the review draft: https://github.com/cgwalters-forge/demo/pull/1#issuecomment-'
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
+    ! grep -q '/signoff' <<<"${out}" || fail "a /signoff note although promote signs off: ${out}"
+
+    # With --no-signoff, the maintainers are told how to sign off.
     local workflow=${FAKE_GH}/rest/repos/up/demo/contents/.github/workflows/signoff.yml
     mkdir -p "$(dirname "${workflow}")"
     touch "${workflow}.404"
     expect_promote "DCO required, no /signoff workflow" yes \
-        $'requires DCO, and these commits have no `Signed-off-by`.*git rebase --signoff <upstream>/main'
-    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
+        $'requires DCO, and these commits have no `Signed-off-by`.*git rebase --signoff <upstream>/main' --no-signoff
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run --no-signoff 2>&1)
     # The note goes before the trailer, which stays last.
     grep -A2 'requires DCO' <<<"${out}" | tail -n1 | grep -qxF 'Generated-by: https://github.com/cgwalters/#llms' ||
         fail "the DCO note isn't right before the trailer: ${out}"
 
     rm "${workflow}.404"
     rest "repos/up/demo/contents/.github/workflows/signoff.yml" '{"path": ".github/workflows/signoff.yml"}'
-    expect_promote "DCO required, with the /signoff workflow" yes 'requires DCO; comment `/signoff`'
-    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run 2>&1)
+    expect_promote "DCO required, with the /signoff workflow" yes 'requires DCO; comment `/signoff`' --no-signoff
+    out=$("${BIN}/bot-pr" promote "https://github.com/${PR_FORK}/pull/1" --dry-run --no-signoff 2>&1)
     test "$(grep -c 'requires DCO' <<<"${out}")" -eq 1 || fail "expected one DCO note: ${out}"
 }
 
