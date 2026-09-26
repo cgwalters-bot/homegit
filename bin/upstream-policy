@@ -53,6 +53,8 @@ const CACHE_FILE = path.join(
 );
 const CACHE_TTL_MS = 24 * 3600 * 1000;
 const WORKFLOWS_DIR = ".github/workflows";
+// The workflow event a merge queue runs checks on.
+const MERGE_GROUP = "merge_group";
 const SOURCE_KEYS = ["repo", "path", "sha"];
 const SHA_RE = /^[0-9a-f]{40}$/;
 // OWNER/REPO, neither of them all dots ('..' would leave the records).
@@ -656,18 +658,36 @@ function recordRebase(name) {
 }
 
 // hasMergeGroupTrigger(text): whether the workflow TEXT runs on
-// merge_group, as a key under 'on:', an item of its list, or on the 'on:'
-// line itself. Comments are dropped, and mentions elsewhere (an 'if:' on
-// github.event_name, say) don't count.
+// merge_group: a trigger of its top-level 'on:', as a key or list item at
+// the first level of the block below it, or in the flow value on its line
+// ('on: [push, merge_group]', which may go on over the lines below). Not a
+// YAML parser: comments are dropped, names may be quoted, and merge_group
+// anywhere else (a job, a branch filter, an 'if:', a script) doesn't count.
 function hasMergeGroupTrigger(text) {
-  return text.split(/\r?\n/).some((raw) => {
-    const line = raw.replace(/(^|\s)#.*$/, "");
-    return (
-      /^\s+merge_group\s*:/.test(line) ||
-      /^\s+-\s*merge_group\s*$/.test(line) ||
-      /^["']?on["']?\s*:.*[\s[,{]merge_group\s*($|[\],}:])/.test(line)
-    );
-  });
+  const lines = text.split(/\r?\n/).map((l) => l.replace(/(^|\s)#.*$/, "").trimEnd());
+  const onKey = /^["']?on["']?\s*:\s*/;
+  const start = lines.findIndex((l) => onKey.test(l));
+  if (start < 0) return false;
+  // The value of 'on:': up to the next top-level key (a block sequence
+  // may start at column 0).
+  const end = lines.findIndex((l, i) => i > start && /^[^\s-]/.test(l));
+  const below = lines.slice(start + 1, end < 0 ? undefined : end).filter((l) => l.trim());
+  const unquote = (s) => s.replace(/^["']|["']$/g, "");
+  const inline = lines[start].replace(onKey, "");
+  if (inline) {
+    // A scalar or a flow collection: merge_group at its top (depth 0 or 1).
+    let depth = 0;
+    for (const tok of [inline, ...below].join(" ").match(/[[\]{}]|[^\s[\]{},:]+/g) || []) {
+      if (tok === "[" || tok === "{") depth++;
+      else if (tok === "]" || tok === "}") depth--;
+      else if (depth <= 1 && unquote(tok) === MERGE_GROUP) return true;
+    }
+    return false;
+  }
+  // A block: a key or item as indented as the first one.
+  const indent = (l) => l.length - l.trimStart().length;
+  const trigger = new RegExp(`^\\s*(?:-\\s*)?(["']?)${MERGE_GROUP}\\1\\s*(?::|$)`);
+  return below.some((l) => indent(l) === indent(below[0]) && trigger.test(l));
 }
 
 // detectMergeQueue(name, branch): why NAME uses a merge queue for
