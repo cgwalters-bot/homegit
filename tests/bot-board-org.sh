@@ -82,6 +82,10 @@ readonly CASES=(
     "other||||Something unrelated|"
     "coreos||https://github.com/coreos/rpm-ostree/pull/5635|||"
     "=|other|https://github.com/example/unknown/issues/1|||"
+    # A tracker issue's URL says nothing: its title, then its body links.
+    "bootc-dev||https://github.com/cgwalters-forge/tracker/issues/5||bootc: composefs edit|"
+    "osbuild|cgwalters-forge|https://github.com/cgwalters-forge/tracker/issues/6||Anything|see https://github.com/cgwalters-forge/image-builder/pull/2"
+    "other||https://github.com/cgwalters-forge/tracker/issues/7||Something unrelated|"
 )
 
 items=()
@@ -90,7 +94,7 @@ for i in "${!CASES[@]}"; do
     items+=("$(jq -nc --arg id "PVTI_${i}" --arg org "${org}" --arg url "${url}" \
         --arg branch "${branch}" --arg title "${title:-item ${i}}" --arg body "${body}" '
         {id: $id, title: $title,
-         content: (if $url == "" then {type: "DraftIssue", body: $body} else {type: "Issue", url: $url} end)}
+         content: (if $url == "" then {type: "DraftIssue", body: $body} else {type: "Issue", url: $url, body: $body} end)}
         + (if $org == "" then {} else {org: $org} end)
         + (if $branch == "" then {} else {branch: $branch} end)')")
 done

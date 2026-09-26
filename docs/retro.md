@@ -64,7 +64,7 @@ off). Transcripts expire after 30 days, summaries after 90.
 `bot-retro` builds a structured summary (`--json`, schema
 `bot-retro-summary/v1`) and renders it as a dated Markdown report:
 counts per signal with a few examples each, reviewer findings, repeated
-steps, devspace runs, and up to five proposed board drafts ranked by
+steps, devspace runs, and up to five proposed board items ranked by
 weight (policy over claims over stops and waste over plain errors) and
 by how many agents each touched.
 
@@ -73,21 +73,22 @@ comments. The report quotes at most 120 characters per example,
 replaces token-shaped strings (the patterns of the devspace redaction,
 plus any long digit-bearing run that is neither hex nor a path) with
 `[REDACTED]`, and still belongs in a **secret** gist, never in a public
-issue. Board drafts carry only the generic proposal text and the gist
-link, since the board is visible to more people than the gist.
+issue. The proposals, filed as public issues in cgwalters-forge/tracker,
+carry only the generic proposal text; the gist link goes in their board
+item's Gist field, never in the issue.
 
 ```bash
 bot-retro --since 24h > retro.md          # read it first
 bot-retro --since 24h --json > summary.json
-bot-retro --from-summary summary.json --narrate --gist --drafts 3
+bot-retro --from-summary summary.json --narrate --gist --issues 3
 ```
 
 `--narrate` hands the summary (never the raw logs) to an agent,
 `claude -p` by default (`BOT_RETRO_AGENT`), for a short narrative at the
 top of the report. `--gist` posts the report as a secret gist and prints
-its URL; `--drafts N` adds the top N proposals to the board as drafts
-with no Status (so they wait for triage), Priority P1 and Org
-cgwalters-bot. Curating the proposals by hand (`bot-board draft`) is
+its URL; `--issues N` opens the top N proposals as tracker issues on
+the board with no Status (so they wait for triage), Priority P1 and Org
+cgwalters-bot. Curating the proposals by hand (`bot-board issue`) is
 often better than filing them blind.
 
 ## Where this goes
@@ -100,8 +101,8 @@ decrypts with `BOT_RUNS_AGE_IDENTITY`), so only a holder of the age
 identity can read them.
 
 The retro then becomes a scheduled workflow: weekly, it runs
-`bot-retro --since 7d --run-transcripts --narrate --gist --drafts 3`,
-posting the report as a secret gist and filing drafts for triage. That
+`bot-retro --since 7d --run-transcripts --narrate --gist --issues 3`,
+posting the report as a secret gist and filing issues for triage. That
 needs a job that can decrypt transcripts, create gists and write to the
 board, so it needs secrets (the age identity, a token for the bot) that
 no workflow holds yet; until they are provisioned deliberately, the

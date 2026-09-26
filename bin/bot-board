@@ -44,7 +44,7 @@ readonly NON_REPO_PATHS=(users orgs settings notifications sponsors marketplace 
 readonly REPO_TTL=86400
 # Org for owners with no Org option of their own.
 readonly ORG_OTHER=other
-# Org by the first word of a title, for draft items without a repository
+# Org by the first word of a title, for tracker issues (and old drafts)
 # link; the word is lowercased, with a trailing ':' removed.
 readonly -A TITLE_ORGS=(
     [bootc]=bootc-dev [bcvk]=bootc-dev [infra]=bootc-dev
@@ -61,6 +61,23 @@ readonly -A TITLE_ORGS=(
 )
 # Org edits sent per GraphQL request by fill-org.
 readonly ORG_BATCH=20
+# Everything on the board that isn't an upstream issue or PR is an issue
+# here: work items, parents of larger efforts, and questions for
+# OPERATOR. Its issues say nothing about which organization their work
+# targets, so the Org of an item there comes from its title and body.
+readonly TRACKER_REPO=cgwalters-forge/tracker
+# The only login whose answers count; questions are assigned to him.
+readonly OPERATOR=cgwalters
+readonly QUESTION_LABEL=question
+readonly QUESTION_STATUS='Needs human'
+readonly DONE_STATUS=Done
+# The first line of a question's body: the board item it blocks.
+readonly BLOCKS_PREFIX='Blocks: '
+# Board text fields are kept short (see the workstream skill).
+readonly WHY_MAX=400
+readonly QUESTION_TITLE_MAX=100
+# Option letters; the recommendation, if any, is always the first.
+readonly OPTION_LETTERS=ABCDEFGHIJ
 # Every gh project call spends the bot's GraphQL quota (5000 points/hour),
 # which all agents share, so reads are cached on disk.
 readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-board
@@ -131,7 +148,34 @@ Commands:
                               URL's repository (a fork's upstream, for
                               forks in cgwalters-forge); prints the new
                               item id
-  draft TITLE BODY            Create a draft item; prints the new item id
+  issue [--parent ITEM] [--org O] TITLE BODY
+                              Open an issue in ${TRACKER_REPO} and add it
+                              to the board (no Status: triage); prints
+                              the new item id. --parent makes it a
+                              sub-issue of that ${TRACKER_REPO} issue.
+                              Org comes from the title and body links
+                              unless given. Board items are never drafts
+  question BLOCKED QUESTION [--option TEXT]... [--recommend WHY]
+           [--context TEXT] [--title TEXT] [--priority P]
+                              Ask ${OPERATOR} something: open an issue in
+                              ${TRACKER_REPO} labelled '${QUESTION_LABEL}' and
+                              assigned to him, whose first line is
+                              '${BLOCKS_PREFIX}URL' and whose options are
+                              lettered in the order given (--recommend:
+                              A is the recommendation, for WHY). A
+                              BLOCKED item that is a ${TRACKER_REPO} issue
+                              gets it as a sub-issue. Both go to Status
+                              '${QUESTION_STATUS}' on the board (the question
+                              with BLOCKED's Org, and its Priority unless
+                              given); prints the question's URL. He
+                              answers with a comment on it. An upstream
+                              BLOCKED is linked in a code span, which
+                              adds nothing to its timeline
+  resolve QUESTION TEXT       After acting on an answer: comment TEXT (one
+                              line saying what was done) on the question
+                              (an issue in ${TRACKER_REPO} labelled
+                              '${QUESTION_LABEL}'), close it and set its item
+                              ${DONE_STATUS}
   set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT]
            [--branch URL...] [--gist URL...] [--field NAME VALUE]...
                               Update fields of an item. Branch holds the
@@ -145,7 +189,7 @@ Commands:
                               Set Org on items that have none (--all:
                               also correct every other item), from the
                               Branch URLs, else the content URL, else the
-                              title's first word, else a draft's body
+                              title's first word, else the body
                               links; '${ORG_OTHER}' when nothing matches
                               and the item has no Org yet
   state-get [--track] NAME    Print the JSON state kept in the archived
@@ -172,6 +216,7 @@ Options:
                               work on ${WORKSTREAM} only
 
 ITEM is a project item id (PVTI_...), an issue/PR URL, or OWNER/REPO#N.
+BLOCKED and QUESTION are issue/PR URLs or OWNER/REPO#N.
 Valid values for Status, Priority, Workflow and Org are read from the board.
 
 Board calls use the bot's GraphQL quota, shared by all agents, so field
@@ -425,20 +470,19 @@ cmd_show() {
            then "\n\($item.content.body)" else empty end)' <<<"${ITEMS_JSON}"
 }
 
-cmd_add() {
-    test $# -eq 1 || fatal "usage: $(basename "$0") add URL"
-    [[ "$1" == https://github.com/* ]] || fatal "expected an issue or PR URL on github.com, got '$1'"
-    local org id
+# add_item URL [ORG]: adds an issue or PR to the board and prints its
+# item id; sets Org to ORG, else to the URL's (on boards with an Org).
+add_item() {
+    local url=$1 org=${2:-} id
     load_fields
     # Other boards have no Org field.
     local want_org=false
     ! has_field Org || want_org=true
     # A failed fork lookup shouldn't keep the item off the board.
-    org=
-    ! ${want_org} || org=$(org_of_url "$1") || org=
+    test -n "${org}" || ! ${want_org} || org=$(org_of_url "${url}") || org=
     invalidate_items
-    id=$(ghq project item-add "${NUMBER}" --owner "${OWNER}" --url "$1" --format json --jq .id) ||
-        fail_after $? "adding $1 to the board failed"
+    id=$(ghq project item-add "${NUMBER}" --owner "${OWNER}" --url "${url}" --format json --jq .id) ||
+        fail_after $? "adding ${url} to the board failed"
     echo "${id}"
     ${want_org} || return 0
     if test -z "${org}" || ! set_org "${id}" "${org}"; then
@@ -446,11 +490,227 @@ cmd_add() {
     fi
 }
 
+cmd_add() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") add URL"
+    [[ "$1" == https://github.com/* ]] || fatal "expected an issue or PR URL on github.com, got '$1'"
+    add_item "$1"
+}
+
 cmd_draft() {
-    test $# -eq 2 || fatal "usage: $(basename "$0") draft TITLE BODY"
-    test -n "$1" || fatal "draft title must not be empty"
-    invalidate_items
-    ghq project item-create "${NUMBER}" --owner "${OWNER}" --title "$1" --body "$2" --format json --jq .id
+    fatal "board items are no longer drafts: use '$(basename "$0") issue TITLE BODY' (an issue in ${TRACKER_REPO}), or 'question' to ask ${OPERATOR} something"
+}
+
+# --- Tracker issues and questions -------------------------------------------
+
+# issue_ref REF: prints "OWNER/REPO NUMBER" for an issue or PR URL or
+# OWNER/REPO#N.
+issue_ref() {
+    if [[ "$1" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(issues|pull)/([0-9]+)([#?].*)?$ ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[3]}"
+    elif [[ "$1" =~ ^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#([0-9]+)$ ]]; then
+        echo "${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+    else
+        fatal "expected an issue or PR URL or OWNER/REPO#N, got '$1'"
+    fi
+}
+
+is_tracker() { # is_tracker OWNER/REPO
+    test "${1,,}" = "${TRACKER_REPO,,}"
+}
+
+# open_issue TITLE BODY [JQ_EXTRA]: opens an issue in TRACKER_REPO (with
+# the fields of the JSON object JQ_EXTRA added) and prints its REST JSON.
+open_issue() {
+    local payload
+    payload=$(jq -nc --arg title "$1" --arg body "$2" --argjson extra "${3:-{\}}" \
+        '{title: $title, body: $body} + $extra')
+    ghq api -X POST "repos/${TRACKER_REPO}/issues" --input - <<<"${payload}" ||
+        fail_after $? "opening an issue in ${TRACKER_REPO} failed"
+}
+
+# add_sub_issue PARENT_REPO PARENT_NUMBER CHILD_ID: makes the issue with
+# REST id CHILD_ID a sub-issue of the parent. Call it in a subshell once
+# the child exists: a rate limit exits.
+add_sub_issue() {
+    ghq api -X POST "repos/$1/issues/$2/sub_issues" -F sub_issue_id="$3" >/dev/null
+}
+
+# text_org TITLE BODY: the Org for an item with this title and body (its
+# first word, else its body's links), or nothing; requires load_fields.
+text_org() {
+    item_org "$(jq -nc --arg title "$1" --arg body "$2" '{title: $title, content: {body: $body}}')"
+}
+
+cmd_issue() {
+    local parent="" org="" args=()
+    while test $# -gt 0; do
+        case "$1" in
+            --parent) test $# -ge 2 || fatal "--parent requires an issue"; parent=$2; shift 2 ;;
+            --org) test $# -ge 2 || fatal "--org requires an argument"; org=$2; shift 2 ;;
+            -*) fatal "unknown option for issue: '$1' (see --help)" ;;
+            *) args+=("$1"); shift ;;
+        esac
+    done
+    test "${#args[@]}" -eq 2 || fatal "usage: $(basename "$0") issue [--parent ITEM] [--org O] TITLE BODY"
+    test -n "${args[0]}" || fatal "the issue title must not be empty"
+    local parent_repo="" parent_number="" ref
+    if test -n "${parent}"; then
+        ref=$(issue_ref "${parent}") || exit
+        read -r parent_repo parent_number <<<"${ref}"
+        is_tracker "${parent_repo}" || fatal "--parent must be an issue in ${TRACKER_REPO}, not '${parent}'"
+    fi
+    load_fields
+    if test -n "${org}"; then
+        option_id Org "${org}" >/dev/null
+    elif has_field Org; then
+        org=$(text_org "${args[0]}" "${args[1]}")
+    fi
+    local issue url id
+    issue=$(open_issue "${args[0]}" "${args[1]}")
+    url=$(jq -r .html_url <<<"${issue}")
+    echo "opened ${url}" 1>&2
+    # On the board before it is a sub-issue: the board's "Auto-add
+    # sub-issues" workflow would add it first, and then item-add fails.
+    id=$(add_item "${url}" "${org}") ||
+        fail_after $? "opened ${url}, but adding it to the board failed; add it with '$(basename "$0") add'"
+    if test -n "${parent}"; then
+        (add_sub_issue "${parent_repo}" "${parent_number}" "$(jq -r .id <<<"${issue}")") ||
+            echo "warning: making ${url} a sub-issue of ${parent} failed; do it on GitHub" 1>&2
+    fi
+    echo "${id}"
+}
+
+# question_body BLOCKED_URL QUESTION CONTEXT RECOMMEND OPTION...: the
+# body of a question issue. A bare link to an issue or PR elsewhere would
+# put "mentioned this" on its timeline, upstream noise; one in a code
+# span doesn't.
+question_body() {
+    local blocked=$1 question=$2 context=$3 recommend=$4 i
+    shift 4
+    if [[ "${blocked,,}" == "https://github.com/${TRACKER_REPO,,}/"* ]]; then
+        printf '%s%s\n\n' "${BLOCKS_PREFIX}" "${blocked}"
+    else
+        printf '%s`%s`\n\n' "${BLOCKS_PREFIX}" "${blocked}"
+    fi
+    test -z "${context}" || printf '%s\n\n' "${context}"
+    printf 'Q: %s\n' "${question}"
+    if test $# -gt 0; then
+        printf '\nOptions:\n'
+        for ((i = 1; i <= $#; i++)); do
+            printf '%s) %s\n' "${OPTION_LETTERS:i-1:1}" "${!i}"
+        done
+    fi
+    test -z "${recommend}" || printf '\nRecommended: A, because %s\n' "${recommend}"
+    printf '\n%s\n' "Answer with a comment on this issue: $(test $# -eq 0 || echo "an option's letter alone on the first line (e.g. \`B\`), optionally followed by your own text, or ")just text. Only comments by the ${OPERATOR} login count."
+}
+
+# one_line TEXT MAX: TEXT on one line, cut to MAX characters.
+one_line() {
+    local text=${1//$'\n'/ }
+    test "${#text}" -le "$2" || text="${text:0:$(($2 - 3))}..."
+    printf '%s' "${text}"
+}
+
+cmd_question() {
+    local blocked="" question="" context="" recommend="" title="" priority="" options=() have_question=false
+    while test $# -gt 0; do
+        case "$1" in
+            --option) test $# -ge 2 || fatal "--option requires a text"; test -n "$2" || fatal "an option must not be empty"
+                options+=("$2"); shift 2 ;;
+            --recommend) test $# -ge 2 || fatal "--recommend requires a reason"; recommend=$2; shift 2 ;;
+            --context) test $# -ge 2 || fatal "--context requires a text"; context=$2; shift 2 ;;
+            --title) test $# -ge 2 || fatal "--title requires a text"; title=$2; shift 2 ;;
+            --priority) test $# -ge 2 || fatal "--priority requires an argument"; priority=$2; shift 2 ;;
+            -*) fatal "unknown option for question: '$1' (see --help)" ;;
+            *)
+                if test -z "${blocked}"; then blocked=$1
+                elif ! ${have_question}; then question=$1; have_question=true
+                else fatal "unexpected argument '$1'; options go in --option"
+                fi
+                shift ;;
+        esac
+    done
+    { test -n "${blocked}" && test -n "${question}"; } ||
+        fatal "usage: $(basename "$0") question BLOCKED QUESTION [--option TEXT]... [--recommend WHY] [--context TEXT] [--title TEXT] [--priority P]"
+    test "${#options[@]}" -ne 1 || fatal "give at least two options, or none"
+    test "${#options[@]}" -le "${#OPTION_LETTERS}" || fatal "at most ${#OPTION_LETTERS} options"
+    test -z "${recommend}" || test "${#options[@]}" -gt 0 ||
+        fatal "--recommend recommends option A, so it needs options (the recommended one first)"
+    local blocked_repo blocked_number blocked_url ref
+    ref=$(issue_ref "${blocked}") || exit
+    read -r blocked_repo blocked_number <<<"${ref}"
+    blocked_url=https://github.com/${blocked_repo}/issues/${blocked_number}
+    [[ "${blocked}" != */pull/* ]] || blocked_url=https://github.com/${blocked_repo}/pull/${blocked_number}
+    # Settle everything the board decides before anything is created.
+    load_fields
+    test -z "${priority}" || option_id Priority "${priority}" >/dev/null
+    load_items
+    local blocked_item org
+    blocked_item=$(jq -c --arg url "${blocked_url,,}" \
+        'first(.items[] | select((.content.url // "" | ascii_downcase) == $url)) // empty' <<<"${ITEMS_JSON}")
+    test -n "${blocked_item}" ||
+        echo "warning: ${blocked_url} is not on the board (or the listing lags); only the question goes on it" 1>&2
+    test -n "${priority}" || priority=$(jq -r '.priority // empty' <<<"${blocked_item:-{\}}")
+    org=$(jq -r '.org // empty' <<<"${blocked_item:-{\}}")
+    test -n "${org}" || org=$(item_org "${blocked_item:-$(jq -nc --arg url "${blocked_url}" '{content: {url: $url}}')}")
+    test -n "${title}" || title=$(one_line "${question}" "${QUESTION_TITLE_MAX}")
+    local body issue url
+    body=$(question_body "${blocked_url}" "${question}" "${context}" "${recommend}" "${options[@]}")
+    issue=$(open_issue "${title}" "${body}" "$(jq -nc --arg label "${QUESTION_LABEL}" --arg op "${OPERATOR}" \
+        '{labels: [$label], assignees: [$op]}')")
+    url=$(jq -r .html_url <<<"${issue}")
+    echo "opened ${url}" 1>&2
+    local id why fields=(--status "${QUESTION_STATUS}")
+    id=$(add_item "${url}" "${org}") ||
+        fail_after $? "opened ${url}, but adding it to the board failed; add it with '$(basename "$0") add' and set Status '${QUESTION_STATUS}'"
+    # Only now a sub-issue (see cmd_issue).
+    if is_tracker "${blocked_repo}" && [[ "${blocked_url}" == */issues/* ]]; then
+        (add_sub_issue "${blocked_repo}" "${blocked_number}" "$(jq -r .id <<<"${issue}")") ||
+            echo "warning: making ${url} a sub-issue of ${blocked_url} failed; its ${BLOCKS_PREFIX% } line still links them" 1>&2
+    fi
+    why="Q: $(one_line "${question}" $((WHY_MAX - 20)))"
+    test -z "${recommend}" || why+=" (rec A)"
+    fields+=(--why "${why}")
+    test -z "${priority}" || fields+=(--priority "${priority}")
+    # In subshells, so that a failed edit still prints the question's id.
+    (cmd_set "${id}" "${fields[@]}" >/dev/null) ||
+        echo "warning: setting up the question's item ${id} failed; set: ${fields[*]}" 1>&2
+    if test -n "${blocked_item}"; then
+        local blocked_id
+        blocked_id=$(jq -r .id <<<"${blocked_item}")
+        (cmd_set "${blocked_id}" --status "${QUESTION_STATUS}" >/dev/null) ||
+            echo "warning: setting ${blocked_id} (${blocked_url}) to ${QUESTION_STATUS} failed; do it by hand" 1>&2
+    fi
+    echo "on the board as ${id}" 1>&2
+    echo "${url}"
+}
+
+cmd_resolve() {
+    test $# -eq 2 || fatal "usage: $(basename "$0") resolve QUESTION TEXT"
+    [[ "$2" =~ [^[:space:]] ]] || fatal "say in TEXT what was done"
+    local repo number url ref
+    ref=$(issue_ref "$1") || exit
+    read -r repo number <<<"${ref}"
+    url=https://github.com/${repo}/issues/${number}
+    is_tracker "${repo}" || fatal "resolve closes questions in ${TRACKER_REPO}, not '$1'; close anything else yourself"
+    local labels
+    labels=$(ghq api "repos/${repo}/issues/${number}" --jq '[.labels[].name] | join(" ")') ||
+        fail_after $? "reading ${url} failed"
+    [[ " ${labels} " == *" ${QUESTION_LABEL} "* ]] ||
+        fatal "${url} isn't labelled '${QUESTION_LABEL}': resolve only closes questions"
+    ghq api -X POST "repos/${repo}/issues/${number}/comments" -f body="$2" >/dev/null ||
+        fail_after $? "commenting on ${url} failed"
+    ghq api -X PATCH "repos/${repo}/issues/${number}" -f state=closed -f state_reason=completed >/dev/null ||
+        fail_after $? "closing ${url} failed"
+    echo "closed ${url}"
+    load_items
+    local id
+    id=$(jq -r --arg url "${url,,}" 'first(.items[] | select((.content.url // "" | ascii_downcase) == $url) | .id) // empty' <<<"${ITEMS_JSON}")
+    if test -z "${id}"; then
+        echo "warning: ${url} is not on the board (or the listing lags); set its item ${DONE_STATUS} by id" 1>&2
+        return 0
+    fi
+    cmd_set "${id}" --status "${DONE_STATUS}"
 }
 
 one_of() { # one_of VALUE CHOICES...
@@ -564,6 +824,7 @@ org_of_url() {
     local owner=${BASH_REMATCH[1],,} repo=${BASH_REMATCH[2],,} source
     ! one_of "${owner}" "${NON_REPO_PATHS[@]}" || return 0
     repo=${owner}/${repo%.git}
+    ! is_tracker "${repo}" || return 0
     if one_of "${owner}" "${FORK_OWNERS[@]}"; then
         source=$(cached "source-${owner}_${repo#*/}" "${REPO_TTL}" \
             gh api "repos/${repo}" --jq '.source.full_name // empty') || {
@@ -582,7 +843,8 @@ org_of_url() {
 
 # item_org ITEM_JSON: the Org derived from an item's Branch URLs (where
 # its work lands), else its content URL, else its title's first word,
-# else the links in a draft's body, else nothing; requires load_fields.
+# else the links in its body, else nothing (an issue in TRACKER_REPO says
+# nothing by its URL); requires load_fields.
 item_org() {
     local urls=() body_urls=() url title word org
     mapfile -t urls < <(jq -r '((.branch // "") | split(" ") | map(select(. != ""))[]), (.content.url // empty)' <<<"$1")
@@ -943,7 +1205,8 @@ command=$1
 shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
-    list|show|add|draft|set) ;;
+    list|show|add|draft|set|issue|resolve) ;;
+    question) workstream_only "${command}" ;;
     fill-org) workstream_only "${command}"; command=fill_org ;;
     state-get) workstream_only "${command}"; command=state_get ;;
     state-put) workstream_only "${command}"; command=state_put ;;
