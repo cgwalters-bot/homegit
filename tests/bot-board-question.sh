@@ -36,7 +36,7 @@ arg() { # arg NAME ARGS...: the value after NAME
 }
 case "$1 $2" in
     "project field-list") cat "${store}/fields.json" ;;
-    "project item-list") cat "${store}/items.json" ;;
+    "project item-list") echo list >>"${store}/lists"; cat "${store}/items.json" ;;
     "project view") echo PVT_fake ;;
     "project item-add") url=$(arg --url "$@"); log "add ${url}"; echo "PVTI_new" ;;
     "project item-edit")
@@ -44,6 +44,19 @@ case "$1 $2" in
         test -n "${value}" || value=$(arg --single-select-option-id "$@")
         log "edit $(arg --id "$@") $(arg --field-id "$@") ${value}" ;;
     "api rate_limit") echo 5000 ;;
+    # The item lookup: the board's items with the fields it reads, all on
+    # one page; and an item's content by id.
+    "api graphql")
+        filter=$(arg --jq "$@")
+        if grep -q 'items(first: 100, query' <<<"$*"; then
+            jq '{data: {user: {projectV2: {items: {pageInfo: {hasNextPage: false}, nodes: [.items[]
+                | {id, content, priority: (if .priority then {name: .priority} else null end),
+                   org: (if .org then {name: .org} else null end)}]}}}}}' "${store}/items.json"
+        else
+            id=$(printf '%s\n' "$@" | sed -n 's/^id=//p')
+            jq --arg id "${id}" '{data: {node: {content: (first(.items[] | select(.id == $id) | .content) // null)}}}' \
+                "${store}/items.json"
+        fi | jq -r "${filter:-.}" ;;
     "api -X")
         method=$3 path=$4
         case "${method} ${path}" in
@@ -58,15 +71,26 @@ case "$1 $2" in
             POST\ repos/*/comments)
                 p=${path#repos/}; p=${p%/comments}
                 log "comment ${p%/issues/*}#${p##*/} $(arg -f "$@")" ;;
+            "POST repos/cgwalters-forge/tracker/labels")
+                log "label $(printf '%s\n' "$@" | sed -n 's/^name=//p') $(printf '%s\n' "$@" | sed -n 's/^color=//p')" ;;
+            POST\ repos/*/labels)
+                p=${path#repos/}; p=${p%/labels}
+                log "addlabels ${p%/issues/*}#${p##*/} $(jq -c .labels)" ;;
+            DELETE\ repos/*/labels/*)
+                p=${path#repos/}; name=${p##*/}; p=${p%/labels/*}
+                log "rmlabel ${p%/issues/*}#${p##*/} ${name}" ;;
             PATCH\ repos/*)
                 p=${path#repos/}
                 log "close ${p%/issues/*}#${p##*/} $(printf '%s ' "$@" | grep -o 'state_reason=[a-z_]*')" ;;
             *) echo "fake gh: unexpected call: $*" 1>&2; exit 1 ;;
         esac ;;
-    # Issue 42 is a question, 43 isn't.
-    "api repos/cgwalters-forge/tracker/issues/42") echo "question" ;;
-    "api repos/cgwalters-forge/tracker/issues/43") echo "enhancement" ;;
-    api\ repos/*) echo "gh: Not Found (HTTP 404)" 1>&2; exit 1 ;;
+    # 'gh api PATH --jq FILTER' reads $FAKE_GH/api/PATH (with '/' as '_', no
+    # query string); a 404 when there's none.
+    api\ --paginate|api\ repos/*)
+        path=$2; test "${path}" != --paginate || path=$3
+        file=${store}/api/$(sed 's/?.*//; s,/,_,g' <<<"${path}")
+        test -e "${file}" || { echo "gh: Not Found (HTTP 404)" 1>&2; exit 1; }
+        filter=$(arg --jq "$@"); jq -r "${filter:-.}" "${file}" ;;
     *) echo "fake gh: unexpected call: $*" 1>&2; exit 1 ;;
 esac
 EOF
@@ -78,19 +102,25 @@ jq -n '{fields: (
      {name: "Org", opts: ["bootc-dev", "composefs", "cgwalters-bot", "other"]}]
     | map({id: "F_\(.name)", name, options: [.opts[] | {id: "O_\(.)", name: .}]})
     + [{id: "F_Why", name: "Why"}])}' >"${FAKE_GH}/fields.json"
+# Issue 42 is a question, 43 isn't; the tracker has two labels so far.
+mkdir -p "${FAKE_GH}/api"
+echo '{"labels": [{"name": "question"}, {"name": "P1"}]}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_42"
+echo '{"labels": [{"name": "enhancement"}]}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_43"
+echo '[{"name": "question"}, {"name": "P1"}]' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_labels"
 jq -n --arg t "${TRACKER}" '{items: [
     {id: "PVTI_parent", title: "composefs-rs: design a stable varlink API v1", status: "In Progress",
      priority: "P0", org: "composefs", content: {type: "Issue", url: "\($t)/issues/5", body: ""}},
     {id: "PVTI_pr", title: "UKI Addons Support", status: "In Review", priority: "P1",
      content: {type: "PullRequest", url: "https://github.com/bootc-dev/bootc/pull/9"}},
-    {id: "PVTI_q", title: "Q", status: "Needs human", content: {type: "Issue", url: "\($t)/issues/42"}}]}' \
+    {id: "PVTI_q", title: "Q", status: "Needs human", content: {type: "Issue", url: "\($t)/issues/42"}},
+    {id: "PVTI_np", title: "No priority", org: "bootc-dev", content: {type: "Issue", url: "\($t)/issues/44"}}]}' \
     >"${FAKE_GH}/items.json"
 
 # run ARGS...: runs bot-board with a fresh cache and log; its stdout is in
 # $out, and the log in $FAKE_GH/log.
 run() {
-    rm -rf "${HOME}/cache" "${FAKE_GH}/log"
-    touch "${FAKE_GH}/log"
+    rm -rf "${HOME}/cache" "${FAKE_GH}/log" "${FAKE_GH}/lists"
+    touch "${FAKE_GH}/log" "${FAKE_GH}/lists"
     out=$("${BIN}/bot-board" "$@" 2>"${WORK}/err")
 }
 
@@ -121,7 +151,7 @@ Answer with a comment on this issue: an option's letter alone on the first line 
 payload=$(sed -n 's/^issue //p' "${FAKE_GH}/log")
 test "$(jq -r .body <<<"${payload}")" = "${want_body}" ||
     fail "question body:"$'\n'"$(jq -r .body <<<"${payload}")"
-jq -e '.title == "Split the interfaces?" and .labels == ["question"] and .assignees == ["cgwalters"]' \
+jq -e '.title == "Split the interfaces?" and .labels == ["question", "P0", "target:composefs"] and .assignees == ["cgwalters"]' \
     <<<"${payload}" >/dev/null || fail "question issue fields: ${payload}"
 expect_log "sub cgwalters-forge/tracker#5 sub_issue_id=900"
 expect_log "add ${TRACKER}/issues/42"
@@ -134,7 +164,14 @@ expect_log "edit PVTI_new F_Status O_Needs human"
 expect_log "edit PVTI_new F_Why Q: Split the interfaces? (rec A)"
 expect_log "edit PVTI_new F_Priority O_P0"
 expect_log "edit PVTI_parent F_Status O_Needs human"
+# Missing labels are created with their colors; P1 exists already.
+expect_log "label P0 d73a4a"
+expect_log "label target:composefs 1d76db"
+! grep -q '^label P1 ' "${FAKE_GH}/log" || fail "recreated an existing label"
 echo "ok: question on a tracker issue"
+
+# A full listing costs ~300 GraphQL points; a question needs none.
+test ! -s "${FAKE_GH}/lists" || fail "question listed the whole board"
 
 # --- A question blocking an upstream PR: no sub-issue ---------------------
 
@@ -196,16 +233,70 @@ run resolve cgwalters-forge/tracker#42 "Split the interfaces in forge composefs-
 expect_log "comment cgwalters-forge/tracker#42 body=Split the interfaces in forge composefs-rs#9."
 expect_log "close cgwalters-forge/tracker#42 state_reason=completed"
 expect_log "edit PVTI_q F_Status O_Done"
+test ! -s "${FAKE_GH}/lists" || fail "resolve listed the whole board"
 echo "ok: resolve"
+
+# --- Labels follow Priority and Org on tracker issues ---------------------
+
+# "ARGS|EXPECTED label calls, ';'-separated, or - for none" (tab-separated
+# args); tracker#42 has the labels question and P1.
+readonly LABEL_CASES=(
+    "set	${TRACKER}/issues/42	--priority	P2|addlabels cgwalters-forge/tracker#42 [\"P2\"];rmlabel cgwalters-forge/tracker#42 P1"
+    "set	cgwalters-forge/tracker#42	--org	cgwalters-bot|addlabels cgwalters-forge/tracker#42 [\"target:cgwalters-bot\"]"
+    "set	PVTI_q	--priority	P1	--status	Done|-"
+    "set	PVTI_q	--priority	P0	--org	bootc-dev|addlabels cgwalters-forge/tracker#42 [\"P0\",\"target:bootc-dev\"];rmlabel cgwalters-forge/tracker#42 P1"
+    "set	https://github.com/bootc-dev/bootc/pull/9	--priority	P0|-"
+    "set	PVTI_q	--why	x|-"
+    "--project	composefs-stable	set	PVTI_q	--priority	P0|-"
+)
+for c in "${LABEL_CASES[@]}"; do
+    IFS='|' read -r argline want <<<"${c}"
+    IFS=$'\t' read -r -a args <<<"${argline}"
+    run "${args[@]}" || fail "'${argline}' failed: $(cat "${WORK}/err")"
+    test ! -s "${FAKE_GH}/lists" || fail "'${argline}' listed the whole board"
+    if test "${want}" = -; then
+        ! grep -qE '^(addlabels|rmlabel) ' "${FAKE_GH}/log" || fail "'${argline}' changed labels: $(cat "${FAKE_GH}/log")"
+    else
+        IFS=';' read -r -a wants <<<"${want}"
+        for w in "${wants[@]}"; do expect_log "${w}"; done
+        test "$(grep -cE '^(addlabels|rmlabel) ' "${FAKE_GH}/log")" -eq "${#wants[@]}" ||
+            fail "'${argline}': other label calls: $(cat "${FAKE_GH}/log")"
+    fi
+done
+# Own infrastructure gets the lighter target color.
+run set "${TRACKER}/issues/42" --org cgwalters-bot
+expect_log "label target:cgwalters-bot bfd4f2"
+echo "ok: ${#LABEL_CASES[@]} label syncs"
+
+run labels --dry-run
+grep -qxF "${TRACKER}/issues/5: P0, target:composefs" <<<"${out}" || fail "labels --dry-run: ${out}"
+grep -qxF "${TRACKER}/issues/42: no priority" <<<"${out}" || fail "labels --dry-run: ${out}"
+# An item with an Org but no Priority keeps the Org as its target.
+grep -qxF "${TRACKER}/issues/44: no priority, target:bootc-dev" <<<"${out}" || fail "labels --dry-run: ${out}"
+test ! -s "${FAKE_GH}/log" || fail "labels --dry-run wrote: $(cat "${FAKE_GH}/log")"
+# #5 gets both labels, #42 loses P1 (its item has no Priority).
+echo '{"labels": []}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_5"
+run labels
+expect_log "addlabels cgwalters-forge/tracker#5 [\"P0\",\"target:composefs\"]"
+expect_log "rmlabel cgwalters-forge/tracker#42 P1"
+test "$(grep -c '^label target:composefs ' "${FAKE_GH}/log")" -eq 1 || fail "created a label twice: $(cat "${FAKE_GH}/log")"
+! run --project composefs-stable labels || fail "labels ran on another board"
+echo "ok: labels"
+
+run add --priority P2 https://github.com/bootc-dev/bootc/issues/77
+expect_log "add https://github.com/bootc-dev/bootc/issues/77"
+expect_log "edit PVTI_new F_Priority O_P2"
+echo "ok: add --priority"
 
 # --- issue -----------------------------------------------------------------
 
-run issue --parent "${TRACKER}/issues/5" "bootc: composefs edit" "Body."
+run issue --parent "${TRACKER}/issues/5" --priority P1 "bootc: composefs edit" "Body."
 payload=$(sed -n 's/^issue //p' "${FAKE_GH}/log")
-jq -e '. == {title: "bootc: composefs edit", body: "Body."}' <<<"${payload}" >/dev/null ||
+jq -e '. == {title: "bootc: composefs edit", body: "Body.", labels: ["P1", "target:bootc-dev"]}' <<<"${payload}" >/dev/null ||
     fail "issue payload: ${payload}"
 expect_log "sub cgwalters-forge/tracker#5 sub_issue_id=900"
 expect_log "add ${TRACKER}/issues/42"
 expect_log "edit PVTI_new F_Org O_bootc-dev"
+expect_log "edit PVTI_new F_Priority O_P1"
 test "${out}" = PVTI_new || fail "issue printed '${out}'"
 echo "ok: issue"
