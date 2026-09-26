@@ -141,6 +141,22 @@ the body), takes the last one for the run and attempt, and marks what it
 read from there as partial. Analysis write-ups aren't searched yet: they
 have no searchable home until the plan's notes repository exists.
 
+Local coordinator and worker runs have no `summary.json`; their footer
+is `bot-run/v1`, which `bin/bot-footer` renders for one task from
+`bot-cost --json`. `bot-pr fork-pr --footer FILE` and `set-body --footer
+FILE` add it at the end of the bot-meta section, after earlier footers,
+and `refresh-meta` keeps both kinds:
+
+```
+<sub>Bot run: session 929c7a64, agent afc36173 · claude-opus-5-5 1.2M in (97% cached) / 40k out · ~$12.30 inference + ~$0.50 compute (est., list prices) · 42m wall · 1.3 core-h, Actions run [123456789](https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/123456789)</sub>
+<!-- bot-run/v1 {"task":"PVTI_...","item":"PVTI_...","sessions":[...],"agents":[...],"first_message_at":"...","last_message_at":"...","duration_s":2520,"models":{"claude-opus-5-5":{"tokens":{...},"usd":12.3}},"usd":{"inference":12.3,"compute":0.5,"total":12.8},"core_hours":1.3,"run_urls":[...],"window_since":"...","generated_at":"...","estimate":true} -->
+```
+
+The same rules hold: ids, numbers, timestamps and URLs only, `--`
+escaped. Costs are list-price estimates of the task's messages and
+Actions runs within bot-footer's `--since` window (default 2 days), and
+the duration is wall time from its first message to its last.
+
 ## Redaction
 
 Before anything is printed to the log or uploaded, the supervisor
