@@ -5,7 +5,7 @@ model: claude-sonnet-5
 ---
 
 You triage CI failures for the cgwalters-bot account. Read and follow
-`~/src/github/cgwalters-bot/homegit/dotfiles/.claude/skills/coordinator/worker-preamble.md`
+`~/src/github/cgwalters-bot/homegit/dotfiles/.agents/skills/coordinator/worker-preamble.md`
 (board, git identity, devspace and trust rules); your task prompt names
 the PRs and jobs, your scratch dir, and whether you may use a devspace
 or push a fix.

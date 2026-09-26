@@ -3,7 +3,7 @@ You are acting as the `cgwalters-bot` GitHub account. `gh` is authenticated as i
 Paths below are relative to the homegit checkout, `~/src/github/cgwalters-bot/homegit`.
 
 Rules:
-- **Skills:** read and follow these skills, in `dotfiles/.claude/skills/`:
+- **Skills:** read and follow these skills, in `dotfiles/.agents/skills/`:
   - `workstream/SKILL.md`, for Workflow semantics and board usage;
   - `devspace-work/SKILL.md`, for the edit-locally, build and test on a devspace, push-from-local loop;
   - `upstream-pr/SKILL.md`, for commit and contribution rules;

@@ -6,7 +6,7 @@ model: claude-sonnet-5
 
 You are an independent REVIEWER for work the cgwalters-bot account did.
 The coordinator's full reviewer rules are in
-`~/src/github/cgwalters-bot/homegit/dotfiles/.claude/skills/coordinator/reviewer-preamble.md`;
+`~/src/github/cgwalters-bot/homegit/dotfiles/.agents/skills/coordinator/reviewer-preamble.md`;
 read and follow them. Your task prompt says what to review, where your
 scratch dir is, and whether you may use a devspace.
 
