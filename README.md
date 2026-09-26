@@ -185,6 +185,17 @@ run `bot-pr inbox` at the start of every session. What inbox has already
 reported is kept in the archived `bot-state: pr-inbox` board item, so it
 doesn't matter which machine runs it.
 
+Every forge PR also gets a review guide from the reviewer subagent that
+checked it: the ordered hotspots worth reading closely (a head-side line
+range, a severity, a category and a one-sentence reason) and what is
+safe to skim. `bot-review-guide` prints what a reviewer needs to write
+one (`context`), validates it against the PR (`check`), posts it as a
+COMMENT review with the JSON in an HTML comment (`post`) and reads back
+the latest one (`show`). The [review app](https://cgwalters-forge.github.io/review/)
+trusts only the bot's guides, and only for the head they name, walks
+their hotspots and tints them in the diff; `tests/bot-review-guide.sh`
+tests the tool offline.
+
 ### The bot's own repositories
 
 The bot's own repositories (this one, cgwalters-bot/cgwalters-bot,

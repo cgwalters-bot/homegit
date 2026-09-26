@@ -1,0 +1,439 @@
+#!/usr/bin/env node
+// Review guides for forge PRs: where a reviewer should look closely and
+// what is safe to skim, as a COMMENT review the review app reads. See --help.
+// Node's standard library only, and gh, like bot-land.
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1] || "bot-review-guide");
+const GH = process.env.BOT_REVIEW_GUIDE_GH || "gh";
+
+const SCHEMA = "review-guide/v1";
+const MARKER_START = `<!-- ${SCHEMA} `;
+const MARKER_END = " -->";
+const BOT_LOGIN = "cgwalters-bot";
+// Owners whose PRs the bot may post guides on.
+const POST_OWNERS = ["cgwalters-forge", "cgwalters-bot"];
+const APP_URL = "https://cgwalters-forge.github.io/review/";
+
+const SEVERITIES = ["risky", "look-closely", "note"];
+const CATEGORIES = ["logic", "security", "error-handling", "test-gap", "api", "perf"];
+const MAX_SUMMARY = 2000;
+const MAX_REASON = 500;
+const MAX_SKIM_REASON = 300;
+const MAX_PATH = 1024;
+const MAX_HOTSPOTS = 50;
+const MAX_SKIM = 200;
+const SHORT_SHA = 10;
+const PER_PAGE = 100;
+// context names the commits touching each file for PRs up to this many commits.
+const MAX_CONTEXT_COMMITS = 50;
+// GitHub lists at most 250 commits and 3000 files of a PR.
+const MAX_PAGES = 30;
+
+const TOP_KEYS = ["schema", "repo", "pr", "head", "summary", "hotspots", "skim"];
+const HOTSPOT_KEYS = ["path", "commit", "start", "end", "severity", "category", "reason"];
+const SKIM_KEYS = ["path", "start", "end", "reason"];
+const SHA_RE = /^[0-9a-f]{40}$/;
+const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+// Control characters other than \n, and bidirectional overrides, which
+// could make displayed text read differently from what it is.
+const BAD_CHARS_RE = /[\u0000-\u0009\u000b-\u001f\u007f‪-‮⁦-⁩]/;
+const HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
+
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+// The guide is invalid, or doesn't fit the PR.
+const EX_INVALID = 3;
+// No trusted guide on the PR (show).
+const EX_NONE = 4;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} context PR
+       ${PROG} check PR GUIDE.json
+       ${PROG} post PR GUIDE.json [--dry-run]
+       ${PROG} show PR [--json]
+
+A review guide tells the reader of a forge PR where to look closely
+(ordered hotspots: a head-side line range, a severity, a category and a
+reason) and what is safe to skim. It is advice and never replaces
+reading. The review app (${APP_URL}) walks its hotspots and tints them
+in the diff. The JSON format is ${SCHEMA}; the full contract is in the
+reviewer preamble of the coordinator skill.
+
+PR is https://github.com/OWNER/REPO/pull/N or OWNER/REPO#N.
+
+  context  prints the head, the commits and each file's head-side hunk
+           ranges, and a JSON skeleton to fill in.
+  check    validates GUIDE.json strictly and against the PR as it is
+           now: the head, the files and the commits. A hotspot outside
+           every hunk of its file is a warning, not an error.
+  post     checks, then posts the guide as a COMMENT review by
+           ${BOT_LOGIN} on the head it names (only in ${POST_OWNERS.join(" or ")}),
+           with a short readable body and the JSON in a
+           '${MARKER_START.trim()} ... -->' line. The head is read again just
+           before posting. --dry-run prints the body instead.
+  show     prints the latest guide ${BOT_LOGIN} posted on the PR, and
+           whether it is current or stale (the head moved since).
+
+Exit status: 0 ok, ${EX_INVALID} the guide is invalid or doesn't fit the PR,
+${EX_NONE} no guide on the PR (show), ${EX_USAGE} usage, ${EX_ERROR} anything else.
+`;
+}
+
+// parsePr(s): {owner, repo, number} from a PR URL or OWNER/REPO#N.
+function parsePr(s) {
+  const m = /^(?:https:\/\/github\.com\/)?([A-Za-z0-9_.-]+)\/([A-Za-z0-9_.-]+)(?:\/pull\/|#)([1-9][0-9]*)\/?$/.exec(s || "");
+  if (!m) throw new Exit(EX_USAGE, `not a PR: '${s}' (want https://github.com/OWNER/REPO/pull/N or OWNER/REPO#N)`);
+  return { owner: m[1], repo: m[2], number: Number(m[3]) };
+}
+
+function parseArgs(argv) {
+  if (argv.includes("-h") || argv.includes("--help")) {
+    process.stdout.write(usage());
+    process.exit(0);
+  }
+  const flags = argv.filter((a) => a.startsWith("--"));
+  const pos = argv.filter((a) => !a.startsWith("--"));
+  const [cmd, pr, file, ...extra] = pos;
+  const allowed = { context: [], check: [], post: ["--dry-run"], show: ["--json"] };
+  if (!cmd) throw new Exit(EX_USAGE, `name a command\n\n${usage()}`);
+  if (!(cmd in allowed)) throw new Exit(EX_USAGE, `unknown command '${cmd}'\n\n${usage()}`);
+  const bad = flags.find((f) => !allowed[cmd].includes(f));
+  if (bad) throw new Exit(EX_USAGE, `unexpected option '${bad}' for ${cmd}`);
+  const needsFile = cmd === "check" || cmd === "post";
+  if (!pr || (needsFile && !file) || (!needsFile && file) || extra.length) {
+    throw new Exit(EX_USAGE, `wrong arguments for ${cmd}\n\n${usage()}`);
+  }
+  return { cmd, pr: parsePr(pr), file, dryRun: flags.includes("--dry-run"), json: flags.includes("--json") };
+}
+
+// gh(args, what, input): gh's output, or an EX_ERROR naming WHAT.
+function gh(args, what, input) {
+  try {
+    return execFileSync(GH, args, { encoding: "utf8", input, maxBuffer: 256 << 20, stdio: [input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+  } catch (e) {
+    throw new Exit(EX_ERROR, `cannot ${what}: ${String(e.stderr || e.message).trim()}`);
+  }
+}
+
+const ghJSON = (p, what) => JSON.parse(gh(["api", p], what));
+
+// getAll(path, what): every page of a REST list.
+function getAll(p, what) {
+  const out = [];
+  for (let page = 1; page <= MAX_PAGES; page++) {
+    const data = ghJSON(`${p}${p.includes("?") ? "&" : "?"}per_page=${PER_PAGE}&page=${page}`, what);
+    if (!Array.isArray(data)) throw new Exit(EX_ERROR, `cannot ${what}: expected a JSON array`);
+    out.push(...data);
+    if (data.length < PER_PAGE) break;
+  }
+  return out;
+}
+
+// loadPr(ref): the PR's head, commits and files, over REST.
+function loadPr(ref) {
+  const base = `repos/${ref.owner}/${ref.repo}/pulls/${ref.number}`;
+  const pull = ghJSON(base, `read ${prName(ref)}`);
+  return {
+    ref,
+    head: pull.head.sha,
+    state: pull.state,
+    title: pull.title || "",
+    commits: getAll(`${base}/commits`, "list the PR's commits").map((c) => ({ sha: c.sha, subject: (c.commit.message || "").split("\n")[0] })),
+    files: getAll(`${base}/files`, "list the PR's files").map((f) => ({
+      path: f.filename, status: f.status, additions: f.additions, deletions: f.deletions, hunks: hunkRanges(f.patch),
+    })),
+  };
+}
+
+const prName = (ref) => `${ref.owner}/${ref.repo}#${ref.number}`;
+const short = (sha) => sha.slice(0, SHORT_SHA);
+
+// hunkRanges(patch): each hunk's head-side [start, end]. A hunk that
+// only deletes covers the line before and after the deletion.
+function hunkRanges(patch) {
+  const out = [];
+  for (const line of (patch || "").split("\n")) {
+    const m = HUNK_RE.exec(line);
+    if (!m) continue;
+    const start = Number(m[1]);
+    const count = m[2] === undefined ? 1 : Number(m[2]);
+    out.push(count === 0 ? [start, start + 1] : [start, start + count - 1]);
+  }
+  return out;
+}
+
+// validateGuide(g): a list of errors, each naming where in the guide.
+function validateGuide(g) {
+  const errors = [];
+  const err = (where, msg) => errors.push(`${where}: ${msg}`);
+  const isObj = (v) => v !== null && typeof v === "object" && !Array.isArray(v);
+  if (!isObj(g)) return ["the guide must be a JSON object"];
+  const keys = (obj, allowed, where) => {
+    for (const k of Object.keys(obj)) if (!allowed.includes(k)) err(where, `unknown key '${k}' (allowed: ${allowed.join(", ")})`);
+  };
+  const text = (v, where, max, { multiline = false } = {}) => {
+    if (typeof v !== "string" || !v.trim()) return err(where, "must be a non-empty string");
+    if (v.length > max) err(where, `is ${v.length} characters, more than ${max}`);
+    if (BAD_CHARS_RE.test(v)) err(where, "has control or bidirectional-override characters");
+    if (!multiline && v.includes("\n")) err(where, "must be one line");
+  };
+  const line = (v, where) => {
+    if (!Number.isInteger(v) || v < 1) err(where, "must be a line number (an integer >= 1)");
+  };
+  const range = (e, where, required) => {
+    if (!required && e.start === undefined && e.end === undefined) return;
+    line(e.start, `${where}.start`);
+    line(e.end, `${where}.end`);
+    if (Number.isInteger(e.start) && Number.isInteger(e.end) && e.start > e.end) err(where, `start ${e.start} is after end ${e.end}`);
+  };
+  keys(g, TOP_KEYS, "guide");
+  for (const k of TOP_KEYS) if (!(k in g)) err("guide", `missing '${k}'`);
+  if ("schema" in g && g.schema !== SCHEMA) err("schema", `must be '${SCHEMA}', not ${JSON.stringify(g.schema)}`);
+  if ("repo" in g && (typeof g.repo !== "string" || !REPO_RE.test(g.repo))) err("repo", "must be OWNER/REPO");
+  if ("pr" in g && (!Number.isInteger(g.pr) || g.pr < 1)) err("pr", "must be a PR number");
+  if ("head" in g && (typeof g.head !== "string" || !SHA_RE.test(g.head))) err("head", "must be a full 40-hex commit id, lower case");
+  if ("summary" in g) text(g.summary, "summary", MAX_SUMMARY, { multiline: true });
+  const list = (name, max, each) => {
+    if (!(name in g)) return;
+    if (!Array.isArray(g[name])) return err(name, "must be a list");
+    if (g[name].length > max) err(name, `has ${g[name].length} entries, more than ${max}`);
+    g[name].forEach((e, i) => {
+      const where = `${name}[${i}]`;
+      if (!isObj(e)) return err(where, "must be an object");
+      each(e, where);
+    });
+  };
+  list("hotspots", MAX_HOTSPOTS, (e, where) => {
+    keys(e, HOTSPOT_KEYS, where);
+    for (const k of HOTSPOT_KEYS) if (!(k in e)) err(where, `missing '${k}'`);
+    text(e.path, `${where}.path`, MAX_PATH);
+    if (typeof e.commit !== "string" || !SHA_RE.test(e.commit)) err(`${where}.commit`, "must be a full 40-hex commit id, lower case");
+    range(e, where, true);
+    if (!SEVERITIES.includes(e.severity)) err(`${where}.severity`, `must be one of ${SEVERITIES.join(", ")}`);
+    if (!CATEGORIES.includes(e.category)) err(`${where}.category`, `must be one of ${CATEGORIES.join(", ")}`);
+    text(e.reason, `${where}.reason`, MAX_REASON);
+  });
+  list("skim", MAX_SKIM, (e, where) => {
+    keys(e, SKIM_KEYS, where);
+    text(e.path, `${where}.path`, MAX_PATH);
+    range(e, where, false);
+    text(e.reason, `${where}.reason`, MAX_SKIM_REASON);
+  });
+  return errors;
+}
+
+const overlaps = ([a, b], [c, d]) => a <= d && c <= b;
+
+// checkAgainstPr(g, pr): {errors, warnings} of a valid guide against the PR as read.
+function checkAgainstPr(g, pr) {
+  const errors = [];
+  const warnings = [];
+  const name = `${pr.ref.owner}/${pr.ref.repo}`;
+  if (g.repo !== name || g.pr !== pr.ref.number) errors.push(`the guide is for ${g.repo}#${g.pr}, not ${prName(pr.ref)}`);
+  if (g.head !== pr.head) errors.push(`the guide is for head ${short(g.head)}, but the PR's head is ${pr.head} now; review the new head`);
+  const files = new Map(pr.files.map((f) => [f.path, f]));
+  const commits = pr.commits.map((c) => c.sha);
+  g.hotspots.forEach((h, i) => {
+    const where = `hotspots[${i}]`;
+    const f = files.get(h.path);
+    if (!f) errors.push(`${where}.path: ${h.path} is not a file this PR changes`);
+    else if (f.status === "removed") errors.push(`${where}.path: ${h.path} is removed at head, so it has no head-side lines`);
+    else if (!f.hunks.some((r) => overlaps(r, [h.start, h.end]))) {
+      const hunks = f.hunks.map(([a, b]) => `${a}-${b}`).join(", ") || "none";
+      warnings.push(`${where}: ${h.path}:${h.start}-${h.end} is outside every hunk (head-side hunks: ${hunks}); the reader has to expand context to see it`);
+    }
+    if (!commits.includes(h.commit)) {
+      const like = commits.filter((c) => c.startsWith(h.commit.slice(0, 7)));
+      errors.push(`${where}.commit: ${short(h.commit)} is not one of the PR's commits${like.length === 1 ? ` (did you mean ${like[0]}?)` : ""}`);
+    }
+  });
+  g.skim.forEach((s, i) => {
+    if (!files.has(s.path)) errors.push(`skim[${i}].path: ${s.path} is not a file this PR changes`);
+  });
+  return { errors, warnings };
+}
+
+// marker(g): the HTML comment line carrying G. With <, > and & escaped
+// the JSON can hold no '-->', and GitHub renders nothing of it.
+const marker = (g) =>
+  `${MARKER_START}${JSON.stringify(g).replace(/[<>&]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`)}${MARKER_END}`;
+
+// parseMarker(body): the JSON of the last marker in BODY, or undefined.
+function parseMarker(body) {
+  const start = (body || "").lastIndexOf(MARKER_START);
+  if (start < 0) return undefined;
+  const end = body.indexOf(MARKER_END, start + MARKER_START.length);
+  if (end < 0) return undefined;
+  try {
+    return JSON.parse(body.slice(start + MARKER_START.length, end));
+  } catch {
+    return undefined;
+  }
+}
+
+// Human text for the body: HTML-escaped so it shows as written, and no
+// line starts with '/' so nothing reads as a bot command.
+const escapeText = (s) =>
+  s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .split("\n").map((l) => l.replace(/^(\s*)\//, "$1\\/")).join("\n");
+const code = (s) => (s.includes("`") ? `\`\` ${s} \`\`` : `\`${s}\``);
+const lines = (e) => (e.start === undefined ? "" : e.start === e.end ? `:${e.start}` : `:${e.start}-${e.end}`);
+
+// composeBody(g): the review body, readable on GitHub, ending in the marker.
+function composeBody(g) {
+  const out = [
+    `**Review guide** for head \`${short(g.head)}\`: where to look closely and what is safe to skim.`
+      + ` It is advice from the bot's reviewer and doesn't replace reading the diff; the [review app](${APP_URL}) walks it.`,
+    "",
+    escapeText(g.summary.trim()),
+  ];
+  if (g.hotspots.length) {
+    out.push("", "**Hotspots**", "");
+    g.hotspots.forEach((h, i) => {
+      out.push(`${i + 1}. **${h.severity}** · ${h.category} — ${code(h.path + lines(h))} (${short(h.commit)}): ${escapeText(h.reason.trim())}`);
+    });
+  }
+  if (g.skim.length) {
+    out.push("", "**Safe to skim**", "");
+    for (const s of g.skim) out.push(`- ${code(s.path + lines(s))}: ${escapeText(s.reason.trim())}`);
+  }
+  out.push("", marker(g));
+  return `${out.join("\n")}\n`;
+}
+
+// trustedGuide(reviews, ref): the latest guide the bot posted on the PR,
+// {guide, review}, or undefined. Only COMMENT reviews by the bot whose
+// commit_id is the guide's head and whose guide validates count.
+function trustedGuide(reviews, ref) {
+  const found = reviews
+    .filter((r) => r.user?.login === BOT_LOGIN && r.state === "COMMENTED" && r.submitted_at)
+    .map((r) => ({ review: r, guide: parseMarker(r.body) }))
+    .filter(({ review, guide }) =>
+      guide !== undefined && validateGuide(guide).length === 0 && guide.head === review.commit_id
+      && guide.repo === `${ref.owner}/${ref.repo}` && guide.pr === ref.number);
+  // A stable sort by time: equal times keep API order, the later wins.
+  found.sort((a, b) => (a.review.submitted_at < b.review.submitted_at ? -1 : a.review.submitted_at > b.review.submitted_at ? 1 : 0));
+  return found.at(-1);
+}
+
+function readGuide(file) {
+  let raw;
+  try {
+    raw = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    throw new Exit(EX_ERROR, `cannot read ${file}: ${e.message}`);
+  }
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    throw new Exit(EX_INVALID, `${file} is not JSON: ${e.message}`);
+  }
+}
+
+const log = (msg) => process.stderr.write(`${PROG}: ${msg}\n`);
+
+// check(opts): the guide and the PR, after reporting every problem.
+function check(opts) {
+  const g = readGuide(opts.file);
+  const schemaErrors = validateGuide(g);
+  if (schemaErrors.length) throw new Exit(EX_INVALID, `${opts.file} is not a valid ${SCHEMA} guide:\n  ${schemaErrors.join("\n  ")}`);
+  const pr = loadPr(opts.pr);
+  const { errors, warnings } = checkAgainstPr(g, pr);
+  for (const w of warnings) log(`warning: ${w}`);
+  if (errors.length) throw new Exit(EX_INVALID, `${opts.file} doesn't fit ${prName(opts.pr)}:\n  ${errors.join("\n  ")}`);
+  return { g, pr };
+}
+
+function context(opts) {
+  const pr = loadPr(opts.pr);
+  // Which commits touch each file, for the hotspots' commit field.
+  const touching = new Map();
+  if (pr.commits.length <= MAX_CONTEXT_COMMITS) {
+    for (const c of pr.commits) {
+      const files = ghJSON(`repos/${pr.ref.owner}/${pr.ref.repo}/commits/${c.sha}`, `read commit ${short(c.sha)}`).files || [];
+      for (const f of files) touching.set(f.filename, [...(touching.get(f.filename) || []), short(c.sha)]);
+    }
+  }
+  const out = [`${prName(pr.ref)}: ${pr.title}`, `head ${pr.head} (${pr.state})`, "", "Commits:"];
+  for (const c of pr.commits) out.push(`  ${c.sha} ${c.subject}`);
+  out.push("", "Files (status +added -deleted [commits touching it], head-side hunk ranges):");
+  for (const f of pr.files) {
+    const hunks = f.hunks.map(([a, b]) => `${a}-${b}`).join(", ");
+    const by = touching.has(f.path) ? ` [${touching.get(f.path).join(" ")}]` : "";
+    out.push(`  ${f.path} (${f.status} +${f.additions} -${f.deletions})${by}${hunks ? `: ${hunks}` : ": no diff"}`);
+  }
+  const skeleton = { schema: SCHEMA, repo: `${pr.ref.owner}/${pr.ref.repo}`, pr: pr.ref.number, head: pr.head, summary: "", hotspots: [], skim: [] };
+  out.push("", "Skeleton:", JSON.stringify(skeleton, null, 2));
+  process.stdout.write(`${out.join("\n")}\n`);
+}
+
+function post(opts) {
+  if (!POST_OWNERS.includes(opts.pr.owner)) throw new Exit(EX_USAGE, `guides are posted only on PRs in ${POST_OWNERS.join(" or ")}, not ${opts.pr.owner}`);
+  const { g, pr } = check(opts);
+  const body = composeBody(g);
+  if (opts.dryRun) {
+    process.stdout.write(body);
+    return;
+  }
+  const login = JSON.parse(gh(["api", "user"], "read the authenticated user")).login;
+  if (login !== BOT_LOGIN) throw new Exit(EX_ERROR, `gh is authenticated as ${login}; guides are posted only as ${BOT_LOGIN}`);
+  const base = `repos/${opts.pr.owner}/${opts.pr.repo}/pulls/${opts.pr.number}`;
+  const fresh = ghJSON(base, `read ${prName(opts.pr)} again`);
+  if (fresh.head.sha !== pr.head) throw new Exit(EX_INVALID, `the head moved to ${fresh.head.sha} while checking; nothing was posted`);
+  const request = { commit_id: g.head, event: "COMMENT", body };
+  const r = JSON.parse(gh(["api", "-X", "POST", `${base}/reviews`, "--input", "-"], "post the review", JSON.stringify(request)));
+  process.stdout.write(`${r.html_url}\n`);
+}
+
+function show(opts) {
+  const base = `repos/${opts.pr.owner}/${opts.pr.repo}/pulls/${opts.pr.number}`;
+  const head = ghJSON(base, `read ${prName(opts.pr)}`).head.sha;
+  const found = trustedGuide(getAll(`${base}/reviews`, "list the PR's reviews"), opts.pr);
+  if (!found) throw new Exit(EX_NONE, `no review guide by ${BOT_LOGIN} on ${prName(opts.pr)}`);
+  const { guide, review } = found;
+  const status = guide.head === head ? "current" : `stale (written for ${short(guide.head)}, head is ${short(head)})`;
+  if (opts.json) {
+    process.stdout.write(`${JSON.stringify({ status: guide.head === head ? "current" : "stale", head, review: review.html_url, guide }, null, 2)}\n`);
+    return;
+  }
+  process.stdout.write(`${review.html_url}\n${status}\n\n${composeBody(guide).split(MARKER_START)[0].trimEnd()}\n`);
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  switch (opts.cmd) {
+    case "context": return context(opts);
+    case "check": {
+      const { g } = check(opts);
+      process.stdout.write(`ok: ${g.hotspots.length} hotspot(s), ${g.skim.length} skim entr${g.skim.length === 1 ? "y" : "ies"} for ${short(g.head)}\n`);
+      return undefined;
+    }
+    case "post": return post(opts);
+    case "show": return show(opts);
+  }
+  return undefined;
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (e) {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  }
+} else {
+  module.exports = { SCHEMA, parsePr, hunkRanges, validateGuide, checkAgainstPr, marker, parseMarker, composeBody, trustedGuide };
+}
