@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-09-20T08:59:00Z","message":{"role":"user","content":"Run the coordinator."}}
+{"type":"assistant","timestamp":"2026-09-20T09:00:00Z","requestId":"req_c1","message":{"id":"msg_c1","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Polling."}],"usage":{"input_tokens":10,"output_tokens":1000,"cache_read_input_tokens":1000000,"cache_creation_input_tokens":0}}}

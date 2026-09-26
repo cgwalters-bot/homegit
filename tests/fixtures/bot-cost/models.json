@@ -1,0 +1,12 @@
+{
+  "anthropic": {"id": "anthropic", "models": {
+    "claude-opus-5-5": {"id": "claude-opus-5-5", "cost": {"input": 4, "output": 20, "cache_read": 0.2, "cache_write": 5}},
+    "claude-sonnet-4-5": {"id": "claude-sonnet-4-5",
+      "cost": {"input": 3, "output": 15, "cache_read": 0.3, "cache_write": 3.75,
+               "context_over_200k": {"input": 6, "output": 22.5, "cache_read": 0.6, "cache_write": 7.5}},
+      "experimental": {"modes": {"fast": {"cost": {"input": 6, "output": 30, "cache_read": 0.6, "cache_write": 7.5}}}}}
+  }},
+  "elsewhere": {"id": "elsewhere", "models": {
+    "gizmo-1": {"id": "gizmo-1", "cost": {"input": 1, "output": 2}}
+  }}
+}

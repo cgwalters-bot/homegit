@@ -1,0 +1,16 @@
+#!/usr/bin/env node
+// A stand-in for bin/bot-runs in tests/bot-cost.test.js: answers show and
+// transcript (with --json) from the files in runs/.
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const dir = path.join(__dirname, "runs");
+const [cmd, run] = process.argv.slice(2);
+if (cmd === "show") {
+  process.stdout.write(fs.readFileSync(path.join(dir, `show-${run}.json`), "utf8"));
+} else if (cmd === "transcript" && fs.existsSync(path.join(dir, `transcript-${run}`))) {
+  process.stdout.write(JSON.stringify({ run_id: Number(run), dir: path.join(dir, `transcript-${run}`), files: ["token-usage.jsonl"] }));
+} else {
+  process.stderr.write(`error: run ${run} has no agent-transcript artifact (expired?)\n`);
+  process.exit(1);
+}

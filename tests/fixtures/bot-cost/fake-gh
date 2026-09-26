@@ -1,0 +1,26 @@
+#!/usr/bin/env node
+// A stand-in for gh in tests/bot-cost.test.js: answers 'gh api' for run
+// listings and run jobs from the files in gh/, and logs each endpoint to
+// $FAKE_GH_LOG when set.
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const [cmd, endpoint] = process.argv.slice(2);
+if (cmd !== "api" || !endpoint) {
+  process.stderr.write(`fake gh: unexpected arguments ${process.argv.slice(2).join(" ")}\n`);
+  process.exit(2);
+}
+if (process.env.FAKE_GH_LOG) fs.appendFileSync(process.env.FAKE_GH_LOG, `${endpoint}\n`);
+const dir = path.join(__dirname, "gh");
+const page = Number(new URLSearchParams(endpoint.split("?")[1] || "").get("page") || 1);
+let m;
+if ((m = /^repos\/([^/]+)\/([^/]+)\/actions\/runs\?/.exec(endpoint))) {
+  const runs = page === 1 ? JSON.parse(fs.readFileSync(path.join(dir, `runs-${m[1]}_${m[2]}.json`), "utf8")) : [];
+  process.stdout.write(JSON.stringify({ total_count: runs.length, workflow_runs: runs }));
+} else if ((m = /^repos\/[^/]+\/[^/]+\/actions\/runs\/(\d+)\/jobs\?/.exec(endpoint))) {
+  const jobs = page === 1 ? JSON.parse(fs.readFileSync(path.join(dir, `jobs-${m[1]}.json`), "utf8")) : [];
+  process.stdout.write(JSON.stringify({ total_count: jobs.length, jobs }));
+} else {
+  process.stderr.write(`gh: Not Found (HTTP 404)\n`);
+  process.exit(1);
+}
