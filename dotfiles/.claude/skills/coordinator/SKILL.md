@@ -148,7 +148,12 @@ closed.
   independent reviewer subagent on its branch or gist, and send the
   findings to the same worker (SendMessage, so it keeps its context) to
   fix. Repeat until the reviewer says it can ship before pointing
-  cgwalters at it.
+  cgwalters at it. For a forge PR, the reviewer also posts a review
+  guide (`bin/bot-review-guide`, see `reviewer-preamble.md`): the
+  hotspots to read closely and what to skim, which the review app
+  (<https://cgwalters-forge.github.io/review/>) walks and tints in the
+  diff. After a fix is pushed, the next review round posts a new guide
+  for the new head; the app shows the old one as stale.
 - **Questions for cgwalters go on the board**, never into a separate
   list (a claude.ai artifact, a local file): his queue is the board's
   "Needs cgwalters" view (Needs human and Draft, by Priority; see
