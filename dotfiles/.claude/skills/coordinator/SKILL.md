@@ -60,6 +60,25 @@ instead of piping it through `tail` and losing lines for good.
   each listed PR, unless a live worker is already on it (check it's
   still running). It stays listed on every sweep until the bot pushes or
   replies, so a listing alone isn't a reason for another worker.
+- **Needs rebase.** `bot-watch` also lists, on every sweep, the bot's
+  open PRs that need rebasing onto their base: CI failing while the
+  base moved on, a base that must be up to date, or conflicts. Each
+  tick, run `bot-pr rebase URL` yourself on up to 3 of the
+  conflict-free ones, unless the failing checks look caused by the PR
+  itself (a lint, build or unit test failure in code it touches: that's
+  a fix for a worker, not a rebase), or it has maintainers' approvals
+  that a force-push would make stale (ask cgwalters instead). PRs with
+  an outstanding review by cgwalters aren't listed there: the worker
+  answering it rebases on the way. It refuses anything that isn't a
+  clean, rebase-only change of the bot's own commits (and his), keeps
+  cgwalters' sign-off, and comments one line on an upstream PR. When it
+  exits 10 (conflicts), or for the conflicting ones, dispatch a worker
+  to resolve the conflicts, retest and push, per `upstream-pr` (on an
+  upstream PR his sign-off then stays only on commits whose resolution
+  changed nothing beyond context; the others need `bot-pr signoff`). A
+  PR the sweep listed for CI isn't listed again once rebased: if CI
+  still fails, it's real, and the next "CI failing" news is work for a
+  worker.
 - **Promote** a fork PR when inbox shows `[APPROVED]` (an approving
   review, or a `/promote` line): run the `bot-pr promote` command it
   prints. A go-ahead in other words only gets its `-> hint:` passed on;

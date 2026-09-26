@@ -272,6 +272,10 @@ change, once, and you decide. Everything else is yours to act on:
   building on the branch, and never force-push over it.
 - Red CI on the bot's branch: look at the failure; a real one is work on
   that item (an In Review PR stays In Review), a flake at most a rerun.
+  One fixed on the base since is a rebase: the "Needs rebase" section
+  lists the bot's PRs that are behind their base with CI failing, or
+  conflicting, and `bot-pr rebase URL` rebases a conflict-free one
+  (see the `coordinator` skill).
 
 Its last-seen state lives in the archived `bot-state: watch` board item
 and advances per URL: one that could not be read (the sweep then exits
