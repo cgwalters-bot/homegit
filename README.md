@@ -104,7 +104,9 @@ published per-minute Linux runner rates, a notional figure for runners
 that may be self-hosted), and inference tokens from the local
 transcripts and agent runs' `token-usage.jsonl`, at the per-model prices
 from [models.dev](https://models.dev). The coordinator puts yesterday's
-estimate in the morning brief.
+estimate in the morning brief. `bot-footer` turns one task's share into
+a run footer that fork PRs carry in their bot-meta section (see "Run
+footer" in the same doc).
 
 `bot-board` is a small CLI over `gh project` for the Workstream board
 (`list`, `show`, `add`, `draft`, `set`, and `state-get`/`state-put` for

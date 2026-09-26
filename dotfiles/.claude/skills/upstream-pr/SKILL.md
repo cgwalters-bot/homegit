@@ -223,6 +223,13 @@ and body as the upstream PR (the PR description rules below apply): once
 approved they are posted upstream as they stand then, minus the bot-meta
 section.
 
+Add `--footer <(bot-footer --scratch NAME)` (your scratch dir's name, or
+`--item PVTI_...`; a file works too) to end the bot-meta section with a
+footer recording the run's session, agents, tokens, cost and duration.
+A later run (a review, a rework) adds its own with `bot-pr set-body
+<fork-pr-url> --footer FILE`. Replies you post with gh on forge PRs may
+end with the same footer; never upstream.
+
 ### CI on forge forks
 
 Forge forks run no CI: every workflow there is disabled, since the
