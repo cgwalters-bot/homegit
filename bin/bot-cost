@@ -1,0 +1,847 @@
+#!/usr/bin/env node
+// Approximate cost of the bot's work: runner time of the devspace and
+// agent workflows, and inference tokens from local transcripts and agent
+// runs, priced from published list prices. See --help.
+// Node's standard library only, plus gh and bot-runs.
+"use strict";
+
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { promisify } = require("node:util");
+
+const execFileP = promisify(execFile);
+
+const PROG = path.basename(process.argv[1] || "bot-cost");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const SCHEMA = "bot-cost/v1";
+const HOME = os.homedir();
+const DEFAULT_SINCE = "today";
+const DEFAULT_PROJECTS_ROOT = path.join(HOME, ".claude", "projects");
+const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(HOME, ".cache"), "bot-cost");
+const GH = process.env.BOT_COST_GH || "gh";
+const BOT_RUNS = process.env.BOT_COST_BOT_RUNS || path.join(BIN_DIR, "bot-runs");
+// The repositories whose Actions runs are the bot's compute: the devspace
+// repository and the bot's fork of it, where agent.yml runs.
+const DEFAULT_REPOS = ["bootc-dev/cgwalters-devspace-sandbox", "cgwalters-bot/cgwalters-devspace-sandbox"];
+const AGENT_WORKFLOW = "agent.yml";
+const PER_PAGE = 100;
+const API_CONCURRENCY = 8;
+// Runs are listed from this long before the window, so a run that started
+// earlier and was still going counts for its part inside the window. It is
+// the devspace workflow's 270-minute timeout plus queueing, rounded up.
+const RUN_LOOKBACK_S = 6 * 3600;
+
+// GitHub's published per-minute list prices for Linux x64 runners by core
+// count: the standard 2-core runner (actions_linux) and the larger runners
+// (linux_N_core). A checked-in table, since the page is HTML.
+const RUNNER_PRICES = {
+  source: "https://docs.github.com/en/billing/reference/actions-runner-pricing",
+  retrieved: "2026-09-25",
+  usdPerMinute: { 1: 0.002, 2: 0.006, 4: 0.012, 8: 0.022, 16: 0.042, 32: 0.082, 64: 0.162, 96: 0.252 },
+};
+// The runner group of GitHub's own standard runners in the jobs API.
+const HOSTED_GROUP = "GitHub Actions";
+// Standard GitHub-hosted Linux runners: 4 cores in public repositories, 2
+// in private ones; free in public repositories.
+const STANDARD_LABEL = /^ubuntu-(latest|\d+\.\d+)$/;
+const STANDARD_CORES = { public: 4, private: 2 };
+// A runner label carrying its size, like rhel10-x86_64-16c-64g or
+// ubuntu-24.04-16core.
+const CORES_LABEL = /(?:^|[-_])(\d+)[-_]?c(?:ores?)?(?:$|[-_])/;
+
+const MODELS_URL = "https://models.dev/api.json";
+const MODELS_MAX_AGE_S = 7 * 86400;
+const MODELS_PROVIDER = "anthropic";
+// Anthropic prices 1-hour cache writes at twice the base input price;
+// models.dev's cache_write is the 5-minute price.
+const CACHE_1H_INPUT_MULT = 2;
+// Above this many prompt tokens, a model's context_over_200k prices apply.
+const LONG_CONTEXT_TOKENS = 200000;
+const SYNTHETIC_MODEL = "<synthetic>";
+
+const TOP_TASKS = 15;
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+const TOKEN_KINDS = ["input", "output", "cache_read", "cache_write_5m", "cache_write_1h"];
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} [--since AGE] [--until DATE] [--projects DIR]... [--repo OWNER/REPO]...
+                [--no-compute] [--no-inference] [--models-json FILE] [--refresh-prices]
+                [--tasks N] [--json]
+
+Estimates what the bot's work cost, per UTC day and per task, at
+published list prices. It is an estimate, not a bill.
+
+  compute    Actions runs of --repo (default ${DEFAULT_REPOS.join(", ")}):
+             each job's runner time (started_at to completed_at, or now
+             while it runs) times its core count, from its runner labels,
+             priced at GitHub's per-minute Linux x64 rates
+             (${RUNNER_PRICES.source},
+             retrieved ${RUNNER_PRICES.retrieved}). Runners outside GitHub's
+             standard pool may be self-hosted, and standard runners are free
+             in public repositories: the report says which, and the price is
+             then notional.
+  inference  token usage of every assistant message in the Claude Code
+             transcripts under --projects (default: each directory in
+             ${DEFAULT_PROJECTS_ROOT.replace(HOME, "~")}), and the token-usage.jsonl of ${AGENT_WORKFLOW} runs
+             (through bot-runs), priced from ${MODELS_URL},
+             cached for a week in ${CACHE_DIR.replace(HOME, "~")} (--refresh-prices refetches;
+             --models-json reads a saved copy). Runs of the mock inference
+             shim are counted apart and not priced.
+
+Tasks are the board item, scratch dir or devspace named in a subagent's
+prompt; a devspace run belongs to the agent that started it by name.
+
+AGE is 12h, 7d, 2w, 'today' or 'yesterday' (midnight UTC), or a date
+(default ${DEFAULT_SINCE}); DATE is 'today', 'yesterday' or a date (default now).
+`;
+}
+
+function parseArgs(argv) {
+  const opts = {
+    since: DEFAULT_SINCE, until: null, projects: [], repos: [], compute: true, inference: true,
+    modelsJson: process.env.BOT_COST_MODELS_JSON || null, refreshPrices: false, tasks: TOP_TASKS, json: false,
+  };
+  const value = (i, name) => {
+    if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
+    return argv[i + 1];
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "-h":
+      case "--help":
+        process.stdout.write(usage());
+        process.exit(0);
+      case "--since": opts.since = value(i++, a); break;
+      case "--until": opts.until = value(i++, a); break;
+      case "--projects": opts.projects.push(value(i++, a)); break;
+      case "--repo": {
+        const r = value(i++, a);
+        if (!/^[\w.-]+\/[\w.-]+$/.test(r)) throw new Exit(EX_USAGE, `--repo takes OWNER/REPO, not '${r}'`);
+        opts.repos.push(r);
+        break;
+      }
+      case "--no-compute": opts.compute = false; break;
+      case "--no-inference": opts.inference = false; break;
+      case "--models-json": opts.modelsJson = value(i++, a); break;
+      case "--refresh-prices": opts.refreshPrices = true; break;
+      case "--tasks":
+        opts.tasks = Number(value(i++, a));
+        if (!Number.isInteger(opts.tasks) || opts.tasks < 0) throw new Exit(EX_USAGE, "--tasks takes a number");
+        break;
+      case "--json": opts.json = true; break;
+      default:
+        throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    }
+  }
+  if (!opts.repos.length) opts.repos = (process.env.BOT_COST_REPOS || DEFAULT_REPOS.join(",")).split(",").filter(Boolean);
+  return opts;
+}
+
+const midnightUTC = (d) => new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+
+// parseTime(s, now): the Date that AGE (12h, 7d, 2w: before NOW), 'today',
+// 'yesterday' or a date names.
+function parseTime(s, now) {
+  if (s === "today") return midnightUTC(now);
+  if (s === "yesterday") return new Date(midnightUTC(now).getTime() - 86400e3);
+  const m = /^(\d+)([mhdw])$/.exec(s);
+  if (m) {
+    const unit = { m: 60, h: 3600, d: 86400, w: 7 * 86400 }[m[2]];
+    return new Date(now.getTime() - Number(m[1]) * unit * 1000);
+  }
+  const d = new Date(s);
+  if (Number.isNaN(d.getTime())) throw new Exit(EX_USAGE, `not an age (12h, 7d, 2w, today, yesterday) or a date: '${s}'`);
+  return d;
+}
+
+const dayOf = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+// splitByDay(start, end): [[day, seconds]] of the interval, split at
+// midnight UTC.
+function splitByDay(start, end) {
+  const out = [];
+  for (let t = start; t < end;) {
+    const next = Math.min(end, midnightUTC(new Date(t)).getTime() + 86400e3);
+    out.push([dayOf(t), (next - t) / 1000]);
+    t = next;
+  }
+  return out;
+}
+
+// --- compute -------------------------------------------------------------------
+
+// runnerOf(job, isPrivate): {cores, kind, group, label} of a job's runner;
+// kind is 'standard' (GitHub's own pool, free in public repositories),
+// 'other' (a larger or self-hosted runner) or 'unknown' (no size found).
+function runnerOf(job, isPrivate) {
+  const labels = job.labels || [];
+  const group = job.runner_group_name || null;
+  const label = labels.join(",");
+  if (labels.some((l) => STANDARD_LABEL.test(l)) && (group === HOSTED_GROUP || group === null)) {
+    return { cores: STANDARD_CORES[isPrivate ? "private" : "public"], kind: "standard", group, label };
+  }
+  for (const l of labels) {
+    const m = CORES_LABEL.exec(l);
+    if (m) return { cores: Number(m[1]), kind: "other", group, label };
+  }
+  return { cores: null, kind: "unknown", group, label };
+}
+
+// usdPerMinute(cores): the list rate of a Linux x64 runner of that size;
+// sizes between the published ones take the next larger size's rate, and
+// sizes past the largest scale linearly from it.
+function usdPerMinute(cores) {
+  const sizes = Object.keys(RUNNER_PRICES.usdPerMinute).map(Number).sort((a, b) => a - b);
+  const size = sizes.find((s) => s >= cores);
+  if (size !== undefined) return RUNNER_PRICES.usdPerMinute[size];
+  const max = sizes[sizes.length - 1];
+  return (RUNNER_PRICES.usdPerMinute[max] * cores) / max;
+}
+
+async function gh(args) {
+  try {
+    const { stdout } = await execFileP(GH, args, { maxBuffer: 256 << 20 });
+    return JSON.parse(stdout);
+  } catch (e) {
+    const detail = (e.stderr || e.message || "").trim().split("\n").pop();
+    throw new Exit(EX_ERROR, `${GH} ${args.join(" ")} failed: ${detail}`);
+  }
+}
+
+// pool(items, fn): runs fn over items, at most API_CONCURRENCY at a time.
+async function pool(items, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(API_CONCURRENCY, items.length) }, worker));
+  return out;
+}
+
+async function listRuns(repo, from, until) {
+  const created = `${new Date(from).toISOString().replace(/\.\d+Z$/, "Z")}..${new Date(until).toISOString().replace(/\.\d+Z$/, "Z")}`;
+  const runs = [];
+  for (let page = 1; ; page++) {
+    const body = await gh(["api", `repos/${repo}/actions/runs?per_page=${PER_PAGE}&page=${page}&created=${encodeURIComponent(created)}`]);
+    const batch = body.workflow_runs || [];
+    runs.push(...batch);
+    if (batch.length < PER_PAGE) break;
+  }
+  return runs;
+}
+
+// jobsOf(repo, run): the jobs of every attempt of a run. A finished run's
+// jobs don't change, so they are cached.
+async function jobsOf(repo, run) {
+  const file = path.join(CACHE_DIR, "jobs", repo.replace("/", "_"), `${run.id}-${run.run_attempt || 1}.json`);
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    // not cached yet
+  }
+  const jobs = [];
+  for (let page = 1; ; page++) {
+    const body = await gh(["api", `repos/${repo}/actions/runs/${run.id}/jobs?filter=all&per_page=${PER_PAGE}&page=${page}`]);
+    const batch = body.jobs || [];
+    jobs.push(...batch.map((j) => ({
+      id: j.id, name: j.name, labels: j.labels, runner_group_name: j.runner_group_name,
+      started_at: j.started_at, completed_at: j.completed_at, status: j.status,
+    })));
+    if (batch.length < PER_PAGE) break;
+  }
+  if (run.status === "completed") {
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, JSON.stringify(jobs));
+    } catch {
+      // the cache is only an optimization
+    }
+  }
+  return jobs;
+}
+
+// devspaceName(run): the NAME of a devspace run titled 'Devspace NAME'.
+const devspaceName = (run) => (/^Devspace (\S+)$/.exec(run.display_title || "") || [])[1] || null;
+const agentRunItem = (run) => (/^agent (PVTI_\S+)/.exec(run.display_title || "") || [])[1] || null;
+
+// computeOf(repo, run, jobs, window): the run's runner time inside the window.
+function computeOf(repo, run, jobs, win) {
+  const isPrivate = Boolean(run.repository && run.repository.private);
+  const record = {
+    repo, run_id: run.id, url: run.html_url, workflow: path.basename(run.path || run.name || ""),
+    title: run.display_title || null, devspace: devspaceName(run), item: agentRunItem(run),
+    status: run.status, conclusion: run.conclusion, private: isPrivate,
+    started_at: null, ended_at: null, running: false,
+    cores: null, runner: null, kind: null, core_hours: 0, list_usd: 0, billed: null, days: {},
+  };
+  for (const job of jobs) {
+    if (!job.started_at) continue;
+    let start = Date.parse(job.started_at);
+    let end = job.completed_at ? Date.parse(job.completed_at) : win.now;
+    if (!job.completed_at) record.running = true;
+    if (!(end > start)) continue;
+    record.started_at = record.started_at && record.started_at < job.started_at ? record.started_at : job.started_at;
+    const endIso = new Date(end).toISOString();
+    record.ended_at = record.ended_at && record.ended_at > endIso ? record.ended_at : endIso;
+    start = Math.max(start, win.since);
+    end = Math.min(end, win.until);
+    if (!(end > start)) continue;
+    const runner = runnerOf(job, isPrivate);
+    record.cores = Math.max(record.cores || 0, runner.cores || 0) || null;
+    record.runner = runner.label;
+    record.group = runner.group;
+    record.kind = record.kind && record.kind !== runner.kind ? "mixed" : runner.kind;
+    for (const [day, s] of splitByDay(start, end)) {
+      const d = (record.days[day] ||= { seconds: 0, core_hours: 0, list_usd: 0 });
+      d.seconds += s;
+      if (runner.cores) {
+        d.core_hours += (s * runner.cores) / 3600;
+        d.list_usd += (s / 60) * usdPerMinute(runner.cores);
+      }
+    }
+  }
+  for (const d of Object.values(record.days)) {
+    record.core_hours += d.core_hours;
+    record.list_usd += d.list_usd;
+  }
+  // Only standard runners in public repositories are known to be free;
+  // anything else is billed however its owner pays for it.
+  record.billed = record.kind === "standard" && !isPrivate ? "free" : "unknown";
+  return record;
+}
+
+async function scanCompute(opts, win, notes) {
+  const records = [];
+  for (const repo of opts.repos) {
+    const runs = (await listRuns(repo, win.since - RUN_LOOKBACK_S * 1000, win.until)).filter((r) => {
+      const start = Date.parse(r.run_started_at || r.created_at);
+      return start < win.until && (r.status !== "completed" || Date.parse(r.updated_at) > win.since);
+    });
+    const jobs = await pool(runs, (r) => jobsOf(repo, r));
+    runs.forEach((r, i) => {
+      const rec = computeOf(repo, r, jobs[i], win);
+      if (Object.keys(rec.days).length) records.push(rec);
+    });
+  }
+  const groups = new Set(records.filter((r) => r.kind === "other").map((r) => r.group || "?"));
+  if (groups.size) {
+    notes.push(`Runners in group(s) ${[...groups].join(", ")} are not GitHub's standard pool and may be self-hosted, `
+      + "so what they cost isn't known here; their $ is GitHub's larger-runner list price for the same core count (notional).");
+  }
+  if (records.some((r) => r.kind === "standard" && r.billed === "free")) {
+    notes.push("Standard GitHub-hosted runners are free in public repositories; their $ is the notional list price.");
+  }
+  const unsized = records.filter((r) => r.kind === "unknown" || r.kind === "mixed");
+  if (unsized.length) notes.push(`${unsized.length} run(s) had a runner of unknown size and are counted without cores.`);
+  return records;
+}
+
+// --- inference: prices ---------------------------------------------------------
+
+async function loadModels(opts, notes) {
+  if (opts.modelsJson) {
+    return { data: JSON.parse(fs.readFileSync(opts.modelsJson, "utf8")), source: opts.modelsJson, fetched: null };
+  }
+  const cached = () => {
+    try {
+      return fs.readdirSync(CACHE_DIR).filter((f) => /^models-dev-\d{4}-\d{2}-\d{2}\.json$/.test(f)).sort().pop() || null;
+    } catch {
+      return null;
+    }
+  };
+  const readCache = (f) => ({
+    data: JSON.parse(fs.readFileSync(path.join(CACHE_DIR, f), "utf8")), source: MODELS_URL,
+    fetched: f.slice("models-dev-".length, -".json".length),
+  });
+  const latest = cached();
+  if (latest && !opts.refreshPrices) {
+    const age = (Date.now() - fs.statSync(path.join(CACHE_DIR, latest)).mtimeMs) / 1000;
+    if (age < MODELS_MAX_AGE_S) return readCache(latest);
+  }
+  try {
+    const res = await fetch(MODELS_URL, { signal: AbortSignal.timeout(30000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const text = await res.text();
+    const data = JSON.parse(text);
+    const fetched = new Date().toISOString().slice(0, 10);
+    fs.mkdirSync(CACHE_DIR, { recursive: true });
+    fs.writeFileSync(path.join(CACHE_DIR, `models-dev-${fetched}.json`), text);
+    if (latest && latest !== `models-dev-${fetched}.json`) fs.rmSync(path.join(CACHE_DIR, latest), { force: true });
+    return { data, source: MODELS_URL, fetched };
+  } catch (e) {
+    if (latest) {
+      notes.push(`Could not fetch ${MODELS_URL} (${e.message}); used the copy cached ${latest.slice(11, 21)}.`);
+      return readCache(latest);
+    }
+    notes.push(`Could not fetch ${MODELS_URL} (${e.message}) and no copy is cached: inference is not priced.`);
+    return { data: {}, source: MODELS_URL, fetched: null };
+  }
+}
+
+// modelPrice(models, id): {id, cost} of the models.dev entry for a model
+// id as transcripts record it (claude-opus-5-5, claude-opus-5-5[1m],
+// anthropic/claude-sonnet-4-5-20250929), or null.
+function modelPrice(models, id) {
+  const base = id.replace(/\[[^\]]*\]$/, "").replace(/^[\w.-]+\//, "");
+  const candidates = [base, base.replace(/-\d{8}$/, "")];
+  const providers = [models[MODELS_PROVIDER], ...Object.entries(models).filter(([k]) => k !== MODELS_PROVIDER).map(([, v]) => v)];
+  for (const c of candidates) {
+    for (const p of providers) {
+      const m = p && p.models && p.models[c];
+      if (m && m.cost && typeof m.cost.input === "number") return { id: `${p.id || "?"}/${c}`, model: m };
+    }
+  }
+  return null;
+}
+
+// usdOf(entry, u): the list price of one message's usage.
+function usdOf(entry, u) {
+  let cost = entry.model.cost;
+  const fast = entry.model.experimental && entry.model.experimental.modes && entry.model.experimental.modes.fast;
+  if (u.speed === "fast" && fast && fast.cost) cost = fast.cost;
+  const prompt = u.input + u.cache_read + u.cache_write_5m + u.cache_write_1h;
+  if (cost.context_over_200k && prompt > LONG_CONTEXT_TOKENS) cost = { ...cost, ...cost.context_over_200k };
+  const input = cost.input || 0;
+  const perM = u.input * input + u.output * (cost.output || 0)
+    + u.cache_read * (cost.cache_read ?? input) + u.cache_write_5m * (cost.cache_write ?? input)
+    + u.cache_write_1h * input * CACHE_1H_INPUT_MULT;
+  return perM / 1e6;
+}
+
+// --- inference: transcripts ----------------------------------------------------
+
+const ITEM_RE = /\bPVTI_[A-Za-z0-9_-]+/;
+const SCRATCH_RE = /scratchpad\/([A-Za-z0-9._-]+)\//;
+const DEVSPACE_PROMPT_RE = /\bDevspace:\s*`?([a-z0-9][a-z0-9_.-]*[a-z0-9])/;
+// bot-devspace's own rule for NAME.
+const DEVSPACE_NAME_RE = /^[a-z0-9][a-z0-9_.-]{0,62}$/;
+const DEVSPACE_START_RE = /\bbot-devspace\s+start\b([^\n;&|]*)/g;
+const DEVSPACE_VALUE_OPTS = new Set(["--ref", "--cores", "--duration"]);
+
+// devspacesStarted(command): the NAMEs of 'bot-devspace start ... NAME' in
+// a shell command, resolving NAME=value assignments made in it.
+function devspacesStarted(command) {
+  const vars = {};
+  for (const m of command.matchAll(/\b([A-Za-z_]\w*)=(["']?)([A-Za-z0-9._-]+)\2/g)) vars[m[1]] = m[3];
+  const out = [];
+  for (const m of command.matchAll(DEVSPACE_START_RE)) {
+    const words = m[1].trim().split(/\s+/).filter(Boolean).map((w) => w.replace(/^["']|["']$/g, ""));
+    // start takes exactly one NAME, after its options; anything else (prose
+    // mentioning the command) is not a start.
+    const positional = [];
+    for (let i = 0; i < words.length && !/^[0-9&]*[<>]/.test(words[i]); i++) {
+      if (DEVSPACE_VALUE_OPTS.has(words[i])) i++;
+      else if (!words[i].startsWith("-")) positional.push(words[i]);
+    }
+    if (positional.length !== 1) continue;
+    let name = positional[0];
+    const v = /^\$\{?([A-Za-z_]\w*)\}?$/.exec(name);
+    if (v) name = vars[v[1]] || null;
+    if (name && DEVSPACE_NAME_RE.test(name)) out.push(name);
+  }
+  return out;
+}
+
+const textOf = (content) => (typeof content === "string" ? content
+  : Array.isArray(content) ? content.filter((c) => c && c.type === "text").map((c) => c.text).join("\n") : "");
+
+function transcriptFiles(dirs, since) {
+  const out = [];
+  const add = (file, kind, extra) => {
+    try {
+      if (fs.statSync(file).mtimeMs >= since) out.push({ file, kind, ...extra });
+    } catch {
+      // vanished
+    }
+  };
+  for (const dir of dirs) {
+    let entries;
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch (e) {
+      throw new Exit(EX_ERROR, `cannot read transcripts in ${dir}: ${e.message}`);
+    }
+    for (const e of entries) {
+      if (e.isFile() && e.name.endsWith(".jsonl")) add(path.join(dir, e.name), "session", { session: e.name.slice(0, -6), project: dir });
+      if (!e.isDirectory()) continue;
+      const sub = path.join(dir, e.name, "subagents");
+      let files = [];
+      try {
+        files = fs.readdirSync(sub);
+      } catch {
+        continue;
+      }
+      for (const f of files) {
+        if (/^agent-.+\.jsonl$/.test(f)) add(path.join(sub, f), "subagent", { session: e.name, project: dir });
+      }
+    }
+  }
+  return out;
+}
+
+// readTranscript(t, win): the agent's identity and its assistant messages'
+// usage inside the window, one record per message id (a message is
+// logged once per content block, with its final usage last).
+function readTranscript(t, win) {
+  const agent = {
+    key: t.kind === "subagent" ? path.basename(t.file, ".jsonl").replace(/^agent-/, "") : t.session,
+    kind: t.kind, session: t.session, label: null, item: null, scratch: null, devspaces: [], first_ts: null,
+  };
+  if (t.kind === "subagent") {
+    try {
+      agent.label = JSON.parse(fs.readFileSync(t.file.replace(/\.jsonl$/, ".meta.json"), "utf8")).description || null;
+    } catch {
+      // no meta
+    }
+  }
+  const messages = new Map();
+  let prompt = null;
+  for (const line of fs.readFileSync(t.file, "utf8").split("\n")) {
+    if (!line) continue;
+    let r;
+    try {
+      r = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (prompt === null && r.type === "user" && r.message) prompt = textOf(r.message.content);
+    if (r.type !== "assistant" || !r.message) continue;
+    for (const c of Array.isArray(r.message.content) ? r.message.content : []) {
+      if (c && c.type === "tool_use" && c.input && typeof c.input.command === "string") {
+        for (const n of devspacesStarted(c.input.command)) {
+          if (!agent.devspaces.includes(n)) agent.devspaces.push(n);
+        }
+      }
+    }
+    const u = r.message.usage;
+    const ts = Date.parse(r.timestamp);
+    if (!u || !r.message.model || r.message.model === SYNTHETIC_MODEL || !(ts >= win.since && ts < win.until)) continue;
+    const cc = u.cache_creation || {};
+    const cw1h = cc.ephemeral_1h_input_tokens || 0;
+    messages.set(r.message.id || r.requestId || r.uuid, {
+      ts, model: r.message.model, speed: u.speed || null,
+      input: u.input_tokens || 0, output: u.output_tokens || 0, cache_read: u.cache_read_input_tokens || 0,
+      cache_write_5m: Math.max(0, (u.cache_creation_input_tokens || 0) - cw1h), cache_write_1h: cw1h,
+    });
+  }
+  if (prompt) {
+    agent.item = (ITEM_RE.exec(prompt) || [])[0] || null;
+    agent.scratch = (SCRATCH_RE.exec(prompt) || [])[1] || null;
+    const d = (DEVSPACE_PROMPT_RE.exec(prompt) || [])[1];
+    if (d && !agent.devspaces.includes(d)) agent.devspaces.unshift(d);
+  }
+  if (!agent.label) agent.label = `${t.kind === "session" ? "session" : "agent"} ${agent.key.slice(0, 8)} (${path.basename(t.project)})`;
+  const usage = [...messages.values()];
+  agent.first_ts = usage.length ? Math.min(...usage.map((m) => m.ts)) : null;
+  return { agent, usage };
+}
+
+// agentRunUsage(repo, run, notes): the per-request usage of an agent.yml
+// run, from its token-usage.jsonl, else its summary's totals.
+async function agentRunUsage(repo, run) {
+  const env = { ...process.env, BOT_RUNS_REPO: repo };
+  const runJson = async (args) => {
+    try {
+      const { stdout } = await execFileP(BOT_RUNS, [...args, "--json"], { env, maxBuffer: 64 << 20 });
+      return JSON.parse(stdout);
+    } catch {
+      return null;
+    }
+  };
+  const shown = await runJson(["show", String(run.id)]);
+  const s = (shown && shown.summary) || {};
+  const res = { mock: s.aic_pricing === "mock", model: s.model || null, usage: [], source: "none" };
+  const transcript = await runJson(["transcript", String(run.id)]);
+  if (transcript && transcript.dir) {
+    try {
+      for (const line of fs.readFileSync(path.join(transcript.dir, "token-usage.jsonl"), "utf8").split("\n")) {
+        if (!line.trim()) continue;
+        const r = JSON.parse(line);
+        res.usage.push({
+          ts: typeof r.ts === "number" ? r.ts * 1000 : Date.parse(r.ts || run.updated_at), model: r.model || res.model,
+          speed: null, input: r.input_tokens ?? r.input ?? 0, output: r.output_tokens ?? r.output ?? 0,
+          cache_read: r.cache_read_input_tokens ?? r.cache_read ?? 0,
+          cache_write_5m: r.cache_creation_input_tokens ?? r.cache_write ?? 0, cache_write_1h: 0,
+        });
+      }
+      res.source = "token-usage";
+    } catch {
+      // expired or missing: fall back to the summary
+    }
+  }
+  if (res.source === "none" && s.tokens && res.model) {
+    res.usage.push({
+      ts: Date.parse(s.finished_at || run.updated_at), model: res.model, speed: null,
+      input: s.tokens.input || 0, output: s.tokens.output || 0, cache_read: s.tokens.cache_read || 0,
+      cache_write_5m: s.tokens.cache_write || 0, cache_write_1h: 0,
+    });
+    res.source = "summary";
+  }
+  return res;
+}
+
+// --- report ----------------------------------------------------------------------
+
+const zeroTokens = () => Object.fromEntries(TOKEN_KINDS.map((k) => [k, 0]));
+const addTokens = (a, u) => TOKEN_KINDS.forEach((k) => { a[k] += u[k] || 0; });
+const sumTokens = (t) => TOKEN_KINDS.reduce((n, k) => n + t[k], 0);
+
+async function scan(opts) {
+  const now = process.env.BOT_COST_NOW ? new Date(process.env.BOT_COST_NOW) : new Date();
+  const since = parseTime(opts.since, now);
+  const until = opts.until ? parseTime(opts.until, now) : now;
+  if (!(since < until)) throw new Exit(EX_USAGE, `the window is empty: ${since.toISOString()} is not before ${until.toISOString()}`);
+  const win = { since: since.getTime(), until: Math.min(until.getTime(), now.getTime()), now: now.getTime() };
+  const notes = [];
+  const days = {};
+  const day = (d) => (days[d] ||= {
+    date: d, compute: { runs: 0, core_hours: 0, list_usd: 0 },
+    inference: { tokens: zeroTokens(), usd: 0, unpriced_tokens: 0, mock_tokens: 0 },
+  });
+  const tasks = new Map();
+  const task = (key, label) => {
+    if (!tasks.has(key)) {
+      tasks.set(key, {
+        key, label, item: null, scratch: null, devspaces: [], agents: 0,
+        core_hours: 0, compute_usd: 0, tokens: 0, inference_usd: 0,
+      });
+    }
+    const t = tasks.get(key);
+    if (!t.label && label) t.label = label;
+    return t;
+  };
+  const models = {};
+  const agents = [];
+
+  let prices = null;
+  const priceUsage = (u, t) => {
+    const d = day(dayOf(u.ts));
+    const entry = modelPrice(prices.data, u.model);
+    const m = (models[u.model] ||= { model: u.model, priced_as: entry ? entry.id : null, tokens: zeroTokens(), usd: 0 });
+    addTokens(m.tokens, u);
+    addTokens(d.inference.tokens, u);
+    const n = sumTokens({ ...zeroTokens(), ...u });
+    if (t) t.tokens += n;
+    if (!entry) {
+      d.inference.unpriced_tokens += n;
+      return;
+    }
+    const usd = usdOf(entry, u);
+    m.usd += usd;
+    d.inference.usd += usd;
+    if (t) t.inference_usd += usd;
+  };
+
+  // Local transcripts first: they name the devspaces each agent started.
+  const devspaceOwners = new Map();
+  if (opts.inference) {
+    prices = await loadModels(opts, notes);
+    let dirs = opts.projects;
+    if (!dirs.length) {
+      try {
+        dirs = fs.readdirSync(DEFAULT_PROJECTS_ROOT, { withFileTypes: true })
+          .filter((e) => e.isDirectory()).map((e) => path.join(DEFAULT_PROJECTS_ROOT, e.name));
+      } catch (e) {
+        notes.push(`No local transcripts: cannot read ${DEFAULT_PROJECTS_ROOT} (${e.code || e.message}).`);
+      }
+    }
+    for (const t of transcriptFiles(dirs, win.since)) {
+      const { agent, usage } = readTranscript(t, win);
+      for (const n of agent.devspaces) {
+        (devspaceOwners.get(n) || devspaceOwners.set(n, []).get(n)).push(agent);
+      }
+      if (!usage.length) continue;
+      const key = agent.item || (agent.scratch && `scratch:${agent.scratch}`) || (agent.kind === "session" ? `session:${agent.key}` : `agent:${agent.key}`);
+      const tk = task(key, agent.label);
+      tk.item ||= agent.item;
+      tk.scratch ||= agent.scratch;
+      agent.devspaces.forEach((n) => tk.devspaces.includes(n) || tk.devspaces.push(n));
+      tk.agents++;
+      agent.task = key;
+      agents.push({ ...agent, messages: usage.length });
+      usage.forEach((u) => priceUsage(u, tk));
+    }
+  }
+
+  let runs = [];
+  if (opts.compute) {
+    runs = await scanCompute(opts, win, notes);
+    for (const r of runs) {
+      for (const [d, v] of Object.entries(r.days)) {
+        const dd = day(d);
+        dd.compute.runs++;
+        dd.compute.core_hours += v.core_hours;
+        dd.compute.list_usd += v.list_usd;
+      }
+      // The devspace belongs to the latest agent that named it before it started.
+      const start = Date.parse(r.started_at);
+      const owners = (r.devspace && devspaceOwners.get(r.devspace)) || [];
+      const owner = owners.filter((a) => a.task && (a.first_ts === null || a.first_ts <= start)).sort((a, b) => b.first_ts - a.first_ts)[0]
+        || owners.find((a) => a.task);
+      const key = (owner && owner.task) || r.item || (r.devspace ? `devspace:${r.devspace}` : `run:${r.workflow}`);
+      const tk = task(key, r.devspace ? `devspace ${r.devspace}` : r.title);
+      if (r.devspace && !tk.devspaces.includes(r.devspace)) tk.devspaces.push(r.devspace);
+      tk.item ||= r.item;
+      tk.core_hours += r.core_hours;
+      tk.compute_usd += r.list_usd;
+      r.task = key;
+    }
+  }
+
+  // Agent runs' inference, once the runs are known.
+  let mockTokens = 0;
+  if (opts.inference && opts.compute) {
+    for (const r of runs.filter((x) => x.workflow === AGENT_WORKFLOW && x.status === "completed")) {
+      const res = await agentRunUsage(r.repo, { id: r.run_id, updated_at: r.ended_at });
+      r.inference_source = res.source;
+      r.mock = res.mock;
+      const inWin = res.usage.filter((u) => u.ts >= win.since && u.ts < win.until);
+      if (res.mock) {
+        for (const u of inWin) {
+          const n = sumTokens({ ...zeroTokens(), ...u });
+          day(dayOf(u.ts)).inference.mock_tokens += n;
+          mockTokens += n;
+        }
+        continue;
+      }
+      inWin.forEach((u) => priceUsage(u, tasks.get(r.task)));
+    }
+  }
+  if (mockTokens) notes.push(`${fmtTokens(mockTokens)} tokens of ${AGENT_WORKFLOW} runs came from the mock inference shim and are not priced.`);
+  const unknown = Object.values(models).filter((m) => !m.priced_as).map((m) => m.model);
+  if (unknown.length) notes.push(`No price on models.dev for model(s) ${unknown.join(", ")}: their tokens are counted but not priced.`);
+  if (opts.inference && Object.values(models).some((m) => m.tokens.cache_write_1h)) {
+    notes.push(`1-hour cache writes are priced at ${CACHE_1H_INPUT_MULT}x the input price (Anthropic's rate; models.dev lists only the 5-minute one).`);
+  }
+
+  const dayList = Object.values(days).sort((a, b) => a.date.localeCompare(b.date));
+  for (const d of dayList) d.total_usd = d.compute.list_usd + d.inference.usd;
+  const taskList = [...tasks.values()].map((t) => ({ ...t, total_usd: t.compute_usd + t.inference_usd }))
+    .sort((a, b) => b.total_usd - a.total_usd);
+  const totals = {
+    core_hours: dayList.reduce((n, d) => n + d.compute.core_hours, 0),
+    compute_usd: dayList.reduce((n, d) => n + d.compute.list_usd, 0),
+    tokens: dayList.reduce((n, d) => n + sumTokens(d.inference.tokens), 0),
+    inference_usd: dayList.reduce((n, d) => n + d.inference.usd, 0),
+  };
+  totals.total_usd = totals.compute_usd + totals.inference_usd;
+  return {
+    schema: SCHEMA, estimate: true, generated_at: now.toISOString(),
+    window: { since: new Date(win.since).toISOString(), until: new Date(win.until).toISOString() },
+    prices: {
+      compute: { source: RUNNER_PRICES.source, retrieved: RUNNER_PRICES.retrieved },
+      inference: prices ? { source: prices.source, fetched: prices.fetched } : null,
+    },
+    totals, days: dayList, tasks: taskList,
+    models: Object.values(models).sort((a, b) => b.usd - a.usd),
+    runs: runs.map(({ days: _days, ...r }) => r),
+    agents: agents.map(({ first_ts: _f, ...a }) => a),
+    notes,
+  };
+}
+
+function fmtTokens(n) {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`;
+  return String(n);
+}
+const fmtUsd = (n) => `$${n.toFixed(2)}`;
+const fmtHours = (n) => n.toFixed(1);
+
+function table(rows, align) {
+  const widths = rows[0].map((_, i) => Math.max(...rows.map((r) => String(r[i]).length)));
+  return rows.map((r) => r.map((c, i) => (align[i] === "r" ? String(c).padStart(widths[i]) : String(c).padEnd(widths[i])))
+    .join("  ").trimEnd()).join("\n");
+}
+
+function render(s, opts = {}) {
+  const top = opts.tasks ?? TOP_TASKS;
+  const out = [];
+  out.push(`Estimated cost, ${s.window.since.slice(0, 16)}Z to ${s.window.until.slice(0, 16)}Z (approximate: list prices, not a bill)`);
+  out.push("");
+  const rows = [["Day (UTC)", "Runs", "Core-h", "Compute", "Tokens", "Inference", "Total"]];
+  for (const d of s.days) {
+    rows.push([d.date, d.compute.runs, fmtHours(d.compute.core_hours), fmtUsd(d.compute.list_usd),
+      fmtTokens(sumTokens(d.inference.tokens)), fmtUsd(d.inference.usd), fmtUsd(d.total_usd)]);
+  }
+  if (s.days.length > 1) {
+    rows.push(["total", s.runs.length, fmtHours(s.totals.core_hours), fmtUsd(s.totals.compute_usd),
+      fmtTokens(s.totals.tokens), fmtUsd(s.totals.inference_usd), fmtUsd(s.totals.total_usd)]);
+  }
+  out.push(s.days.length ? table(rows, "lrrrrrr") : "Nothing found in the window.");
+  if (s.models.length) {
+    out.push("", "By model:");
+    const m = [["Model", "Input", "Output", "Cache read", "Cache write", "Cost"]];
+    for (const x of s.models) {
+      m.push([x.model, fmtTokens(x.tokens.input), fmtTokens(x.tokens.output), fmtTokens(x.tokens.cache_read),
+        fmtTokens(x.tokens.cache_write_5m + x.tokens.cache_write_1h), x.priced_as ? fmtUsd(x.usd) : "unpriced"]);
+    }
+    out.push(table(m, "lrrrrr"));
+  }
+  const sized = s.runs.filter((r) => r.cores);
+  if (sized.length) {
+    const byCores = {};
+    for (const r of sized) {
+      const c = (byCores[r.cores] ||= { runs: 0, core_hours: 0, usd: 0 });
+      c.runs++;
+      c.core_hours += r.core_hours;
+      c.usd += r.list_usd;
+    }
+    out.push("", "By runner size:");
+    const c = [["Cores", "Runs", "Core-h", "Compute"]];
+    for (const [k, v] of Object.entries(byCores).sort((a, b) => a[0] - b[0])) c.push([k, v.runs, fmtHours(v.core_hours), fmtUsd(v.usd)]);
+    out.push(table(c, "rrrr"));
+  }
+  if (s.tasks.length && top) {
+    out.push("", `By task (top ${Math.min(top, s.tasks.length)} of ${s.tasks.length}):`);
+    const t = [["Task", "Core-h", "Compute", "Tokens", "Inference", "Total"]];
+    for (const x of s.tasks.slice(0, top)) {
+      const name = [x.item, x.scratch && `scratch ${x.scratch}`, x.devspaces.length && `devspace ${x.devspaces.join(",")}`]
+        .filter(Boolean).join(" ");
+      const label = !name ? x.label || x.key : x.label && !name.includes(x.label) ? `${name}: ${x.label}` : name;
+      t.push([label.length > 70 ? `${label.slice(0, 69)}…` : label, fmtHours(x.core_hours), fmtUsd(x.compute_usd),
+        fmtTokens(x.tokens), fmtUsd(x.inference_usd), fmtUsd(x.total_usd)]);
+    }
+    out.push(table(t, "lrrrrr"));
+  }
+  out.push("", "Prices:");
+  out.push(`  compute: GitHub Actions per-minute Linux x64 list rates, ${s.prices.compute.source} (checked in, retrieved ${s.prices.compute.retrieved})`);
+  if (s.prices.inference) {
+    out.push(`  inference: ${s.prices.inference.source}${s.prices.inference.fetched ? ` (fetched ${s.prices.inference.fetched})` : ""}`);
+  }
+  for (const n of s.notes) out.push(`  note: ${n}`);
+  return `${out.join("\n")}\n`;
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const summary = await scan(opts);
+  process.stdout.write(opts.json ? `${JSON.stringify(summary, null, 2)}\n` : render(summary, opts));
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  });
+} else {
+  module.exports = { parseTime, splitByDay, runnerOf, usdPerMinute, modelPrice, usdOf, devspacesStarted, render, scan };
+}

@@ -1,0 +1,1 @@
+{"run":{"id":202},"summary":{"schema":"agent-run-summary/v1","model":"claude-sonnet-4-5","aic_pricing":"mock","finished_at":"2026-09-20T13:09:00Z","tokens":{"input":1000,"output":100,"cache_read":0,"cache_write":0}},"source":"artifact"}
