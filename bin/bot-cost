@@ -101,6 +101,9 @@ published list prices. It is an estimate, not a bill.
 
 Tasks are the board item, scratch dir or devspace named in a subagent's
 prompt; a devspace run belongs to the agent that started it by name.
+With --json, each task also lists its first and last message times, its
+sessions, subagents and Actions runs, and its tokens and cost per model
+(what bot-footer shows).
 
 AGE is 12h, 7d, 2w, 'today' or 'yesterday' (midnight UTC), or a date
 (default ${DEFAULT_SINCE}); DATE is 'today', 'yesterday' or a date (default now).
@@ -620,6 +623,7 @@ async function scan(opts) {
       tasks.set(key, {
         key, label, item: null, scratch: null, devspaces: [], agents: 0,
         core_hours: 0, compute_usd: 0, tokens: 0, inference_usd: 0,
+        first_message_at: null, last_message_at: null, sessions: [], subagents: [], run_urls: [], models: {},
       });
     }
     const t = tasks.get(key);
@@ -637,7 +641,14 @@ async function scan(opts) {
     addTokens(m.tokens, u);
     addTokens(d.inference.tokens, u);
     const n = sumTokens({ ...zeroTokens(), ...u });
-    if (t) t.tokens += n;
+    const tm = t && (t.models[u.model] ||= { tokens: zeroTokens(), usd: 0 });
+    if (t) {
+      t.tokens += n;
+      addTokens(tm.tokens, u);
+      const iso = new Date(u.ts).toISOString();
+      if (!t.first_message_at || iso < t.first_message_at) t.first_message_at = iso;
+      if (!t.last_message_at || iso > t.last_message_at) t.last_message_at = iso;
+    }
     if (!entry) {
       d.inference.unpriced_tokens += n;
       return;
@@ -645,8 +656,12 @@ async function scan(opts) {
     const usd = usdOf(entry, u);
     m.usd += usd;
     d.inference.usd += usd;
-    if (t) t.inference_usd += usd;
+    if (t) {
+      t.inference_usd += usd;
+      tm.usd += usd;
+    }
   };
+  const addUnique = (list, v) => v && !list.includes(v) && list.push(v);
 
   // Local transcripts first: they name the devspaces each agent started.
   const devspaceOwners = new Map();
@@ -671,7 +686,9 @@ async function scan(opts) {
       const tk = task(key, agent.label);
       tk.item ||= agent.item;
       tk.scratch ||= agent.scratch;
-      agent.devspaces.forEach((n) => tk.devspaces.includes(n) || tk.devspaces.push(n));
+      agent.devspaces.forEach((n) => addUnique(tk.devspaces, n));
+      addUnique(tk.sessions, agent.session);
+      if (agent.kind === "subagent") addUnique(tk.subagents, agent.key);
       tk.agents++;
       agent.task = key;
       agents.push({ ...agent, messages: usage.length });
@@ -696,7 +713,8 @@ async function scan(opts) {
         || owners.find((a) => a.task);
       const key = (owner && owner.task) || r.item || (r.devspace ? `devspace:${r.devspace}` : `run:${r.workflow}`);
       const tk = task(key, r.devspace ? `devspace ${r.devspace}` : r.title);
-      if (r.devspace && !tk.devspaces.includes(r.devspace)) tk.devspaces.push(r.devspace);
+      addUnique(tk.devspaces, r.devspace);
+      addUnique(tk.run_urls, r.url);
       tk.item ||= r.item;
       tk.core_hours += r.core_hours;
       tk.compute_usd += r.list_usd;
