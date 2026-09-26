@@ -31,7 +31,7 @@ WORK=$(mktemp -d "${TMPDIR:-/tmp}/bot-watch-test.XXXXXX")
 readonly WORK
 trap 'test -n "${KEEP:-}" || rm -rf "${WORK}"' EXIT
 export FAKE_GH=${WORK}/gh
-export XDG_CACHE_HOME=${WORK}/cache XDG_STATE_HOME=${WORK}/state
+export XDG_CACHE_HOME=${WORK}/cache XDG_STATE_HOME=${WORK}/state UPSTREAM_POLICY_DIR=${WORK}/policy
 export PATH=${WORK}/bin:${PATH}
 readonly REST=${FAKE_GH}/rest
 
@@ -394,6 +394,9 @@ rb_ci() {
 }
 put repos/example/rb/actions/runs '{"workflow_runs": []}'
 put repos/example/rb/actions/workflows '{"workflows": []}'
+# No merge queue: no branch rules, and no workflows.
+put repos/example/rb/rules/branches/main '[]'
+put repos/example/rb/git/trees/main '{"truncated": false, "tree": []}'
 readonly RB=${GH}/example/rb/pull
 # #1 fails CI and is behind; #2 conflicts; #3 fails but is up to date;
 # #4 is fine; #5's base must be up to date and it isn't. The fork PR
@@ -463,6 +466,23 @@ rb_ci aaaa000000000000000000000000000000000011 success
 sweep rebase 2026-09-25T16:30:00Z
 jq -e --arg rb "${RB}" '.rebase | has("\($rb)/1") | not' "${WORK}/rebase.state" >/dev/null ||
     fail "rebase: the state still remembers #1: $(cat "${WORK}/rebase.state")"
+
+# A merge queue, or a record saying so: only the conflicting PRs are
+# listed, as 'bot-pr rebase' refuses the others.
+readonly CONFLICTING_JQ='[.needs_rebase[].url] | sort == ([$fork, "\($rb)/2"] | sort)'
+expect rebase "conflict-free ones listed before" --arg rb "${RB}" '[.needs_rebase[].url] | index("\($rb)/5")'
+put repos/example/rb/rules/branches/main '[{"type": "merge_queue", "parameters": {}}]'
+rm -r "${XDG_CACHE_HOME}/upstream-policy"
+sweep rebase 2026-09-25T16:40:00Z
+expect rebase "merge queue: only the conflicting ones" "${rebase_args[@]}" "${CONFLICTING_JQ}"
+grep -qx "  conflict-free:" "${WORK}/rebase.txt" && fail "rebase: merge queue: conflict-free ones listed: $(cat "${WORK}/rebase.txt")"
+put repos/example/rb/rules/branches/main '[]'
+rm -r "${XDG_CACHE_HOME}/upstream-policy"
+mkdir -p "${UPSTREAM_POLICY_DIR}/example"
+printf '%s\n' --- 'verdict: bot-ok' 'ai-trailer: none' 'dco: no' 'sources: []' 'checked: today' 'rebase: conflicts-only' --- '' 'Asked.' \
+    >"${UPSTREAM_POLICY_DIR}/example/rb.md"
+sweep rebase 2026-09-25T16:50:00Z
+expect rebase "record: only the conflicting ones" "${rebase_args[@]}" "${CONFLICTING_JQ}"
 
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
 echo "ok: bot-watch first-sight news, outstanding reviews and PRs that need a rebase as expected"
