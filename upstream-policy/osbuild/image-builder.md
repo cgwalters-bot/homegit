@@ -28,6 +28,7 @@ sources:
     path: docs/developer-guide/01-general/workflow.md
     sha: afe4c7f80c59133416e52ff67c6eee7dd8ef943d
 checked: 2026-09-25 by the policy-check subagent (coordinator session 929c7a64, converted from an earlier read-only survey and re-read against current upstream)
+rebase: conflicts-only
 ---
 
 `osbuild/images` redirects here (the CLI repository osbuild/image-builder-cli
@@ -61,3 +62,10 @@ either (no Assisted-by, Generated-by or Claude trailers in the last 100
 commits on main), and cgwalters is not a core maintainer, so it's worth asking
 the osbuild maintainers before sending bot-written text. PR titles are expected
 to reference a Jira ticket.
+
+## Rebasing
+
+Rebase the bot's PRs here only to resolve conflicts: the repository has a
+merge queue (workflows run on merge_group), and every push from an
+outside contributor needs its CI approved again. A maintainer asked for
+this in https://github.com/osbuild/image-builder/pull/2719#issuecomment-5844231608.
