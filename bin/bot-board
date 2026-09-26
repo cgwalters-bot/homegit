@@ -81,6 +81,7 @@ readonly -A STATE_ITEMS=(
     [watch]='PVTI_lAHOAQ_SPs4Bj2Gizg8bu2Q DI_lAHOAQ_SPs4Bj2GizgLL6AY'
     [pr-inbox]='PVTI_lAHOAQ_SPs4Bj2Gizg8evC8 DI_lAHOAQ_SPs4Bj2GizgLMD8k'
     [lease]='PVTI_lAHOAQ_SPs4Bj2Gizg8evDc DI_lAHOAQ_SPs4Bj2GizgLMD8s'
+    [tmt-numbers]='PVTI_lAHOAQ_SPs4Bj2Gizg84Ipc DI_lAHOAQ_SPs4Bj2GizgLNEX0'
 )
 # GitHub's limit on the body of a draft item, in characters.
 readonly STATE_BODY_MAX=65536

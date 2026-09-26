@@ -1,0 +1,36 @@
+#!/usr/bin/env node
+// A stand-in for 'bot-board state-get [--track] NAME' and 'bot-board
+// state-put --checked --strict NAME JSON' in tests/bot-tmt-number.test.js,
+// keeping the state in $FAKE_BOARD_DIR/state.json. A strict put fails
+// with 3 if the state changed since the tracked read. While
+// $FAKE_BOARD_DIR/race.json holds a list of states, each tracked read is
+// followed by "another machine" writing the next one of them.
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const dir = process.env.FAKE_BOARD_DIR;
+const file = (name) => path.join(dir, name);
+const read = (name, fallback) => (fs.existsSync(file(name)) ? fs.readFileSync(file(name), "utf8") : fallback);
+const args = process.argv.slice(2);
+fs.appendFileSync(file("calls"), `${args.join(" ")}\n`);
+const state = read("state.json", "{}");
+if (args[0] === "state-get") {
+  process.stdout.write(`${state}\n`);
+  if (args[1] === "--track") {
+    fs.writeFileSync(file("base.json"), state);
+    const race = JSON.parse(read("race.json", "[]"));
+    if (race.length) {
+      fs.writeFileSync(file("state.json"), JSON.stringify(race.shift()));
+      fs.writeFileSync(file("race.json"), JSON.stringify(race));
+    }
+  }
+} else if (args[0] === "state-put" && args[1] === "--checked" && args[2] === "--strict") {
+  if (read("base.json", null) !== state) {
+    process.stderr.write("fake bot-board: changed since state-get\n");
+    process.exit(3);
+  }
+  fs.writeFileSync(file("state.json"), JSON.stringify(JSON.parse(args[4])));
+} else {
+  process.stderr.write(`fake bot-board: unexpected arguments ${args.join(" ")}\n`);
+  process.exit(2);
+}
