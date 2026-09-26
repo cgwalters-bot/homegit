@@ -51,10 +51,14 @@ Runners are billed while they run, and larger ones cost more. So:
 - Start one only for work that needs it: a real build or test run, not a
   one-line doc fix.
 - Pick the smallest size that fits: `--cores 4` for a quick Rust crate,
-  16 (default) for bootc-sized builds, 64 only for heavy VM or
-  compose-style tests. Pick the shortest `--duration` that covers the work
+  16 (default) for bootc-sized builds. 64 cores cost about four times as much
+  per minute; use them only when a 16-core run has proven too slow for
+  the task (or the brief asks for them), and say why in your report.
+  Pick the shortest `--duration` that covers the work
   (30/60/120/240 minutes, other values round up; default 240), since
   it's a hard upper bound.
+- `bot-cost` shows what devspaces and inference cost per day and task
+  (an estimate at list prices).
 - **Stop it as soon as the task's testing is done**, and before parking
   the item as Draft or Needs human. Never leave one running between
   tasks "just in case".
