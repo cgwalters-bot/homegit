@@ -69,6 +69,12 @@ readonly TRACKER_REPO=cgwalters-forge/tracker
 # The only login whose answers count; questions are assigned to him.
 readonly OPERATOR=cgwalters
 readonly QUESTION_LABEL=question
+# Asks that aren't questions: approving a PR at a given head, and chores
+# such as rerunning failed CI jobs. Each ask is one issue, with one of
+# these labels or QUESTION_LABEL.
+readonly REVIEW_LABEL=review
+readonly CHORE_LABEL=chore
+readonly ASK_LABELS=("${QUESTION_LABEL}" "${REVIEW_LABEL}" "${CHORE_LABEL}")
 readonly QUESTION_STATUS='Needs human'
 readonly DONE_STATUS=Done
 # The first line of a question's body: the board item it blocks.
@@ -166,6 +172,7 @@ Commands:
                               Org comes from the title and body links
                               unless given. Board items are never drafts
   question BLOCKED QUESTION [--option TEXT]... [--recommend WHY]
+           [--review PR_URL@SHA | --rerun RUN_URL... | --chore]
            [--context TEXT] [--title TEXT] [--priority P]
                               Ask ${OPERATOR} something: open an issue in
                               ${TRACKER_REPO} labelled '${QUESTION_LABEL}' and
@@ -180,11 +187,15 @@ Commands:
                               given); prints the question's URL. He
                               answers with a comment on it. An upstream
                               BLOCKED is linked in a code span, which
-                              adds nothing to its timeline
+                              adds nothing to its timeline. An ask that
+                              isn't a decision is a '${REVIEW_LABEL}' (approve
+                              that PR at that head) or a '${CHORE_LABEL}' (rerun
+                              the failed jobs of those runs, or --chore:
+                              anything else); QUESTION is then the ask
   resolve QUESTION TEXT       After acting on an answer: comment TEXT (one
                               line saying what was done) on the question
                               (an issue in ${TRACKER_REPO} labelled
-                              '${QUESTION_LABEL}'), close it and set its item
+                              ${ASK_LABELS[*]}), close it and set its item
                               ${DONE_STATUS}
   set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT]
            [--branch URL...] [--gist URL...] [--field NAME VALUE]...
@@ -746,9 +757,10 @@ cmd_issue() {
 }
 
 # question_body BLOCKED_URL QUESTION CONTEXT RECOMMEND OPTION...: the
-# body of a question issue. A bare link to an issue or PR elsewhere would
-# put "mentioned this" on its timeline, upstream noise; one in a code
-# span doesn't.
+# body of a question issue, or of a review or chore when ASK_KIND says
+# so, with the 'Review:' or 'Rerun:' lines in ASK_LINES. A bare link to
+# an issue or PR elsewhere would put "mentioned this" on its timeline,
+# upstream noise; one in a code span doesn't.
 question_body() {
     local blocked=$1 question=$2 context=$3 recommend=$4 i
     shift 4
@@ -758,6 +770,13 @@ question_body() {
         printf '%s`%s`\n\n' "${BLOCKS_PREFIX}" "${blocked}"
     fi
     test -z "${context}" || printf '%s\n\n' "${context}"
+    if test -n "${ASK_KIND}"; then
+        # A review or chore: the ask, then what the review app acts on.
+        printf 'Ask: %s\n' "${question}"
+        test -z "${ASK_LINES}" || printf '%s\n' "${ASK_LINES}"
+        printf '\n%s\n' "When it's done, say so in a comment on this issue; the bot then closes it. Only comments by the ${OPERATOR} login count."
+        return 0
+    fi
     printf 'Q: %s\n' "${question}"
     if test $# -gt 0; then
         printf '\nOptions:\n'
@@ -776,10 +795,44 @@ one_line() {
     printf '%s' "${text}"
 }
 
+# review_line PR_URL@SHA: prints the 'Review:' line, with the full head
+# sha (REST).
+review_line() {
+    local pr=${1%@*} sha=${1##*@} ref repo number full
+    [[ "$1" == *@* && "${pr}" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+$ ]] ||
+        fatal "--review takes PR_URL@SHA, got '$1'"
+    [[ "${sha}" =~ ^[0-9a-f]{7,40}$ ]] || fatal "not a commit sha: '${sha}'"
+    ref=$(issue_ref "${pr}") || exit
+    read -r repo number <<<"${ref}"
+    full=$(ghq api "repos/${repo}/commits/${sha}" --jq .sha) || fail_after $? "no commit ${sha} in ${repo}"
+    printf 'Review: `%s` at %s' "${pr}" "${full}"
+}
+
+# rerun_line RUN_URL: prints a 'Rerun:' line for a workflow run.
+rerun_line() {
+    local run=${1%/}
+    run=${run%%/job/*}
+    run=${run%%/attempts/*}
+    [[ "${run}" =~ ^https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/actions/runs/[0-9]+$ ]] ||
+        fatal "--rerun takes a workflow run URL (https://github.com/OWNER/REPO/actions/runs/ID), got '$1'"
+    printf 'Rerun: `%s`' "${run}"
+}
+
+ASK_KIND=
+ASK_LINES=
 cmd_question() {
     local blocked="" question="" context="" recommend="" title="" priority="" options=() have_question=false
+    local kind=${QUESTION_LABEL} lines=() line
     while test $# -gt 0; do
         case "$1" in
+            --review) test $# -ge 2 || fatal "--review requires PR_URL@SHA"
+                test "${kind}" != "${CHORE_LABEL}" || fatal "an ask is a review or a chore, not both"
+                kind=${REVIEW_LABEL}; line=$(review_line "$2") || exit; lines+=("${line}"); shift 2 ;;
+            --rerun) test $# -ge 2 || fatal "--rerun requires a run URL"
+                test "${kind}" != "${REVIEW_LABEL}" || fatal "an ask is a review or a chore, not both"
+                kind=${CHORE_LABEL}; line=$(rerun_line "$2") || exit; lines+=("${line}"); shift 2 ;;
+            --chore) test "${kind}" != "${REVIEW_LABEL}" || fatal "an ask is a review or a chore, not both"
+                kind=${CHORE_LABEL}; shift ;;
             --option) test $# -ge 2 || fatal "--option requires a text"; test -n "$2" || fatal "an option must not be empty"
                 options+=("$2"); shift 2 ;;
             --recommend) test $# -ge 2 || fatal "--recommend requires a reason"; recommend=$2; shift 2 ;;
@@ -801,6 +854,11 @@ cmd_question() {
     test "${#options[@]}" -le "${#OPTION_LETTERS}" || fatal "at most ${#OPTION_LETTERS} options"
     test -z "${recommend}" || test "${#options[@]}" -gt 0 ||
         fatal "--recommend recommends option A, so it needs options (the recommended one first)"
+    if test "${kind}" != "${QUESTION_LABEL}"; then
+        test "${#options[@]}" -eq 0 || fatal "a ${kind} has no options; ask a question for a decision"
+        ASK_KIND=${kind}
+        test "${#lines[@]}" -eq 0 || ASK_LINES=$(printf '%s\n' "${lines[@]}")
+    fi
     local blocked_repo blocked_number blocked_url ref
     ref=$(issue_ref "${blocked}") || exit
     read -r blocked_repo blocked_number <<<"${ref}"
@@ -820,7 +878,7 @@ cmd_question() {
     local body issue url
     body=$(question_body "${blocked_url}" "${question}" "${context}" "${recommend}" "${options[@]}")
     item_labels "${priority}" "${org}"
-    issue=$(open_issue "${title}" "${body}" "$(jq -nc --arg label "${QUESTION_LABEL}" --arg op "${OPERATOR}" \
+    issue=$(open_issue "${title}" "${body}" "$(jq -nc --arg label "${kind}" --arg op "${OPERATOR}" \
         --argjson l "${ITEM_LABELS}" '{labels: ([$label] + $l), assignees: [$op]}')")
     url=$(jq -r .html_url <<<"${issue}")
     echo "opened ${url}" 1>&2
@@ -832,7 +890,12 @@ cmd_question() {
         (add_sub_issue "${blocked_repo}" "${blocked_number}" "$(jq -r .id <<<"${issue}")") ||
             echo "warning: making ${url} a sub-issue of ${blocked_url} failed; its ${BLOCKS_PREFIX% } line still links them" 1>&2
     fi
-    why="Q: $(one_line "${question}" $((WHY_MAX - 20)))"
+    case "${kind}" in
+        "${REVIEW_LABEL}") why="Review: " ;;
+        "${CHORE_LABEL}") why="Chore: " ;;
+        *) why="Q: " ;;
+    esac
+    why+=$(one_line "${question}" $((WHY_MAX - 20)))
     test -z "${recommend}" || why+=" (rec A)"
     fields+=(--why "${why}")
     test -z "${priority}" || fields+=(--priority "${priority}")
@@ -860,8 +923,9 @@ cmd_resolve() {
     local labels
     labels=$(ghq api "repos/${repo}/issues/${number}" --jq '[.labels[].name] | join(" ")') ||
         fail_after $? "reading ${url} failed"
-    [[ " ${labels} " == *" ${QUESTION_LABEL} "* ]] ||
-        fatal "${url} isn't labelled '${QUESTION_LABEL}': resolve only closes questions"
+    local l ask=false
+    for l in "${ASK_LABELS[@]}"; do [[ " ${labels} " != *" ${l} "* ]] || ask=true; done
+    ${ask} || fatal "${url} isn't labelled ${ASK_LABELS[*]}: resolve only closes asks"
     ghq api -X POST "repos/${repo}/issues/${number}/comments" -f body="$2" >/dev/null ||
         fail_after $? "commenting on ${url} failed"
     ghq api -X PATCH "repos/${repo}/issues/${number}" -f state=closed -f state_reason=completed >/dev/null ||

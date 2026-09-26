@@ -99,6 +99,10 @@ jq -n --arg t "${TRACKER}" '{number: 10, title: "Q", html_url: "https://github.c
     labels: [{name: "question"}], body: "", user: {login: "cgwalters-bot", type: "User"},
     created_at: "2026-09-26T09:00:00Z"}' | api "repos/${TRACKER}/issues/10"
 comment 10 6 cgwalters "@cgwalters-bot go with A" | jq -s . | api "repos/${TRACKER}/issues/10/comments"
+# Tracker #11: a chore he says he did.
+jq -n --arg t "${TRACKER}" '{number: 11, title: "Rerun", html_url: "https://github.com/\($t)/issues/11",
+    labels: [{name: "chore"}], body: ""}' | api "repos/${TRACKER}/issues/11"
+comment 11 7 cgwalters "Reran them." | jq -s . | api "repos/${TRACKER}/issues/11/comments"
 # example/repo#5: an assignment GitHub has no event for yet, in a thread
 # without comments: the fallback trigger has no text.
 jq -n '{number: 5, title: "Some issue", html_url: "https://github.com/example/repo/issues/5", labels: [], body: null}' |
@@ -120,13 +124,16 @@ thread() {
     thread 104 assign example/repo 5
     thread 105 mention cgwalters-forge/bootc 7 PullRequest
     thread 106 mention "${TRACKER}" 10
+    thread 107 author "${TRACKER}" 11
 } | jq -s . >"${WORK}/threads.json"
 
 out=$("${BIN}/bot-notify" --dry-run --from-file "${WORK}/threads.json" 2>"${WORK}/err") ||
     fail "bot-notify failed: $(cat "${WORK}/err")"$'\n'"${out}"
 records=$(sed -n 's/^\(answer\|request\) //p' <<<"${out}")
 
-jq -se 'length == 3' <<<"${records}" >/dev/null || fail "expected 3 records, got:"$'\n'"${records}"
+jq -se 'length == 4' <<<"${records}" >/dev/null || fail "expected 4 records, got:"$'\n'"${records}"
+jq -se 'any(.[]; .type == "answer" and .thread_id == "107" and .choice == null)' \
+    <<<"${records}" >/dev/null || fail "his comment on a chore isn't an answer:"$'\n'"${records}"
 jq -se 'any(.[]; .type == "answer" and .reason == "mention" and .thread_id == "106" and .choice == null)' \
     <<<"${records}" >/dev/null || fail "his answer mentioning the bot isn't an answer:"$'\n'"${records}"
 jq -se --arg t "${TRACKER}" 'any(.[]; .type == "answer" and .author == "cgwalters" and .choice == "B"

@@ -203,6 +203,38 @@ grep -q "is not on the board" "${WORK}/err" || fail "no warning about the missin
 grep -q "making .* a sub-issue .* failed" "${WORK}/err" || fail "no warning about the failed sub-issue: $(cat "${WORK}/err")"
 echo "ok: question on an item missing from the board"
 
+# --- Reviews and chores ----------------------------------------------------
+
+readonly HEAD=aec657dd0123456789abcdef0123456789abcdef
+echo "{\"sha\": \"${HEAD}\"}" >"${FAKE_GH}/api/repos_bootc-dev_bootc_commits_aec657dd"
+readonly DONE_LINE="When it's done, say so in a comment on this issue; the bot then closes it. Only comments by the cgwalters login count."
+run question https://github.com/bootc-dev/bootc/pull/9 "Re-approve bootc#9 at its new head" \
+    --review https://github.com/bootc-dev/bootc/pull/9@aec657dd --context "Squashed the fix into your commit."
+payload=$(sed -n 's/^issue //p' "${FAKE_GH}/log")
+want_body="Blocks: \`https://github.com/bootc-dev/bootc/pull/9\`
+
+Squashed the fix into your commit.
+
+Ask: Re-approve bootc#9 at its new head
+Review: \`https://github.com/bootc-dev/bootc/pull/9\` at ${HEAD}
+
+${DONE_LINE}"
+test "$(jq -r .body <<<"${payload}")" = "${want_body}" || fail "review body:"$'\n'"$(jq -r .body <<<"${payload}")"
+jq -e '.labels[0] == "review"' <<<"${payload}" >/dev/null || fail "review label: ${payload}"
+expect_log "edit PVTI_new F_Why Review: Re-approve bootc#9 at its new head"
+echo "ok: review"
+
+run question https://github.com/bootc-dev/bootc/pull/9 "Rerun the legs that lost their runner" \
+    --rerun https://github.com/bootc-dev/bootc/actions/runs/123/job/456 --rerun https://github.com/bootc-dev/bootc/actions/runs/124
+payload=$(sed -n 's/^issue //p' "${FAKE_GH}/log")
+jq -e --arg tail "${DONE_LINE}" '.labels[0] == "chore" and (.body | endswith("\n\nAsk: Rerun the legs that lost their runner\nRerun: `https://github.com/bootc-dev/bootc/actions/runs/123`\nRerun: `https://github.com/bootc-dev/bootc/actions/runs/124`\n\n" + $tail))' \
+    <<<"${payload}" >/dev/null || fail "rerun chore: $(jq .body <<<"${payload}")"
+run question "${TRACKER}/issues/5" "Save the view's sort" --chore
+payload=$(sed -n 's/^issue //p' "${FAKE_GH}/log")
+jq -e --arg tail "${DONE_LINE}" '.labels[0] == "chore" and (.body == "Blocks: https://github.com/cgwalters-forge/tracker/issues/5\n\nAsk: Save the view'"'"'s sort\n\n" + $tail)' \
+    <<<"${payload}" >/dev/null || fail "plain chore: $(jq .body <<<"${payload}")"
+echo "ok: chores"
+
 # --- Refusals: nothing is created -----------------------------------------
 
 # "ERROR SUBSTRING|ARGS" (tab-separated args)
@@ -216,7 +248,12 @@ readonly REFUSALS=(
     "no longer drafts|draft	T	B"
     "say in TEXT|resolve	${TRACKER}/issues/42	 "
     "closes questions in cgwalters-forge/tracker|resolve	https://github.com/bootc-dev/bootc/pull/9	Merged."
-    "isn't labelled 'question'|resolve	${TRACKER}/issues/43	Done."
+    "isn't labelled question review chore|resolve	${TRACKER}/issues/43	Done."
+    "has no options|question	${TRACKER}/issues/5	Approve	--review	https://github.com/bootc-dev/bootc/pull/9@aec657dd	--option	a	--option	b"
+    "not both|question	${TRACKER}/issues/5	X	--chore	--review	https://github.com/bootc-dev/bootc/pull/9@aec657dd"
+    "takes a workflow run URL|question	${TRACKER}/issues/5	X	--rerun	https://github.com/bootc-dev/bootc/pull/9"
+    "takes PR_URL@SHA|question	${TRACKER}/issues/5	X	--review	https://github.com/bootc-dev/bootc/issues/9@aec657dd"
+    "no commit 0badc0de|question	${TRACKER}/issues/5	X	--review	https://github.com/bootc-dev/bootc/pull/9@0badc0de"
 )
 for c in "${REFUSALS[@]}"; do
     IFS='|' read -r want argline <<<"${c}"
