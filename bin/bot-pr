@@ -30,6 +30,10 @@ readonly BRANCH_PREFIX=bot/
 readonly ITEM_ID_RE='PVTI_[A-Za-z0-9_-]+'
 readonly META_START='<!-- bot-meta -->'
 readonly META_END='<!-- /bot-meta -->'
+# The last line of a run footer (bot-footer's bot-run/v1, or an agent.yml
+# run's agent-run-summary/v1), after its summary line; footers accumulate
+# at the end of the bot-meta section.
+readonly FOOTER_MARKER_RE='^<!-- (bot-run|agent-run-summary)/v1 [{].*[}] -->$'
 readonly LLMS_TRAILER='Generated-by: https://github.com/cgwalters/#llms'
 # A line consisting of this, in a comment or review by REVIEWER, asks for
 # the upstream PR to be opened as a draft.
@@ -118,7 +122,7 @@ reviews it, and only his approval opens the upstream PR.
 
 Commands:
   fork-pr --repo OWNER/REPO --base BRANCH --branch ${BRANCH_PREFIX}SLUG --item PVTI_...
-          --title TITLE --body-file FILE [--from DIR] [--force] [--ci WORKFLOW]...
+          --title TITLE --body-file FILE [--footer FILE] [--from DIR] [--force] [--ci WORKFLOW]...
         Fork OWNER/REPO into ${FORGE_ORG} if needed, set up its Actions
         (see fork-setup; --ci is passed on), sync the fork's
         BRANCH with upstream, push
@@ -129,7 +133,8 @@ Commands:
         name. TITLE and FILE are the future upstream PR: why, what was
         tested, caveats, ending with '${LLMS_TRAILER}'.
         A trailing ${META_START} section records the upstream target
-        and board item, with instructions for the reviewer. It refuses if
+        and board item, with instructions for the reviewer, and ends with
+        the run footer in --footer's FILE (bot-footer's output). It refuses if
         another open fork PR in the fork already records that item, which
         is usually a copied id (after splitting a PR, the new part needs
         its own item); --force allows that.
@@ -222,7 +227,7 @@ Commands:
         Re-render a fork PR's bot-meta section from the current template,
         keeping the upstream, base and board item it records, after
         running fork-setup on its fork (so that its Fork CI line is
-        current). The rest of the body is left as is, including edits by
+        current), and its run footers. The rest of the body is left as is, including edits by
         ${REVIEWER}; like set-body, this is recorded as the bot's edit.
         Nothing is written if the section is already current, and it
         refuses if anyone else edited the section since the bot last
@@ -243,9 +248,12 @@ Commands:
         Print a fork PR's description without its bot-meta section, to
         edit and pass to set-body, and remember it as the base that
         set-body checks for changes.
-  set-body FORK_PR_URL --body-file FILE [--force]
+  set-body FORK_PR_URL [--body-file FILE] [--footer FILE] [--force]
         Replace a fork PR's description with FILE, keeping its bot-meta
-        section, and record it as the bot's, so that inbox doesn't report
+        section, and add the run footer in --footer's FILE (bot-footer's
+        output) to the end of that section, after any earlier ones; with
+        only --footer, the description stays as is. Record the new body
+        as the bot's, so that inbox doesn't report
         it as an edit. Use this for every change the bot makes to a fork
         PR's body, starting from get-body's output. It refuses if the body
         changed since get-body, or, without get-body, if ${REVIEWER}
@@ -834,7 +842,9 @@ push_branch() {
 # The bot-meta section appended to fork PR bodies. Its "Upstream:" and
 # "Board item:" lines are parsed back by promote.
 meta_section() {
-    local upstream=$1 base=$2 item=$3 notes list
+    local upstream=$1 base=$2 item=$3 footers=${4:-} notes list
+    # After a blank line, so that the markdown ends the list before them.
+    test -z "${footers}" || footers=$'\n'"${footers}"$'\n'
     if test "${#CI_ACTIVE[@]}" -eq 0; then
         notes=$'\n'"- Fork CI: off; the devspace testing described above is this PR's CI, and upstream CI runs once it is opened there"
     else
@@ -864,8 +874,47 @@ To review:
 - Add a \`${DRAFT_COMMAND}\` line (in the same comment or before) to open it upstream as a draft (\`${READY_COMMAND}\` undoes that).
 - **Close** to drop it.
 - Edit the title and description freely: they become the upstream PR's. Review comments are squashed into the commits they concern, with a reply here.
-${META_END}
+${footers}${META_END}
 EOF
+}
+
+# meta_footers < META: prints the run footers in a bot-meta section (see
+# FOOTER_MARKER_RE), each its summary line and marker, blank-separated.
+meta_footers() {
+    awk -v re="${FOOTER_MARKER_RE}" '
+        $0 ~ re {
+            if (n++) print ""
+            if (prev != "" && prev !~ re && prev !~ /^<!-- \/?bot-meta -->$/) print prev
+            print
+        }
+        { prev = $0 }'
+}
+
+# read_footer FILE: prints the run footer in FILE (a pipe works too),
+# failing unless it is one, as bot-footer prints it: a summary line, then
+# a marker line.
+read_footer() {
+    local file=$1 footer human marker
+    test -r "${file}" || fatal "--footer '${file}' is missing"
+    footer=$(tr -d '\r' <"${file}" | sed '/^[[:space:]]*$/d')
+    test -n "${footer}" || fatal "--footer '${file}' is empty; did bot-footer fail?"
+    human=${footer%$'\n'*}
+    marker=${footer##*$'\n'}
+    if [[ "${footer}" != *$'\n'* || "${human}" == *$'\n'* || "${human}" == *'<!--'* || "${footer}" == *bot-meta* ]] ||
+        ! [[ "${marker}" =~ ${FOOTER_MARKER_RE} ]]; then
+        fatal "--footer '${file}' doesn't look like bot-footer output: a summary line, then a '<!-- bot-run/v1 {...} -->' line"
+    fi
+    printf '%s\n' "${footer}"
+}
+
+# add_footer META FOOTER: prints the bot-meta section META with FOOTER
+# after its other footers, as meta_section lays them out.
+add_footer() {
+    local prefix=${1%"${META_END}"}
+    while [[ "${prefix}" == *$'\n' ]]; do
+        prefix=${prefix%$'\n'}
+    done
+    printf '%s\n\n%s\n%s\n' "${prefix}" "$2" "${META_END}"
 }
 
 # jq definitions for fork PR bodies. Bodies edited in the web UI use CRLF.
@@ -1052,11 +1101,11 @@ check_item_free() {
 }
 
 cmd_fork_pr() {
-    local upstream="" base="" branch="" item="" title="" body_file="" from=. force=false ci=()
+    local upstream="" base="" branch="" item="" title="" body_file="" footer_file="" from=. force=false ci=()
     while test $# -gt 0; do
         case "$1" in
             --force) force=true; shift ;;
-            --repo|--base|--branch|--item|--title|--body-file|--from|--ci)
+            --repo|--base|--branch|--item|--title|--body-file|--footer|--from|--ci)
                 test $# -ge 2 || fatal "$1 requires an argument"
                 case "$1" in
                     --repo) upstream=$2 ;;
@@ -1065,6 +1114,7 @@ cmd_fork_pr() {
                     --item) item=$2 ;;
                     --title) title=$2 ;;
                     --body-file) body_file=$2 ;;
+                    --footer) footer_file=$2 ;;
                     --from) from=$2 ;;
                     --ci) ci+=("$2") ;;
                 esac
@@ -1090,6 +1140,8 @@ cmd_fork_pr() {
     ! grep -qF "${META_START}" <<<"${body}" || fatal "${body_file} already has a bot-meta section; fork-pr adds it"
     grep -qxF "${LLMS_TRAILER}" <<<"${body}" ||
         warn "${body_file} has no '${LLMS_TRAILER}' line; add one unless the project's policy says otherwise"
+    local footer=""
+    test -z "${footer_file}" || footer=$(read_footer "${footer_file}")
     require_yaml_parser
     check_login
 
@@ -1125,6 +1177,8 @@ cmd_fork_pr() {
         existing_url=$(jq -r .html_url <<<"${existing}")
         recorded=$(recorded_item <<<"${existing}")
         info "A fork PR for ${branch} is already open; not opening another"
+        test -z "${footer}" ||
+            warn "--footer is not added to an existing fork PR; run '$(basename "$0") set-body ${existing_url} --footer FILE'"
         test "${recorded}" = "${item}" ||
             warn "${existing_url} records board item ${recorded:-(none)}, not ${item}; if --item is right, run '$(basename "$0") set-item ${existing_url} ${item}'"
         echo "${existing_url}"
@@ -1132,7 +1186,7 @@ cmd_fork_pr() {
     fi
 
     local full_body url
-    full_body="${body}"$'\n\n'"$(meta_section "${upstream}" "${base}" "${item}")"
+    full_body="${body}"$'\n\n'"$(meta_section "${upstream}" "${base}" "${item}" "${footer}")"
     local created
     created=$(jq -n --arg title "${title}" --arg head "${branch}" --arg base "${base}" --arg body "${full_body}" \
         '{title: $title, head: $head, base: $base, body: $body, draft: true}' |
@@ -1233,7 +1287,7 @@ cmd_refresh_meta() {
     lock_state
     state=$(load_state)
     read_refresh_target "${url}"
-    fresh=$(meta_section "${META_UPSTREAM}" "${META_BASE}" "${META_ITEM}")
+    fresh=$(meta_section "${META_UPSTREAM}" "${META_BASE}" "${META_ITEM}" "$(meta_footers <<<"${META}")")
     if test "${META}" = "${fresh}"; then
         info "${url}'s bot-meta section is already current"
         return 0
@@ -1349,19 +1403,22 @@ cmd_get_body() {
 }
 
 cmd_set_body() {
-    local url="" body_file="" force=false
+    local url="" body_file="" footer_file="" force=false
     while test $# -gt 0; do
         case "$1" in
             --body-file) test $# -ge 2 || fatal "--body-file requires an argument"; body_file=$2; shift 2 ;;
+            --footer) test $# -ge 2 || fatal "--footer requires an argument"; footer_file=$2; shift 2 ;;
             --force) force=true; shift ;;
             -*) fatal "unknown argument for set-body: $1 (see --help)" ;;
             *) test -z "${url}" || fatal "set-body takes one fork PR URL"; url=$1; shift ;;
         esac
     done
-    if test -z "${url}" || test -z "${body_file}"; then
-        fatal "usage: $(basename "$0") set-body FORK_PR_URL --body-file FILE [--force]"
+    if test -z "${url}" || { test -z "${body_file}" && test -z "${footer_file}"; }; then
+        fatal "usage: $(basename "$0") set-body FORK_PR_URL [--body-file FILE] [--footer FILE] [--force]"
     fi
-    test -s "${body_file}" || fatal "--body-file '${body_file}' is missing or empty"
+    test -z "${body_file}" || test -s "${body_file}" || fatal "--body-file '${body_file}' is missing or empty"
+    local footer=""
+    test -z "${footer_file}" || footer=$(read_footer "${footer_file}")
     local FORK NUMBER PR
     parse_fork_pr_url "${url}"
     check_login
@@ -1372,6 +1429,16 @@ cmd_set_body() {
     state=$(load_state)
     read_fork_pr "${url}"
     meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${PR}")
+    test -z "${footer}" || meta=$(add_footer "${meta}" "${footer}")
+    local hash base_body HIS EDITS_UNKNOWN
+    if test -z "${body_file}"; then
+        # Only the bot-meta section changes, as with set-item.
+        body=$(jq -r --arg m "${meta}" "${BODY_JQ}"' .body | strip_meta + "\n\n" + $m' <<<"${PR}")
+        reviewer_edits_since_bot "${url}"
+        write_body "${url}" "${body}" "kept; then set-body added a run footer" true
+        info "Added a run footer to ${url}"
+        return 0
+    fi
     # FILE may have the section or not; the PR's current one is kept
     # either way.
     body=$(jq -Rsr "${BODY_JQ} strip_meta" <"${body_file}")
@@ -1380,7 +1447,6 @@ cmd_set_body() {
     grep -qxF "${LLMS_TRAILER}" <<<"${body}" ||
         warn "${body_file} has no '${LLMS_TRAILER}' line; add one unless the project's policy says otherwise"
 
-    local hash base_body HIS EDITS_UNKNOWN
     hash=$(body_hash <<<"${PR}")
     base_body=$(jq -r --arg u "${url}" '.prs[$u].base_body // "-"' <<<"${state}")
     reviewer_edits_since_bot "${url}"
