@@ -1439,6 +1439,7 @@ cmd_set_body() {
         fatal "usage: $(basename "$0") set-body FORK_PR_URL [--body-file FILE] [--footer FILE] [--force]"
     fi
     test -z "${body_file}" || test -s "${body_file}" || fatal "--body-file '${body_file}' is missing or empty"
+    test -n "${body_file}" || ! ${force} || fatal "--force only applies with --body-file; a footer alone never replaces the description"
     local footer=""
     test -z "${footer_file}" || footer=$(read_footer "${footer_file}")
     local FORK NUMBER PR
@@ -1451,7 +1452,12 @@ cmd_set_body() {
     state=$(load_state)
     read_fork_pr "${url}"
     meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${PR}")
-    test -z "${footer}" || meta=$(add_footer "${meta}" "${footer}")
+    if test -n "${footer}"; then
+        # read_fork_pr checks this too; add_footer must never write an end
+        # marker without its start.
+        test -n "${meta}" || fatal "no complete bot-meta section in ${url}; restore it before adding a run footer"
+        meta=$(add_footer "${meta}" "${footer}")
+    fi
     local hash base_body HIS EDITS_UNKNOWN
     if test -z "${body_file}"; then
         # Only the bot-meta section changes, as with set-item.
