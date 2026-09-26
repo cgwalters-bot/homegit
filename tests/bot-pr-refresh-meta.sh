@@ -4,7 +4,10 @@
 # it records and the text outside it (edits by cgwalters included, with
 # line endings normalized), writes nothing when the section is current,
 # and refuses a section it can't parse, one someone else edited, or one
-# whose Fork CI line it can't know. bot-pr runs from a copy of bin/ whose
+# whose Fork CI line it can't know. It keeps the run footers at the end
+# of the section, where 'set-body --footer' adds them after any earlier
+# ones, and set-body and fork-pr refuse a --footer that isn't one. bot-pr
+# runs from a copy of bin/ whose
 # bot-board is a fake keeping the inbox state in a file, and a fake gh
 # serves one fork PR and a fork with no workflows. No network.
 #   tests/bot-pr-refresh-meta.sh
@@ -258,6 +261,82 @@ while IFS='|' read -r name from to want; do
 done <<'EOF'
 no-upstream|- Upstream:|- Target:|cannot find the 'Upstream
 no-item|- Board item:.*|- Board item: none|record one with
+EOF
+
+# Run footers: bot-footer's, and an agent.yml run's, which the apply step
+# wrote right after the section's start.
+readonly F1='<sub>Bot run: session aaaaaaaa · ~$1.00 inference (est., list prices) · 5m wall</sub>
+<!-- bot-run/v1 {"task":"PVTI_x","sessions":["aaaaaaaa"],"estimate":true} -->'
+readonly F2='<sub>Bot run: session bbbbbbbb, agent cccccccc · ~$2.00 inference (est., list prices) · 9m wall</sub>
+<!-- bot-run/v1 {"task":"PVTI_x","sessions":["bbbbbbbb"],"agents":["cccccccc"],"estimate":true} -->'
+readonly AGENT_FOOTER='Agent run [1003](https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1003): claude, 10m, success
+<!-- agent-run-summary/v1 {"run_id":1003,"result":"success","duration_s":600} -->'
+readonly SECTION_END=$'\n<!-- /bot-meta -->'
+
+# refresh-meta keeps both, at the end, and then finds the section current.
+meta=$(old_meta)
+meta=${meta%%$'\n'*}$'\n'${AGENT_FOOTER}$'\n'${meta#*$'\n'}
+reset "${TEXT}"$'\n\n'"${meta%"${SECTION_END}"}"$'\n\n'"${F1}${SECTION_END}"
+if run footers; then
+    check_refreshed footers main
+    [[ "$(body)" == *$'with a reply here.\n\n'"${AGENT_FOOTER}"$'\n\n'"${F1}${SECTION_END}" ]] ||
+        fail "footers: not kept at the end of the section: $(body)"
+    test "$(grep -c 'run/v1\|run-summary/v1' <<<"$(body)")" = 2 || fail "footers: duplicated: $(body)"
+    : >"${FAKE_GH}/calls"
+    run footers-again || fail "footers-again: $(cat "${WORK}/footers-again.err")"
+    test "$(patches)" = 0 || fail "footers-again: rewrote a current section"
+else
+    fail "footers: refresh-meta failed: $(cat "${WORK}/footers.err")"
+fi
+
+# set-body --footer alone adds one after the others and keeps the text;
+# with --body-file too, it replaces the text as well. A pipe works.
+printf '%s\n' "${F2}" >"${WORK}/f2"
+if "${WORK}/bin/bot-pr" set-body "${URL}" --footer "${WORK}/f2" 2>"${WORK}/add.err"; then
+    [[ "$(body)" == "${TEXT}"$'\n\n<!-- bot-meta -->\n'*$'with a reply here.\n\n'"${AGENT_FOOTER}"$'\n\n'"${F1}"$'\n\n'"${F2}${SECTION_END}" ]] ||
+        fail "add: $(body)"
+else
+    fail "add: set-body --footer failed: $(cat "${WORK}/add.err")"
+fi
+printf 'New text.\n\nGenerated-by: https://github.com/cgwalters/#llms\n' >"${WORK}/new-body"
+if "${WORK}/bin/bot-pr" set-body "${URL}" --body-file "${WORK}/new-body" --footer <(printf '%s\n' "${F1}") 2>"${WORK}/both.err"; then
+    [[ "$(body)" == $'New text.\n\nGenerated-by: https://github.com/cgwalters/#llms\n\n<!-- bot-meta -->\n'*"${F1}"$'\n\n'"${F2}"$'\n\n'"${F1}${SECTION_END}" ]] ||
+        fail "both: $(body)"
+else
+    fail "both: set-body --body-file --footer failed: $(cat "${WORK}/both.err")"
+fi
+# ... and still refreshes to the same section.
+: >"${FAKE_GH}/calls"
+run footers-kept || fail "footers-kept: $(cat "${WORK}/footers-kept.err")"
+test "$(patches)" = 0 || fail "footers-kept: refresh-meta rewrote the footers: $(body)"
+
+# A --footer that isn't bot-footer's output is refused, by set-body before
+# writing and by fork-pr before any call.
+printf 'Fix it.\n' >"${WORK}/body"
+while IFS='|' read -r name content want; do
+    printf '%b' "${content}" >"${WORK}/footer-${name}"
+    : >"${FAKE_GH}/calls"
+    if "${WORK}/bin/bot-pr" set-body "${URL}" --footer "${WORK}/footer-${name}" 2>"${WORK}/${name}.err"; then
+        fail "${name}: set-body accepted it"
+    else
+        grep -q "${want}" "${WORK}/${name}.err" || fail "${name}: no '${want}' in: $(cat "${WORK}/${name}.err")"
+    fi
+    test "$(patches)" = 0 || fail "${name}: set-body wrote the body"
+    : >"${FAKE_GH}/calls"
+    if "${WORK}/bin/bot-pr" fork-pr --repo bootc-dev/bootc --base main --branch bot/x --item "${ITEM}" --title T \
+        --body-file "${WORK}/body" --footer "${WORK}/footer-${name}" 2>"${WORK}/${name}-fork.err"; then
+        fail "${name}: fork-pr accepted it"
+    else
+        grep -q "${want}" "${WORK}/${name}-fork.err" || fail "${name}: fork-pr: no '${want}' in: $(cat "${WORK}/${name}-fork.err")"
+    fi
+    test ! -s "${FAKE_GH}/calls" || fail "${name}: fork-pr called gh: $(cat "${FAKE_GH}/calls")"
+done <<'EOF'
+empty||is empty; did bot-footer fail
+no-marker|<sub>Bot run: x</sub>\n|doesn't look like bot-footer output
+marker-only|<!-- bot-run/v1 {"task":"x"} -->\n|doesn't look like bot-footer output
+three-lines|a\nb\n<!-- bot-run/v1 {"task":"x"} -->\n|doesn't look like bot-footer output
+other-comment|<sub>x</sub>\n<!-- bot-run/v2 {"task":"x"} -->\n|doesn't look like bot-footer output
+meta-marker|<!-- /bot-meta -->\n<!-- bot-run/v1 {"task":"x"} -->\n|doesn't look like bot-footer output
 EOF
 
 # Only forge fork PRs.
