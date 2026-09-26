@@ -96,6 +96,18 @@ After his approval, only his later reviews and his comments that
 mention @${BOT_LOGIN} count. So nothing the edge-triggered report
 missed is lost.
 
+Also on every sweep, "Needs rebase" lists the bot's open PRs (upstream
+ones, on the board or not, and its fork PRs on the board) that need
+rebasing onto their base: GitHub finds them conflicting
+(mergeable_state dirty), or behind a base that must be up to date
+(behind), or their CI fails while their base has moved on (by the
+compare API; fork PRs run no CI), unless they have outstanding reviews
+by ${REQUESTER}, which a rebase's push would seem to answer. They are
+split into conflict-free
+ones, for 'bot-pr rebase', and conflicting ones, for a worker. One
+listed for CI is not listed again once its head moved with CI still
+failing: the rebase didn't fix it.
+
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
 lists (fork PRs included) is open: with one of its upstream PRs merged
@@ -430,20 +442,66 @@ outstanding_review() {
           else $open[-1] + {count: ($open | length), excerpt: ($open[-1].body | excerpt)} | del(.author, .body) end'
 }
 
-# pr_outstanding URL: outstanding_review for a PR the sweep doesn't
-# probe; prints null for one that isn't open or isn't the bot's.
-pr_outstanding() {
-    local repo number data reviews
+# pr_off_board URL: for a PR the sweep doesn't probe, prints
+# {outstanding, rebase}: its outstanding_review and rebase_candidate;
+# both null for one that isn't open or isn't the bot's.
+pr_off_board() {
+    local repo number data reviews head outstanding ci rebase
     [[ "$1" =~ ^https://github\.com/([^/]+/[^/]+)/pull/([0-9]+)$ ]] || return 1
     repo=${BASH_REMATCH[1]}
     number=${BASH_REMATCH[2]}
     data=$(rest_get "repos/${repo}/pulls/${number}") || return
     if ! jq -e --arg bot "${BOT_LOGIN}" '.state == "open" and .user.login == $bot' <<<"${data}" >/dev/null; then
+        echo '{"outstanding": null, "rebase": null}'
+        return 0
+    fi
+    head=$(jq -r .head.sha <<<"${data}")
+    reviews=$(rest_pages "repos/${repo}/pulls/${number}/reviews") || return
+    outstanding=$(outstanding_review "${repo}" "${number}" "${head}" "${reviews}") || return
+    ci=$(checks_state "${repo}" "${head}") || return
+    rebase=$(rebase_candidate "${repo}" "${data}" "${ci}" false) || return
+    jq -nc --argjson o "${outstanding}" --argjson r "${rebase}" '{outstanding: $o, rebase: $r}'
+}
+
+# rebase_candidate REPO DATA CI FORK: for the bot's open PR REPO with the
+# JSON DATA and checks_state CI, prints what makes it need a rebase onto
+# its base, if anything, as {reason, conflicts, behind_by, failing, head,
+# base, checks}: reason "conflict" (GitHub's mergeable_state is dirty),
+# "behind" (it is behind, and the base requires an up-to-date branch), or
+# "ci" (CI fails and the base moved on since, which may have fixed it;
+# not for fork PRs, FORK true, which run no CI); conflicts is true, false
+# or null (GitHub hasn't computed it yet). A PR whose CI fails or is
+# still running that needs none of this prints reason null, so that the
+# sweep keeps remembering it (a rebase's CI runs at first); any other
+# prints null. So does a fork PR without a bot-meta section (the bot's
+# own repositories' PRs), which 'bot-pr rebase' can't take. Only a failing CI costs a request, the compare.
+rebase_candidate() {
+    local repo=$1 data=$2 ci=$3 fork=$4 mstate checks reason="" behind=null head_repo
+    if ${fork} && ! jq -e '(.body // "") | contains("<!-- bot-meta -->")' <<<"${data}" >/dev/null; then
         echo null
         return 0
     fi
-    reviews=$(rest_pages "repos/${repo}/pulls/${number}/reviews") || return
-    outstanding_review "${repo}" "${number}" "$(jq -r .head.sha <<<"${data}")" "${reviews}"
+    mstate=$(jq -r '.mergeable_state // "unknown"' <<<"${data}")
+    checks=$(jq -r .checks <<<"${ci}")
+    case "${mstate}" in
+        dirty) reason=conflict ;;
+        behind) reason=behind ;;
+    esac
+    head_repo=$(jq -r '.head.repo.full_name // empty' <<<"${data}")
+    if test -z "${reason}" && ! ${fork} && test "${checks}" = failure && test -n "${head_repo}"; then
+        behind=$(rest_get "repos/${repo}/compare/$(jq -r .base.ref <<<"${data}")...${head_repo%%/*}:$(jq -r .head.ref <<<"${data}")" |
+            jq -e '.behind_by | numbers') || return
+        test "${behind}" -eq 0 || reason=ci
+    fi
+    if test -z "${reason}" && test "${checks}" != failure && test "${checks}" != pending; then
+        echo null
+        return 0
+    fi
+    jq -c --arg reason "${reason}" --argjson behind "${behind}" --argjson ci "${ci}" '
+        {reason: (if $reason == "" then null else $reason end),
+         conflicts: (if .mergeable_state == "dirty" or .mergeable == false then true
+                     elif .mergeable == true then false else null end),
+         behind_by: $behind, failing: $ci.failing, checks: $ci.checks, head: .head.sha, base: .base.ref}' <<<"${data}"
 }
 
 # sub_status STATUS: the status for probe to return after a failed
@@ -457,7 +515,7 @@ sub_status() {
 # (null the first time), and DROPPED_AT when it was last seen, if it left
 # the sweep since.
 probe() {
-    local url=$1 prev=$2 dropped_at=$3 repo kind number data cur changes='[]' info outstanding=null
+    local url=$1 prev=$2 dropped_at=$3 repo kind number data cur changes='[]' info outstanding=null rebase=null
     [[ "${url}" =~ ^https://github\.com/([^/]+/[^/]+)/(issues|pull)/([0-9]+)$ ]] || return 1
     repo=${BASH_REMATCH[1]}
     kind=${BASH_REMATCH[2]}
@@ -590,6 +648,9 @@ probe() {
         ci=$(checks_state "${repo}" "${head}") || return "$(sub_status $?)"
         checks=$(jq -r .checks <<<"${ci}")
         cur=$(jq -c --arg c "${checks}" '.checks = $c' <<<"${cur}")
+        if jq -e --arg bot "${BOT_LOGIN}" '.author == $bot' <<<"${info}" >/dev/null; then
+            rebase=$(rebase_candidate "${repo}" "${data}" "${ci}" "${fork}") || return "$(sub_status $?)"
+        fi
         prev_checks=$(jq -r '.checks // empty' <<<"${prev}")
         # A URL seen for the first time: only the bot's own red CI is news.
         if test "${checks}" = failure && test "${prev_checks}" != failure &&
@@ -604,8 +665,8 @@ probe() {
         cur=$(jq -c --arg c "$(jq -r '.checks // empty' <<<"${prev}")" '.checks = (if $c == "" then null else $c end)' <<<"${cur}")
     fi
     jq -cn --argjson cur "${cur}" --argjson changes "${changes}" --argjson info "${info}" --arg prev_state "${prev_state}" \
-        --argjson outstanding "${outstanding}" \
-        '{cur: $cur, changes: $changes, info: $info, prev_state: $prev_state, outstanding: $outstanding}'
+        --argjson outstanding "${outstanding}" --argjson rebase "${rebase}" \
+        '{cur: $cur, changes: $changes, info: $info, prev_state: $prev_state, outstanding: $outstanding, rebase: $rebase}'
 }
 
 results='{}'
@@ -684,12 +745,13 @@ outstanding=$(jq -c --slurpfile results "${scratch}/results.json" '
     $results[0] as $results
     | [.[] | select($results[.url].outstanding != null)
        | {url, items: [.items[] | {id, title}]} + $results[.url].outstanding]' <<<"${watch}")
-# off_board_outstanding: prints the outstanding reviews on the bot's
-# open upstream PRs that the sweep doesn't probe (not on the board, or
-# not any more), as JSON lines: one search, which has no ETags, then
-# their reviews. Fails if the search does; a PR that can't be read is
+# off_board: prints the outstanding reviews and rebase candidates (see
+# pr_off_board) of the bot's open upstream PRs that the sweep doesn't
+# probe (not on the board, or not any more), as JSON lines {url, items,
+# outstanding, rebase}: one search, which has no ETags, then their
+# reviews and CI. Fails if the search does; a PR that can't be read is
 # skipped with a warning.
-off_board_outstanding() {
+off_board() {
     local search_q search extra url o rc
     search_q="is:pr+is:open+author:${BOT_LOGIN}$(jq -r 'map("+-user:" + .) | join("")' <<<"${FORK_OWNERS}")"
     search=$(rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}") ||
@@ -704,16 +766,16 @@ off_board_outstanding() {
         | select(capture("^https://github\\.com/(?<o>[^/]+)/").o as $o | $forks | index($o) | not)' <<<"${search}")
     while IFS= read -r url; do
         test -n "${url}" || continue
-        # pr_outstanding checks every step itself, as errexit is off here.
+        # pr_off_board checks every step itself, as errexit is off here.
         rc=0
-        o=$(pr_outstanding "${url}") || rc=$?
+        o=$(pr_off_board "${url}") || rc=$?
         if test "${rc}" -eq "${EX_RATELIMIT}"; then
             return "${rc}"
         elif test "${rc}" -ne 0; then
             warn "reading ${url} (off the board) for outstanding reviews failed (status ${rc}); skipped"
             continue
         fi
-        test "${o}" = null || jq -c --arg u "${url}" '{url: $u, items: []} + .' <<<"${o}"
+        jq -c --arg u "${url}" 'select(.outstanding != null or .rebase != null) | {url: $u, items: []} + .' <<<"${o}"
     done <<<"${extra}"
 }
 
@@ -722,12 +784,12 @@ off_board_outstanding() {
 # state: only a warning, and a nonzero exit.
 search_failed=false
 rc=0
-off_board_outstanding >"${scratch}/extra.json" 2>"${scratch}/extra.err" &
+off_board >"${scratch}/extra.json" 2>"${scratch}/extra.err" &
 wait "$!" || rc=$?
 case "${rc}" in
     0)
         cat "${scratch}/extra.err" 1>&2
-        outstanding=$(jq -sc --argjson o "${outstanding}" '$o + .' "${scratch}/extra.json")
+        outstanding=$(jq -sc --argjson o "${outstanding}" '$o + [.[] | select(.outstanding != null) | {url, items} + .outstanding]' "${scratch}/extra.json")
         ;;
     "${EX_RATELIMIT}")
         warn "GitHub is rate limiting the bot's search (or its reads of PRs off the board); only the board's PRs were checked for outstanding reviews"
@@ -740,6 +802,38 @@ case "${rc}" in
         ;;
 esac
 report=$(jq -c 'map(select((.changes | length) > 0 or (.actions | length) > 0) | del(.retry))' <<<"${report}")
+
+# The bot's open PRs that need a rebase: also a to-do, listed on every
+# sweep until done. One listed for failing CI while behind its base
+# (reason "ci") is remembered with its head then, in the state's
+# 'rebase', for as long as its CI fails: once its head moved (rebased)
+# with CI still failing, the failure is not the base's, and it isn't
+# listed again. URLs that could not be read keep what was remembered.
+# PRs with an outstanding review by REQUESTER are left out: they are a
+# worker's, and a rebase's push would look like an answer.
+prev_rebase=$(jq -c '.rebase // {}' <<<"${state}")
+candidates=$(jq -c --slurpfile results "${scratch}/results.json" --slurpfile extra "${scratch}/extra.json" \
+    --argjson search_failed "${search_failed}" '
+    $results[0] as $results
+    | [(.[] | select($results[.url].rebase != null)
+        | {url, items: [.items[] | {id, title}]} + $results[.url].rebase),
+       (if $search_failed then empty else $extra[] | select(.rebase != null) | {url, items} + .rebase end)]' <<<"${watch}")
+{ read -r needs_rebase; read -r new_rebase; } < <(jq -r --argjson prev "${prev_rebase}" --argjson failed "${failed}" \
+    --argjson search_failed "${search_failed}" --argjson watch "${watch}" --argjson outstanding "${outstanding}" '
+    reduce .[] as $c ({list: [], keep: {}};
+        $prev[$c.url] as $p
+        | if $c.reason == "ci" then
+              if $p != null and $p != $c.head then .keep[$c.url] = $p
+              else .keep[$c.url] = $c.head | .list += [$c] end
+          elif $c.reason == null then (if $p != null then .keep[$c.url] = $p else . end)
+          else .list += [$c] end)
+    | ([$watch[].url]) as $swept
+    | .keep += ($prev | with_entries(select(.key as $u
+          | ($failed | index($u)) or ($search_failed and ($swept | index($u) | not)))))
+    # A rebase is a push that would look like it answered his review.
+    | .list |= map(select(.url as $u | [$outstanding[].url] | index($u) | not))
+    | (.list | tojson), (.keep | tojson)' <<<"${candidates}")
+test -n "${new_rebase}" || fatal "internal error: selecting the PRs that need a rebase failed"
 
 # keep_last_seen ITEM: puts the URLs of ITEM back to their last-seen
 # state, so that the next sweep sees their transitions again (and
@@ -811,7 +905,8 @@ if ${dry_run}; then
     advance=false
     why_kept="dry run"
 elif jq -e --argjson new "${new_seen}" '. == $new' <<<"${seen}" >/dev/null &&
-    test "$(jq -S . <<<"${dropped}")" = "$(jq -S . <<<"${new_dropped}")"; then
+    test "$(jq -S . <<<"${dropped}")" = "$(jq -S . <<<"${new_dropped}")" &&
+    test "$(jq -S . <<<"${prev_rebase}")" = "$(jq -S . <<<"${new_rebase}")"; then
     advance=false
     why_kept="nothing new"
 fi
@@ -820,9 +915,9 @@ if ${json}; then
     jq --argjson new "${new_urls}" --argjson failed "${failed}" \
         --argjson gone "${gone}" --argjson nurls "${nurls}" --argjson nitems "${nitems}" \
         --argjson advance "${advance}" \
-        --argjson outstanding "${outstanding}" \
+        --argjson outstanding "${outstanding}" --argjson needs_rebase "${needs_rebase}" \
         --argjson search_failed "${search_failed}" \
-        '{swept: {urls: $nurls, items: $nitems}, items: ., outstanding_reviews: $outstanding, new_urls: $new,
+        '{swept: {urls: $nurls, items: $nitems}, items: ., outstanding_reviews: $outstanding, needs_rebase: $needs_rebase, new_urls: $new,
           failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news.
@@ -835,6 +930,17 @@ else
                 + ": \(if .excerpt != "" then .excerpt else "(line comments)" end)",
                 "      \(.link)"),
             "" end' <<<"${outstanding}"
+    jq -r --argjson sha "${SHORT_SHA}" "${REPO_REF_JQ}"'
+        def entry: "    \(.url | repo_ref)  \(if .items == [] then "(not on the board)" else .items | map(.title) | join("; ") end)",
+            "      " + (if .reason == "conflict" then "conflicts with \(.base)"
+                        elif .reason == "behind" then "behind \(.base), which must be up to date"
+                        else "CI failing (\(.failing | join(", "))), \(.behind_by) behind \(.base)" end)
+            + " at \(.head[:$sha])";
+        if length == 0 then empty else
+            "Needs rebase (bot-pr rebase URL):",
+            ([.[] | select(.conflicts != true)] | if length > 0 then "  conflict-free:", (.[] | entry) else empty end),
+            ([.[] | select(.conflicts == true)] | if length > 0 then "  conflicting (a worker resolves):", (.[] | entry) else empty end),
+            "" end' <<<"${needs_rebase}"
     jq -r --argjson sha "${SHORT_SHA}" "${REPO_REF_JQ}"'
         def short: .[:$sha];
         .[] | .status as $status | "\(.title)  [\($status // "no status")]  \(.id)",
@@ -856,7 +962,7 @@ else
               elif .allowed then " (with --apply)"
               else " (not applied from \($status // "no status"); a human decides)" end),
         ""' <<<"${report}"
-    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
 # Failed URLs kept their last-seen state in new_seen, so their changes
@@ -865,8 +971,9 @@ if ! ${advance}; then
     echo "State unchanged (${why_kept})." 1>&2
 else
     new_state=$(jq -nc --argjson v "${STATE_VERSION}" --argjson items "${new_seen}" --argjson dropped "${new_dropped}" \
-        --arg now "$(date -u +%FT%TZ)" --arg swept "${swept_at}" --arg host "$(hostname)" \
-        '{version: $v, updated_at: $now, swept_at: $swept, host: $host, items: $items, dropped: $dropped}')
+        --arg now "$(date -u +%FT%TZ)" --arg swept "${swept_at}" --arg host "$(hostname)" --argjson rebase "${new_rebase}" \
+        '{version: $v, updated_at: $now, swept_at: $swept, host: $host, items: $items, dropped: $dropped}
+         + if $rebase == {} then {} else {rebase: $rebase} end')
     if test -n "${state_file}"; then
         printf '%s\n' "${new_state}" >"${state_file}"
     else

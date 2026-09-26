@@ -372,5 +372,91 @@ EOF
 grep -q "review COMMENTED at 2026-09-25T13:55:00Z: (line comments)" "${WORK}/case-line-comments.txt" ||
     fail "case-line-comments: text report: $(cat "${WORK}/case-line-comments.txt")"
 
+# --- Needs rebase ---
+# The bot's PRs in example/rb from cgwalters-forge/rb:bot/rb-N.
+# rb_pr N HEAD MERGEABLE_STATE MERGEABLE BEHIND: PR #N, BEHIND commits
+# behind main (by the compare API).
+rb_pr() {
+    put "repos/example/rb/pulls/$1" "$(jq -nc --argjson n "$1" --arg head "$2" --arg ms "$3" --argjson m "$4" '
+        {state: "open", merged: false, title: "Rebase \($n)", updated_at: "2026-09-25T12:00:00Z",
+         created_at: "2026-09-25T11:00:00Z", user: {login: "cgwalters-bot"}, mergeable: $m, mergeable_state: $ms,
+         base: {ref: "main"}, head: {sha: $head, ref: "bot/rb-\($n)", repo: {full_name: "cgwalters-forge/rb", owner: {login: "cgwalters-forge"}}}}')"
+    put "repos/example/rb/issues/$1/events" '[]'
+    : | reviews "repos/example/rb/pulls/$1"
+    : | comments "repos/example/rb/issues/$1"
+    put "repos/example/rb/compare/main...cgwalters-forge:bot/rb-$1" "{\"behind_by\": $5}"
+}
+# rb_ci SHA CONCLUSION: the commit SHA of example/rb with one check run.
+rb_ci() {
+    commit example/rb "$1" 2026-09-25T11:30:00Z
+    put "repos/example/rb/commits/$1/check-runs" "$(jq -nc --arg c "$2" \
+        '{total_count: 1, check_runs: [{name: "tests", status: "completed", conclusion: $c, check_suite: {id: 1}}]}')"
+}
+put repos/example/rb/actions/runs '{"workflow_runs": []}'
+put repos/example/rb/actions/workflows '{"workflows": []}'
+readonly RB=${GH}/example/rb/pull
+# #1 fails CI and is behind; #2 conflicts; #3 fails but is up to date;
+# #4 is fine; #5's base must be up to date and it isn't. The fork PR
+# conflicts with its base. #2600 off the board is behind a base that must
+# be up to date too, but has cgwalters' outstanding review: left out.
+rb_pr 1 aaaa000000000000000000000000000000000001 blocked true 3
+rb_ci aaaa000000000000000000000000000000000001 failure
+rb_pr 2 aaaa000000000000000000000000000000000002 dirty false 5
+commit example/rb aaaa000000000000000000000000000000000002 2026-09-25T11:30:00Z
+rb_pr 3 aaaa000000000000000000000000000000000003 blocked true 0
+rb_ci aaaa000000000000000000000000000000000003 failure
+rb_pr 4 aaaa000000000000000000000000000000000004 clean true 2
+rb_ci aaaa000000000000000000000000000000000004 success
+rb_pr 5 aaaa000000000000000000000000000000000005 behind true 1
+rb_ci aaaa000000000000000000000000000000000005 success
+put repos/cgwalters-forge/bootc/pulls/19 "$(jq -c '.mergeable = false | .mergeable_state = "dirty" | .base.ref = "main" | .body = "Why.\n\n<!-- bot-meta -->\n<!-- /bot-meta -->"' \
+    "${REST}/repos/cgwalters-forge/bootc/pulls/19.json")"
+put repos/bootc-dev/bootc/pulls/2600 "$(jq -c '.mergeable = true | .mergeable_state = "behind" | .base.ref = "main"' \
+    "${REST}/repos/bootc-dev/bootc/pulls/2600.json")"
+jq -n --arg rb "${RB}" --arg fork "${FORK_PR}" '
+    [range(1; 6) as $n | {id: "PVTI_rb\($n)", title: "Rebase \($n)", status: "In Review",
+                           content: {type: "PullRequest", url: "\($rb)/\($n)"}}
+     | if $n == 2 then .branch = $fork else . end]' >"${WORK}/board.json"
+
+readonly NEEDS_REBASE_JQ='[.needs_rebase[] | [.url, .reason, .conflicts, .behind_by, [.items[].id]]] | sort == ([
+    ["\($rb)/1", "ci", false, 3, ["PVTI_rb1"]],
+    ["\($rb)/2", "conflict", true, null, ["PVTI_rb2"]],
+    [$fork, "conflict", true, null, ["PVTI_rb2"]],
+    ["\($rb)/5", "behind", false, null, ["PVTI_rb5"]]] | sort)'
+rebase_args=(--arg rb "${RB}" --arg fork "${FORK_PR}")
+sweep rebase 2026-09-25T16:00:00Z "${EARLIER}"
+expect rebase "the PRs that need a rebase" "${rebase_args[@]}" "${NEEDS_REBASE_JQ}"
+jq -e --arg rb "${RB}" '.rebase == {"\($rb)/1": "aaaa000000000000000000000000000000000001"}' "${WORK}/rebase.state" >/dev/null ||
+    fail "rebase: the state doesn't remember #1: $(cat "${WORK}/rebase.state")"
+if ! grep -qx "Needs rebase (bot-pr rebase URL):" "${WORK}/rebase.txt" ||
+    ! grep -qx "  conflict-free:" "${WORK}/rebase.txt" || ! grep -qx "  conflicting (a worker resolves):" "${WORK}/rebase.txt" ||
+    ! grep -q "CI failing (tests), 3 behind main at aaaa000000" "${WORK}/rebase.txt" ||
+    ! grep -q "conflicts with main at 3333333333" "${WORK}/rebase.txt"; then
+    fail "rebase: the text report lacks the rebase section: $(cat "${WORK}/rebase.txt")"
+fi
+# Listed until done: the same again.
+sweep rebase 2026-09-25T16:10:00Z
+expect rebase "still listed" "${rebase_args[@]}" "${NEEDS_REBASE_JQ}"
+# #1 rebased, its CI running: remembered. Then CI fails, and main has
+# moved again: not listed again, and remembered while its CI fails.
+rb_pr 1 aaaa000000000000000000000000000000000011 blocked true 0
+rb_ci aaaa000000000000000000000000000000000011 failure
+put repos/example/rb/commits/aaaa000000000000000000000000000000000011/check-runs \
+    '{"total_count": 1, "check_runs": [{"name": "tests", "status": "in_progress", "conclusion": null, "check_suite": {"id": 1}}]}'
+sweep rebase 2026-09-25T16:15:00Z
+jq -e --arg rb "${RB}" '.rebase == {"\($rb)/1": "aaaa000000000000000000000000000000000001"}' "${WORK}/rebase.state" >/dev/null ||
+    fail "rebase: the state forgot #1 while its CI runs: $(cat "${WORK}/rebase.state")"
+rb_pr 1 aaaa000000000000000000000000000000000011 blocked true 1
+rb_ci aaaa000000000000000000000000000000000011 failure
+sweep rebase 2026-09-25T16:20:00Z
+expect rebase "not listed once rebased" --arg rb "${RB}" '[.needs_rebase[].url] | index("\($rb)/1") | not'
+jq -e --arg rb "${RB}" '.rebase == {"\($rb)/1": "aaaa000000000000000000000000000000000001"}' "${WORK}/rebase.state" >/dev/null ||
+    fail "rebase: the state forgot #1 while its CI fails: $(cat "${WORK}/rebase.state")"
+# Its CI passes: forgotten.
+rb_ci aaaa000000000000000000000000000000000011 success
+sweep rebase 2026-09-25T16:30:00Z
+jq -e 'has("rebase") | not' "${WORK}/rebase.state" >/dev/null ||
+    fail "rebase: the state still remembers #1: $(cat "${WORK}/rebase.state")"
+
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
-echo "ok: bot-watch first-sight news and outstanding reviews as expected"
+echo "ok: bot-watch first-sight news, outstanding reviews and PRs that need a rebase as expected"
