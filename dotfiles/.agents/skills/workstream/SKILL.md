@@ -95,8 +95,31 @@ tracker issue's own URL says nothing). Set
 organization turns up, add its option to the board's Org field (the
 GraphQL `updateProjectV2Field` replaces the whole option list, so pass
 every existing option with its `id`) and run `bot-board fill-org --all`.
-Board filters for these views: `org:cgwalters-forge,cgwalters-bot` (own
-infra) and `-org:cgwalters-forge,cgwalters-bot` (outbound).
+Org is the board's target space (the Composefs Stable board has it too).
+Tracker issues mirror Priority and Org as labels, `P0`/`P1`/`P2` (red,
+orange, grey) and `target:<org>` (blue; light blue for own infra), so
+the plain issue list filters the same way (`is:open label:P0
+label:target:bootc-dev`). `bot-board` sets them when `issue` or
+`question` opens one and keeps them in sync when `set` or `fill-org`
+changes Priority or Org on the Workstream board; `bot-board labels`
+resyncs them all. Never edit those labels
+by hand: change the board field.
+
+### Views
+
+The Projects API can't create or edit views, so cgwalters sets these up
+by hand; keep this list in step with them.
+
+| View | Layout | Filter | Group / sort |
+|------|--------|--------|--------------|
+| Needs cgwalters (views/2) | Table | `status:"Needs human",Draft` | sort Priority |
+| Questions | Table | `label:question is:open` | group Org, sort Priority |
+| P0 by target | Board | `priority:P0 -status:Done` | columns Org |
+| Outbound | Table | `-org:cgwalters-forge,cgwalters-bot -status:Done` | group Org, sort Priority |
+| Own infra | Table | `org:cgwalters-forge,cgwalters-bot -status:Done` | sort Priority |
+
+Show the "Parent issue" and "Sub-issues progress" fields in table views,
+so parents show how far along they are.
 
 ## Workflow
 

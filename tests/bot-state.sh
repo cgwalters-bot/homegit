@@ -27,11 +27,11 @@ write_fake_gh() {
 set -euo pipefail
 store=${FAKE_GH:?}
 printf '%s\n' "$*" >>"${store}/calls"
-arg() { # arg NAME ARGS...: the value of '-f NAME=...'
+arg() { # arg NAME ARGS...: the value of '-f NAME=...' (or -F)
     local name=$1
     shift
     while test $# -gt 0; do
-        if test "$1" = -f && [[ "$2" == "${name}="* ]]; then
+        if { test "$1" = -f || test "$1" = -F; } && [[ "$2" == "${name}="* ]]; then
             printf '%s' "${2#"${name}"=}"
             return 0
         fi
@@ -87,6 +87,15 @@ case "$1 $2" in
                     '{updateProjectV2DraftIssue: {draftIssue: {id: $id, title: ($t | rtrimstr("\n"))}}}'
                 ;;
             *archiveProjectV2Item*) echo '{}' ;;
+            # bot-board's item lookup: board N's items, all on one page.
+            *"items(first: 100, query"*)
+                n=$(arg number "$@")
+                echo "lookup ${n}" >>"${store}/calls"
+                items=${store}/items-${n}.json
+                test -e "${items}" || items=${store}/items.json
+                jq -c '{user: {projectV2: {items: {pageInfo: {hasNextPage: false}, nodes: [.items[]
+                    | {id, content, priority: null, org: null}]}}}}' "${items}"
+                ;;
             # A PR body's edits: $FAKE_GH/body-edits.json (as
             # [{at, by}], newest first), or none.
             *userContentEdits*)
@@ -343,7 +352,7 @@ JSON
         >"${FAKE_GH}/items-2.json"
     reset_calls
     "${BIN}/bot-board" --project composefs-stable set o/r#1 --field Area docs --field Owner bot >/dev/null
-    grep -qx 'project item-list 2 .*' "${FAKE_GH}/calls" || fail "set didn't read board 2: $(cat "${FAKE_GH}/calls")"
+    grep -qx 'lookup 2' "${FAKE_GH}/calls" || fail "set didn't look up the item on board 2: $(cat "${FAKE_GH}/calls")"
     grep -q -- '--field-id F_area --single-select-option-id=O_docs' "${FAKE_GH}/calls" || fail "Area not set"
     grep -q -- '--field-id F_owner --text=bot' "${FAKE_GH}/calls" || fail "Owner not set"
     ! "${BIN}/bot-board" --project composefs-stable set PVTI_a --field Area nope 2>/dev/null ||
@@ -352,10 +361,14 @@ JSON
     test -e "${XDG_CACHE_HOME}/bot-board/project-2/items.json" || fail "board 2 isn't cached apart"
     # Board-bound commands and the default board.
     local cmd
-    for cmd in "state-get x" "state-put x {}" "fill-org --dry-run"; do
+    for cmd in "state-get x" "state-put x {}"; do
         # shellcheck disable=SC2086
         ! "${BIN}/bot-board" --project composefs-stable ${cmd} 2>/dev/null || fail "${cmd} ran on another board"
     done
+    # fill-org works on any board with an Org field; this one has none.
+    local out
+    out=$("${BIN}/bot-board" --project composefs-stable fill-org --dry-run 2>&1 || true); grep -q "no .Org. field" <<<"${out}" ||
+        fail "fill-org didn't say board 2 lacks Org"
     ! "${BIN}/bot-board" --project nope list 2>/dev/null || fail "an unknown board was accepted"
     reset_calls
     "${BIN}/bot-board" --refresh list >/dev/null

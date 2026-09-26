@@ -78,6 +78,16 @@ readonly WHY_MAX=400
 readonly QUESTION_TITLE_MAX=100
 # Option letters; the recommendation, if any, is always the first.
 readonly OPTION_LETTERS=ABCDEFGHIJ
+# Tracker issues mirror their item's Priority and Org as labels, so the
+# plain issue list filters like the board: 'P0' and 'target:bootc-dev'.
+readonly PRIORITY_LABEL_RE='^P[0-9]$'
+readonly TARGET_LABEL_PREFIX='target:'
+readonly -A PRIORITY_COLORS=([P0]=d73a4a [P1]=fb8c00 [P2]=9e9e9e)
+readonly PRIORITY_COLOR_OTHER=bdbdbd
+# Targets are one hue family: outbound work darker than own infra.
+readonly TARGET_COLOR=1d76db
+readonly TARGET_COLOR_OWN=bfd4f2
+readonly OWN_ORGS=(cgwalters-bot cgwalters-forge)
 # Every gh project call spends the bot's GraphQL quota (5000 points/hour),
 # which all agents share, so reads are cached on disk.
 readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-board
@@ -144,11 +154,11 @@ Commands:
                               '--status none' lists untriaged items,
                               '--org none' items without an Org.
   show ITEM                   Show all fields of one item
-  add URL                     Add an issue or PR and set its Org from the
+  add [--priority P] URL      Add an issue or PR and set its Org from the
                               URL's repository (a fork's upstream, for
                               forks in cgwalters-forge); prints the new
                               item id
-  issue [--parent ITEM] [--org O] TITLE BODY
+  issue [--parent ITEM] [--org O] [--priority P] TITLE BODY
                               Open an issue in ${TRACKER_REPO} and add it
                               to the board (no Status: triage); prints
                               the new item id. --parent makes it a
@@ -192,6 +202,10 @@ Commands:
                               title's first word, else the body
                               links; '${ORG_OTHER}' when nothing matches
                               and the item has no Org yet
+  labels [--dry-run]          Make every ${TRACKER_REPO} issue's labels
+                              match its item's Priority and Org ('P0',
+                              '${TARGET_LABEL_PREFIX}bootc-dev'); 'set', 'issue',
+                              'question' and 'fill-org' keep them in sync
   state-get [--track] NAME    Print the JSON state kept in the archived
                               draft item '${STATE_PREFIX}NAME' ({} if it
                               doesn't exist yet). --track records it as
@@ -212,7 +226,7 @@ Options:
   --refresh                   Ignore cached board data and refetch it
   --project NAME              The board to use: $(project_names) (default
                               ${WORKSTREAM}), or a project number of
-                              ${OWNER}. state-get, state-put and fill-org
+                              ${OWNER}. state-get, state-put and question
                               work on ${WORKSTREAM} only
 
 ITEM is a project item id (PVTI_...), an issue/PR URL, or OWNER/REPO#N.
@@ -308,6 +322,10 @@ select_project() {
     fi
 }
 
+is_workstream() {
+    test "${NUMBER}" = "${PROJECTS[${WORKSTREAM}]}"
+}
+
 # workstream_only COMMAND: the state items and the Org field exist only
 # on the Workstream board.
 workstream_only() {
@@ -381,6 +399,45 @@ option_id() { # option_id FIELD VALUE; requires load_fields
     id=$(jq -r --arg v "$2" '.options[] | select(.name == $v) | .id' <<<"${field}")
     test -n "${id}" || fatal "invalid $1 '$2'; valid values: $(option_names "$1") (cached; --refresh rereads the board)"
     echo "${id}"
+}
+
+# A listing ('gh project item-list') costs about 300 GraphQL points on a
+# board this size, since it reads every field of every item; this reads
+# a few fields of the items in one repository, about 1 point per 100.
+readonly ITEM_LOOKUP_QUERY='query($owner: String!, $number: Int!, $q: String!, $after: String) {
+  user(login: $owner) { projectV2(number: $number) { items(first: 100, query: $q, after: $after) {
+    pageInfo { hasNextPage endCursor }
+    nodes { id
+      content { ... on Issue { url title body } ... on PullRequest { url title body } }
+      priority: fieldValueByName(name: "Priority") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+      org: fieldValueByName(name: "Org") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
+      branch: fieldValueByName(name: "Branch") { ... on ProjectV2ItemFieldTextValue { text } } } } } } }'
+
+# lookup_item URL: prints the board item of an issue or PR, shaped like an
+# item of 'list --json' but with only id, content, priority, org and
+# branch, or nothing if it isn't on the board (or GitHub's index lags).
+lookup_item() {
+    local url=${1%%#*} repo after="" data found
+    url=${url%/}
+    [[ "${url}" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/(issues|pull)/[0-9]+$ ]] ||
+        fatal "expected an issue or PR URL, got '$1'"
+    repo=${BASH_REMATCH[1]}
+    while :; do
+        data=$(gqlq "${ITEM_LOOKUP_QUERY}" -f owner="${OWNER}" -F number="${NUMBER}" -f q="repo:${repo}" \
+            ${after:+-f after="${after}"}) || fail_after $? "looking up ${url} on the board failed"
+        # An issue and a PR share numbers, so either path finds the item.
+        found=$(jq -c --arg url "${url,,}" 'def key: ascii_downcase | sub("/(issues|pull)/"; "/");
+            first(.user.projectV2.items.nodes[]
+            | select((.content.url // "" | key) == ($url | key))
+            | {id, content, priority: .priority.name, org: .org.name, branch: .branch.text}
+            | with_entries(select(.value != null))) // empty' <<<"${data}")
+        if test -n "${found}"; then
+            echo "${found}"
+            return 0
+        fi
+        jq -e '.user.projectV2.items.pageInfo.hasNextPage' <<<"${data}" >/dev/null || return 0
+        after=$(jq -r '.user.projectV2.items.pageInfo.endCursor' <<<"${data}")
+    done
 }
 
 # Prints the project item id for ITEM; requires load_items.
@@ -491,9 +548,25 @@ add_item() {
 }
 
 cmd_add() {
-    test $# -eq 1 || fatal "usage: $(basename "$0") add URL"
-    [[ "$1" == https://github.com/* ]] || fatal "expected an issue or PR URL on github.com, got '$1'"
-    add_item "$1"
+    local url="" priority=""
+    while test $# -gt 0; do
+        case "$1" in
+            --priority) test $# -ge 2 || fatal "--priority requires an argument"; priority=$2; shift 2 ;;
+            -*) fatal "unknown option for add: '$1' (see --help)" ;;
+            *) test -z "${url}" || fatal "usage: $(basename "$0") add [--priority P] URL"; url=$1; shift ;;
+        esac
+    done
+    [[ "${url}" == https://github.com/* ]] || fatal "expected an issue or PR URL on github.com, got '${url}'"
+    local id
+    if test -n "${priority}"; then
+        load_fields
+        option_id Priority "${priority}" >/dev/null
+    fi
+    id=$(add_item "${url}") || exit
+    echo "${id}"
+    test -n "${priority}" || return 0
+    (ITEM_URL_HINT=${url} cmd_set "${id}" --priority "${priority}" >/dev/null) ||
+        echo "warning: setting Priority ${priority} on ${id} failed; set it by hand" 1>&2
 }
 
 cmd_draft() {
@@ -541,17 +614,102 @@ text_org() {
     item_org "$(jq -nc --arg title "$1" --arg body "$2" '{title: $title, content: {body: $body}}')"
 }
 
+# --- Tracker labels ----------------------------------------------------------
+
+target_label() { # target_label ORG
+    echo "${TARGET_LABEL_PREFIX}$1"
+}
+
+# Label names known to exist in TRACKER_REPO, loaded once.
+TRACKER_LABELS=
+# ensure_label NAME: creates the label in TRACKER_REPO with its color,
+# unless it exists (REST only).
+ensure_label() {
+    local name=$1 color
+    if test -z "${TRACKER_LABELS}"; then
+        TRACKER_LABELS=$(ghq api --paginate "repos/${TRACKER_REPO}/labels?per_page=100" --jq '.[].name') ||
+            fail_after $? "listing the labels of ${TRACKER_REPO} failed"
+        TRACKER_LABELS=${TRACKER_LABELS:-$'\n'}
+    fi
+    grep -qxF -- "${name}" <<<"${TRACKER_LABELS}" && return 0
+    if [[ "${name}" =~ ${PRIORITY_LABEL_RE} ]]; then
+        color=${PRIORITY_COLORS[${name}]:-${PRIORITY_COLOR_OTHER}}
+    elif one_of "${name#"${TARGET_LABEL_PREFIX}"}" "${OWN_ORGS[@]}"; then
+        color=${TARGET_COLOR_OWN}
+    else
+        color=${TARGET_COLOR}
+    fi
+    # A 422 means someone just created it.
+    ghq api -X POST "repos/${TRACKER_REPO}/labels" -f name="${name}" -f color="${color}" >/dev/null 2>&1 || true
+    TRACKER_LABELS+=$'\n'"${name}"
+}
+
+# ITEM_LABELS=PRIORITY ORG: sets ITEM_LABELS to the JSON array of labels
+# for them (either may be empty), creating them in TRACKER_REPO if needed.
+# Not in a command substitution, which would lose the label cache.
+ITEM_LABELS=
+item_labels() {
+    local labels=() l
+    test -z "$1" || labels+=("$1")
+    test -z "$2" || labels+=("$(target_label "$2")")
+    for l in "${labels[@]}"; do ensure_label "${l}"; done
+    ITEM_LABELS=$(printf '%s\n' "${labels[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))')
+}
+
+# sync_labels URL [--priority P] [--org O]: on a TRACKER_REPO issue,
+# replaces the priority and/or target label by the given one (none for
+# an empty value); anything else is left alone.
+sync_labels() {
+    local url=$1 ref repo number priority="" org="" set_priority=false set_org=false
+    shift
+    while test $# -gt 0; do
+        case "$1" in
+            --priority) set_priority=true; priority=$2; shift 2 ;;
+            --org) set_org=true; org=$2; shift 2 ;;
+        esac
+    done
+    # Only the Workstream board's fields: the other boards' Priority means
+    # something else.
+    is_workstream || return 0
+    ref=$(issue_ref "${url}") || return 1
+    read -r repo number <<<"${ref}"
+    is_tracker "${repo}" || return 0
+    [[ "${url}" != */pull/* ]] || return 0
+    local current new
+    current=$(ghq api "repos/${repo}/issues/${number}" --jq '[.labels[].name]') || return 1
+    ! ${set_priority} || test -z "${priority}" || ensure_label "${priority}"
+    ! ${set_org} || test -z "${org}" || ensure_label "$(target_label "${org}")"
+    new=$(jq -c --argjson sp "${set_priority}" --arg p "${priority}" --argjson so "${set_org}" \
+        --arg t "$(test -z "${org}" || target_label "${org}")" --arg pre "${TARGET_LABEL_PREFIX}" --arg pre_re "${PRIORITY_LABEL_RE}" '
+        map(select(($sp and test($pre_re)) or ($so and startswith($pre)) | not))
+        + (if $sp and $p != "" then [$p] else [] end) + (if $so and $t != "" then [$t] else [] end)
+        | unique' <<<"${current}")
+    # Adds and removes only these, so a label someone else changes
+    # meanwhile isn't lost.
+    local add name
+    add=$(jq -c --argjson cur "${current}" '. - $cur' <<<"${new}")
+    if test "${add}" != '[]'; then
+        jq -nc --argjson labels "${add}" '{labels: $labels}' |
+            ghq api -X POST "repos/${repo}/issues/${number}/labels" --input - >/dev/null || return 1
+    fi
+    while IFS= read -r name; do
+        test -n "${name}" || continue
+        ghq api -X DELETE "repos/${repo}/issues/${number}/labels/$(jq -rn --arg n "${name}" '$n | @uri')" >/dev/null || return 1
+    done < <(jq -r --argjson new "${new}" '(. - $new)[]' <<<"${current}")
+}
+
 cmd_issue() {
-    local parent="" org="" args=()
+    local parent="" org="" priority="" args=()
     while test $# -gt 0; do
         case "$1" in
             --parent) test $# -ge 2 || fatal "--parent requires an issue"; parent=$2; shift 2 ;;
             --org) test $# -ge 2 || fatal "--org requires an argument"; org=$2; shift 2 ;;
+            --priority) test $# -ge 2 || fatal "--priority requires an argument"; priority=$2; shift 2 ;;
             -*) fatal "unknown option for issue: '$1' (see --help)" ;;
             *) args+=("$1"); shift ;;
         esac
     done
-    test "${#args[@]}" -eq 2 || fatal "usage: $(basename "$0") issue [--parent ITEM] [--org O] TITLE BODY"
+    test "${#args[@]}" -eq 2 || fatal "usage: $(basename "$0") issue [--parent ITEM] [--org O] [--priority P] TITLE BODY"
     test -n "${args[0]}" || fatal "the issue title must not be empty"
     local parent_repo="" parent_number="" ref
     if test -n "${parent}"; then
@@ -565,14 +723,21 @@ cmd_issue() {
     elif has_field Org; then
         org=$(text_org "${args[0]}" "${args[1]}")
     fi
+    test -z "${priority}" || option_id Priority "${priority}" >/dev/null
     local issue url id
-    issue=$(open_issue "${args[0]}" "${args[1]}")
+    ITEM_LABELS='[]'
+    ! is_workstream || item_labels "${priority}" "${org}"
+    issue=$(open_issue "${args[0]}" "${args[1]}" "$(jq -nc --argjson l "${ITEM_LABELS}" '{labels: $l}')")
     url=$(jq -r .html_url <<<"${issue}")
     echo "opened ${url}" 1>&2
     # On the board before it is a sub-issue: the board's "Auto-add
     # sub-issues" workflow would add it first, and then item-add fails.
     id=$(add_item "${url}" "${org}") ||
         fail_after $? "opened ${url}, but adding it to the board failed; add it with '$(basename "$0") add'"
+    if test -n "${priority}"; then
+        (ITEM_URL_HINT=${url} cmd_set "${id}" --priority "${priority}" >/dev/null) ||
+            echo "warning: setting Priority ${priority} on ${id} failed; set it by hand" 1>&2
+    fi
     if test -n "${parent}"; then
         (add_sub_issue "${parent_repo}" "${parent_number}" "$(jq -r .id <<<"${issue}")") ||
             echo "warning: making ${url} a sub-issue of ${parent} failed; do it on GitHub" 1>&2
@@ -644,10 +809,8 @@ cmd_question() {
     # Settle everything the board decides before anything is created.
     load_fields
     test -z "${priority}" || option_id Priority "${priority}" >/dev/null
-    load_items
     local blocked_item org
-    blocked_item=$(jq -c --arg url "${blocked_url,,}" \
-        'first(.items[] | select((.content.url // "" | ascii_downcase) == $url)) // empty' <<<"${ITEMS_JSON}")
+    blocked_item=$(lookup_item "${blocked_url}") || exit
     test -n "${blocked_item}" ||
         echo "warning: ${blocked_url} is not on the board (or the listing lags); only the question goes on it" 1>&2
     test -n "${priority}" || priority=$(jq -r '.priority // empty' <<<"${blocked_item:-{\}}")
@@ -656,8 +819,9 @@ cmd_question() {
     test -n "${title}" || title=$(one_line "${question}" "${QUESTION_TITLE_MAX}")
     local body issue url
     body=$(question_body "${blocked_url}" "${question}" "${context}" "${recommend}" "${options[@]}")
+    item_labels "${priority}" "${org}"
     issue=$(open_issue "${title}" "${body}" "$(jq -nc --arg label "${QUESTION_LABEL}" --arg op "${OPERATOR}" \
-        '{labels: [$label], assignees: [$op]}')")
+        --argjson l "${ITEM_LABELS}" '{labels: ([$label] + $l), assignees: [$op]}')")
     url=$(jq -r .html_url <<<"${issue}")
     echo "opened ${url}" 1>&2
     local id why fields=(--status "${QUESTION_STATUS}")
@@ -673,7 +837,7 @@ cmd_question() {
     fields+=(--why "${why}")
     test -z "${priority}" || fields+=(--priority "${priority}")
     # In subshells, so that a failed edit still prints the question's id.
-    (cmd_set "${id}" "${fields[@]}" >/dev/null) ||
+    (ITEM_URL_HINT=${url} cmd_set "${id}" "${fields[@]}" >/dev/null) ||
         echo "warning: setting up the question's item ${id} failed; set: ${fields[*]}" 1>&2
     if test -n "${blocked_item}"; then
         local blocked_id
@@ -703,14 +867,13 @@ cmd_resolve() {
     ghq api -X PATCH "repos/${repo}/issues/${number}" -f state=closed -f state_reason=completed >/dev/null ||
         fail_after $? "closing ${url} failed"
     echo "closed ${url}"
-    load_items
     local id
-    id=$(jq -r --arg url "${url,,}" 'first(.items[] | select((.content.url // "" | ascii_downcase) == $url) | .id) // empty' <<<"${ITEMS_JSON}")
+    id=$(lookup_item "${url}" | jq -r '.id // empty') || exit
     if test -z "${id}"; then
         echo "warning: ${url} is not on the board (or the listing lags); set its item ${DONE_STATUS} by id" 1>&2
         return 0
     fi
-    cmd_set "${id}" --status "${DONE_STATUS}"
+    ITEM_URL_HINT=${url} cmd_set "${id}" --status "${DONE_STATUS}"
 }
 
 one_of() { # one_of VALUE CHOICES...
@@ -743,7 +906,7 @@ cmd_set() {
     shift
     test $# -gt 0 || fatal "nothing to set; valid options: ${SET_OPTIONS[*]}"
     # Resolve and validate everything before changing anything.
-    local field_ids=() args=() names=() field field_id option
+    local field_ids=() args=() names=() field field_id option label_args=()
     load_fields
     while test $# -gt 0; do
         case "$1" in
@@ -762,6 +925,7 @@ cmd_set() {
                     args+=("--single-select-option-id=${option}")
                 fi
                 names+=("${field} = $2")
+                case "${field}" in Priority|Org) label_args+=("--${field,,}" "$2") ;; esac
                 shift 2
                 ;;
             --field)
@@ -782,12 +946,15 @@ cmd_set() {
         esac
     done
     local id project remaining i
-    # A project item id needs no lookup; anything else resolves via the list.
+    # A project item id needs no lookup; a URL is looked up cheaply.
+    local item_url=${ITEM_URL_HINT:-}
     if [[ "${item}" == PVTI_* ]]; then
         id=${item}
     else
-        load_items
-        id=$(resolve_item "${item}")
+        issue_ref "${item}" >/dev/null || exit
+        if [[ "${item}" == https://* ]]; then item_url=${item%%#*}; else item_url=https://github.com/${item/\#//issues/}; fi
+        id=$(lookup_item "${item_url}" | jq -r '.id // empty') || exit
+        test -n "${id}" || fatal "'${item}' is not on the board (${BOARD_URL}); if it was just added, use its PVTI_ id"
     fi
     project=$(project_id) || fail_after $? "cannot look up the project id"
     # Don't start a batch of edits that the quota can't finish.
@@ -805,6 +972,19 @@ cmd_set() {
         echo "${id}: ${names[i]}"
     done
     invalidate_items
+    test "${#label_args[@]}" -gt 0 && is_workstream || return 0
+    # A tracker issue's labels follow its Priority and Org.
+    local url=${item_url}
+    if test -z "${url}"; then
+        url=$(gqlq 'query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
+            content { ... on Issue { url } ... on PullRequest { url } } } } }' -f id="${id}" |
+            jq -r '.node.content.url // empty') || url=
+    fi
+    if test -z "${url}"; then
+        echo "warning: couldn't look up the URL of ${id}, so its tracker labels (if any) weren't updated; rerun the set later" 1>&2
+    elif ! (sync_labels "${url}" "${label_args[@]}"); then
+        echo "warning: updating the labels of ${url} failed" 1>&2
+    fi
 }
 
 # --- Org -------------------------------------------------------------------
@@ -906,7 +1086,7 @@ cmd_fill_org() {
         fi
         test "${current}" = "${org}" && continue
         printf '%s\t%s\t%s\n' "${id}" "${org}" "${title:0:${TITLE_WIDTH}}"
-        updates+=("${id} $(option_id Org "${org}")")
+        updates+=("${id} $(option_id Org "${org}") ${org} $(jq -r '.content.url // "-"' <<<"${item}")")
     done < <(jq -c --argjson all "${all}" '.items[] | select($all or .org == null)' <<<"${ITEMS_JSON}")
     if test "${#leftovers[@]}" -gt 0; then
         echo "No org derivable for these, so they get '${ORG_OTHER}':" 1>&2
@@ -916,7 +1096,15 @@ cmd_fill_org() {
     if ${dry_run} || test "${#updates[@]}" -eq 0; then
         return 0
     fi
-    local project requests remaining start i query option
+    local project requests remaining start i query option url
+    # The labels exist before any edit (a failure here changes nothing),
+    # and before the sync's subshells, which can't add to the label cache.
+    if is_workstream; then
+        for i in "${!updates[@]}"; do
+            read -r _ _ org url <<<"${updates[i]}"
+            [[ "${url,,}" != "https://github.com/${TRACKER_REPO,,}/issues/"* ]] || ensure_label "$(target_label "${org}")"
+        done
+    fi
     project=$(project_id) || fail_after $? "cannot look up the project id"
     # Each request is one mutation of ORG_BATCH aliased edits.
     requests=$(( (${#updates[@]} + ORG_BATCH - 1) / ORG_BATCH ))
@@ -928,7 +1116,7 @@ cmd_fill_org() {
     for ((start = 0; start < ${#updates[@]}; start += ORG_BATCH)); do
         query='mutation($project: ID!, $field: ID!) {'
         for ((i = start; i < start + ORG_BATCH && i < ${#updates[@]}; i++)); do
-            read -r id option <<<"${updates[i]}"
+            read -r id option _ <<<"${updates[i]}"
             query+=" m${i}: updateProjectV2ItemFieldValue(input: {projectId: \$project, itemId: \"${id}\",
                 fieldId: \$field, value: {singleSelectOptionId: \"${option}\"}}) { projectV2Item { id } }"
         done
@@ -938,6 +1126,49 @@ cmd_fill_org() {
         echo "set Org on items $((start + 1))-${i} of ${#updates[@]}" 1>&2
     done
     invalidate_items
+    # Tracker issues carry their Org as a label too.
+    local url
+    for i in "${!updates[@]}"; do
+        read -r id _ org url <<<"${updates[i]}"
+        [[ "${url,,}" == "https://github.com/${TRACKER_REPO,,}/issues/"* ]] || continue
+        (sync_labels "${url}" --org "${org}") || echo "warning: updating the labels of ${url} failed" 1>&2
+    done
+}
+
+# cmd_labels [--dry-run]: backfill every tracker issue's labels from its
+# item's Priority and Org.
+cmd_labels() {
+    local dry_run=false
+    case "${1:-}" in
+        --dry-run) dry_run=true ;;
+        "") ;;
+        *) fatal "unknown argument for labels: $1 (see --help)" ;;
+    esac
+    load_items
+    # Fields split on a non-whitespace separator: IFS would merge
+    # tab-separated empty ones.
+    local n=0 url priority org rows
+    rows=$(jq -r --arg prefix "https://github.com/${TRACKER_REPO,,}/issues/" '.items[]
+        | select((.content.url // "" | ascii_downcase) | startswith($prefix))
+        | [.content.url, .priority // "", .org // ""] | join("\u001f")' <<<"${ITEMS_JSON}")
+    if ! ${dry_run}; then
+        # Created up front: the loop's subshells can't add to the cache.
+        while IFS=$'\x1f' read -r url priority org; do
+            test -z "${priority}" || ensure_label "${priority}"
+            test -z "${org}" || ensure_label "$(target_label "${org}")"
+        done <<<"${rows}"
+    fi
+    while IFS=$'\x1f' read -r url priority org; do
+        test -n "${url}" || continue
+        n=$((n + 1))
+        if ${dry_run}; then
+            echo "${url}: ${priority:-no priority}${org:+, $(target_label "${org}")}"
+            continue
+        fi
+        (sync_labels "${url}" --priority "${priority}" --org "${org}") ||
+            echo "warning: updating the labels of ${url} failed" 1>&2
+    done <<<"${rows}"
+    echo "${n} tracker issue(s) $(${dry_run} && echo "would be synced" || echo synced)" 1>&2
 }
 
 # --- State items -----------------------------------------------------------
@@ -1207,7 +1438,8 @@ case "${command}" in
     -h|--help|help) usage; exit 0 ;;
     list|show|add|draft|set|issue|resolve) ;;
     question) workstream_only "${command}" ;;
-    fill-org) workstream_only "${command}"; command=fill_org ;;
+    fill-org) command=fill_org ;;
+    labels) workstream_only "${command}" ;;
     state-get) workstream_only "${command}"; command=state_get ;;
     state-put) workstream_only "${command}"; command=state_put ;;
     *) fatal "unknown command '${command}' (see --help)" ;;

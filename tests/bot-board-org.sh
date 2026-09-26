@@ -35,6 +35,10 @@ case "$1 $2" in
     "project view") echo PVT_fake ;;
     "api rate_limit") echo 5000 ;;
     "api graphql") { printf '%s' "$*" | tr -s '\n ' ' '; echo; } >>"${store}/mutations"; echo '{}' ;;
+    # Tracker issues have no labels yet; label writes are logged.
+    "api --paginate") echo '' ;;
+    api\ repos/cgwalters-forge/tracker/issues/*) echo '[]' ;;
+    "api -X") echo "$3 ${4#repos/cgwalters-forge/tracker/}" >>"${store}/labels" ;;
     api\ repos/*)
         source=$(awk -v r="${2#repos/}" '$1 == r { print $2 }' "${store}/sources")
         test -n "${source}" || { echo "gh: Not Found (HTTP 404)" 1>&2; exit 1; }
@@ -112,4 +116,9 @@ for i in "${!CASES[@]}"; do
             "${FAKE_GH}/mutations" || fail "case ${i}: no mutation setting O_${want}"
     fi
 done
-echo "all ${#CASES[@]} fill-org cases passed"
+# Tracker issues whose Org changed get the matching label; nothing else.
+for want in "POST labels" "POST issues/5/labels" "POST issues/6/labels" "POST issues/7/labels"; do
+    grep -qxF "${want}" "${FAKE_GH}/labels" || fail "no '${want}' label call: $(cat "${FAKE_GH}/labels")"
+done
+test "$(grep -c '/labels$' "${FAKE_GH}/labels")" -eq 3 || fail "label calls for non-tracker items: $(cat "${FAKE_GH}/labels")"
+echo "all ${#CASES[@]} fill-org cases passed, tracker labels synced"
