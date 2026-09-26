@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Offline tests of which SSH user 'bot-devspace start' settles on, and of
 # what 'bot-devspace provision' then does. Devspaces admit the unprivileged
-# 'agent' (no sudo; the workflow installs the toolchain) or, from workflow
+# 'runner-sandbox' (no sudo; the workflow installs the toolchain) or, from workflow
 # revisions that predate it, only 'runner' (sudo; provision installs it).
 # A fake gh keeps one dispatched run in a temporary directory, and a fake
 # ssh admits the users in $FAKE_SSH_USERS and records what it was asked to
@@ -93,8 +93,8 @@ chmod +x "${WORK}/bin/gh" "${WORK}/bin/ssh"
 
 # (users the devspace admits, the user start must pick, provision's mode)
 cases=(
-    "agent runner|agent|check"
-    "agent|agent|check"
+    "runner-sandbox runner|runner-sandbox|check"
+    "runner-sandbox|runner-sandbox|check"
     "runner|runner|install"
 )
 for case in "${cases[@]}"; do

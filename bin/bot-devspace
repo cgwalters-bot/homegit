@@ -10,12 +10,12 @@ readonly WORKFLOW_PATH=.github/workflows/${WORKFLOW}
 # tooling and easily exhausted by parallel agents.
 readonly RUNS_API="repos/${REPO}/actions/workflows/${WORKFLOW}/runs?event=workflow_dispatch&per_page=100"
 readonly HOST_PREFIX=cgwalters-devspace-
-# SSH sessions run as the unprivileged 'agent', without sudo: the 'runner'
+# SSH sessions run as the unprivileged 'runner-sandbox', without sudo: the 'runner'
 # user holds the job's credentials. Devspaces from a workflow revision that
 # predates it admit only 'runner'; start probes both, in this order, and
 # records which one worked.
-# TODO: drop 'runner' once devspace.yml on main creates 'agent'.
-readonly SSH_USER=agent
+# TODO: drop 'runner' once devspace.yml on main creates 'runner-sandbox'.
+readonly SSH_USER=runner-sandbox
 readonly LEGACY_SSH_USER=runner
 readonly SSH_USERS=("${SSH_USER}" "${LEGACY_SSH_USER}")
 readonly ALIAS_PREFIX=devspace-

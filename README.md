@@ -77,7 +77,7 @@ credentials, and borrow compute for building and testing. `bot-devspace`
 ephemeral RHEL 10 runner from
 [bootc-dev/cgwalters-devspace-sandbox](https://github.com/bootc-dev/cgwalters-devspace-sandbox),
 waits for it to be reachable over the tailnet and hands out an
-ssh_config for its unprivileged `agent` user (the workflow installs the
+ssh_config for its unprivileged `runner-sandbox` user (the workflow installs the
 toolchain: podman, gcc, Rust, bcvk, ...), so an agent edits
 locally, pushes its branch to the devspace with plain git over SSH, runs
 the project's tests there (KVM is available for VM tests), and pushes the
