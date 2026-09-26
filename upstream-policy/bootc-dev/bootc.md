@@ -46,6 +46,7 @@ sources:
     path: common/REVIEW.md
     sha: 3068dd57b2c3ef45cb1c3147442e8d63505bb643
 checked: 2026-09-25 by the policy-check subagent (coordinator session 929c7a64, converted from an earlier read-only survey and re-read against current upstream)
+rebase: any
 ---
 
 `AGENTS.md`, `REVIEW.md`, `.claude/CLAUDE.md` and `.cursorrules` are the
@@ -126,3 +127,11 @@ agent-specific rule in its "CRITICAL instructions" section, so the bot uses the
 generic `Assisted-by: AI` (substantial assistance) or `Generated-by: AI`
 (effectively entirely generated); the bot's default `Generated-by: AI` fits
 work it wrote end to end.
+
+## Rebasing
+
+Rebase the bot's PRs here whenever they need it, conflicting or not:
+cgwalters maintains this repository and wants PRs that are merely behind
+rebased so that CI passes (he said so on
+https://github.com/bootc-dev/bootc/pull/2495). This overrides the merge
+queue detection (.github/workflows/ci.yml runs on merge_group).
