@@ -15,8 +15,17 @@ readonly REQUESTER=cgwalters
 readonly FORGE_ORG=cgwalters-forge
 # Notification reasons that ask something of the bot. The rest (comment,
 # author, state_change, ci_activity, subscribed) are about threads the bot
-# already follows, which are on the board, where bot-watch reports them.
+# already follows, which are on the board, where bot-watch reports them,
+# except in TRACKER_REPO.
 readonly SELECT_REASONS='["mention", "team_mention", "review_requested", "assign"]'
+# The bot's own issues, questions for REQUESTER among them (labelled
+# QUESTION_LABEL). Every comment REQUESTER makes on one is routed, as
+# reason COMMENT_REASON: on a question it is his answer, printed as an
+# 'answer' record; on any other issue there, a 'request'. Everyone else's
+# comments there, the bot's own included, are left to bot-watch.
+readonly TRACKER_REPO=cgwalters-forge/tracker
+readonly QUESTION_LABEL=question
+readonly COMMENT_REASON=comment
 readonly API=https://api.github.com
 readonly DEFAULT_LOOKBACK_DAYS=7
 readonly PER_PAGE=50
@@ -79,7 +88,8 @@ Poll ${BOT_LOGIN}'s GitHub notifications once, and route every new
 mention, team mention, review request and assignment. GitHub doesn't
 reliably notify the bot, so every run also looks for them in
 ${REQUESTER}'s public events (his reviews, comments, assignments and
-review requests that mention or name @${BOT_LOGIN}) and searches for
+review requests that mention or name @${BOT_LOGIN}, and his comments in
+${TRACKER_REPO}) and searches for
 mentions of @${BOT_LOGIN} since the last poll; what that finds is routed
 the same way, as threads whose THREAD_ID is the issue or PR URL:
 
@@ -89,13 +99,20 @@ the same way, as threads whose THREAD_ID is the issue or PR URL:
     per line, for the agent to turn into a board item. Every run prints
     them again until 'ack THREAD_ID' says they're on the board, which
     also marks a notification thread read;
+  - a comment by ${REQUESTER} on an issue in ${TRACKER_REPO}, where the
+    bot's own issues are: on a question (labelled '${QUESTION_LABEL}') it is
+    his answer, printed as an 'answer' record with the option letter he
+    picked (a first line that is just the letter) in 'choice'; elsewhere
+    there a 'request'. Both stay until acked, like requests. Comments by
+    anyone else there, the bot's own included, are left to bot-watch;
   - from anyone else: file an issue in ${DEFAULT_ISSUE_REPO} mentioning
     @${REQUESTER}, once per trigger (deduped locally, then by a hidden
     marker in the issues); the bot never acts on it. For a non-public
     source the issue has links only.
 
-Threads in ${FORGE_ORG} are skipped: 'bot-pr inbox' covers them. Other
-threads are marked read once routed, unless they hold unacked requests.
+Threads in ${FORGE_ORG} other than ${TRACKER_REPO} are skipped: 'bot-pr
+inbox' covers them. Other threads are marked read once routed, unless
+they hold unacked requests.
 The poll state (since, Last-Modified) and the unacked requests are kept
 in the archived 'bot-state: ${STATE_NAME}' draft item on the board,
 shared by every machine. The poll state only advances when every thread,
@@ -209,6 +226,9 @@ def names_bot: (. // "") | test("@" + $bot + "(?![A-Za-z0-9-])"; "i");
         {number: $p.pull_request.number, pr: true, reason: "mention", url: $p.comment.html_url}
     elif .type == "PullRequestReviewEvent" and ($p.review.body | names_bot) then
         {number: $p.pull_request.number, pr: true, reason: "mention", url: $p.review.html_url}
+    elif .type == "IssueCommentEvent" and $p.action == "created" and (.repo.name | ascii_downcase) == $tracker
+        and $p.issue.pull_request == null then
+        {number: $p.issue.number, pr: false, reason: "comment", url: $p.comment.html_url, title: $p.issue.title}
     elif .type == "IssuesEvent" and $p.action == "opened" and ($p.issue.body | names_bot) then
         {number: $p.issue.number, pr: false, reason: "mention", url: $p.issue.html_url, title: $p.issue.title}
     elif .type == "IssuesEvent" and $p.action == "assigned" and $p.assignee.login? == $bot then
@@ -248,6 +268,9 @@ from_file=
 # JSON array, looking back to a given time, offline, and exits.
 events_file=
 events_window=
+# Hidden test hook: another repository standing for TRACKER_REPO (a
+# throwaway one), with --from-file or --event-threads only.
+tracker_repo=${TRACKER_REPO}
 subcmd=poll
 ack_ids=()
 if test "${1:-}" = ack; then
@@ -270,16 +293,20 @@ while test $# -gt 0; do
         --from-file) test $# -ge 2 || fatal "--from-file requires a file"; from_file=$2; shift 2 ;;
         --event-threads) test $# -ge 3 || fatal "--event-threads requires a file and a time"
             events_file=$2; events_window=$3; shift 3 ;;
+        --tracker-repo) test $# -ge 2 || fatal "--tracker-repo requires OWNER/REPO"; tracker_repo=$2; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fatal "unknown argument: $1 (see --help)" ;;
     esac
 done
 [[ "${issue_repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fatal "--repo must be OWNER/REPO, not '${issue_repo}'"
+if test "${tracker_repo}" != "${TRACKER_REPO}" && test -z "${from_file}${events_file}"; then
+    fatal "--tracker-repo is a test hook and needs --from-file or --event-threads"
+fi
 if test -n "${from_file}"; then
     jq -e 'type == "array"' "${from_file}" >/dev/null 2>&1 || fatal "--from-file ${from_file} is not a JSON array of notification threads"
 fi
 if test -n "${events_file}"; then
-    jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" "${EVENT_HITS_JQ}" "${events_file}" |
+    jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" --arg tracker "${tracker_repo,,}" "${EVENT_HITS_JQ}" "${events_file}" |
         jq -sc --arg window "${events_window}" --argjson known '[]' "${HITS_TO_THREADS_JQ}"
     exit 0
 fi
@@ -408,9 +435,10 @@ print_pending() {
     local n
     n=$(jq '.pending | length' <<<"${PENDING_JSON}")
     test "${n}" -gt 0 || return 0
-    echo "${n} requests from ${REQUESTER} to put on the board; then 'bot-notify ack THREAD_ID...':"
-    jq -c '.pending | to_entries | sort_by(.value.thread_id, .key) | .[].value | {type: "request"} + .' <<<"${PENDING_JSON}" |
-        sed 's/^/request /'
+    echo "${n} requests and answers from ${REQUESTER} to act on; then 'bot-notify ack THREAD_ID...':"
+    jq -r '.pending | to_entries | sort_by(.value.thread_id, .key) | .[].value
+        | {type: (if .question then "answer" else "request" end)} + .
+        | "\(.type) \(tojson)"' <<<"${PENDING_JSON}"
 }
 
 if test "${subcmd}" = ack; then
@@ -538,12 +566,12 @@ event_hits() {
         *) warn "unexpected HTTP status '${status}' reading ${REQUESTER}'s events"; return 1 ;;
     esac
     etag=$(header ETag)
-    hits=$(jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" "${EVENT_HITS_JQ}" "${scratch}/body")
+    hits=$(jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" --arg tracker "${tracker_repo,,}" "${EVENT_HITS_JQ}" "${scratch}/body")
     oldest=$(jq -r '.[-1].created_at // empty' "${scratch}/body")
     next=$(header Link | grep -oP '<\K[^>]+(?=>; rel="next")' || true)
     while test -n "${next}" && test -n "${oldest}" && [[ "${oldest}" > "${window}" ]] && test "${pages}" -lt "${EVENTS_MAX_PAGES}"; do
         status=$(fetch_page "${next#"${API}"/}") || return 1
-        hits+=$'\n'$(jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" "${EVENT_HITS_JQ}" "${scratch}/body")
+        hits+=$'\n'$(jq -c --arg bot "${BOT_LOGIN}" --arg requester "${REQUESTER}" --arg tracker "${tracker_repo,,}" "${EVENT_HITS_JQ}" "${scratch}/body")
         oldest=$(jq -r '.[-1].created_at // empty' "${scratch}/body")
         next=$(header Link | grep -oP '<\K[^>]+(?=>; rel="next")' || true)
         pages=$((pages + 1))
@@ -646,6 +674,19 @@ triggers() {
                     'select(($lr == "" or .at > $lr) and (.body // "" | test($re; "i")) and ($self or .author != $bot))
                      | del(.at) + {located: true}' <<<"${candidates}")
                 ;;
+            "${COMMENT_REASON}")
+                # Only what a trusted login wrote: on a question, that's
+                # the answer. Nothing else here is filed or acted on, and
+                # there's nothing to fall back on below.
+                local trusted_json
+                trusted_json=$(printf '%s\n' "${trusted[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))')
+                found=$(ghapi --paginate "repos/${repo}/issues/${number}/comments?per_page=100${last_read:+&since=${last_read}}" \
+                    --jq '.[] | {author: .user.login, author_type: .user.type, url: .html_url, body, at: .created_at}' |
+                    jq -c --arg lr "${last_read}" --argjson trusted "${trusted_json}" \
+                        'select(($lr == "" or .at > $lr) and .author_type == "User" and (.author | IN($trusted[])))
+                         | del(.at) + {located: true}') || return 1
+                test -n "${found}" || return 0
+                ;;
             review_requested|assign)
                 local filter
                 if test "${reason}" = assign; then
@@ -668,7 +709,11 @@ triggers() {
             return 0
         fi
         if test -n "${found}"; then
-            found=$(jq -c --arg title "$(jq -r .title <<<"${issue}")" '. + {issue_title: $title}' <<<"${found}")
+            # A comment on a question in the tracker is an answer, whether
+            # or not it also mentions the bot.
+            found=$(jq -c --argjson issue "${issue}" --arg label "${QUESTION_LABEL}" --argjson tracker "$(
+                test "${repo,,}" = "${tracker_repo,,}" && echo true || echo false)" \
+                '. + {issue_title: $issue.title, question: ($tracker and any($issue.labels[]?; .name == $label))}' <<<"${found}")
         fi
     fi
     if test -z "${found}"; then
@@ -825,7 +870,8 @@ while IFS= read -r thread; do
         continue
     fi
     nselected=$((nselected + 1))
-    if test "$(jq -r .repository.owner.login <<<"${thread}")" = "${FORGE_ORG}"; then
+    if test "$(jq -r .repository.owner.login <<<"${thread}")" = "${FORGE_ORG}" &&
+        test "$(jq -r '.repository.full_name | ascii_downcase' <<<"${thread}")" != "${tracker_repo,,}"; then
         echo "Skipped ${desc}: ${FORGE_ORG} fork PRs are for 'bot-pr inbox'"
         nskipped=$((nskipped + 1))
         mark_read "${id}" || nfailed=$((nfailed + 1))
@@ -848,7 +894,9 @@ while IFS= read -r thread; do
             | {reason: \$th.reason, repo: \$th.repository.full_name, private: \$th.repository.private,
                number: ((\$th.subject.url // \"\" | capture(\"/(?<n>[0-9]+)\$\") | .n) // null),
                title: (\$th.subject.title // .issue_title), thread_url: (.url | sub(\"#.*\"; \"\")),
-               thread_id: \$th.id, author, url, excerpt: \$ex, located}" <<<"${trig}")
+               thread_id: \$th.id, author, url, excerpt: \$ex, located, question: (.question // false),
+               choice: ((.body // \"\") | split(\"\\n\") | (.[0] // \"\") | gsub(\"^\\\\s+|\\\\s+\$\"; \"\")
+                        | if test(\"^[A-Z]\$\") then . else null end)}" <<<"${trig}")
         if jq -e '.private == null' <<<"${t}" >/dev/null; then
             priv=false
             ! is_private "$(jq -r .repo <<<"${t}")" || priv=true
@@ -878,7 +926,11 @@ while IFS= read -r thread; do
             add_pending "${t}"
             nrequests=$((nrequests + 1))
             ! jq -e .source <<<"${thread}" >/dev/null || nunnotified=$((nunnotified + 1))
-            echo "  request from @${author}, pending until acked"
+            if jq -e .question <<<"${t}" >/dev/null; then
+                echo "  answer from @${author}$(jq -r '.choice // empty | " (picked \(.))"' <<<"${t}"), pending until acked"
+            else
+                echo "  request from @${author}, pending until acked"
+            fi
         fi
     done <<<"${found}"
     if ! ${ok}; then
@@ -892,7 +944,10 @@ while IFS= read -r thread; do
     else
         mark_read "${id}" || nfailed=$((nfailed + 1))
     fi
-done < <(jq -c --argjson reasons "${SELECT_REASONS}" '.[] | select(.reason as $r | $reasons | index($r))' <<<"${threads_all}")
+done < <(jq -c --argjson reasons "${SELECT_REASONS}" --arg tracker "${tracker_repo,,}" --arg comment "${COMMENT_REASON}" '
+    .[] | (.reason as $r | $reasons | index($r) != null) as $asks
+    | select($asks or (.repository.full_name | ascii_downcase) == $tracker)
+    | if $asks then . else .reason = $comment end' <<<"${threads_all}")
 ! ${safety_failed} || nfailed=$((nfailed + 1))
 
 filed_verb=filed

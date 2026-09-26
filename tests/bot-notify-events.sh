@@ -9,7 +9,10 @@
 # bot without a notification; the rest are synthetic edge cases: a
 # mention in other case, a longer login, another actor, an event older
 # than the window, assignments to the bot and to someone else, a review
-# request, and a private repository.
+# request, a private repository, and comments in the tracker repository
+# (his on an issue, which count; the bot's, and his on a PR, which don't;
+# a mention there, which stays a mention) and in the review sandbox, which
+# counts only when --tracker-repo stands it in for the tracker.
 set -euo pipefail
 
 TESTS=$(cd "$(dirname "$0")" && pwd)
@@ -19,7 +22,9 @@ readonly BOT_NOTIFY=${TESTS}/../bin/bot-notify
 readonly WINDOW=2026-09-23T12:00:00Z
 
 # ID REASON PRIVATE SUBJECT_TYPE, one line per expected thread, sorted.
-readonly EXPECTED='https://github.com/coreos/rpm-ostree/pull/5635	mention	false	PullRequest
+readonly EXPECTED='https://github.com/cgwalters-forge/tracker/issues/3	comment	false	Issue
+https://github.com/cgwalters-forge/tracker/issues/6	mention	false	Issue
+https://github.com/coreos/rpm-ostree/pull/5635	mention	false	PullRequest
 https://github.com/example/private/pull/8	mention	true	PullRequest
 https://github.com/example/repo/issues/1	mention	false	Issue
 https://github.com/example/repo/issues/5	assign	false	Issue
@@ -40,5 +45,11 @@ fi
 # A window after everything leaves nothing.
 none=$("${BOT_NOTIFY}" --event-threads "${FIXTURE}" 2026-09-25T00:00:00Z)
 test -z "${none}" || { printf 'FAIL: threads after the last event:\n%s\n' "${none}" 1>&2; exit 1; }
+
+# The sandbox standing in for the tracker: its comment counts instead.
+sandbox=$("${BOT_NOTIFY}" --event-threads "${FIXTURE}" "${WINDOW}" --tracker-repo cgwalters-bot/review-sandbox |
+    jq -r 'select(.reason == "comment") | .id')
+test "${sandbox}" = https://github.com/cgwalters-bot/review-sandbox/issues/7 ||
+    { printf 'FAIL: comment threads with --tracker-repo: %s\n' "${sandbox}" 1>&2; exit 1; }
 
 echo "ok: $(wc -l <<<"${EXPECTED}") safety-net threads from $(jq length "${FIXTURE}") events as expected"
