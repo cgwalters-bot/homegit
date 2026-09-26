@@ -67,7 +67,10 @@ looked (new comments and reviews, merges and closes, pushes by others,
 CI going red), and with `--apply`, when it sees an item's upstream PR
 merge or close, moves it to Done or Needs human (from Todo, Draft or In
 Review only). Its last-seen state is another archived item,
-`bot-state: watch`.
+`bot-state: watch`. Every sweep also lists the bot's PRs that just need
+a rebase (behind their base with CI failing, or conflicting); `bot-pr
+rebase URL` does that for a conflict-free one, keeping my sign-off, and
+the coordinator runs it on its own.
 
 ### Overnight working model
 
