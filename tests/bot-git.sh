@@ -22,6 +22,7 @@ trap 'rm -rf "${WORK}"' EXIT
 readonly REPO=${WORK}/repo
 export GIT_CONFIG_GLOBAL=${WORK}/gitconfig GIT_CONFIG_NOSYSTEM=1
 unset GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+unset BOT_GIT_SHARED_CLONES BOT_GIT_ALLOW_SHARED_CLONE
 # The machine's own identity is the human's; bot-git must override it.
 git config --global user.name "${HUMAN% <*}"
 git config --global user.email walters@verbum.org
@@ -115,6 +116,71 @@ rebase --signoff|refuse|rebase,--signoff,--root
 cherry-pick -s|refuse|cherry-pick,-s,HEAD
 format-patch -s|refuse|format-patch,-1,-s,-o,${WORK}/patches
 CASES
+
+# --- shared clones ---
+# Clones of REPO under WORK, as the config below lists them: shared,
+# glob-x (by a glob), tilde (by ~/, with HOME at WORK/home), viasym (by a
+# symlink to it), the default homegit clone, and free (not listed), with
+# shared-wt a worktree of shared.
+readonly HOMEGIT=home/src/github/cgwalters-bot/homegit
+for d in shared glob-x home/tilde viasym "${HOMEGIT}" free; do
+    git clone -q "${REPO}" "${WORK}/${d}"
+done
+git -C "${WORK}/shared" worktree add -q -b topic "${WORK}/shared-wt"
+mkdir "${WORK}/shared/sub"
+ln -s viasym "${WORK}/linked"
+cat >"${WORK}/shared-clones" <<EOF
+# The clones other agents use.
+${WORK}/shared   # a comment after it
+  ${WORK}/glob-*
+~/tilde
+${WORK}/linked/
+EOF
+# heads: the HEAD of each clone.
+heads() {
+    local d
+    for d in shared glob-x home/tilde viasym "${HOMEGIT}"; do
+        git -C "${WORK}/${d}" rev-parse HEAD
+    done
+}
+# NAME|DIR|ENV|ARGS|EXPECT: bot-git ARGS (comma-separated) run in WORK/DIR
+# with ENV (NAME=VALUE, or nothing); EXPECT is refuse or ok.
+while IFS='|' read -r name dir envs args expect; do
+    test -n "${name}" || continue
+    IFS=, read -ra argv <<<"${args}"
+    heads_before=$(heads)
+    status=0
+    out=$(cd "${WORK}/${dir}" && env HOME="${WORK}/home" BOT_GIT_SHARED_CLONES="${WORK}/shared-clones" ${envs:+"${envs}"} \
+        "${BOT_GIT}" "${argv[@]}" 2>&1) || status=$?
+    if test "${expect}" = refuse; then
+        test "${status}" -ne 0 || fail "shared clone: ${name}: not refused: ${out}"
+        grep -q "it is a shared clone other agents use. Work in your own worktree" <<<"${out}" || fail "shared clone: ${name}: ${out}"
+        grep -q "set BOT_GIT_ALLOW_SHARED_CLONE=1" <<<"${out}" || fail "shared clone: ${name}: no escape hatch: ${out}"
+        test "$(heads)" = "${heads_before}" || fail "shared clone: ${name}: committed anyway"
+    else
+        test "${status}" -eq 0 || fail "shared clone: ${name}: exit status ${status}: ${out}"
+    fi
+done <<EOF
+commit|shared||commit,--allow-empty,-m,x|refuse
+in a subdirectory|shared/sub||commit,--allow-empty,-m,x|refuse
+with -C|.||-C,shared,commit,--allow-empty,-m,x|refuse
+-C out of a shared clone|shared||-C,${WORK}/free,commit,--allow-empty,-m,x|ok
+rebase|shared||rebase,-q,HEAD|refuse
+cherry-pick|shared||cherry-pick,HEAD|refuse
+merge|shared||merge,HEAD|refuse
+stash|shared||stash|refuse
+rework|shared||rework,--was,HEAD|refuse
+status is fine|shared||status,-s|ok
+check is fine|shared||check,--no-ai-trailer,HEAD..HEAD|ok
+its worktree|shared-wt||commit,--allow-empty,-m,x|ok
+the escape hatch|shared|BOT_GIT_ALLOW_SHARED_CLONE=1|commit,--allow-empty,-m,x|ok
+the escape hatch takes only 1|shared|BOT_GIT_ALLOW_SHARED_CLONE=yes|commit,--allow-empty,-m,x|refuse
+by a glob|glob-x||commit,--allow-empty,-m,x|refuse
+by ~/|home/tilde||commit,--allow-empty,-m,x|refuse
+by a symlink|viasym||commit,--allow-empty,-m,x|refuse
+homegit, without a config|${HOMEGIT}|BOT_GIT_SHARED_CLONES=${WORK}/none|commit,--allow-empty,-m,x|refuse
+not listed|free||commit,--allow-empty,-m,x|ok
+EOF
 
 # --- check ---
 # NAME|AUTHOR|COMMITTER|MESSAGE|OPTIONS|EXPECT: one commit on BASE by those

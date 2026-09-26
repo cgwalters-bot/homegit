@@ -88,7 +88,14 @@ instead of piping it through `tail` and losing lines for good.
 - **Own repositories take pull requests only.** homegit and the bot's
   other own repositories (listed in `worker-preamble.md`) require a pull
   request with a green `ci` check on main, rebase-merged; workers land
-  there with `bin/bot-land`, never with a push to main.
+  there with `bin/bot-land`, never with a push to main. Commit in a
+  worktree of your own (`git worktree add`), not in the shared clone:
+  `bot-git` refuses to commit or rebase in
+  `~/src/github/cgwalters-bot/homegit` and the clones listed in
+  `~/.config/bot-git/shared-clones`. For a rare one-line fix that has to
+  be made right there, prefix that one command with
+  `BOT_GIT_ALLOW_SHARED_CLONE=1`; bot-land's fast-forward of the shared
+  clone needs nothing.
 - **Review feedback** on a fork PR goes to a worker, preferably the one
   that wrote it if it's still around.
 - **Dispatch** workers for Todo items (by priority, per `workstream`) and

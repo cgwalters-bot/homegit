@@ -24,6 +24,11 @@ git config --global user.name nobody
 git config --global user.email nobody@example.com
 git config --global init.defaultBranch main
 git config --global commit.gpgSign false
+# The shared clone is one bot-git refuses to commit in; bot-land still
+# rebases the worktree and fast-forwards the shared clone.
+export BOT_GIT_SHARED_CLONES=${WORK}/shared-clones
+unset BOT_GIT_ALLOW_SHARED_CLONE
+echo "${WORK}/shared" >"${BOT_GIT_SHARED_CLONES}"
 
 failures=0
 fail() {
@@ -119,6 +124,7 @@ called "title=topic: Change 1" || fail "title: $(cat "${FAKE_GH}/calls")"
 called "pr merge 5 --repo acme/proj --auto --rebase" || fail "no auto-merge"
 test "$(git -C "${WORK}/shared" rev-parse main)" = "$(git -C "${WORKTREE}" rev-parse HEAD)" || fail "shared clone not fast-forwarded"
 test "$(git --git-dir="${WORK}/origin.git" rev-parse "${BRANCH}")" = "$(git -C "${WORKTREE}" rev-parse HEAD)" || fail "branch not pushed"
+"${BOT_GIT}" -C "${WORK}/shared" commit -q --allow-empty -m x 2>/dev/null && fail "bot-git committed in the shared clone"
 
 # The shared clone is left alone when it has changes.
 setup
