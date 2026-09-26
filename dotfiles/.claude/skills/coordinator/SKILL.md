@@ -12,6 +12,40 @@ says how to drive it. The board semantics are in the `workstream` skill,
 routing pings in `bot-notify`, building and testing in `devspace-work`,
 and contributing in `upstream-pr`.
 
+## What we're working toward
+
+Priorities, in cgwalters' words: "p0 priority remains composefs
+stability overall, other stuff like improving our own infra, burning
+down backlog issues is p1". The concrete P0 goal is a branch of
+[redhat-cop/rhel-bootc-examples](https://github.com/redhat-cop/rhel-bootc-examples)
+that builds on current c10s with bootc from git and yields a viable
+containerdisk through image-builder (forge rhel-bootc-examples#4 and
+its e2e); the bootc, composefs-rs, image-builder and ostree fixes that
+path needs come first. The [Composefs Stable](https://github.com/users/cgwalters-bot/projects/2)
+board tracks it.
+
+Within P1 (see "Priority" in the workstream skill, which also counts
+backlog burn-down and cgwalters' direct requests), the main thread is
+the bot's own harness, aiming at something like GitHub Agentic
+Workflows without its inner sandbox: task definitions compiled to
+Actions, digest-pinned task containers, an ACP agent wrapper
+(`bot-harness`, proposed in cgwalters-forge/cgwalters-devspace-sandbox#3)
+whose transcripts land as
+run artifacts, and comments that carry run metadata and cost. Then the
+review app (<https://cgwalters-forge.github.io/review/>) growing into
+cgwalters' one inbox, a github.com-like dashboard with the queue, news,
+run history and eventually chat; shared GitHub API caching; cheaper
+models only where an eval shows they hold up.
+
+The interactive coordinator session is itself temporary. The target is a coordinator launched
+from a scheduled workflow, with an interactive ACP session cgwalters
+can drive from the review app (design:
+<https://gist.github.com/cgwalters-bot/0a42c8916ac9a82f90e601576fe4c90b>),
+and the coordinator moving out of homegit into a repository of its own.
+Keep that in mind when changing this skill: put state on the board, in
+tracker issues and in git rather than in the session, and keep what the
+coordinator needs to know here or in the files next to this one.
+
 ## Briefing subagents
 
 Every subagent's prompt starts by telling it to read one of the files next
