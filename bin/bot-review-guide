@@ -38,10 +38,13 @@ const TOP_KEYS = ["schema", "repo", "pr", "head", "summary", "hotspots", "skim"]
 const HOTSPOT_KEYS = ["path", "commit", "start", "end", "severity", "category", "reason"];
 const SKIM_KEYS = ["path", "start", "end", "reason"];
 const SHA_RE = /^[0-9a-f]{40}$/;
-const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
-// Control characters other than \n, and bidirectional overrides, which
-// could make displayed text read differently from what it is.
-const BAD_CHARS_RE = /[\u0000-\u0009\u000b-\u001f\u007f‪-‮⁦-⁩]/;
+// The review app's own validation of a guide, which these match exactly.
+const REPO_RE = /^[A-Za-z0-9-]+\/[A-Za-z0-9._-]+$/;
+const MAX_LINE = 10_000_000;
+// C0 controls but \n, DEL, C1 controls, and zero-width and bidirectional
+// controls ("Trojan Source"), which could make displayed text read
+// differently from what it is.
+const BAD_CHARS_RE = /[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/;
 const HUNK_RE = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/;
 
 const EX_ERROR = 1;
@@ -190,7 +193,13 @@ function validateGuide(g) {
     if (!multiline && v.includes("\n")) err(where, "must be one line");
   };
   const line = (v, where) => {
-    if (!Number.isInteger(v) || v < 1) err(where, "must be a line number (an integer >= 1)");
+    if (!Number.isInteger(v) || v < 1 || v > MAX_LINE) err(where, `must be a line number (an integer from 1 to ${MAX_LINE})`);
+  };
+  const filePath = (v, where) => {
+    text(v, where, MAX_PATH);
+    if (typeof v === "string" && (v.startsWith("/") || v.split("/").some((seg) => seg === "" || seg === "." || seg === ".."))) {
+      err(where, "must be a relative path without empty, '.' or '..' segments");
+    }
   };
   const range = (e, where, required) => {
     if (!required && e.start === undefined && e.end === undefined) return;
@@ -218,7 +227,7 @@ function validateGuide(g) {
   list("hotspots", MAX_HOTSPOTS, (e, where) => {
     keys(e, HOTSPOT_KEYS, where);
     for (const k of HOTSPOT_KEYS) if (!(k in e)) err(where, `missing '${k}'`);
-    text(e.path, `${where}.path`, MAX_PATH);
+    filePath(e.path, `${where}.path`);
     if (typeof e.commit !== "string" || !SHA_RE.test(e.commit)) err(`${where}.commit`, "must be a full 40-hex commit id, lower case");
     range(e, where, true);
     if (!SEVERITIES.includes(e.severity)) err(`${where}.severity`, `must be one of ${SEVERITIES.join(", ")}`);
@@ -227,7 +236,7 @@ function validateGuide(g) {
   });
   list("skim", MAX_SKIM, (e, where) => {
     keys(e, SKIM_KEYS, where);
-    text(e.path, `${where}.path`, MAX_PATH);
+    filePath(e.path, `${where}.path`);
     range(e, where, false);
     text(e.reason, `${where}.reason`, MAX_SKIM_REASON);
   });
