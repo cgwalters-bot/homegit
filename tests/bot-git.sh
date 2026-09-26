@@ -518,5 +518,42 @@ test "$(git -C "${REPO}" show -s --format='%cn <%ce>' HEAD)" = "${HUMAN}" || fai
 out=$(cd "${REPO}" && "${BOT_GIT}" check --was "${OLD}" newbase..HEAD 2>&1) || fail "rebased: check: ${out}"
 grep -q "^ok: 1 commits in newbase..HEAD, 1 with cgwalters' sign-off kept" <<<"${out}" || fail "rebased: check: ${out}"
 
+# Someone else's commit (here one cgwalters rewrote with an AI trailer
+# and pushed himself) rebased by the bot: check lets it pass unchanged
+# against the published head, but not once its content or message changed.
+# NAME|AUTHOR|CHANGE|EXPECT: CHANGE is none, content or message.
+while IFS='|' read -r name author change expect; do
+    test -n "${name}" || continue
+    git -C "${REPO}" reset -q --hard "${BASE}"
+    echo old >"${REPO}/own"
+    git -C "${REPO}" add own
+    commit_as "${author}" "${author}" "own\n\n${AI}\n${SOB}"
+    OLD=$(git -C "${REPO}" rev-parse HEAD)
+    git -C "${REPO}" reset -q --hard "${BASE}"
+    commit_as other other "upstream moved\n"
+    git -C "${REPO}" branch -q -f newbase HEAD
+    (cd "${REPO}" && "${BOT_GIT}" cherry-pick "${OLD}" >/dev/null) || fail "${name}: cherry-pick failed"
+    case "${change}" in
+        content) echo new >"${REPO}/own"; (cd "${REPO}" && "${BOT_GIT}" commit -q -a --amend --no-edit) ;;
+        message) (cd "${REPO}" && "${BOT_GIT}" commit -q --amend -m "own" -m "reworded" -m "${AI}") ;;
+    esac
+    status=0
+    out=$(cd "${REPO}" && "${BOT_GIT}" check --was "${OLD}" newbase..HEAD 2>&1) || status=$?
+    if test "${expect}" = ok; then
+        test "${status}" -eq 0 || fail "${name}: ${out}"
+        grep -q "^    note: not the bot's: [0-9a-f]* of the published head, rebased unchanged$" <<<"${out}" || fail "${name}: no note: ${out}"
+        grep -q "^ok: 1 commits in newbase..HEAD, 1 not the bot's, rebased unchanged$" <<<"${out}" || fail "${name}: ${out}"
+    else
+        test "${status}" -eq 1 || fail "${name}: exit status ${status}: ${out}"
+        grep -qE -- "${expect}" <<<"${out}" || fail "${name}: output lacks '${expect}': ${out}"
+    fi
+    # Without a published head, nothing to tell a rebase from new work.
+    out=$(cd "${REPO}" && "${BOT_GIT}" check newbase..HEAD 2>&1) && fail "${name}: passed without --was: ${out}"
+done <<EOF
+cgwalters' own, rebased|human|none|ok
+cgwalters' own, content changed|human|content|has a Generated-by trailer but was made as cgwalters
+cgwalters' own, message changed|human|message|has a Generated-by trailer but was made as cgwalters
+EOF
+
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
 echo "ok: bot-git commits as the bot, refuses to sign off, keeps cgwalters' on reworked commits, and checks commits"

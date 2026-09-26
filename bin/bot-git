@@ -121,7 +121,10 @@ pushing, and lists what's wrong with them:
     --pair and --patch-id, with RANGE's start as UPSTREAM);
   - commits made as cgwalters with a Generated-by trailer, which is the
     bot's work done with plain git; it warns about those he authored with
-    an AI trailer, and others' commits he committed;
+    an AI trailer, and others' commits he committed (except, with a
+    published head to pair with as above, others' commits that only a
+    rebase changed: the same author, message and patch-id as their pair,
+    e.g. one he rewrote and pushed himself);
   - bot commits without a ${AI_TRAILER_KEYS[0]} or ${AI_TRAILER_KEYS[1]} trailer
     (--no-ai-trailer skips this, for projects that say not to add one).
 It exits 1 if it found any errors; warnings don't fail it.
@@ -485,9 +488,24 @@ kept_note() {
     echo "kept cgwalters' sign-off on $(git rev-parse --short "$1") (was on $(git rev-parse --short "$2")); name it in your reply"
 }
 
+# unchanged_note NEW OLD: the line naming someone else's commit rebased
+# unchanged from the published OLD.
+unchanged_note() {
+    echo "not the bot's: $(git rev-parse --short "$2") of the published head, rebased unchanged"
+}
+
+# rebased_unchanged NEW OLD: succeeds if NEW is OLD with only its parent
+# and committer changed: the same author, message and patch-id.
+rebased_unchanged() {
+    local fmt='%an <%ae> %ad%n%B'
+    test "$(git show -s --format="${fmt}" --date=raw "$1")" = "$(git show -s --format="${fmt}" --date=raw "$2")" &&
+        test "$(patch_id "$1")" = "$(patch_id "$2")"
+}
+
 # problems COMMIT CHECK_TRAILER PROMOTED: prints one line per problem
 # with COMMIT, as 'error: ...' or 'warning: ...', or a 'note: ...' for a
-# sign-off kept as its pair in PAIRED had it (see cmd_check).
+# sign-off kept as its pair in PAIRED had it, or for someone else's
+# commit rebased unchanged from its pair (see cmd_check).
 problems() {
     local c=$1 check_trailer=$2 promoted=$3 an ae cn ce parents subject sobs ai key
     local -a f
@@ -508,6 +526,14 @@ problems() {
     if test "${ae}" != "${bot}"; then
         if test "${ce}" = "${bot}" && ! is_bot_name "${cn}"; then
             echo "error: committed as '${cn} <${f[3]}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>': rebase with ${PROG}"
+        fi
+        # A commit as the published branch has it, only rebased (e.g. one
+        # cgwalters rewrote and pushed himself): what it is was decided
+        # when it was published, not by this rebase.
+        local was=${PAIRED[${c}]:-}
+        if test -n "${was}" && rebased_unchanged "${c}" "${was}"; then
+            echo "note: $(unchanged_note "${c}" "${was}")"
+            return 0
         fi
         # The bot's work, done with plain git on this machine, whose own
         # identity is cgwalters'.
@@ -573,7 +599,7 @@ cmd_check() {
         test -n "${was}" || test "${base}" != '@{upstream}' || was=${base}
     fi
     pair_published "${range}" "${was}"
-    local commits c n=0 bad=0 warned=0 kept=0 p=()
+    local commits c n=0 bad=0 warned=0 kept=0 unchanged=0 p=()
     commits=$(git rev-list --reverse "${range}") || die "cannot list the commits in '${range}'"
     for c in ${commits}; do
         n=$((n + 1))
@@ -583,6 +609,8 @@ cmd_check() {
             bad=$((bad + 1))
         elif printf '%s\n' "${p[@]}" | grep -q '^warning:'; then
             warned=$((warned + 1))
+        elif printf '%s\n' "${p[@]}" | grep -q "^note: not the bot's"; then
+            unchanged=$((unchanged + 1))
         else
             kept=$((kept + 1))
         fi
@@ -595,7 +623,7 @@ cmd_check() {
         echo "${PROG}: ${bad} of ${n} commits in ${range} need fixing before pushing" 1>&2
         exit 1
     fi
-    echo "ok: ${n} commits in ${range}$(test "${warned}" -eq 0 || echo ", ${warned} with warnings")$(test "${kept}" -eq 0 || echo ", ${kept} with cgwalters' sign-off kept")"
+    echo "ok: ${n} commits in ${range}$(test "${warned}" -eq 0 || echo ", ${warned} with warnings")$(test "${kept}" -eq 0 || echo ", ${kept} with cgwalters' sign-off kept")$(test "${unchanged}" -eq 0 || echo ", ${unchanged} not the bot's, rebased unchanged")"
 }
 
 # pair_published RANGE WAS: for check, pairs RANGE's commits with those of
