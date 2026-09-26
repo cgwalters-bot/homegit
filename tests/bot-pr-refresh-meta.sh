@@ -310,6 +310,28 @@ fi
 run footers-kept || fail "footers-kept: $(cat "${WORK}/footers-kept.err")"
 test "$(patches)" = 0 || fail "footers-kept: refresh-meta rewrote the footers: $(body)"
 
+# A footer needs a complete section to go in, and --force only means
+# something with --body-file; nothing is written otherwise.
+printf '%s\n' "${F1}" >"${WORK}/f1"
+while IFS='|' read -r name section args want; do
+    if test "${section}" = none; then
+        reset "${TEXT}"
+    else
+        reset "${TEXT}"$'\n\n'"$(old_meta)"
+    fi
+    # shellcheck disable=SC2086 # ARGS are words
+    if "${WORK}/bin/bot-pr" set-body "${URL}" ${args//@/${WORK}/} --footer "${WORK}/f1" 2>"${WORK}/${name}.err"; then
+        fail "${name}: set-body succeeded"
+    else
+        grep -q -- "${want}" "${WORK}/${name}.err" || fail "${name}: no '${want}' in: $(cat "${WORK}/${name}.err")"
+    fi
+    test "$(patches)" = 0 || fail "${name}: wrote the body"
+done <<'EOF'
+no-meta-footer|none||no complete .*bot-meta.* section
+no-meta-body|none|--body-file @new-body|no complete .*bot-meta.* section
+footer-force|meta|--force|--force only applies with --body-file
+EOF
+
 # A --footer that isn't bot-footer's output is refused, by set-body before
 # writing and by fork-pr before any call.
 printf 'Fix it.\n' >"${WORK}/body"
