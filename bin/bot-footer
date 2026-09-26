@@ -1,0 +1,217 @@
+#!/usr/bin/env node
+// A run-metadata footer for what the bot posts: which session and agents
+// did a task, how long it took and what it cost, from bot-cost. See --help.
+// Node's standard library only, plus bot-cost.
+"use strict";
+
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const { promisify } = require("node:util");
+
+const execFileP = promisify(execFile);
+
+const PROG = path.basename(process.argv[1] || "bot-footer");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const BOT_COST = process.env.BOT_FOOTER_BOT_COST || path.join(BIN_DIR, "bot-cost");
+const SCHEMA = "bot-run/v1";
+const COST_SCHEMA = "bot-cost/v1";
+const DEFAULT_SINCE = "2d";
+const ITEM_RE = /^PVTI_[A-Za-z0-9_-]+$/;
+const SCRATCH_RE = /^[A-Za-z0-9._-]+$/;
+// Ids are shortened to this many characters in the human line.
+const SHORT_ID = 8;
+// Models shown in the human line; the JSON has them all.
+const TOP_MODELS = 2;
+const CLOSE_MATCHES = 5;
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} (--item PVTI_... | --scratch NAME | --task KEY) [--since AGE]
+                  [--projects DIR]... [--no-compute] [--json]
+
+Prints a footer for a PR body or comment recording the bot run that made
+it: one compact human line, then the same data as JSON in an HTML comment,
+
+  <sub>Bot run: session 929c7a64, agents afc36173 +1 · ... </sub>
+  <!-- ${SCHEMA} {...} -->
+
+from '${path.basename(BOT_COST)} --json' over --since AGE (default ${DEFAULT_SINCE}). The task is a
+board item (--item), the scratch dir named in a subagent's prompt
+(--scratch, bot-cost's task scratch:NAME), or any bot-cost task key
+(--task). Costs are estimates at list prices; the duration is wall time
+from the task's first to its last message. The JSON has no free text.
+--json prints only the JSON. --projects and --no-compute are passed on
+to bot-cost.
+`;
+}
+
+function parseArgs(argv) {
+  const opts = { task: null, since: DEFAULT_SINCE, projects: [], compute: true, json: false };
+  const value = (i, name) => {
+    if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
+    return argv[i + 1];
+  };
+  const setTask = (key, name) => {
+    if (opts.task) throw new Exit(EX_USAGE, `give one of --item, --scratch and --task, not several (${name})`);
+    opts.task = key;
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "-h":
+      case "--help":
+        process.stdout.write(usage());
+        process.exit(0);
+      case "--item": {
+        const v = value(i++, a);
+        if (!ITEM_RE.test(v)) throw new Exit(EX_USAGE, `--item takes a board item id (PVTI_...), not '${v}'`);
+        setTask(v, a);
+        break;
+      }
+      case "--scratch": {
+        const v = value(i++, a).replace(/\/+$/, "");
+        // A path to the scratch dir works too.
+        const name = path.basename(v);
+        if (!SCRATCH_RE.test(name)) throw new Exit(EX_USAGE, `--scratch takes the scratch dir's name, not '${v}'`);
+        setTask(`scratch:${name}`, a);
+        break;
+      }
+      case "--task": setTask(value(i++, a), a); break;
+      case "--since": opts.since = value(i++, a); break;
+      case "--projects": opts.projects.push(value(i++, a)); break;
+      case "--no-compute": opts.compute = false; break;
+      case "--json": opts.json = true; break;
+      default:
+        throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    }
+  }
+  if (!opts.task) throw new Exit(EX_USAGE, `name the task with --item, --scratch or --task\n\n${usage()}`);
+  return opts;
+}
+
+async function costReport(opts) {
+  const args = ["--since", opts.since, "--json", ...opts.projects.flatMap((p) => ["--projects", p])];
+  if (!opts.compute) args.push("--no-compute");
+  let stdout;
+  try {
+    ({ stdout } = await execFileP(BOT_COST, args, { maxBuffer: 256 << 20 }));
+  } catch (e) {
+    const detail = (e.stderr || e.message || "").trim();
+    throw new Exit(e.code === 2 ? EX_USAGE : EX_ERROR, `${path.basename(BOT_COST)} failed: ${detail}`);
+  }
+  const report = JSON.parse(stdout);
+  if (report.schema !== COST_SCHEMA) {
+    throw new Exit(EX_ERROR, `${path.basename(BOT_COST)} printed ${report.schema}, not ${COST_SCHEMA}`);
+  }
+  return report;
+}
+
+// findTask(report, key, since): the task KEY of a bot-cost report, or an
+// error naming the tasks whose key, item, scratch dir or devspace look
+// like it, or how to find the right key.
+function findTask(report, key, since) {
+  const found = report.tasks.find((t) => t.key === key);
+  if (found) return found;
+  const needle = key.replace(/^\w+:/, "").toLowerCase();
+  const like = (s) => s && (s.toLowerCase().includes(needle) || needle.includes(s.toLowerCase()));
+  const close = report.tasks
+    .filter((t) => [t.key.replace(/^\w+:/, ""), t.item, t.scratch, ...(t.devspaces || [])].some(like))
+    .map((t) => t.key).slice(0, CLOSE_MATCHES);
+  const hint = close.length ? `close matches: ${close.join(", ")}`
+    : `bot-cost keys tasks by the board item (PVTI_...) or else the scratch dir (scratch:NAME) named in a subagent's prompt; `
+      + `'${path.basename(BOT_COST)} --since ${since}' lists them, and a task older than that needs a longer --since`;
+  throw new Exit(EX_ERROR, `no task ${key} in ${report.tasks.length} task(s) since ${report.window.since}; ${hint}`);
+}
+
+const round = (n, digits) => Math.round(n * 10 ** digits) / 10 ** digits;
+
+// record(report, task): the footer's JSON, only structured fields.
+function record(report, t) {
+  const models = {};
+  for (const [m, v] of Object.entries(t.models || {}).sort((a, b) => b[1].usd - a[1].usd)) {
+    models[m] = { tokens: v.tokens, usd: round(v.usd, 4) };
+  }
+  const first = t.first_message_at && Date.parse(t.first_message_at);
+  const last = t.last_message_at && Date.parse(t.last_message_at);
+  return {
+    task: t.key, item: t.item || null, sessions: t.sessions || [], agents: t.subagents || [],
+    first_message_at: t.first_message_at || null, last_message_at: t.last_message_at || null,
+    duration_s: first && last ? Math.round((last - first) / 1000) : null,
+    models,
+    usd: { inference: round(t.inference_usd, 4), compute: round(t.compute_usd, 4), total: round(t.inference_usd + t.compute_usd, 4) },
+    core_hours: round(t.core_hours, 3), run_urls: t.run_urls || [],
+    window_since: report.window.since, generated_at: report.generated_at, estimate: true,
+  };
+}
+
+function fmtTokens(n) {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`;
+  return String(n);
+}
+
+function fmtDuration(s) {
+  if (s < 60) return `${s}s`;
+  const m = Math.round(s / 60);
+  return m < 60 ? `${m}m` : `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+const ids = (list, what) => (list.length ? `${what} ${list[0].slice(0, SHORT_ID)}${list.length > 1 ? ` +${list.length - 1}` : ""}` : null);
+// Model ids come from transcripts; keep the human line plain.
+const safeModel = (m) => m.replace(/[^\w.:/[\]-]/g, "");
+
+// humanLine(rec, compute): the one-line summary, in <sub>.
+function humanLine(rec, compute) {
+  const parts = [];
+  const who = [ids(rec.sessions, "session"), ids(rec.agents, rec.agents.length > 1 ? "agents" : "agent")].filter(Boolean);
+  parts.push(who.length ? who.join(", ") : rec.task);
+  const models = Object.entries(rec.models);
+  if (models.length) {
+    const shown = models.slice(0, TOP_MODELS).map(([m, { tokens: t }]) => {
+      const input = t.input + t.cache_read + t.cache_write_5m + t.cache_write_1h;
+      const cached = t.cache_read ? ` (${Math.round((100 * t.cache_read) / input)}% cached)` : "";
+      return `${safeModel(m)} ${fmtTokens(input)} in${cached} / ${fmtTokens(t.output)} out`;
+    });
+    if (models.length > TOP_MODELS) shown.push(`+${models.length - TOP_MODELS} more`);
+    parts.push(shown.join(", "));
+  }
+  const usd = [`~$${rec.usd.inference.toFixed(2)} inference`];
+  if (compute && (rec.usd.compute || rec.run_urls.length)) usd.push(`~$${rec.usd.compute.toFixed(2)} compute`);
+  parts.push(`${usd.join(" + ")} (est., list prices)`);
+  if (rec.duration_s !== null) parts.push(`${fmtDuration(rec.duration_s)} wall`);
+  if (rec.run_urls.length) {
+    const links = rec.run_urls.map((u) => `[${u.split("/").pop()}](${u})`).join(", ");
+    parts.push(`${rec.core_hours.toFixed(1)} core-h, Actions run${rec.run_urls.length > 1 ? "s" : ""} ${links}`);
+  }
+  return `<sub>Bot run: ${parts.join(" · ")}</sub>`;
+}
+
+// marker(rec): the HTML comment carrying REC; no '--' may end it early.
+const marker = (rec) => `<!-- ${SCHEMA} ${JSON.stringify(rec).replace(/--/g, "-\\u002d")} -->`;
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const report = await costReport(opts);
+  const rec = record(report, findTask(report, opts.task, opts.since));
+  process.stdout.write(opts.json ? `${JSON.stringify(rec, null, 2)}\n` : `${humanLine(rec, opts.compute)}\n${marker(rec)}\n`);
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  });
+} else {
+  module.exports = { parseArgs, findTask, record, humanLine, marker, fmtDuration };
+}
