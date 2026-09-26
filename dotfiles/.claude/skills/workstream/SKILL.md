@@ -432,7 +432,8 @@ below.
 
   ```bash
   FORK_PR=$(bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
-    --branch bot/<short-slug> --item "$ITEM" --title "..." --body-file pr-body.md)
+    --branch bot/<short-slug> --item "$ITEM" --title "..." --body-file pr-body.md \
+    --footer <(bot-footer --item "$ITEM"))
   bot-board set "$ITEM" --status Draft --branch "$FORK_PR" \
     --why "<short rationale>. Result: <one-line test summary>"
   ```
@@ -441,7 +442,12 @@ below.
   a Renovate PR it is that PR's branch, which fork-pr copies to the fork.
   To update the description later (e.g. new test results), use
   `bot-pr get-body "$FORK_PR" > pr-body.md`, edit it, then
-  `bot-pr set-body "$FORK_PR" --body-file pr-body.md`.
+  `bot-pr set-body "$FORK_PR" --body-file pr-body.md`; a later run
+  (review, rework) adds its own footer with `--footer <(bot-footer
+  --scratch NAME)`, with or without `--body-file`. bot-footer finds your
+  task by the board item in your prompt, else by your scratch dir's
+  first component under `scratchpad/`, so use a scratch dir of your own
+  there (not a subdirectory shared with sibling workers) or `--item`.
 
   `--item` is what promote later moves to In Review, so it must be the
   item this PR resolves: when you split a PR, the new part gets its own
