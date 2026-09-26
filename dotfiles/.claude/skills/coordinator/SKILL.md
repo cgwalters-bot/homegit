@@ -25,7 +25,12 @@ to this one, by path in the homegit checkout
 
 Then comes the task itself: the board item or ask, the repository and
 base branch, the worker's scratch dir (e.g. a per-task directory under
-the session scratchpad), and anything specific. For the overnight batch
+the session scratchpad), and anything specific. When the task needs a
+devspace, name it after the task and give it 16 cores or fewer (16 is
+the default) and the shortest duration that fits; brief 64 cores only
+when a 16-core run has proven too slow for this work, and say why.
+Naming the board item, scratch dir and devspace in the prompt is also
+what lets `bot-cost` attribute the task's cost. For the overnight batch
 job of turning Draft items into review-ready forge PRs, also point the
 worker at `forge-migrate.md` in the same directory and list its batch of
 items.
@@ -147,7 +152,10 @@ summary of it:
 - **quick wins**: fork PRs that are small and ready, with links;
 - **review queue**: everything else Draft, in priority order;
 - **decisions**: Needs human items, each with its one question;
-- **reading**: analysis gists and notable upstream activity.
+- **reading**: analysis gists and notable upstream activity;
+- **cost**: yesterday's estimate from `bot-cost --since yesterday
+  --until today`: the total, compute (core-hours) against inference, and
+  the top few tasks, labeled as an estimate at list prices.
 
 Keep it scannable, and end it with
 `Generated-by: https://github.com/cgwalters/#llms`.
