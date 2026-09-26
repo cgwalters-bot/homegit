@@ -143,7 +143,9 @@ Commands:
         hours in ${CACHE_FILE}. A record's 'rebase: ${REBASE_ANY}' (where
         cgwalters maintains and wants them) overrides detection, but
         only once committed and what the checkout's ${REMOTE}/${REMOTE_BRANCH}
-        has (not fetched); otherwise it warns and detects.
+        has (not fetched); otherwise it warns, and a HEAD or
+        ${REMOTE}/${REMOTE_BRANCH} record saying '${REBASE_CONFLICTS_ONLY}' still
+        holds, else detection decides.
 
 A record counts only when it is committed and is what ${REMOTE}/${REMOTE_BRANCH}
 has (check fetches it first), as a regular file (no symlinks). Its
@@ -530,6 +532,18 @@ function checkHistoryKept(top) {
   };
 }
 
+// recordInGit(name, run): where NAME's record is in git, as {top, rel},
+// with RUN (git or gitMaybe) finding the repository; null if RUN does.
+// The path is unresolved below the records' directory's parent, so that
+// a symlinked directory there is refused too (see checkPushed).
+function recordInGit(name, run) {
+  const parent = fs.realpathSync(path.dirname(POLICY_DIR));
+  const top = run(parent, ["rev-parse", "--show-toplevel"]);
+  if (top === null) return null;
+  const rel = path.posix.join(path.relative(top.trim(), parent).split(path.sep).join("/"), path.basename(POLICY_DIR), `${name}.md`);
+  return { top: top.trim(), rel };
+}
+
 // checkPushed(name, file, stat, fetch): where NAME's record FILE (lstat
 // STAT) is in git, as {top, rel}, after checking that it is a regular
 // file, committed, and what REMOTE's REMOTE_BRANCH has (fetched first if
@@ -537,11 +551,7 @@ function checkHistoryKept(top) {
 function checkPushed(name, file, stat, fetch) {
   // A symlink would make its target's history the record's.
   if (!stat.isFile()) throw new Exit(EX_INVALID, `${file} is not a regular file (a symlink?); a record must be one`);
-  // The path in git, unresolved below the records' directory's parent,
-  // so that a symlinked directory there is refused too (see below).
-  const parent = fs.realpathSync(path.dirname(POLICY_DIR));
-  const top = git(parent, ["rev-parse", "--show-toplevel"], `find the git repository of ${file}`);
-  const rel = path.posix.join(path.relative(top, parent).split(path.sep).join("/"), path.basename(POLICY_DIR), `${name}.md`);
+  const { top, rel } = recordInGit(name, (dir, args) => git(dir, args, `find the git repository of ${file}`));
   if (git(top, ["status", "--porcelain", "--", rel], `tell whether ${file} is committed`) !== "") {
     throw new Exit(EX_INVALID, `${file} has uncommitted changes; commit and push it first`);
   }
@@ -634,7 +644,8 @@ function check(requested, allowHumanText) {
 // a record. Read from the checkout, not through the gate: conflicts-only
 // only restricts, and 'any' only lets the bot do what it does where there
 // is no merge queue, and counts only as committed and pushed (checked
-// against the last fetch, as bot-watch asks for every repository).
+// against the last fetch, as bot-watch asks for every repository);
+// until then, what is committed or pushed decides (committedRestriction).
 function recordRebase(name) {
   const file = path.join(POLICY_DIR, `${name}.md`);
   let text;
@@ -651,10 +662,25 @@ function recordRebase(name) {
     } catch (e) {
       if (!(e instanceof Exit)) throw e;
       console.error(`warning: ignoring 'rebase: ${REBASE_ANY}': ${e.message}`);
-      return null;
+      return committedRestriction(name);
     }
   }
   return rebase ? { rebase, file } : null;
+}
+
+// committedRestriction(name): {rebase, file} where NAME's record says
+// conflicts-only at HEAD or REMOTE's REMOTE_BRANCH, or null: an edit to
+// 'any' that doesn't count yet mustn't lift what the maintainers asked.
+function committedRestriction(name) {
+  const where = recordInGit(name, gitMaybe);
+  for (const rev of where ? ["HEAD", `${REMOTE}/${REMOTE_BRANCH}`] : []) {
+    const spec = `${rev}:${where.rel}`;
+    const text = gitMaybe(where.top, ["show", spec]);
+    if (text !== null && parseRecord(text, spec).rebase === REBASE_CONFLICTS_ONLY) {
+      return { rebase: REBASE_CONFLICTS_ONLY, file: spec };
+    }
+  }
+  return null;
 }
 
 // hasMergeGroupTrigger(text): whether the workflow TEXT runs on
