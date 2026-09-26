@@ -1,6 +1,6 @@
 ---
 name: backlog-planning
-description: Bootstrap or refill the cgwalters-bot Workstream board by reviewing recent GitHub activity of cgwalters and cgwalters-bot and adding items worth AI help. Read-only everywhere except the board. Use when asked to plan, triage, or refill the backlog (e.g. `bot-work --plan`).
+description: Bootstrap or refill the cgwalters-bot Workstream board by reviewing recent GitHub activity of cgwalters and cgwalters-bot and adding items worth AI help. Read-only everywhere except the board and the bot's public tracker issues. Use when asked to plan, triage, or refill the backlog (e.g. `bot-work --plan`).
 ---
 
 # backlog-planning — Refilling the Workstream board
@@ -10,11 +10,12 @@ GitHub activity of `cgwalters` (the human) and `cgwalters-bot`, and to put it on
 the Workstream board (see the `workstream` skill for the board's fields and
 the `bot-board` tool) so a human can triage it.
 
-**This skill is read-only everywhere except the board.** Never comment on,
+**This skill is read-only everywhere except the board** (and the public
+issues in cgwalters-forge/tracker that stand for board items). Never comment on,
 label, assign, react to, or edit any issue or PR while planning. The only
-write commands allowed are `bot-board add`, `bot-board draft` and
-`bot-board set` (or the `gh project item-add`, `item-create` and
-`item-edit` calls they wrap) against project 1 of `cgwalters-bot`, and
+write commands allowed are `bot-board add`, `bot-board issue` and
+`bot-board set` (or the `gh project item-add` and `item-edit` calls and
+the tracker issue they wrap) against project 1 of `cgwalters-bot`, and
 `bot-feedback --file-issues` and `bot-notify` (section 0), which file
 issues on the bot's own repository (`bot-notify` also adds cgwalters'
 assignments to the board, and it and `bot-notify ack` mark the bot's
@@ -287,20 +288,22 @@ ITEM_ID=$(bot-board add "$URL")
 ```
 
 When the actionable thing is a comment in a thread with no single issue that
-captures it (e.g. "we should also..." in a PR review), create a draft issue
-whose body links to the source comment, so it can be deduped later:
+captures it (e.g. "we should also..." in a PR review), open a tracker issue
+whose body links to the source comment, so it can be deduped later. The
+tracker is public, and a bare link there puts "mentioned this" on the
+upstream thread's timeline, so the link goes in a code span:
 
 ```bash
-ITEM_ID=$(bot-board draft "$TITLE" "Source: $COMMENT_URL
+ITEM_ID=$(bot-board issue "$TITLE" "Source: \`$COMMENT_URL\`
 
 $SHORT_SUMMARY")
 ```
 
 Then, in one call, record the rationale in the **Why** field (one sentence
 quoting or linking the triggering comment), and set its **Priority** and
-**Workflow**, plus **Org** for a draft (`add` derives it from the URL, a
-draft has none; use the organization the work targets, as the
-`workstream` skill describes):
+**Workflow**, plus **Org** when `issue` couldn't derive one from the title
+or the body's links (it says so; use the organization the work targets,
+as the `workstream` skill describes):
 
 ```bash
 bot-board set "$ITEM_ID" --priority P1 --workflow branch --org bootc-dev \
