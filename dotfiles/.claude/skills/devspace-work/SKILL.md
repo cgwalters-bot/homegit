@@ -127,6 +127,17 @@ branches in one tree it can silently test the previous branch's build. Before
 recording a result, check that the build really came from the branch's head
 commit.
 
+Separate checkouts are not enough for bootc's container build: its
+Dockerfile mounts `--mount=type=cache,target=/src/target`, a cache shared
+by every build on the devspace whatever the checkout or image tag. A
+control build of another branch (say, main after a fix branch) can then
+reuse the previous binary, since cargo treats sources with older mtimes
+as fresh, and the "control" silently tests the fix. Before a control run,
+drop that cache with `buildah prune -f` (`BOOTC_nocache=1` only skips
+the layer cache, not the cache mounts), and check that the built
+binaries differ, e.g. compare `podman run --rm IMAGE sha256sum
+/usr/bin/bootc` across the two images.
+
 Containers and VMs: when a project's CI builds or tests in containers, run
 those same steps with rootless podman on the devspace. `/dev/kvm` is
 available, so VM-based tests (e.g. `bcvk ephemeral`, or a project's
