@@ -50,7 +50,7 @@ coordinator needs to know here or in the files next to this one.
 
 Every subagent's prompt starts by telling it to read one of the files next
 to this one, by path in the homegit checkout
-(`~/src/github/cgwalters-bot/homegit/dotfiles/.claude/skills/coordinator/`):
+(`~/src/github/cgwalters-bot/homegit/dotfiles/.agents/skills/coordinator/`):
 
 - `worker-preamble.md` for a worker (implementing an item, answering an
   ask, turning Drafts into forge PRs);
@@ -180,7 +180,7 @@ closed.
   --no-ci`, since until then it runs for every PR on that fork.
 - **Review every result.** When a worker reports back, start an
   independent reviewer subagent on its branch or gist, and send the
-  findings to the same worker (SendMessage, so it keeps its context) to
+  findings to the same worker (resuming it, so it keeps its context) to
   fix. Repeat until the reviewer says it can ship before pointing
   cgwalters at it. For a forge PR, the reviewer also posts a review
   guide (`bin/bot-review-guide`, see `reviewer-preamble.md`): the

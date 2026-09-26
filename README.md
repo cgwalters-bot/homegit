@@ -15,8 +15,11 @@ and only once cgwalters approves one does it go upstream (In Review);
 only a human's acceptance makes something Done.
 
 Install with `make install` as usual. The shared agent prompt is still
-[AGENTS.md](AGENTS.md), and the skills in `dotfiles/.claude/skills` are
-picked up by both agent CLIs: `workstream` (using the board),
+[AGENTS.md](AGENTS.md). The skills are plain [Agent Skills](https://agentskills.io)
+in `dotfiles/.agents/skills`, installed as `~/.agents/skills` where
+opencode, Codex, Gemini CLI and Cursor look; Claude Code reads only
+`~/.claude/skills`, so `dotfiles/.claude/skills` has a symlink to each
+(`tests/skills.sh` checks they match). They are `workstream` (using the board),
 `backlog-planning` (refilling the board from recent GitHub activity),
 `bot-feedback` (surfacing reactions on the bot's work), `bot-notify`
 (routing mentions of and requests to the bot),
@@ -225,7 +228,7 @@ defaults), with the quotes and rationale in its body. They refuse
 unless the record is committed, every source is unchanged on upstream's
 default branch, no new policy file has appeared, and the verdict is
 `bot-ok`. A separate read-only subagent writes the records
-(`dotfiles/.claude/skills/coordinator/policy-check.md`); to overrule
+(`dotfiles/.agents/skills/coordinator/policy-check.md`); to overrule
 one, I have the bot open a pull request that edits its verdict, and
 approve it. Records count only as merged to homegit's main, and a
 commit there that loosens a verdict (say human-text to bot-ok) must
