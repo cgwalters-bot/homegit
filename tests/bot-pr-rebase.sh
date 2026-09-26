@@ -244,6 +244,7 @@ mqforce|${F}|bot|mqforce|mqforce\n\n${AI}|
 mqconflict|${F}|bot|README|mqconflict\n\n${AI}|
 mqfork|${F}|bot|mqfork|mqfork\n\n${AI}|
 mqfail|${F}|bot|mqfail|mqfail\n\n${AI}|
+mqunknown|${F}|bot|mqunknown|mqunknown\n\n${AI}|
 EOF
 pr acme/proj 1 "${F}" bot/plain
 pr acme/proj 2 "${F}" bot/signed
@@ -290,14 +291,18 @@ jq -n --arg sha "$(git -C "${REMOTES}/${F}" rev-parse bot/approved)" \
        html_url: "https://github.com/cgwalters-forge/proj/pull/11#pullrequestreview-7", body: ""}]' |
     fixture "repos/${F}/pulls/11/reviews"
 echo '{"default_branch": "main"}' | fixture repos/acme/proj
-# For a repository with a merge queue: GitHub finds #22 conflicting.
+# For a repository with a merge queue: GitHub finds #20 mergeable and
+# #22 conflicting, and hasn't looked at #25 yet.
 pr acme/proj 20 "${F}" bot/mqplain
+jq '.mergeable = true | .mergeable_state = "clean"' "${FAKE_GH}/rest/repos/acme/proj/pulls/20.json" >"${WORK}/pr.json"
+mv "${WORK}/pr.json" "${FAKE_GH}/rest/repos/acme/proj/pulls/20.json"
 pr acme/proj 21 "${F}" bot/mqforce
 pr acme/proj 22 "${F}" bot/mqconflict
 jq '.mergeable = false | .mergeable_state = "dirty"' "${FAKE_GH}/rest/repos/acme/proj/pulls/22.json" >"${WORK}/pr.json"
 mv "${WORK}/pr.json" "${FAKE_GH}/rest/repos/acme/proj/pulls/22.json"
 pr "${F}" 23 "${F}" bot/mqfork
 pr acme/proj 24 "${F}" bot/mqfail
+pr acme/proj 25 "${F}" bot/mqunknown
 
 # Upstream moves on: a change to README (which #4 conflicts with), one to
 # a line of ctx near #7's (its context changes), and #9's change.
@@ -413,10 +418,11 @@ merge queue, dry run|${U}/20|--dry-run|acme/proj is rebased only on conflicts|
 merge queue, forced|${U}/21|--force-merge-queue|rebased 1 commit, no content change|b
 merge queue, conflicting|${U}/22||conflict README|
 merge queue, a fork PR|https://github.com/${F}/pull/23||rebased 1 commit, no content change|b
+merge queue, not worked out yet|${U}/25||GitHub hasn't worked out yet whether .*/25 conflicts with main, and acme/proj is rebased only on conflicts: a merge queue .*; try again in a minute|
 EOF
 test "$(sort -u "${FAKE_GH}/policy-calls")" = "rebase acme/proj main" ||
     fail "merge queue: upstream-policy calls: $(cat "${FAKE_GH}/policy-calls")"
-test "$(wc -l <"${FAKE_GH}/policy-calls")" -eq 2 || fail "merge queue: upstream-policy not called just for #20, twice: $(cat "${FAKE_GH}/policy-calls")"
+test "$(wc -l <"${FAKE_GH}/policy-calls")" -eq 3 || fail "merge queue: upstream-policy not called just for #20, twice, and #25: $(cat "${FAKE_GH}/policy-calls")"
 # The record's 'rebase: any' overrides the merge queue, as on bootc.
 echo "any: the policy record says 'rebase: any' (upstream-policy/acme/proj.md)" >"${FAKE_GH}/rebase-mode"
 check_cases <<EOF
