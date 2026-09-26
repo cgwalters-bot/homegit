@@ -497,15 +497,21 @@ workflows() {
     jq -n --arg c "$(printf '%s' "$4" | base64 -w0)" '{content: $c, encoding: "base64"}' |
         fixture "repos/$1/git/blobs/$(sha "$2"4)"
 }
-# Mentions of merge_group that are no trigger.
+# Mentions of merge_group that are no trigger: comments, a branch
+# filter, a job, a condition, a script.
 readonly PLAIN_WORKFLOW="on:  # merge_group, some day
   pull_request:
 #  merge_group:
+  push:
+    branches:
+      - merge_group
 jobs:
-  test:
+  merge_group:
     if: github.event_name == 'merge_group'
     steps:
-      - run: echo merge_group"
+      - run: |
+          echo merge_group
+          merge_group: not YAML"
 echo '[{"type": "required_status_checks"}]' | fixture repos/acme/plain/rules/branches/main
 workflows acme/plain 50 ci.yml "${PLAIN_WORKFLOW}"
 echo '[{"type": "merge_queue", "parameters": {}}]' | fixture repos/acme/ruled/rules/branches/main
@@ -520,6 +526,15 @@ workflows acme/flow 53 ci.yml "on: [pull_request, merge_group]"
 workflows acme/listed 54 ci.yml "on:
   - push
   - merge_group"
+# A block sequence at column 0, and quoted.
+workflows acme/quoted 55 ci.yml "'on':
+- push
+- 'merge_group'
+jobs: {}"
+# A flow sequence over several lines.
+workflows acme/wrapped 56 ci.yml "on: [push,
+  merge_group]
+jobs: {}"
 while read -r repo pattern; do
     run "rebase ${repo}" 0 "${pattern}" rebase "${repo}" main
 done <<'EOF'
@@ -528,6 +543,8 @@ acme/ruled ^conflicts-only: a merge queue \(a merge_queue rule on main\)$
 acme/grouped ^conflicts-only: a merge queue \(\.github/workflows/tests\.yaml on main runs on merge_group\)$
 acme/flow ^conflicts-only: .*/ci\.yml on main runs on merge_group
 acme/listed ^conflicts-only: .*/ci\.yml on main runs on merge_group
+acme/quoted ^conflicts-only: .*/ci\.yml on main runs on merge_group
+acme/wrapped ^conflicts-only: .*/ci\.yml on main runs on merge_group
 EOF
 # Cached, without calls, until a day has passed.
 workflows acme/grouped 52 tests.yaml "${PLAIN_WORKFLOW}"
