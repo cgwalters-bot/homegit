@@ -60,11 +60,17 @@ review app (cgwalters-forge/review) is the UI over this same view.
   sub-issue of the work item it blocks when that is a tracker issue.
   Several questions about one item are several question issues, so he
   can answer each with one comment.
-- An action he must take on an upstream PR (re-review, sign off, rerun
-  a flaked job, merge) sets that PR's item to Needs human with the action
-  in Why: he does it on GitHub, where it is visible. `bot-watch --apply`
-  only suggests Done for a Needs human item whose PR merged, so apply it
-  yourself once the action is moot.
+- **An action he must take is an ask issue too**, of another kind:
+  `--review PR_URL@SHA` (approve that PR at that head, e.g. a re-approval
+  before `bot-pr signoff`), `--rerun RUN_URL` (rerun the failed jobs of
+  that run; repeatable) or `--chore` (anything else: push, merge, click
+  in a UI). The review app acts on each: a review opens the PR at the
+  expected head, a rerun offers its failed jobs, a chore takes a comment.
+  One ask per issue: an item with a re-approval and a rerun gets two.
+- **Every Needs human item has at least one open ask issue.** The review
+  app shows one without as a bot bug. `bot-watch --apply` only suggests
+  Done for a Needs human item whose PR merged, so apply it (and resolve
+  its asks) yourself once they are moot.
 - For a Draft, Why says in one line what to review; a side question he
   can answer in his review goes there too. Only a decision that blocks
   the review makes it Needs human.
@@ -524,9 +530,15 @@ bot-board set "$ITEM_URL" --why "<short rationale>. Q: $Q"
 
 For an upstream item (an issue or PR the bot can't add sub-issues to),
 the question is a standalone tracker issue; its `Blocks:` line is the
-link. An action only he can take on an upstream PR (rerun, re-review,
-sign off, merge) is not a question: set Needs human with the action in
-Why (see "cgwalters' queue").
+link. An action only he can take (rerun, re-review, sign off, merge) is
+not a question but a review or chore ask, the same command:
+
+```bash
+bot-board question "$ITEM_URL" "Re-approve bootc#2500 at its new head, then the bot runs bot-pr signoff" \
+  --review https://github.com/bootc-dev/bootc/pull/2500@aec657dd
+bot-board question "$ITEM_URL" "Rerun the two composefs UKI legs that lost their runner" \
+  --rerun https://github.com/bootc-dev/bootc/actions/runs/123456
+```
 
 Ask upstream (an issue or PR comment) only when the question is genuinely for
 that project's maintainers, such as which of two approaches they would

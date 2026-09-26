@@ -19,12 +19,13 @@ readonly FORGE_ORG=cgwalters-forge
 # except in TRACKER_REPO.
 readonly SELECT_REASONS='["mention", "team_mention", "review_requested", "assign"]'
 # The bot's own issues, questions for REQUESTER among them (labelled
-# QUESTION_LABEL). Every comment REQUESTER makes on one is routed, as
-# reason COMMENT_REASON: on a question it is his answer, printed as an
+# ASK_LABELS). Every comment REQUESTER makes on one is routed, as
+# reason COMMENT_REASON: on an ask it is his answer, printed as an
 # 'answer' record; on any other issue there, a 'request'. Everyone else's
 # comments there, the bot's own included, are left to bot-watch.
 readonly TRACKER_REPO=cgwalters-forge/tracker
-readonly QUESTION_LABEL=question
+# Asks for REQUESTER: a question, a PR to review, or a chore.
+readonly ASK_LABELS='["question", "review", "chore"]'
 readonly COMMENT_REASON=comment
 readonly API=https://api.github.com
 readonly DEFAULT_LOOKBACK_DAYS=7
@@ -100,9 +101,9 @@ the same way, as threads whose THREAD_ID is the issue or PR URL:
     them again until 'ack THREAD_ID' says they're on the board, which
     also marks a notification thread read;
   - a comment by ${REQUESTER} on an issue in ${TRACKER_REPO}, where the
-    bot's own issues are: on a question (labelled '${QUESTION_LABEL}') it is
-    his answer, printed as an 'answer' record with the option letter he
-    picked (a first line that is just the letter) in 'choice'; elsewhere
+    bot's own issues are: on an ask (labelled $(jq -r 'join(", ")' <<<"${ASK_LABELS}"))
+    it is his answer, printed as an 'answer' record with the option letter
+    he picked (a first line that is just the letter) in 'choice'; elsewhere
     there a 'request'. Both stay until acked, like requests. Comments by
     anyone else there, the bot's own included, are left to bot-watch;
   - from anyone else: file an issue in ${DEFAULT_ISSUE_REPO} mentioning
@@ -711,9 +712,9 @@ triggers() {
         if test -n "${found}"; then
             # A comment on a question in the tracker is an answer, whether
             # or not it also mentions the bot.
-            found=$(jq -c --argjson issue "${issue}" --arg label "${QUESTION_LABEL}" --argjson tracker "$(
+            found=$(jq -c --argjson issue "${issue}" --argjson asks "${ASK_LABELS}" --argjson tracker "$(
                 test "${repo,,}" = "${tracker_repo,,}" && echo true || echo false)" \
-                '. + {issue_title: $issue.title, question: ($tracker and any($issue.labels[]?; .name == $label))}' <<<"${found}")
+                '. + {issue_title: $issue.title, question: ($tracker and any($issue.labels[]?; .name | IN($asks[])))}' <<<"${found}")
         fi
     fi
     if test -z "${found}"; then

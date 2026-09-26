@@ -33,7 +33,7 @@ bodies. Each trigger is routed as follows:
 - **A comment by `cgwalters` on an issue in
   [cgwalters-forge/tracker](https://github.com/cgwalters-forge/tracker)**,
   where the bot's own work items and its questions for him are: on a
-  question (labelled `question`) it is his answer, an `answer` record
+  question, review or chore (labelled so) it is his answer, an `answer` record
   (below); on any other tracker issue, a `request` about that item. Both
   are printed until acked. Comments there by anyone else, the bot's own
   included, are neither filed nor printed: `bot-watch` reports them as
@@ -109,9 +109,11 @@ must not create issues, say).
 
 ## Act on answers
 
-An `answer` record is cgwalters' answer on a question issue
-(`thread_url`): `choice` is the option letter he picked (a first line
-that is just the letter), or null; `url` is his comment, and `excerpt`
+An `answer` record is cgwalters' comment on an ask issue
+(`thread_url`, labelled `question`, `review` or `chore`): his answer, or
+his note that he did the review or chore (the review app posts one after
+he approves or reruns). `choice` is the option letter he picked (a
+first line that is just the letter), or null; `url` is his comment, and `excerpt`
 its start. Read the whole comment and the question (his text after the
 letter can change what the option means). Don't dedupe it against the
 board: the question is on the board by design. Then:
