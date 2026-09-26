@@ -48,6 +48,8 @@ readonly EX_RATELIMIT=75
 readonly EX_NOTFOUND=66
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
+UPSTREAM_POLICY=$(dirname "$(readlink -f "$0")")/upstream-policy
+readonly UPSTREAM_POLICY
 # shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
@@ -112,6 +114,9 @@ split into conflict-free
 ones, for 'bot-pr rebase', and conflicting ones, for a worker. One
 listed for CI is not listed again once its head moved with CI still
 failing: the rebase didn't fix it.
+Upstream PRs that don't conflict are left out where 'upstream-policy
+rebase' says conflicts-only (a merge queue, or the maintainers asked),
+as 'bot-pr rebase' refuses them.
 
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
@@ -336,6 +341,8 @@ nitems=$(jq '[.[].items[].id] | unique | length' <<<"${watch}")
 # OWNER/REPO#N for an issue or PR URL.
 readonly REPO_REF_JQ='def repo_ref:
     capture("github\\.com/(?<r>[^/]+/[^/]+)/(issues|pull)/(?<n>[0-9]+)") | "\(.r)#\(.n)";'
+# repo: the OWNER/REPO of a PR entry's url.
+readonly REBASE_REPO_JQ='def repo: .url | capture("github\\.com/(?<r>[^/]+/[^/]+)/pull/").r;'
 
 # disabled_suites REPO SHA: prints the ids of the check suites of SHA's
 # Actions runs whose workflow is disabled now, as a JSON array. Their
@@ -798,6 +805,18 @@ candidates=$(jq -c --slurpfile results "${scratch}/results.json" --slurpfile ext
     | .list |= map(select(.url as $u | [$outstanding[].url] | index($u) | not))
     | (.list | tojson), (.keep | tojson)' <<<"${candidates}")
 test -n "${new_rebase}" || fatal "internal error: selecting the PRs that need a rebase failed"
+# Where a merge queue tests against the new base anyway, or the
+# maintainers asked, a conflict-free rebase only reruns CI they approve
+# again. Undecided (upstream-policy failed) means listed: bot-pr decides.
+conflicts_only='[]'
+while IFS=$'\t' read -r repo base; do
+    mode=$("${UPSTREAM_POLICY}" rebase "${repo}" "${base}") ||
+        { warn "cannot tell whether ${repo} takes conflict-free rebases; listing them"; continue; }
+    test "${mode}" = any || conflicts_only=$(jq -c --arg r "${repo}" --arg b "${base}" '. + [[$r, $b]]' <<<"${conflicts_only}")
+done < <(jq -r --argjson forks "${FORK_OWNERS}" "${REBASE_REPO_JQ}"'
+    [.[] | select(.conflicts != true) | [repo, .base] | select(.[0] | split("/")[0] | IN($forks[]) | not)] | unique[] | @tsv' <<<"${needs_rebase}")
+needs_rebase=$(jq -c --argjson co "${conflicts_only}" "${REBASE_REPO_JQ}"'
+    map(select(.conflicts == true or ([repo, .base] | IN($co[]) | not)))' <<<"${needs_rebase}")
 
 # keep_last_seen ITEM: puts the URLs of ITEM back to their last-seen
 # state, so that the next sweep sees their transitions again (and

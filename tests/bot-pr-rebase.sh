@@ -137,6 +137,17 @@ elif test -n "${json}"; then
 fi
 EOF
 chmod +x "${WORK}/bin/gh"
+# The stand-in for 'upstream-policy rebase' (tested on its own): prints
+# $FAKE_GH/rebase-mode, by default 'any', or fails with
+# $FAKE_GH/rebase-mode.fail. Calls are logged to $FAKE_GH/policy-calls.
+cat >"${WORK}/bin/upstream-policy" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FAKE_GH}/policy-calls"
+test ! -e "${FAKE_GH}/rebase-mode.fail" || { echo "error: GitHub is down" 1>&2; exit 1; }
+cat "${FAKE_GH}/rebase-mode" 2>/dev/null || echo any
+EOF
+chmod +x "${WORK}/bin/upstream-policy"
+export BOT_PR_UPSTREAM_POLICY=${WORK}/bin/upstream-policy
 
 # fixture PATH: store stdin as the answer to 'gh api PATH'.
 fixture() {
@@ -228,6 +239,11 @@ answered|${F}|bot|answered|changes made\n\n${AI}|
 commented|${F}|bot|commented|changes made\n\n${AI}|
 latecomment|${F}|bot|latecomment|changes made\n\n${AI}|
 question|${F}|bot|question|asked\n\n${AI}|
+mqplain|${F}|bot|mqplain|mqplain\n\n${AI}|
+mqforce|${F}|bot|mqforce|mqforce\n\n${AI}|
+mqconflict|${F}|bot|README|mqconflict\n\n${AI}|
+mqfork|${F}|bot|mqfork|mqfork\n\n${AI}|
+mqfail|${F}|bot|mqfail|mqfail\n\n${AI}|
 EOF
 pr acme/proj 1 "${F}" bot/plain
 pr acme/proj 2 "${F}" bot/signed
@@ -274,6 +290,14 @@ jq -n --arg sha "$(git -C "${REMOTES}/${F}" rev-parse bot/approved)" \
        html_url: "https://github.com/cgwalters-forge/proj/pull/11#pullrequestreview-7", body: ""}]' |
     fixture "repos/${F}/pulls/11/reviews"
 echo '{"default_branch": "main"}' | fixture repos/acme/proj
+# For a repository with a merge queue: GitHub finds #22 conflicting.
+pr acme/proj 20 "${F}" bot/mqplain
+pr acme/proj 21 "${F}" bot/mqforce
+pr acme/proj 22 "${F}" bot/mqconflict
+jq '.mergeable = false | .mergeable_state = "dirty"' "${FAKE_GH}/rest/repos/acme/proj/pulls/22.json" >"${WORK}/pr.json"
+mv "${WORK}/pr.json" "${FAKE_GH}/rest/repos/acme/proj/pulls/22.json"
+pr "${F}" 23 "${F}" bot/mqfork
+pr acme/proj 24 "${F}" bot/mqfail
 
 # Upstream moves on: a change to README (which #4 conflicts with), one to
 # a line of ctx near #7's (its context changes), and #9's change.
@@ -297,61 +321,65 @@ pr acme/proj 13 "${F}" bot/current
 # REGEX of the refusal. COMMITTERS are the rebased commits' committers
 # (b: the bot, h: cgwalters), oldest first.
 readonly U=https://github.com/acme/proj/pull
-while IFS='|' read -r name url opts expect committers; do
-    test -n "${name}" || continue
-    [[ "${url}" =~ /([^/]+/[^/]+)/pull/([0-9]+)$ ]]
-    repo=${BASH_REMATCH[1]} n=${BASH_REMATCH[2]}
-    head_repo=$(jq -r .head.repo.full_name "${FAKE_GH}/rest/repos/${repo}/pulls/${n}.json")
-    ref=$(jq -r .head.ref "${FAKE_GH}/rest/repos/${repo}/pulls/${n}.json")
-    before=$(git -C "${REMOTES}/${head_repo}" rev-parse "refs/heads/${ref}")
-    : >"${FAKE_GH}/comments"
-    read -ra argv <<<"${opts}"
-    status=0
-    out=$("${BOT_PR}" rebase "${url}" "${argv[@]}" 2>&1) || status=$?
-    after=$(git -C "${REMOTES}/${head_repo}" rev-parse "refs/heads/${ref}")
-    comments=$(cat "${FAKE_GH}/comments")
-    case "${expect}" in
-        rebased\ *)
-            test "${status}" -eq 0 || { fail "${name}: exit status ${status}: ${out}"; continue; }
-            summary=${expect#rebased }
-            git -C "${REMOTES}/${head_repo}" merge-base --is-ancestor "${MAIN}" "${after}" || fail "${name}: not on upstream main"
-            test "$(git -C "${REMOTES}/${head_repo}" rev-list --count "${MAIN}..${after}")" = \
-                "$(git -C "${REMOTES}/${head_repo}" rev-list --count "${BASE}..${before}")" || fail "${name}: commit count changed"
-            test "$(git -C "${REMOTES}/${head_repo}" log --reverse --format=%an%ae%B "${MAIN}..${after}")" = \
-                "$(git -C "${REMOTES}/${head_repo}" log --reverse --format=%an%ae%B "${BASE}..${before}")" ||
-                fail "${name}: authors or messages changed"
-            got=$(git -C "${REMOTES}/${head_repo}" log --reverse --format=%ce "${MAIN}..${after}" |
-                sed -e "s/^${BOT_EMAIL}\$/b/" -e "s/^${HUMAN_EMAIL}\$/h/" | paste -sd' ')
-            test "${got}" = "${committers}" || fail "${name}: committers '${got}', expected '${committers}'"
-            if test "${repo}" = acme/proj; then
-                want="repos/acme/proj/issues/${n}/comments $(printf 'Rebased onto main; %s.\n\n%s' "${summary}" "${TRAILER}" | jq -Rsc .)"
-                test "${comments}" = "${want}" || fail "${name}: comment '${comments}', expected '${want}'"
-            else
-                test -z "${comments}" || fail "${name}: commented on a fork PR: ${comments}"
-                test "$(git -C "${REMOTES}/${repo}" rev-parse main)" = "${MAIN}" || fail "${name}: the fork's main wasn't synced"
-            fi ;;
-        dry\ *)
-            test "${status}" -eq 0 || { fail "${name}: exit status ${status}: ${out}"; continue; }
-            grep -qF "Would push ${ref} rebased onto acme/proj:main" <<<"${out}" || fail "${name}: ${out}"
-            grep -qF "${expect#dry }" <<<"${out}" || fail "${name}: no summary: ${out}"
-            test "${after}" = "${before}" || fail "${name}: pushed in a dry run"
-            test -z "${comments}" || fail "${name}: commented in a dry run" ;;
-        uptodate)
-            test "${status}" -eq 0 || fail "${name}: exit status ${status}: ${out}"
-            grep -q 'is up to date with acme/proj:main; nothing to do' <<<"${out}" || fail "${name}: ${out}"
-            test "${after}" = "${before}" || fail "${name}: pushed" ;;
-        conflict\ *)
-            test "${status}" -eq "${EX_CONFLICT}" || fail "${name}: exit status ${status}, expected ${EX_CONFLICT}: ${out}"
-            grep -qF "conflicts with acme/proj:main in: ${expect#conflict }; nothing was pushed" <<<"${out}" || fail "${name}: ${out}"
-            test "${after}" = "${before}" || fail "${name}: pushed"
-            test -z "${comments}" || fail "${name}: commented" ;;
-        *)
-            test "${status}" -ne 0 || fail "${name}: not refused: ${out}"
-            grep -qE -- "${expect}" <<<"${out}" || fail "${name}: output lacks '${expect}': ${out}"
-            test "${after}" = "${before}" || fail "${name}: pushed anyway"
-            test -z "${comments}" || fail "${name}: commented" ;;
-    esac
-done <<EOF
+# check_cases: runs the cases on stdin, as above.
+check_cases() {
+    while IFS='|' read -r name url opts expect committers; do
+        test -n "${name}" || continue
+        [[ "${url}" =~ /([^/]+/[^/]+)/pull/([0-9]+)$ ]]
+        repo=${BASH_REMATCH[1]} n=${BASH_REMATCH[2]}
+        head_repo=$(jq -r .head.repo.full_name "${FAKE_GH}/rest/repos/${repo}/pulls/${n}.json")
+        ref=$(jq -r .head.ref "${FAKE_GH}/rest/repos/${repo}/pulls/${n}.json")
+        before=$(git -C "${REMOTES}/${head_repo}" rev-parse "refs/heads/${ref}")
+        : >"${FAKE_GH}/comments"
+        read -ra argv <<<"${opts}"
+        status=0
+        out=$("${BOT_PR}" rebase "${url}" "${argv[@]}" 2>&1) || status=$?
+        after=$(git -C "${REMOTES}/${head_repo}" rev-parse "refs/heads/${ref}")
+        comments=$(cat "${FAKE_GH}/comments")
+        case "${expect}" in
+            rebased\ *)
+                test "${status}" -eq 0 || { fail "${name}: exit status ${status}: ${out}"; continue; }
+                summary=${expect#rebased }
+                git -C "${REMOTES}/${head_repo}" merge-base --is-ancestor "${MAIN}" "${after}" || fail "${name}: not on upstream main"
+                test "$(git -C "${REMOTES}/${head_repo}" rev-list --count "${MAIN}..${after}")" = \
+                    "$(git -C "${REMOTES}/${head_repo}" rev-list --count "${BASE}..${before}")" || fail "${name}: commit count changed"
+                test "$(git -C "${REMOTES}/${head_repo}" log --reverse --format=%an%ae%B "${MAIN}..${after}")" = \
+                    "$(git -C "${REMOTES}/${head_repo}" log --reverse --format=%an%ae%B "${BASE}..${before}")" ||
+                    fail "${name}: authors or messages changed"
+                got=$(git -C "${REMOTES}/${head_repo}" log --reverse --format=%ce "${MAIN}..${after}" |
+                    sed -e "s/^${BOT_EMAIL}\$/b/" -e "s/^${HUMAN_EMAIL}\$/h/" | paste -sd' ')
+                test "${got}" = "${committers}" || fail "${name}: committers '${got}', expected '${committers}'"
+                if test "${repo}" = acme/proj; then
+                    want="repos/acme/proj/issues/${n}/comments $(printf 'Rebased onto main; %s.\n\n%s' "${summary}" "${TRAILER}" | jq -Rsc .)"
+                    test "${comments}" = "${want}" || fail "${name}: comment '${comments}', expected '${want}'"
+                else
+                    test -z "${comments}" || fail "${name}: commented on a fork PR: ${comments}"
+                    test "$(git -C "${REMOTES}/${repo}" rev-parse main)" = "${MAIN}" || fail "${name}: the fork's main wasn't synced"
+                fi ;;
+            dry\ *)
+                test "${status}" -eq 0 || { fail "${name}: exit status ${status}: ${out}"; continue; }
+                grep -qF "Would push ${ref} rebased onto acme/proj:main" <<<"${out}" || fail "${name}: ${out}"
+                grep -qF "${expect#dry }" <<<"${out}" || fail "${name}: no summary: ${out}"
+                test "${after}" = "${before}" || fail "${name}: pushed in a dry run"
+                test -z "${comments}" || fail "${name}: commented in a dry run" ;;
+            uptodate)
+                test "${status}" -eq 0 || fail "${name}: exit status ${status}: ${out}"
+                grep -q 'is up to date with acme/proj:main; nothing to do' <<<"${out}" || fail "${name}: ${out}"
+                test "${after}" = "${before}" || fail "${name}: pushed" ;;
+            conflict\ *)
+                test "${status}" -eq "${EX_CONFLICT}" || fail "${name}: exit status ${status}, expected ${EX_CONFLICT}: ${out}"
+                grep -qF "conflicts with acme/proj:main in: ${expect#conflict }; nothing was pushed" <<<"${out}" || fail "${name}: ${out}"
+                test "${after}" = "${before}" || fail "${name}: pushed"
+                test -z "${comments}" || fail "${name}: commented" ;;
+            *)
+                test "${status}" -ne 0 || fail "${name}: not refused: ${out}"
+                grep -qE -- "${expect}" <<<"${out}" || fail "${name}: output lacks '${expect}': ${out}"
+                test "${after}" = "${before}" || fail "${name}: pushed anyway"
+                test -z "${comments}" || fail "${name}: commented" ;;
+        esac
+    done
+}
+check_cases <<EOF
 the bot's commit|${U}/1||rebased 1 commit, no content change|b
 dry run first|${U}/2|--dry-run|dry 2 commits, no content change|
 cgwalters' sign-off is kept|${U}/2||rebased 2 commits, no content change|h b
@@ -373,6 +401,25 @@ replaced by a later comment review, answered|${U}/16||rebased 1 commit, no conte
 replaced by a later comment review, unanswered|${U}/17||has an unanswered review \(COMMENTED\) by cgwalters|
 an unanswered comment|${U}/18||has an unanswered comment by cgwalters|
 up to date after the rebase|${U}/1||uptodate|
+EOF
+
+# A merge queue (or the policy record) upstream: only conflicting upstream
+# PRs are rebased, unless forced; fork PRs push nothing upstream.
+echo "conflicts-only: a merge queue (.github/workflows/ci.yml on main runs on merge_group)" >"${FAKE_GH}/rebase-mode"
+: >"${FAKE_GH}/policy-calls"
+check_cases <<EOF
+merge queue|${U}/20||doesn't conflict with main, and acme/proj is rebased only on conflicts: a merge queue \(\.github/workflows/ci\.yml on main runs on merge_group\); not rebasing it \(--force-merge-queue|
+merge queue, dry run|${U}/20|--dry-run|acme/proj is rebased only on conflicts|
+merge queue, forced|${U}/21|--force-merge-queue|rebased 1 commit, no content change|b
+merge queue, conflicting|${U}/22||conflict README|
+merge queue, a fork PR|https://github.com/${F}/pull/23||rebased 1 commit, no content change|b
+EOF
+test "$(sort -u "${FAKE_GH}/policy-calls")" = "rebase acme/proj main" ||
+    fail "merge queue: upstream-policy calls: $(cat "${FAKE_GH}/policy-calls")"
+test "$(wc -l <"${FAKE_GH}/policy-calls")" -eq 2 || fail "merge queue: upstream-policy not called just for #20, twice: $(cat "${FAKE_GH}/policy-calls")"
+touch "${FAKE_GH}/rebase-mode.fail"
+check_cases <<EOF
+merge queue undecided|${U}/24||cannot tell whether acme/proj takes conflict-free rebases.*--force-merge-queue skips that|
 EOF
 
 out=$("${BOT_PR}" rebase https://github.com/acme/proj/issues/1 2>&1) && fail "an issue URL: not refused: ${out}"

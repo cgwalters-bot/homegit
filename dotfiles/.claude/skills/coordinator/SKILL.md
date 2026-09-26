@@ -73,9 +73,12 @@ closed.
   a fix for a worker, not a rebase), or it has maintainers' approvals
   that a force-push would make stale (ask cgwalters instead). PRs with
   an outstanding review by cgwalters aren't listed there: the worker
-  answering it rebases on the way. It refuses anything that isn't a
-  clean, rebase-only change of the bot's own commits (and his), keeps
-  cgwalters' sign-off, and comments one line on an upstream PR. When it
+  answering it rebases on the way. Nor are conflict-free upstream PRs
+  in repositories with a merge queue or a policy record saying `rebase:
+  conflicts-only`: there a rebase only reruns CI that the maintainers
+  must approve again, and `bot-pr rebase` refuses it. It refuses
+  anything that isn't a clean, rebase-only change of the bot's own
+  commits (and his), keeps cgwalters' sign-off, and comments one line on an upstream PR. When it
   exits 10 (conflicts), or for the conflicting ones, dispatch a worker
   to resolve the conflicts, retest and push, per `upstream-pr` (on an
   upstream PR his sign-off then stays only on commits whose resolution
