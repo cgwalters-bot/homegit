@@ -128,6 +128,33 @@ closed.
   be made right there, prefix that one command with
   `BOT_GIT_ALLOW_SHARED_CLONE=1`; bot-land's fast-forward of the shared
   clone needs nothing.
+- **Harness changes merge after an independent review, not after
+  cgwalters.** For the bot's own harness (the own repositories above,
+  cgwalters-forge/review and cgwalters-forge/tracker), a change may
+  auto-merge once a separate reviewer subagent (never the worker that
+  wrote it) has approved that exact head and its verdict is posted on
+  the pull request. For bootc-dev/cgwalters-devspace-sandbox the same
+  review counts as his approval for promote, only if that repository
+  doesn't enforce DCO (his sign-off always needs his own approval). He
+  asked for this so harness work doesn't queue behind him; he reads it
+  afterwards in the review app's news pane. Exceptions, which still need
+  his approval before merging (open them with `bot-land --no-auto` and
+  a Needs human question):
+  - **architecture:** a new component or service, a new trust boundary,
+    or a change of direction against a design he wrote or approved;
+  - **security:** credentials and tokens, sandboxing and containment,
+    workflow `permissions:` and secrets, action or container pinning,
+    the review app's auth, CSP and approve guard, egress;
+  - **the rules themselves:** `bot-git`'s sign-off handling, the
+    upstream-policy gate, `bot-pr promote`/`signoff`, this list, and
+    anything else in AGENTS.md or these skills that loosens what the bot
+    may do without him.
+  When unsure whether a change falls under an exception, treat it as
+  one.
+- **Housekeeping needs no question.** Clearing local caches, removing
+  finished worktrees and scratch clones, stopping idle devspaces and
+  similar routine cleanup of the bot's own local state: just do it and
+  mention it in passing. cgwalters doesn't want to be asked about these.
 - **Review feedback** on a fork PR goes to a worker, preferably the one
   that wrote it if it's still around.
 - **Dispatch** workers for Todo items (by priority, per `workstream`) and
