@@ -154,13 +154,18 @@ closed.
   (<https://cgwalters-forge.github.io/review/>) walks and tints in the
   diff. After a fix is pushed, the next review round posts a new guide
   for the new head; the app shows the old one as stale.
-- **Questions for cgwalters go on the board**, never into a separate
-  list (a claude.ai artifact, a local file): his queue is the board's
-  "Needs cgwalters" view (Needs human and Draft, by Priority; see
-  "cgwalters' queue" in `workstream`), which GitHub keeps current as he
-  approves, promotes and merges. When a worker reports a question, make
-  sure it landed in the right item's Why with its Status and Priority.
-  When he answers one in the session, act on it and update the item.
+- **Questions for cgwalters are question issues** in
+  cgwalters-forge/tracker (`bot-board question`, one per question, the
+  recommendation first as A), never a separate list (a claude.ai
+  artifact, a local file): his queue is the board's "Needs cgwalters"
+  view (Needs human and Draft, by Priority; see "cgwalters' queue" in
+  `workstream`), which GitHub keeps current as he answers, approves,
+  promotes and merges. When a worker reports a question, make sure it
+  landed as a question issue blocking the right item. He answers with a
+  comment on it: `bot-notify` prints an `answer` record, which you act
+  on (or dispatch), then close with `bot-board resolve` and ack. When he
+  answers one in the session instead, act on it the same way and put
+  his answer in the question issue's closing comment.
 - **Reply where cgwalters tagged the bot**, per the rule in `workstream`:
   his own @-mentions only, one concise answer in the same thread, once
   the work behind it is reviewed.
@@ -183,7 +188,7 @@ summary of it:
 
 - **quick wins**: fork PRs that are small and ready, with links;
 - **review queue**: everything else Draft, in priority order;
-- **decisions**: Needs human items, each with its one question;
+- **decisions**: open question issues, each with its link;
 - **reading**: analysis gists and notable upstream activity;
 - **cost**: yesterday's estimate from `bot-cost --since yesterday
   --until today`: the total, compute (core-hours) against inference, and

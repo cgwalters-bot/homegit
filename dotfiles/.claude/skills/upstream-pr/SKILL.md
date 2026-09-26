@@ -337,8 +337,8 @@ someone else's commits**: if a maintainer pushed to your branch, fetch and
 rebase on top of their work first, and never force-push to branches you
 did not create. Reply to each review comment saying what changed, or why
 you disagree, in a few lines. If a comment on an upstream PR needs a
-judgment call from Colin, put the question in the board item (see `workstream`) and set
-Needs human rather than asking on the PR; ask on the PR only when the
+judgment call from Colin, ask him with a question issue (`bot-board question`, see
+`workstream`) rather than on the PR; ask on the PR only when the
 question is for the maintainers.
 
 cgwalters' comments on a fork PR are handled the same way, and the reply
