@@ -44,6 +44,7 @@ being the session's scratch dir):
 bot-notify
 bot-pr inbox --dry-run
 bot-watch --apply > "$SCRATCH/watch-$(date +%H%M).txt"
+bot-tmt-number --gc
 ```
 
 `bot-notify` routes new pings (see its skill; ack requests once they're on
@@ -52,6 +53,9 @@ fork PRs without consuming it, so the worker who picks up a fork PR still
 sees it. `bot-watch --apply` consumes its news (the next sweep won't
 report it again), so capture its whole output to a file and read that,
 instead of piping it through `tail` and losing lines for good.
+`bot-tmt-number --gc` releases the bootc tmt test numbers workers
+reserved once their number is on main or in their open PR, or their PR
+closed.
 
 ## Acting on it
 
