@@ -409,12 +409,17 @@ rb_pr 4 aaaa000000000000000000000000000000000004 clean true 2
 rb_ci aaaa000000000000000000000000000000000004 success
 rb_pr 5 aaaa000000000000000000000000000000000005 behind true 1
 rb_ci aaaa000000000000000000000000000000000005 success
+# #6 fails CI and is behind, and his change request was answered by the
+# bot's push since (at 11:30): listed, as 'bot-pr rebase' takes it.
+rb_pr 6 aaaa000000000000000000000000000000000006 blocked true 2
+rb_ci aaaa000000000000000000000000000000000006 failure
+review 60 cgwalters CHANGES_REQUESTED 2026-09-25T11:10:00Z "Fix it." | reviews repos/example/rb/pulls/6
 put repos/cgwalters-forge/bootc/pulls/19 "$(jq -c '.mergeable = false | .mergeable_state = "dirty" | .base.ref = "main" | .body = "Why.\n\n<!-- bot-meta -->\n<!-- /bot-meta -->"' \
     "${REST}/repos/cgwalters-forge/bootc/pulls/19.json")"
 put repos/bootc-dev/bootc/pulls/2600 "$(jq -c '.mergeable = true | .mergeable_state = "behind" | .base.ref = "main"' \
     "${REST}/repos/bootc-dev/bootc/pulls/2600.json")"
 jq -n --arg rb "${RB}" --arg fork "${FORK_PR}" '
-    [range(1; 6) as $n | {id: "PVTI_rb\($n)", title: "Rebase \($n)", status: "In Review",
+    [range(1; 7) as $n | {id: "PVTI_rb\($n)", title: "Rebase \($n)", status: "In Review",
                            content: {type: "PullRequest", url: "\($rb)/\($n)"}}
      | if $n == 2 then .branch = $fork else . end]' >"${WORK}/board.json"
 
@@ -422,11 +427,12 @@ readonly NEEDS_REBASE_JQ='[.needs_rebase[] | [.url, .reason, .conflicts, .behind
     ["\($rb)/1", "ci", false, 3, ["PVTI_rb1"]],
     ["\($rb)/2", "conflict", true, null, ["PVTI_rb2"]],
     [$fork, "conflict", true, null, ["PVTI_rb2"]],
-    ["\($rb)/5", "behind", false, null, ["PVTI_rb5"]]] | sort)'
+    ["\($rb)/5", "behind", false, null, ["PVTI_rb5"]],
+    ["\($rb)/6", "ci", false, 2, ["PVTI_rb6"]]] | sort)'
 rebase_args=(--arg rb "${RB}" --arg fork "${FORK_PR}")
 sweep rebase 2026-09-25T16:00:00Z "${EARLIER}"
 expect rebase "the PRs that need a rebase" "${rebase_args[@]}" "${NEEDS_REBASE_JQ}"
-jq -e --arg rb "${RB}" '.rebase == {"\($rb)/1": "aaaa000000000000000000000000000000000001"}' "${WORK}/rebase.state" >/dev/null ||
+jq -e --arg rb "${RB}" '.rebase["\($rb)/1"] == "aaaa000000000000000000000000000000000001"' "${WORK}/rebase.state" >/dev/null ||
     fail "rebase: the state doesn't remember #1: $(cat "${WORK}/rebase.state")"
 if ! grep -qx "Needs rebase (bot-pr rebase URL):" "${WORK}/rebase.txt" ||
     ! grep -qx "  conflict-free:" "${WORK}/rebase.txt" || ! grep -qx "  conflicting (a worker resolves):" "${WORK}/rebase.txt" ||
@@ -444,18 +450,18 @@ rb_ci aaaa000000000000000000000000000000000011 failure
 put repos/example/rb/commits/aaaa000000000000000000000000000000000011/check-runs \
     '{"total_count": 1, "check_runs": [{"name": "tests", "status": "in_progress", "conclusion": null, "check_suite": {"id": 1}}]}'
 sweep rebase 2026-09-25T16:15:00Z
-jq -e --arg rb "${RB}" '.rebase == {"\($rb)/1": "aaaa000000000000000000000000000000000001"}' "${WORK}/rebase.state" >/dev/null ||
+jq -e --arg rb "${RB}" '.rebase["\($rb)/1"] == "aaaa000000000000000000000000000000000001"' "${WORK}/rebase.state" >/dev/null ||
     fail "rebase: the state forgot #1 while its CI runs: $(cat "${WORK}/rebase.state")"
 rb_pr 1 aaaa000000000000000000000000000000000011 blocked true 1
 rb_ci aaaa000000000000000000000000000000000011 failure
 sweep rebase 2026-09-25T16:20:00Z
 expect rebase "not listed once rebased" --arg rb "${RB}" '[.needs_rebase[].url] | index("\($rb)/1") | not'
-jq -e --arg rb "${RB}" '.rebase == {"\($rb)/1": "aaaa000000000000000000000000000000000001"}' "${WORK}/rebase.state" >/dev/null ||
+jq -e --arg rb "${RB}" '.rebase["\($rb)/1"] == "aaaa000000000000000000000000000000000001"' "${WORK}/rebase.state" >/dev/null ||
     fail "rebase: the state forgot #1 while its CI fails: $(cat "${WORK}/rebase.state")"
 # Its CI passes: forgotten.
 rb_ci aaaa000000000000000000000000000000000011 success
 sweep rebase 2026-09-25T16:30:00Z
-jq -e 'has("rebase") | not' "${WORK}/rebase.state" >/dev/null ||
+jq -e --arg rb "${RB}" '.rebase | has("\($rb)/1") | not' "${WORK}/rebase.state" >/dev/null ||
     fail "rebase: the state still remembers #1: $(cat "${WORK}/rebase.state")"
 
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }

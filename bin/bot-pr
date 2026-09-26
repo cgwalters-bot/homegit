@@ -15,6 +15,14 @@ for f in "${BOT_GIT}" "$(dirname "${BOT_GIT}")/dco-detect.sh"; do
 done
 # shellcheck source=bin/bot-git disable=SC1091 # followed with shellcheck -x
 source "${BOT_GIT}"
+# OUTSTANDING_REVIEW_JQ, shared with bot-watch.
+REVIEW_STATE=$(dirname "${BOT_GIT}")/review-state.sh
+test -r "${REVIEW_STATE}" || {
+    echo "error: ${REVIEW_STATE} not found; ${0##*/} needs it from homegit's bin/ next to it" 1>&2
+    exit 1
+}
+# shellcheck source=bin/review-state.sh disable=SC1091 # followed with shellcheck -x
+source "${REVIEW_STATE}"
 # dco_checks, shared with dco-signoff.
 # shellcheck source=bin/dco-detect.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "${BOT_GIT}")/dco-detect.sh"
@@ -227,7 +235,8 @@ Commands:
         opened by ${BOT_LOGIN} whose commits are all by ${BOT_LOGIN} or
         ${REVIEWER} are touched; a fork PR ${REVIEWER} approved at its
         head is left to promote, which rebases it itself, and an upstream
-        PR whose latest review of his requests changes to a worker. It
+        PR with a review or comment of his that has no answer yet (as
+        bot-watch's "Outstanding reviews" decide) to a worker. It
         refuses on
         conflicts, listing the conflicting paths (exit status
         ${EX_CONFLICT}) for a worker to resolve, and if the rebase drops a
@@ -2366,15 +2375,24 @@ cmd_rebase() {
             fatal "${REVIEWER} approved ${url} at ${head_sha:0:12}; a push would void that, and 'bot-pr promote' rebases it itself"
     fi
 
-    # His change request is a worker's to answer, and a rebase's push
-    # would look like an answer to bot-watch.
+    # His review still waiting for an answer is a worker's (rebasing on
+    # the way), and a rebase's push would look like the answer. One
+    # answered already, even a change request, is no reason not to: a
+    # rebase changes nothing he asked for. bot-watch decides the same.
     if ! ${fork_pr}; then
-        local last_review
-        last_review=$(ghapi --paginate "repos/${repo}/pulls/${number}/reviews?per_page=100" \
-            --jq ".[] | select(.user.login == \"${REVIEWER}\" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\"))) | .state" |
-            tail -n1) || fatal "cannot list the reviews of ${url}"
-        test "${last_review}" != CHANGES_REQUESTED ||
-            fatal "${REVIEWER} requested changes on ${url}; that's a worker's to address (rebasing on the way), not a bare rebase"
+        local push outstanding
+        push=$(ghapi "repos/${repo}/commits/${head_sha}" |
+            jq -r --arg bot "${BOT_LOGIN}" --arg req "${REVIEWER}" "${REVIEW_PUSH_JQ}") ||
+            fatal "cannot read ${url}'s head commit"
+        outstanding=$({
+            ghapi --paginate "repos/${repo}/pulls/${number}/reviews?per_page=100" --jq '.[]' ||
+                fatal "cannot list the reviews of ${url}"
+            ghapi --paginate "repos/${repo}/issues/${number}/comments?per_page=100" --jq '.[]' ||
+                fatal "cannot list the comments of ${url}"
+        } | jq -sc --arg push "${push}" --arg bot "${BOT_LOGIN}" --arg req "${REVIEWER}" \
+            --argjson len "${EXCERPT_LEN}" "${OUTSTANDING_REVIEW_JQ}") || fatal "cannot tell whether ${url} has an unanswered review"
+        test "${outstanding}" = null ||
+            fatal "${url} has an unanswered $(jq -r 'if .type == "review" then "review (\(.review_state))" else "comment" end' <<<"${outstanding}") by ${REVIEWER} ($(jq -r .link <<<"${outstanding}")); that's a worker's to address (rebasing on the way), not a bare rebase"
     fi
 
     # Only the bot's and his commits: anyone else's are theirs to rebase.

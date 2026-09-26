@@ -53,6 +53,11 @@ source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
     exit 1
 }
+# shellcheck source=bin/review-state.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/review-state.sh" || {
+    echo "error: ${0##*/} needs review-state.sh from homegit's bin/ next to it" 1>&2
+    exit 1
+}
 
 usage() {
     cat <<EOF
@@ -328,15 +333,6 @@ nitems=$(jq '[.[].items[].id] | unique | length' <<<"${watch}")
 
 # --- Sweep -----------------------------------------------------------------
 
-# The first line of a text that isn't blank or quoted (a reply starts by
-# quoting what it answers), without control or bidi characters that a
-# terminal would act on; $len is its maximum length.
-readonly EXCERPT_JQ='def excerpt:
-    [(. // "") | splits("\n") | gsub("[[:cntrl:]\u200e\u200f\u202a-\u202e\u2066-\u2069]"; " ")
-     | select(test("\\S") and (test("^\\s*>") | not))]
-    | (first // "") | gsub("^\\s+|\\s+$"; "") | gsub("\\s+"; " ")
-    | if length > $len then .[:$len] + "..." else . end;'
-
 # OWNER/REPO#N for an issue or PR URL.
 readonly REPO_REF_JQ='def repo_ref:
     capture("github\\.com/(?<r>[^/]+/[^/]+)/(issues|pull)/(?<n>[0-9]+)") | "\(.r)#\(.n)";'
@@ -396,50 +392,18 @@ checks_state() {
 }
 
 # outstanding_review REPO NUMBER HEAD REVIEWS: on the bot's own open
-# upstream PR, prints what REQUESTER asked that has no answer yet, as
-# {at, type, review_state, link, excerpt, count} of his latest; else
-# null. It's reported on every sweep until answered, so that news the
-# edge-triggered report missed (or that was read and dropped) can't lose
-# the work. A review requesting changes is answered by a push of the
-# bot's or his own after it, or by his own later review (a dismissed one
-# is gone); his other reviews and comments by such a push or a reply of
-# the bot's. His approval answers all before it; after it, only his
-# reviews and the comments that mention the bot count, until another
-# review. REVIEWS is the PR's reviews, one per line.
+# upstream PR, prints what REQUESTER asked that has no answer yet (see
+# OUTSTANDING_REVIEW_JQ); else null. It's reported on every sweep until
+# answered, so that news the edge-triggered report missed (or that was
+# read and dropped) can't lose the work. REVIEWS is the PR's reviews, one
+# per line.
 outstanding_review() {
     local repo=$1 number=$2 head=$3 reviews=$4 commit push comments
     commit=$(rest_get "repos/${repo}/commits/${head}") || return
-    # Only a push of the bot's, or his own (he acted on it himself), can
-    # answer him: not GitHub's "Update branch" (committed by web-flow)
-    # or anyone else's push.
-    push=$(jq -r --arg bot "${BOT_LOGIN}" --arg req "${REQUESTER}" \
-        'if .committer.login | IN($bot, $req) then .commit.committer.date else "" end' <<<"${commit}") || return
+    push=$(jq -r --arg bot "${BOT_LOGIN}" --arg req "${REQUESTER}" "${REVIEW_PUSH_JQ}" <<<"${commit}") || return
     comments=$(rest_pages "repos/${repo}/issues/${number}/comments") || return
     printf '%s\n' "${reviews}" "${comments}" | jq -sc --arg push "${push}" --arg bot "${BOT_LOGIN}" \
-        --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
-        [.[] | select(.user.login == $bot or .user.login == $req)
-         | if has("submitted_at") then select(.submitted_at != null and (.state | IN("PENDING", "DISMISSED") | not))
-               | {type: "review", review_state: .state, at: .submitted_at}
-           else {type: "comment", at: .created_at} end
-           + {author: .user.login, link: .html_url, body: (.body // "")}]
-        | ([.[] | select(.author == $bot) | .at] | max // "") as $bot_reply
-        | [.[] | select(.author == $req)] as $his
-        | ([$his[] | select(.type == "review")] | sort_by(.at)) as $his_reviews
-        | ([$his_reviews[] | select(.review_state == "APPROVED") | .at] | max // "") as $approved
-        | [$his[] | . as $x
-           | select(.at > $approved and .review_state != "APPROVED")
-           # A comment right after his approval is a thank-you, unless it
-           # asks the bot for something.
-           | select(.type == "review" or ([$his_reviews[] | select(.at <= $x.at)] | last | .review_state) != "APPROVED"
-                    or (.body | test("@" + $bot + "(?![A-Za-z0-9-])"; "i")))
-           | select(if .review_state == "CHANGES_REQUESTED"
-                    # Any later review of his replaces it, even one that
-                    # only comments: he said what he still wants there.
-                    then ($push > $x.at or any($his_reviews[]; .at > $x.at)) | not
-                    else [$push, $bot_reply] | max <= $x.at end)]
-        | sort_by(.at) as $open
-        | if ($open | length) == 0 then null
-          else $open[-1] + {count: ($open | length), excerpt: ($open[-1].body | excerpt)} | del(.author, .body) end'
+        --arg req "${REQUESTER}" --argjson len "${EXCERPT_LEN}" "${OUTSTANDING_REVIEW_JQ}"
 }
 
 # pr_off_board URL: for a PR the sweep doesn't probe, prints
