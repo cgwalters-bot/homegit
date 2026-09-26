@@ -161,6 +161,35 @@ test("the fixture window adds up per day, per model and per task", async () => {
   assert.equal(tasks["agent:r1"].scratch, null);
   assert.ok(tasks["session:sess1"]);
 
+  // What a run footer needs per task: when its messages ran, which
+  // sessions, subagents and Actions runs it had, and its tokens per model.
+  const tok = (o) => ({ input: 0, output: 0, cache_read: 0, cache_write_5m: 0, cache_write_1h: 0, ...o });
+  const RUNS = "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs";
+  const AGENT_RUNS = "https://github.com/cgwalters-bot/cgwalters-devspace-sandbox/actions/runs";
+  const footerCases = [
+    ["PVTI_item1", "2026-09-20T22:00:01.000Z", "2026-09-21T01:00:00.000Z", ["sess1"], ["w1"], [`${RUNS}/101`], {
+      "claude-opus-5-5": [tok({ input: 100, output: 2000, cache_read: 50000, cache_write_5m: 6000, cache_write_1h: 4000 }), worker],
+      "mystery-9": [tok({ input: 500, output: 500 }), 0],
+    }],
+    ["PVTI_item2", "2026-09-20T12:10:00.500Z", "2026-09-20T12:20:00.500Z", [], [], [`${AGENT_RUNS}/201`], {
+      "claude-sonnet-4-5": [tok({ input: 251000, output: 1100 }), agentRun],
+    }],
+    ["agent:r1", "2026-09-21T02:00:00.000Z", "2026-09-21T02:00:00.000Z", ["sess1"], ["r1"], [], {
+      "claude-opus-5-5[1m]": [tok({ output: 1000 }), (1000 * 20) / 1e6],
+    }],
+    ["devspace:big", null, null, [], [], [`${RUNS}/102`], {}],
+  ];
+  for (const [key, first, last, sessions, subagents, runUrls, models] of footerCases) {
+    const t = tasks[key];
+    assert.deepEqual([t.first_message_at, t.last_message_at, t.sessions, t.subagents, t.run_urls],
+      [first, last, sessions, subagents, runUrls], key);
+    assert.deepEqual(Object.keys(t.models).sort(), Object.keys(models).sort(), `${key} models`);
+    for (const [m, [tokens, usd]] of Object.entries(models)) {
+      assert.deepEqual(t.models[m].tokens, tokens, `${key} ${m} tokens`);
+      close(t.models[m].usd, usd, `${key} ${m} usd`);
+    }
+  }
+
   const notes = s.notes.join("\n");
   for (const want of [/group\(s\) rhel10 are not/, /free in public repositories/, /1 run\(s\) had a runner of unknown size/,
     /1k tokens of agent.yml runs came from the mock/, /No price on models.dev for model\(s\) mystery-9/, /1-hour cache writes/]) {
