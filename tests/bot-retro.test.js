@@ -133,7 +133,7 @@ test("the report renders the summary and leaks no token", () => {
     const report = run(["--from-summary", file]);
     assert.doesNotMatch(report, /ghp_[A-Za-z0-9]/);
     assert.match(report, /^# Agent retro 2026-09-21$/m);
-    for (const h of ["Policy violations", "Claims without test evidence", "Stopped and interrupted agents", "Wasted loops and long waits", "Tool errors", "Reviewer findings", "Devspace runs", "Proposed board drafts"]) {
+    for (const h of ["Policy violations", "Claims without test evidence", "Stopped and interrupted agents", "Wasted loops and long waits", "Tool errors", "Reviewer findings", "Devspace runs", "Proposed board items"]) {
       assert.match(report, new RegExp(`^## ${h}$`, "m"), h);
     }
     assert.match(report, /\*\*build or test on the coordinator machine\*\*: 1× in 1 agent\(s\)\./);
@@ -143,7 +143,7 @@ test("the report renders the summary and leaks no token", () => {
 });
 
 test("usage errors exit 2", () => {
-  for (const args of [["--bogus"], ["--since", "yesterdayish"], ["--drafts", "9"], ["--since", "1h", "--until", "2020-01-01"]]) {
+  for (const args of [["--bogus"], ["--since", "yesterdayish"], ["--issues", "9"], ["--since", "1h", "--until", "2020-01-01"]]) {
     assert.throws(() => run([...args, "--no-runs", "--projects", path.join(FIXTURES, "projects")]), (e) => e.status === 2, args.join(" "));
   }
 });

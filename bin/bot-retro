@@ -32,7 +32,7 @@ const POLL_LOOP_MIN = 5;
 // A command template run by at least this many agents is a candidate for tooling.
 const MANUAL_MIN_AGENTS = 5;
 const MANUAL_MAX = 12;
-const DRAFTS_MAX = 5;
+const PROPOSALS_MAX = 5;
 const NARRATE_CMD = process.env.BOT_RETRO_AGENT || "claude -p";
 const BOT_RUNS = process.env.BOT_RETRO_BOT_RUNS || path.join(BIN_DIR, "bot-runs");
 const BOT_BOARD = process.env.BOT_RETRO_BOT_BOARD || path.join(BIN_DIR, "bot-board");
@@ -51,7 +51,7 @@ class Exit extends Error {
 function usage() {
   return `Usage: ${PROG} [--since AGE] [--until DATE] [--projects DIR] [--no-local]
                  [--no-runs] [--run-transcripts] [--json]
-                 [--from-summary FILE] [--narrate] [--gist] [--drafts N]
+                 [--from-summary FILE] [--narrate] [--gist] [--issues N]
 
 Scans agent logs for problems and prints a Markdown retro report (with
 --json, the structured summary it is rendered from). Sources:
@@ -76,8 +76,9 @@ AGE is like 12h, 7d or 2w, or a date (default ${DEFAULT_SINCE}); DATE is a date
   --narrate            add a narrative written by '${NARRATE_CMD}' (BOT_RETRO_AGENT)
                        from the summary, never from the raw logs
   --gist               post the report as a secret gist and print its URL
-  --drafts N           add the top N (at most ${DRAFTS_MAX}) proposals to the board as
-                       drafts with no Status (P1, Org cgwalters-bot)
+  --issues N           open the top N (at most ${PROPOSALS_MAX}) proposals as issues in
+                       the tracker repository, on the board with no Status
+                       (P1, Org cgwalters-bot)
 `;
 }
 
@@ -85,7 +86,7 @@ function parseArgs(argv) {
   const opts = {
     since: DEFAULT_SINCE, until: null, projects: process.env.BOT_RETRO_PROJECTS || DEFAULT_PROJECTS,
     local: true, runs: true, runTranscripts: false, json: false, fromSummary: null,
-    narrate: false, gist: false, drafts: 0,
+    narrate: false, gist: false, issues: 0,
   };
   const value = (i, name) => {
     if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
@@ -108,10 +109,10 @@ function parseArgs(argv) {
       case "--from-summary": opts.fromSummary = value(i++, a); break;
       case "--narrate": opts.narrate = true; break;
       case "--gist": opts.gist = true; break;
-      case "--drafts":
-        opts.drafts = Number(value(i++, a));
-        if (!Number.isInteger(opts.drafts) || opts.drafts < 0 || opts.drafts > DRAFTS_MAX) {
-          throw new Exit(EX_USAGE, `--drafts takes a number from 0 to ${DRAFTS_MAX}`);
+      case "--issues":
+        opts.issues = Number(value(i++, a));
+        if (!Number.isInteger(opts.issues) || opts.issues < 0 || opts.issues > PROPOSALS_MAX) {
+          throw new Exit(EX_USAGE, `--issues takes a number from 0 to ${PROPOSALS_MAX}`);
         }
         break;
       default:
@@ -725,13 +726,13 @@ function summarize(opts, window, out) {
     .sort((a, b) => WEIGHT[b.category] * b.agents - WEIGHT[a.category] * a.agents || b.count - a.count);
   const proposals = kinds
     .filter((k) => PROPOSALS[k.kind] && (k.category === "policy" || k.agents >= 2))
-    .slice(0, DRAFTS_MAX)
+    .slice(0, PROPOSALS_MAX)
     .map((k) => ({ kind: k.kind, title: PROPOSALS[k.kind][0], body: `${PROPOSALS[k.kind][1]} Seen ${k.count}× in ${k.agents} agent(s).` }));
   const topFinding = Object.entries(findingCats).sort((a, b) => b[1] - a[1])[0];
-  if (proposals.length < DRAFTS_MAX && topFinding && topFinding[1] >= 3) {
+  if (proposals.length < PROPOSALS_MAX && topFinding && topFinding[1] >= 3) {
     proposals.push({ kind: `review_${topFinding[0]}`, title: `Add ${topFinding[0]} checks to the worker checklist`, body: `Reviewers caught ${topFinding[1]} ${topFinding[0]} findings in this window: the most common kind. A line in the worker preamble or commit-review would move them before review.` });
   }
-  if (proposals.length < DRAFTS_MAX && manual[0] && manual[0].agents >= 2 * MANUAL_MIN_AGENTS) {
+  if (proposals.length < PROPOSALS_MAX && manual[0] && manual[0].agents >= 2 * MANUAL_MIN_AGENTS) {
     proposals.push({ kind: "manual", title: `Tool for the step '${manual[0].template}'`, body: `${manual[0].agents} agents ran '${manual[0].template}' by hand in this window.` });
   }
   const verdicts = { approve: 0, changes: 0, none: 0 };
@@ -838,7 +839,7 @@ function render(summary, narrative) {
     L.push("");
   }
   if (summary.proposals.length) {
-    L.push("## Proposed board drafts", "");
+    L.push("## Proposed board items", "");
     for (const p of summary.proposals) L.push(`- **${p.title}**: ${p.body}`);
     L.push("");
   }
@@ -867,17 +868,19 @@ function postGist(report, day) {
   }
 }
 
-function fileDrafts(proposals, n, gist) {
+function fileIssues(proposals, n, gist) {
   const ids = [];
   for (const p of proposals.slice(0, n)) {
-    const body = `${p.body}\n\nFrom the agent retro${gist ? `: ${gist}` : ""} (bot-retro).`;
+    // The issue is public and the report's gist is secret: the gist URL
+    // goes only in the item's Gist field.
+    const body = `${p.body}\n\nFrom the agent retro (bot-retro).`;
     const board = (args) => execFileSync(BOT_BOARD, args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
     try {
-      const id = board(["draft", p.title, body]);
-      board(["set", id, "--priority", "P1", "--org", "cgwalters-bot"]);
+      const id = board(["issue", "--org", "cgwalters-bot", p.title, body]);
+      board(["set", id, "--priority", "P1", ...(gist ? ["--gist", gist] : [])]);
       ids.push({ id, title: p.title });
     } catch (e) {
-      throw new Exit(EX_ERROR, `cannot add the draft '${p.title}': ${String(e.stderr || e.message).trim()}`);
+      throw new Exit(EX_ERROR, `cannot open the issue '${p.title}': ${String(e.stderr || e.message).trim()}`);
     }
   }
   return ids;
@@ -892,14 +895,14 @@ function main() {
     return;
   }
   const report = render(summary, opts.narrate ? narrate(summary) : null);
-  if (!opts.gist && !opts.drafts) {
+  if (!opts.gist && !opts.issues) {
     process.stdout.write(report);
     return;
   }
   const day = summary.window.until.slice(0, 10);
   const gist = opts.gist ? postGist(report, day) : null;
   if (gist) console.log(gist);
-  for (const d of fileDrafts(summary.proposals, opts.drafts, gist)) console.log(`${d.id} ${d.title}`);
+  for (const d of fileIssues(summary.proposals, opts.issues, gist)) console.log(`${d.id} ${d.title}`);
 }
 
 if (require.main === module) {
