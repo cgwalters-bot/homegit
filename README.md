@@ -124,6 +124,21 @@ forge fork (`branch`, the default), a write-up in a secret gist (`analysis`), a
 draft PR straight upstream (`pr`, set only by a human), or nothing
 (`manual`). In the morning, Draft items link to what's ready for review.
 
+`bot-tmt-number` hands out bootc's tmt test numbers (the `# number: N`
+header that becomes plan-N and test-N), which concurrent bot branches
+used to collide on. The next free number is one past the highest taken
+on main, in the added lines of every open PR upstream and on the forge
+fork (read with conditional REST requests, each PR rescanned only when
+its head moves), and in the reservations workers make with `--reserve
+BRANCH` before they open a PR. Those live in the `tmt-numbers` board
+state item rather than in a committed file: a reservation has to be
+visible to the other workers within seconds, and landing a homegit PR
+takes minutes of CI, while a strict checked `state-put` (retried when
+another machine wrote meanwhile) plus a local lock gives that at the
+cost of one GraphQL call each. `--gc` releases a reservation once its
+number is on main or in its branch's open PR, or its PR closed;
+`tests/bot-tmt-number.sh` tests it offline against a fake `gh`.
+
 ### Reviewing the bot's work
 
 The bot doesn't open upstream PRs on its own. A finished `branch` item is

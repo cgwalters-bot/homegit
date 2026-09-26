@@ -1,0 +1,591 @@
+#!/usr/bin/env node
+// Pick the next free tmt test number for bootc, so that concurrent
+// branches don't collide on '# number: N'; see --help.
+// Node's standard library only, plus gh and bot-board.
+"use strict";
+
+const { execFile } = require("node:child_process");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { promisify } = require("node:util");
+
+const execFileP = promisify(execFile);
+
+const PROG = path.basename(process.argv[1] || "bot-tmt-number");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const GH = process.env.BOT_TMT_NUMBER_GH || "gh";
+const BOT_BOARD = process.env.BOT_TMT_NUMBER_BOT_BOARD || path.join(BIN_DIR, "bot-board");
+const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "bot-tmt-number");
+// Bump when the parsing changes, to drop the numbers cached per blob and PR.
+const CACHE_VERSION = "v1";
+const DEFAULT_REPO = "bootc-dev/bootc";
+// Where the bot's own branches live: the forge forks hold draft PRs, and
+// both push branches that become upstream PRs.
+const FORGE_ORG = "cgwalters-forge";
+const BOT_OWNERS = [FORGE_ORG, "cgwalters-bot"];
+// The bot-board state item holding the reservations.
+const STATE_NAME = "tmt-numbers";
+// bot-board's exit status for a checked write that lost a race.
+const EX_CONFLICT_BOARD = 3;
+const RESERVE_ATTEMPTS = 4;
+// A reservation whose branch never got a PR is dropped by --gc after this.
+const STALE_DAYS = 14;
+// The tmt tree, relative to the repository root; what xtask's tmt.rs reads.
+const TMT_DIR = "tmt";
+// xtask reads the '# number:' header from a test's first lines.
+const HEADER_LINES = 50;
+const HEADER_RE = /^#\s*number:\s*(\d+)\s*$/;
+// Generated and hand-written fmf names: /plan-NN-name, /test-NN-name, and
+// test files named test-NN-name.
+const FMF_NAME_RE = /(?:^|[/\s])(?:plan|test)-(\d+)-[A-Za-z]/g;
+const FILE_NAME_RE = /^test-(\d+)-/;
+const SCANNED_EXT = /\.(nu|sh|py|fmf)$/;
+const MAX_BLOB = 256 * 1024;
+const PER_PAGE = 100;
+const API_CONCURRENCY = 8;
+const LOCK_WAIT_MS = 60_000;
+const LOCK_STALE_MS = 10 * 60_000;
+
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} [-v|--verbose] [REPO]
+       ${PROG} [-v] --reserve BRANCH [REPO]
+       ${PROG} --release BRANCH [REPO]
+       ${PROG} [-v] --gc [REPO]
+       ${PROG} --list
+
+Prints the next free tmt test number ('# number: N' in a test's header,
+which becomes plan-N and test-N in the generated fmf files) of REPO
+(default ${DEFAULT_REPO}): one more than the highest number taken by
+  - the default branch's ${TMT_DIR}/ tree (headers and fmf names);
+  - the lines added by every open PR in REPO and in its fork
+    ${FORGE_ORG}/NAME (read from the PR files API);
+  - the reservations in the Workstream board state item
+    'bot-state: ${STATE_NAME}'.
+
+  --reserve BRANCH  Record the number for BRANCH (the bot branch that will
+                    add the test) and print it; prints the existing one if
+                    BRANCH already holds a reservation for REPO
+  --release BRANCH  Drop BRANCH's reservations for REPO
+  --gc              Drop reservations whose number is on the default
+                    branch or in the open PR from their branch, whose
+                    branch's PR was closed or merged, or that are older
+                    than ${STALE_DAYS} days without a PR
+  --list            Print every reservation as a Markdown table
+  -v, --verbose     Say on stderr where the taken numbers come from
+
+GitHub reads are REST, cached in ${CACHE_DIR}: conditional
+requests (a 304 costs no quota), and each PR is only rescanned when its
+head moves. Reservations are shared by every machine through
+'bot-board state-put --checked --strict', retried when another machine
+wrote meanwhile, and serialized on this machine by a lock file.
+`;
+}
+
+function parseArgs(argv) {
+  const opts = { mode: "next", repo: DEFAULT_REPO, branch: null, verbose: false };
+  const setMode = (mode, branch) => {
+    if (opts.mode !== "next") throw new Exit(EX_USAGE, `--${opts.mode} and --${mode} don't go together`);
+    opts.mode = mode;
+    opts.branch = branch;
+  };
+  let repoSet = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    const value = () => {
+      if (i + 1 >= argv.length || argv[i + 1].startsWith("-")) throw new Exit(EX_USAGE, `${a} takes a branch name`);
+      return argv[++i];
+    };
+    if (a === "-h" || a === "--help") {
+      process.stdout.write(usage());
+      process.exit(0);
+    } else if (a === "-v" || a === "--verbose") opts.verbose = true;
+    else if (a === "--reserve") setMode("reserve", value());
+    else if (a === "--release") setMode("release", value());
+    else if (a === "--gc") setMode("gc", null);
+    else if (a === "--list") setMode("list", null);
+    else if (a.startsWith("-")) throw new Exit(EX_USAGE, `unknown option ${a} (see --help)`);
+    else if (!repoSet && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(a)) {
+      opts.repo = a;
+      repoSet = true;
+    } else throw new Exit(EX_USAGE, `unexpected argument '${a}'; REPO is OWNER/NAME (see --help)`);
+  }
+  return opts;
+}
+
+// --- Parsing ---------------------------------------------------------------
+
+// numbersInText(TEXT, IS_FMF): the numbers a file's content takes.
+function numbersInText(text, isFmf) {
+  const found = new Set();
+  const lines = text.split("\n");
+  for (const line of lines.slice(0, HEADER_LINES)) {
+    const m = HEADER_RE.exec(line.trim());
+    if (m) found.add(Number(m[1]));
+  }
+  if (isFmf) for (const m of text.matchAll(FMF_NAME_RE)) found.add(Number(m[1]));
+  return found;
+}
+
+function numbersInName(file) {
+  const m = FILE_NAME_RE.exec(path.posix.basename(file));
+  return m ? [Number(m[1])] : [];
+}
+
+// numbersInPatch(PATCH, FILE): the numbers a PR's added lines take. A
+// header added far down a new file is still a header, so every added line
+// counts, not only the first ones.
+function numbersInPatch(patch, file) {
+  const added = patch
+    .split("\n")
+    .filter((l) => l.startsWith("+") && !l.startsWith("+++"))
+    .map((l) => l.slice(1));
+  const found = new Set();
+  for (const line of added) {
+    const m = HEADER_RE.exec(line.trim());
+    if (m) found.add(Number(m[1]));
+  }
+  if (file.endsWith(".fmf")) for (const n of numbersInText(added.join("\n"), true)) found.add(n);
+  return found;
+}
+
+// --- GitHub ----------------------------------------------------------------
+
+function cachePath(kind, key) {
+  const name = crypto.createHash("sha256").update(key).digest("hex").slice(0, 32);
+  return path.join(CACHE_DIR, CACHE_VERSION, kind, `${name}.json`);
+}
+
+function readJson(file, fallback) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    if (e.code === "ENOENT") return fallback;
+    process.stderr.write(`${PROG}: warning: ignoring unreadable cache ${file}: ${e.message}\n`);
+    return fallback;
+  }
+}
+
+function writeJson(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, JSON.stringify(value));
+  fs.renameSync(tmp, file);
+}
+
+// splitResponse(RAW): the status, headers and body of 'gh api -i' output.
+function splitResponse(raw) {
+  const text = raw.replace(/\r/g, "");
+  const end = text.indexOf("\n\n");
+  const head = end < 0 ? text : text.slice(0, end);
+  const body = end < 0 ? "" : text.slice(end + 2);
+  const [statusLine, ...headerLines] = head.split("\n");
+  const m = /^HTTP\/[\d.]+ (\d{3})/.exec(statusLine);
+  const headers = {};
+  for (const l of headerLines) {
+    const i = l.indexOf(":");
+    if (i > 0) headers[l.slice(0, i).trim().toLowerCase()] = l.slice(i + 1).trim();
+  }
+  return { status: m ? Number(m[1]) : null, headers, body };
+}
+
+// ghGet(ENDPOINT): the JSON of a REST GET, revalidated with its cached
+// ETag, so that an unchanged answer costs no quota.
+async function ghGet(endpoint) {
+  const file = cachePath("http", endpoint);
+  const cached = readJson(file, null);
+  const args = ["api", "-i", endpoint];
+  if (cached && cached.etag) args.push("-H", `If-None-Match: ${cached.etag}`);
+  let stdout;
+  let stderr = "";
+  try {
+    ({ stdout } = await execFileP(GH, args, { maxBuffer: 256 << 20 }));
+  } catch (e) {
+    // gh exits 1 on any non-2xx status, 304 included.
+    if (typeof e.stdout !== "string") throw new Exit(EX_ERROR, `running ${GH} failed: ${e.message}`);
+    stdout = e.stdout;
+    stderr = (e.stderr || "").trim();
+  }
+  const res = splitResponse(stdout);
+  if (res.status === 304 && cached) return cached.body;
+  if (res.status !== 200) {
+    throw new Exit(EX_ERROR, `GET ${endpoint} failed (HTTP ${res.status ?? "?"})${stderr ? `: ${stderr}` : ""}`);
+  }
+  let body;
+  try {
+    body = JSON.parse(res.body);
+  } catch (e) {
+    throw new Exit(EX_ERROR, `GET ${endpoint}: cannot parse the answer: ${e.message}`);
+  }
+  if (res.headers.etag) writeJson(file, { etag: res.headers.etag, body });
+  return body;
+}
+
+async function ghPages(endpoint) {
+  const sep = endpoint.includes("?") ? "&" : "?";
+  const all = [];
+  for (let page = 1; ; page++) {
+    const items = await ghGet(`${endpoint}${sep}per_page=${PER_PAGE}&page=${page}`);
+    if (!Array.isArray(items)) throw new Exit(EX_ERROR, `GET ${endpoint}: expected a list`);
+    all.push(...items);
+    if (items.length < PER_PAGE) return all;
+  }
+}
+
+// mapLimit(ITEMS, FN): FN over ITEMS, API_CONCURRENCY at a time.
+async function mapLimit(items, fn) {
+  const out = new Array(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(API_CONCURRENCY, items.length) }, worker));
+  return out;
+}
+
+// blobNumbers(REPO, SHA, FILE): the numbers in a blob, cached forever since
+// a blob never changes.
+async function blobNumbers(repo, sha, file) {
+  const cacheFile = cachePath("blob", sha);
+  const cached = readJson(cacheFile, null);
+  if (cached) return cached;
+  const blob = await ghGet(`repos/${repo}/git/blobs/${sha}`);
+  const text = Buffer.from(blob.content || "", blob.encoding === "base64" ? "base64" : "utf8").toString("utf8");
+  const nums = [...numbersInText(text, file.endsWith(".fmf"))];
+  writeJson(cacheFile, nums);
+  return nums;
+}
+
+// scanMain(REPO): Map number -> [files] on the default branch.
+async function scanMain(repo) {
+  const tree = await ghGet(`repos/${repo}/git/trees/HEAD:${TMT_DIR}?recursive=1`);
+  if (tree.truncated) throw new Exit(EX_ERROR, `the ${TMT_DIR}/ tree of ${repo} is too big to list in one call`);
+  const blobs = tree.tree.filter((e) => e.type === "blob" && SCANNED_EXT.test(e.path) && (e.size ?? 0) <= MAX_BLOB);
+  const taken = new Map();
+  const add = (n, where) => taken.set(n, [...(taken.get(n) || []), where]);
+  await mapLimit(blobs, async (e) => {
+    const where = `${TMT_DIR}/${e.path}`;
+    for (const n of numbersInName(e.path)) add(n, where);
+    for (const n of await blobNumbers(repo, e.sha, e.path)) add(n, where);
+  });
+  return taken;
+}
+
+// prNumbers(REPO, PR): the numbers PR adds, rescanned only when its head
+// moved.
+async function prNumbers(repo, pr) {
+  const cacheFile = cachePath("pr", `${repo}#${pr.number}`);
+  const cached = readJson(cacheFile, null);
+  if (cached && cached.sha === pr.head.sha) return cached.numbers;
+  const files = await ghPages(`repos/${repo}/pulls/${pr.number}/files`);
+  const found = new Set();
+  for (const f of files) {
+    if (!f.filename.startsWith(`${TMT_DIR}/`) || f.status === "removed") continue;
+    for (const n of numbersInName(f.filename)) found.add(n);
+    if (typeof f.patch === "string") {
+      for (const n of numbersInPatch(f.patch, f.filename)) found.add(n);
+    } else if (SCANNED_EXT.test(f.filename) && f.sha) {
+      // No patch for a large diff: read the whole new file.
+      for (const n of await blobNumbers(repo, f.sha, f.filename)) found.add(n);
+    }
+  }
+  const numbers = [...found].sort((a, b) => a - b);
+  writeJson(cacheFile, { sha: pr.head.sha, numbers });
+  return numbers;
+}
+
+// scanPrs(REPOS): [{repo, number, url, branch, owner, numbers}] of the open PRs.
+async function scanPrs(repos) {
+  const prs = [];
+  for (const repo of repos) {
+    for (const pr of await ghPages(`repos/${repo}/pulls?state=open`)) prs.push({ repo, pr });
+  }
+  return mapLimit(prs, async ({ repo, pr }) => ({
+    repo,
+    number: pr.number,
+    url: pr.html_url,
+    branch: pr.head.ref,
+    owner: pr.head.repo ? pr.head.repo.owner.login : null,
+    numbers: await prNumbers(repo, pr),
+  }));
+}
+
+function forkOf(repo) {
+  return `${FORGE_ORG}/${repo.split("/")[1]}`;
+}
+
+async function scan(repo) {
+  const repos = [repo];
+  if (forkOf(repo) !== repo) repos.push(forkOf(repo));
+  const [main, prs] = await Promise.all([scanMain(repo), scanPrs(repos)]);
+  return { main, prs };
+}
+
+// --- Reservations ----------------------------------------------------------
+
+async function board(args) {
+  try {
+    const { stdout } = await execFileP(BOT_BOARD, args, { maxBuffer: 16 << 20 });
+    return { status: 0, stdout };
+  } catch (e) {
+    if (typeof e.code !== "number") throw new Exit(EX_ERROR, `running ${BOT_BOARD} failed: ${e.message}`);
+    return { status: e.code, stdout: e.stdout || "", stderr: (e.stderr || "").trim() };
+  }
+}
+
+// readReservations(TRACK): the state {REPO: {NUMBER: {branch, host, reserved_at}}}.
+async function readReservations(track) {
+  const r = await board(["state-get", ...(track ? ["--track"] : []), STATE_NAME]);
+  if (r.status !== 0) throw new Exit(EX_ERROR, `reading the reservations (bot-board state-get ${STATE_NAME}) failed: ${r.stderr}`);
+  try {
+    return JSON.parse(r.stdout);
+  } catch (e) {
+    throw new Exit(EX_ERROR, `bot-board state-get ${STATE_NAME} printed no JSON: ${e.message}`);
+  }
+}
+
+// writeReservations(STATE): true if written, false if another machine
+// wrote since the tracked read.
+async function writeReservations(state) {
+  const r = await board(["state-put", "--checked", "--strict", STATE_NAME, JSON.stringify(state)]);
+  if (r.status === 0) return true;
+  if (r.status === EX_CONFLICT_BOARD) return false;
+  throw new Exit(EX_ERROR, `writing the reservations (bot-board state-put ${STATE_NAME}) failed: ${r.stderr}`);
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+// withLock(FN): FN while holding this machine's lock on the reservations,
+// since bot-board's tracked reads must not overlap on one machine.
+async function withLock(fn) {
+  const lock = path.join(CACHE_DIR, "reservations.lock");
+  fs.mkdirSync(CACHE_DIR, { recursive: true });
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  for (;;) {
+    try {
+      fs.writeFileSync(lock, `${process.pid}\n`, { flag: "wx" });
+      break;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw new Exit(EX_ERROR, `cannot create ${lock}: ${e.message}`);
+      let stale = false;
+      try {
+        const pid = Number(fs.readFileSync(lock, "utf8").trim());
+        stale = !pid || !pidAlive(pid) || Date.now() - fs.statSync(lock).mtimeMs > LOCK_STALE_MS;
+      } catch {
+        continue; // Released meanwhile.
+      }
+      if (stale) {
+        fs.rmSync(lock, { force: true });
+        continue;
+      }
+      if (Date.now() > deadline) throw new Exit(EX_ERROR, `timed out waiting for ${lock}; remove it if its process is gone`);
+      await sleep(200);
+    }
+  }
+  try {
+    return await fn();
+  } finally {
+    fs.rmSync(lock, { force: true });
+  }
+}
+
+// updateReservations(REPO, FN): runs FN(entries of REPO) on a fresh tracked
+// read and writes the result, retrying when another machine won the race.
+// FN changes the entries in place and returns what to report.
+async function updateReservations(repo, fn) {
+  return withLock(async () => {
+    for (let attempt = 1; attempt <= RESERVE_ATTEMPTS; attempt++) {
+      const state = await readReservations(true);
+      const entries = { ...(state[repo] || {}) };
+      const before = JSON.stringify(entries);
+      const result = await fn(entries);
+      if (JSON.stringify(entries) === before) return result;
+      if (Object.keys(entries).length) state[repo] = entries;
+      else delete state[repo];
+      if (await writeReservations(state)) return result;
+      process.stderr.write(`${PROG}: another machine changed the reservations meanwhile; retrying\n`);
+    }
+    throw new Exit(EX_ERROR, `gave up after ${RESERVE_ATTEMPTS} conflicting writes of the reservations`);
+  });
+}
+
+// --- Commands --------------------------------------------------------------
+
+// nextFree(SCAN, ENTRIES): one more than the highest number taken.
+function nextFree({ main, prs }, entries) {
+  const all = [...main.keys(), ...prs.flatMap((p) => p.numbers), ...Object.keys(entries).map(Number)];
+  return all.length ? Math.max(...all) + 1 : 1;
+}
+
+function describe({ main, prs }, entries) {
+  const out = [];
+  const mainMax = main.size ? Math.max(...main.keys()) : null;
+  out.push(`default branch: highest ${mainMax ?? "none"}${mainMax ? ` (${main.get(mainMax).join(", ")})` : ""}`);
+  for (const p of prs.filter((p) => p.numbers.length).sort((a, b) => Math.max(...a.numbers) - Math.max(...b.numbers))) {
+    out.push(`open PR ${p.url}: ${p.numbers.join(", ")}`);
+  }
+  for (const [n, e] of Object.entries(entries)) out.push(`reserved: ${n} for ${e.branch} (${e.host}, ${e.reserved_at})`);
+  return out.map((l) => `${PROG}: ${l}\n`).join("");
+}
+
+function reservedFor(entries, branch) {
+  const hit = Object.entries(entries).find(([, e]) => e.branch === branch);
+  return hit ? Number(hit[0]) : null;
+}
+
+// hostId(): this machine's name, as bot-work names it in its lease: the
+// hostname can be as generic as 'toolbx', so the machine id tells them apart.
+function hostId() {
+  let id = "";
+  try {
+    id = fs.readFileSync("/etc/machine-id", "utf8").trim().slice(0, 8);
+  } catch {
+    // No machine id: the hostname alone.
+  }
+  return id ? `${os.hostname()}/${id}` : os.hostname();
+}
+
+function now() {
+  return process.env.BOT_TMT_NUMBER_NOW || new Date().toISOString();
+}
+
+async function cmdReserve(opts) {
+  const scanned = await scan(opts.repo);
+  return updateReservations(opts.repo, async (entries) => {
+    const existing = reservedFor(entries, opts.branch);
+    if (existing !== null) {
+      process.stderr.write(`${PROG}: ${opts.branch} already holds ${existing}\n`);
+      return existing;
+    }
+    const n = nextFree(scanned, entries);
+    if (opts.verbose) process.stderr.write(describe(scanned, entries));
+    entries[n] = { branch: opts.branch, host: hostId(), reserved_at: now() };
+    return n;
+  });
+}
+
+async function cmdRelease(opts) {
+  const released = await updateReservations(opts.repo, async (entries) => {
+    const nums = Object.keys(entries).filter((n) => entries[n].branch === opts.branch);
+    for (const n of nums) delete entries[n];
+    return nums;
+  });
+  if (!released.length) throw new Exit(EX_ERROR, `${opts.branch} holds no reservation for ${opts.repo}`);
+  process.stdout.write(released.map((n) => `released ${n} (${opts.branch})\n`).join(""));
+}
+
+// closedPr(REPOS, BRANCH, SINCE): the URL of a PR from the bot's BRANCH
+// closed or merged after SINCE (a branch name reused later doesn't count),
+// or null.
+async function closedPr(repos, branch, since) {
+  for (const repo of repos) {
+    for (const owner of BOT_OWNERS) {
+      const q = new URLSearchParams({ state: "closed", head: `${owner}:${branch}` });
+      const prs = await ghGet(`repos/${repo}/pulls?${q}`);
+      const hit = prs.find((p) => !(Date.parse(p.closed_at) < Date.parse(since)));
+      if (hit) return hit.html_url;
+    }
+  }
+  return null;
+}
+
+// gcReason(SCANNED, REPOS, N, ENTRY): why the reservation of N can go, or null.
+async function gcReason(scanned, repos, n, entry) {
+  if (scanned.main.has(n)) return `on the default branch (${scanned.main.get(n).join(", ")})`;
+  const open = scanned.prs.filter((p) => p.branch === entry.branch && BOT_OWNERS.includes(p.owner));
+  const carrying = open.find((p) => p.numbers.includes(n));
+  if (carrying) return `in its open PR ${carrying.url}`;
+  if (open.length) return null;
+  const closed = await closedPr(repos, entry.branch, entry.reserved_at);
+  if (closed) return `its PR ${closed} is closed`;
+  const ageDays = (Date.parse(now()) - Date.parse(entry.reserved_at)) / 86_400_000;
+  if (!(ageDays <= STALE_DAYS)) return `no PR after ${STALE_DAYS} days`;
+  return null;
+}
+
+async function cmdGc(opts) {
+  const scanned = await scan(opts.repo);
+  const repos = [opts.repo, forkOf(opts.repo)];
+  const released = await updateReservations(opts.repo, async (entries) => {
+    const out = [];
+    for (const [n, entry] of Object.entries(entries)) {
+      const why = await gcReason(scanned, repos, Number(n), entry);
+      if (why) {
+        delete entries[n];
+        out.push(`released ${n} (${entry.branch}): ${why}\n`);
+      }
+    }
+    return out;
+  });
+  process.stdout.write(released.join(""));
+  if (opts.verbose) process.stderr.write(`${PROG}: ${released.length} released\n`);
+}
+
+function renderList(state) {
+  const rows = [];
+  for (const [repo, entries] of Object.entries(state).sort()) {
+    for (const [n, e] of Object.entries(entries).sort((a, b) => a[0] - b[0])) {
+      rows.push(`| ${n} | ${repo} | ${e.branch} | ${e.host} | ${e.reserved_at} |`);
+    }
+  }
+  if (!rows.length) return "No reservations.\n";
+  return ["| number | repo | branch | host | reserved at |", "|---|---|---|---|---|", ...rows, ""].join("\n");
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  switch (opts.mode) {
+    case "next": {
+      const [scanned, state] = await Promise.all([scan(opts.repo), readReservations(false)]);
+      const entries = state[opts.repo] || {};
+      if (opts.verbose) process.stderr.write(describe(scanned, entries));
+      process.stdout.write(`${nextFree(scanned, entries)}\n`);
+      break;
+    }
+    case "reserve":
+      process.stdout.write(`${await cmdReserve(opts)}\n`);
+      break;
+    case "release":
+      await cmdRelease(opts);
+      break;
+    case "gc":
+      await cmdGc(opts);
+      break;
+    case "list":
+      process.stdout.write(renderList(await readReservations(false)));
+      break;
+  }
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  });
+} else {
+  module.exports = { numbersInText, numbersInPatch, numbersInName, splitResponse, nextFree, parseArgs };
+}

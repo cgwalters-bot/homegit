@@ -1,0 +1,31 @@
+#!/usr/bin/env node
+// A stand-in for 'gh api -i [-H "If-None-Match: ETAG"] ENDPOINT' in
+// tests/bot-tmt-number.test.js: answers from $FAKE_GH_DIR/routes.json
+// ({ENDPOINT: {etag, body}}), with a 304 when the ETag matches, like gh
+// exiting 1 on any non-2xx status. Logs "ENDPOINT[ (conditional)]" per
+// call to $FAKE_GH_DIR/calls.
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const dir = process.env.FAKE_GH_DIR;
+const args = process.argv.slice(2);
+if (args[0] !== "api" || args[1] !== "-i" || !args[2]) {
+  process.stderr.write(`fake gh: unexpected arguments ${args.join(" ")}\n`);
+  process.exit(2);
+}
+const endpoint = args[2];
+const inm = args[3] === "-H" && /^If-None-Match: (.*)$/.exec(args[4] || "");
+fs.appendFileSync(path.join(dir, "calls"), `${endpoint}${inm ? " (conditional)" : ""}\n`);
+const routes = JSON.parse(fs.readFileSync(path.join(dir, "routes.json"), "utf8"));
+const route = routes[endpoint];
+if (!route) {
+  process.stdout.write('HTTP/2.0 404 Not Found\r\nContent-Type: application/json\r\n\r\n{"message":"Not Found"}');
+  process.stderr.write("gh: Not Found (HTTP 404)\n");
+  process.exit(1);
+}
+if (inm && inm[1] === route.etag) {
+  process.stdout.write(`HTTP/2.0 304 Not Modified\r\nEtag: ${route.etag}\r\n\r\n`);
+  process.stderr.write("gh: HTTP 304\n");
+  process.exit(1);
+}
+process.stdout.write(`HTTP/2.0 200 OK\r\nEtag: ${route.etag}\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(route.body)}`);
