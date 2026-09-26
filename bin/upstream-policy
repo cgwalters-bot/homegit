@@ -38,6 +38,18 @@ const VERDICTS = {
   "no-go": "the bot does not contribute here",
 };
 const REQUIRED_KEYS = ["verdict", "ai-trailer", "dco", "sources", "checked"];
+// The optional 'rebase:' of a record: only ever a restriction, like a
+// maintainer asking the bot not to rebase PRs that don't conflict.
+const REBASE_CONFLICTS_ONLY = "conflicts-only";
+// Where 'rebase' caches merge queue detection, per repository and branch,
+// and for how long: a repository rarely adds or drops one.
+const CACHE_FILE = path.join(
+  process.env.XDG_CACHE_HOME || path.join(require("node:os").homedir(), ".cache"),
+  "upstream-policy",
+  "merge-queue.json",
+);
+const CACHE_TTL_MS = 24 * 3600 * 1000;
+const WORKFLOWS_DIR = ".github/workflows";
 const SOURCE_KEYS = ["repo", "path", "sha"];
 const SHA_RE = /^[0-9a-f]{40}$/;
 // OWNER/REPO, neither of them all dots ('..' would leave the records).
@@ -86,6 +98,7 @@ Each record starts with a front matter:
       path: CONTRIBUTING.md
       sha: the blob (or tree) id read, on the default branch
   checked: DATE by WHO
+  rebase: ${REBASE_CONFLICTS_ONLY} (optional; see the rebase command)
   ---
 
 and its body quotes what the verdict rests on, with a one-paragraph
@@ -111,6 +124,17 @@ Commands:
         copilot-instructions, PULL_REQUEST_TEMPLATE, DCO, or with AI or
         LLM as a word in their name. A record may list more sources
         (anywhere in those repositories); it must list all of these.
+  rebase OWNER/REPO BRANCH
+        Print whether the bot may rebase its PRs onto BRANCH that don't
+        conflict with it: 'any', or '${REBASE_CONFLICTS_ONLY}: WHY' when
+        the record says 'rebase: ${REBASE_CONFLICTS_ONLY}' (a maintainer
+        asked; read from the checkout, as it only restricts) or the
+        repository uses a merge queue, where such a rebase only reruns
+        CI the maintainers then have to approve again. A merge queue is
+        a merge_queue rule in BRANCH's branch rules, or a merge_group
+        trigger in a workflow in ${WORKFLOWS_DIR} there (what shows when
+        the rules don't, to outsiders). Detection is cached for
+        ${CACHE_TTL_MS / 3600000} hours in ${CACHE_FILE}.
 
 A record counts only when it is committed and is what ${REMOTE}/${REMOTE_BRANCH}
 has (check fetches it first), as a regular file (no symlinks). Its
@@ -286,6 +310,9 @@ function parseRecord(text, file) {
     throw bad(0, `unknown verdict '${fields.verdict}' (expected one of ${Object.keys(VERDICTS).join(", ")})`);
   }
   if (!/^(yes|no)\b/.test(fields.dco)) throw bad(0, "'dco' starts with yes or no");
+  if ("rebase" in fields && fields.rebase !== REBASE_CONFLICTS_ONLY) {
+    throw bad(0, `'rebase' can only be '${REBASE_CONFLICTS_ONLY}' (leave it out otherwise)`);
+  }
   for (const s of fields.sources) {
     if (!s.path) throw bad(s.line, "a source has no 'path'");
     if (!SHA_RE.test(s.sha || "")) throw bad(s.line, `the source ${s.path} has no 40-hex 'sha'`);
@@ -585,17 +612,109 @@ function check(requested, allowHumanText) {
   return verdict;
 }
 
+// recordRebase(name): the record's 'rebase:' for NAME, or null without
+// a record. Read from the checkout, not through the gate: it only ever
+// restricts.
+function recordRebase(name) {
+  const file = path.join(POLICY_DIR, `${name}.md`);
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") return null;
+    throw new Exit(EX_ERROR, `cannot read ${file}: ${e.message}`);
+  }
+  const rebase = parseRecord(text, file).rebase;
+  return rebase ? { rebase, file } : null;
+}
+
+// hasMergeGroupTrigger(text): whether the workflow TEXT runs on
+// merge_group, as a key under 'on:', an item of its list, or on the 'on:'
+// line itself. Comments are dropped, and mentions elsewhere (an 'if:' on
+// github.event_name, say) don't count.
+function hasMergeGroupTrigger(text) {
+  return text.split(/\r?\n/).some((raw) => {
+    const line = raw.replace(/(^|\s)#.*$/, "");
+    return (
+      /^\s+merge_group\s*:/.test(line) ||
+      /^\s+-\s*merge_group\s*$/.test(line) ||
+      /^["']?on["']?\s*:.*[\s[,{]merge_group\s*($|[\],}:])/.test(line)
+    );
+  });
+}
+
+// detectMergeQueue(name, branch): why NAME uses a merge queue for
+// BRANCH, or null.
+function detectMergeQueue(name, branch) {
+  const rules = gh([`repos/${name}/rules/branches/${encodeURIComponent(branch)}`], true) || [];
+  if (Array.isArray(rules) && rules.some((r) => r && r.type === "merge_queue")) {
+    return `a merge queue (a merge_queue rule on ${branch})`;
+  }
+  const workflows = new Repo(name, branch).entries(WORKFLOWS_DIR);
+  for (const [entry, { sha, type }] of [...workflows].sort(([a], [b]) => a.localeCompare(b))) {
+    if (type !== "blob" || !/\.ya?ml$/.test(entry)) continue;
+    const blob = gh([`repos/${name}/git/blobs/${sha}`]);
+    if (!blob || typeof blob.content !== "string") {
+      throw new Exit(EX_ERROR, `GitHub gave no content for ${WORKFLOWS_DIR}/${entry} in ${name}`);
+    }
+    const text = Buffer.from(blob.content, blob.encoding === "base64" ? "base64" : "utf8").toString("utf8");
+    if (hasMergeGroupTrigger(text)) return `a merge queue (${WORKFLOWS_DIR}/${entry} on ${branch} runs on merge_group)`;
+  }
+  return null;
+}
+
+function readCache() {
+  try {
+    const cache = JSON.parse(fs.readFileSync(CACHE_FILE, "utf8"));
+    return cache && typeof cache === "object" && !Array.isArray(cache) ? cache : {};
+  } catch {
+    return {};
+  }
+}
+
+// A lost cache only costs a few calls, so failing to write one is fine.
+function writeCache(cache) {
+  try {
+    fs.mkdirSync(path.dirname(CACHE_FILE), { recursive: true });
+    const tmp = `${CACHE_FILE}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify(cache)}\n`);
+    fs.renameSync(tmp, CACHE_FILE);
+  } catch (e) {
+    console.error(`warning: cannot write ${CACHE_FILE}: ${e.message}`);
+  }
+}
+
+// rebaseMode(name, branch): 'any', or 'conflicts-only: WHY'.
+function rebaseMode(name, branch) {
+  const record = recordRebase(name);
+  if (record) return `${record.rebase}: the policy record says 'rebase: ${record.rebase}' (${record.file})`;
+  const now = Date.now();
+  const fresh = (e) => e && typeof e.at === "number" && e.at <= now && now - e.at < CACHE_TTL_MS;
+  const key = `${name.toLowerCase()}@${branch}`;
+  const cache = readCache();
+  if (!fresh(cache[key])) {
+    for (const k of Object.keys(cache)) if (!fresh(cache[k])) delete cache[k];
+    cache[key] = { at: now, why: detectMergeQueue(name, branch) };
+    writeCache(cache);
+  }
+  const why = cache[key].why;
+  return why ? `${REBASE_CONFLICTS_ONLY}: ${why}` : "any";
+}
+
 function main(argv) {
   if (argv.includes("-h") || argv.includes("--help")) {
     process.stdout.write(usage());
     return;
   }
   const [command, name, ...rest] = argv;
-  if (!command || !name || !REPO_RE.test(name)) throw new Exit(EX_USAGE, `usage: ${PROG} check|scan OWNER/REPO (see --help)`);
+  if (!command || !name || !REPO_RE.test(name)) throw new Exit(EX_USAGE, `usage: ${PROG} check|scan|rebase OWNER/REPO (see --help)`);
   if (command === "check") {
     const allow = rest.length === 1 && rest[0] === "--allow-human-text";
     if (rest.length > (allow ? 1 : 0)) throw new Exit(EX_USAGE, `unknown arguments for check: ${rest.join(" ")}`);
     console.log(check(name, allow));
+  } else if (command === "rebase") {
+    if (rest.length !== 1 || !rest[0] || rest[0].startsWith("-")) throw new Exit(EX_USAGE, `usage: ${PROG} rebase OWNER/REPO BRANCH`);
+    console.log(rebaseMode(name, rest[0]));
   } else if (command === "scan") {
     if (rest.length) throw new Exit(EX_USAGE, `unknown arguments for scan: ${rest.join(" ")}`);
     const found = scan(name);

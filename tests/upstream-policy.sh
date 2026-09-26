@@ -15,7 +15,7 @@ readonly EX_ERROR=1 EX_MISSING=3 EX_STALE=4 EX_HUMAN_TEXT=5 EX_REFUSED=6 EX_INVA
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/upstream-policy-test.XXXXXX")
 readonly WORK
 trap 'rm -rf "${WORK}"' EXIT
-export FAKE_GH=${WORK}/gh UPSTREAM_POLICY_DIR=${WORK}/homegit/upstream-policy XDG_STATE_HOME=${WORK}/state
+export FAKE_GH=${WORK}/gh UPSTREAM_POLICY_DIR=${WORK}/homegit/upstream-policy XDG_STATE_HOME=${WORK}/state XDG_CACHE_HOME=${WORK}/cache
 export GIT_CONFIG_GLOBAL=${WORK}/gitconfig GIT_CONFIG_NOSYSTEM=1
 # Fixed commit dates, so that runs don't depend on how fast they are:
 # commits with the same parent, tree and message are then the same commit.
@@ -486,6 +486,75 @@ proj_tree "doc tree $(sha 40)"
 tree acme/proj "$(sha 40)" "AI-POLICY.md blob $(sha 41)"
 run "stale: new in doc/" "${EX_STALE}" 'acme/proj:doc/AI-POLICY.md is not in the record' check acme/proj
 proj_tree
+
+# --- rebase: conflicts-only on a merge queue, or when the record says so ---
+# workflows REPO ID FILE CONTENT: REPO's main has .github/workflows/FILE
+# with CONTENT; ID keeps the tree and blob ids apart between repositories.
+workflows() {
+    tree "$1" main ".github tree $(sha "$2"1)"
+    tree "$1" "$(sha "$2"1)" "workflows tree $(sha "$2"2)"
+    tree "$1" "$(sha "$2"2)" "README.md blob $(sha "$2"3)" "$3 blob $(sha "$2"4)"
+    jq -n --arg c "$(printf '%s' "$4" | base64 -w0)" '{content: $c, encoding: "base64"}' |
+        fixture "repos/$1/git/blobs/$(sha "$2"4)"
+}
+# Mentions of merge_group that are no trigger.
+readonly PLAIN_WORKFLOW="on:  # merge_group, some day
+  pull_request:
+#  merge_group:
+jobs:
+  test:
+    if: github.event_name == 'merge_group'
+    steps:
+      - run: echo merge_group"
+echo '[{"type": "required_status_checks"}]' | fixture repos/acme/plain/rules/branches/main
+workflows acme/plain 50 ci.yml "${PLAIN_WORKFLOW}"
+echo '[{"type": "merge_queue", "parameters": {}}]' | fixture repos/acme/ruled/rules/branches/main
+workflows acme/ruled 51 ci.yml "${PLAIN_WORKFLOW}"
+# No rules fixture (a 404) for the rest, as GitHub may show outsiders.
+workflows acme/grouped 52 tests.yaml "on:
+  pull_request:
+  # for merge queue
+  merge_group:
+    types: [checks_requested]"
+workflows acme/flow 53 ci.yml "on: [pull_request, merge_group]"
+workflows acme/listed 54 ci.yml "on:
+  - push
+  - merge_group"
+while read -r repo pattern; do
+    run "rebase ${repo}" 0 "${pattern}" rebase "${repo}" main
+done <<'EOF'
+acme/plain ^any$
+acme/ruled ^conflicts-only: a merge queue \(a merge_queue rule on main\)$
+acme/grouped ^conflicts-only: a merge queue \(\.github/workflows/tests\.yaml on main runs on merge_group\)$
+acme/flow ^conflicts-only: .*/ci\.yml on main runs on merge_group
+acme/listed ^conflicts-only: .*/ci\.yml on main runs on merge_group
+EOF
+# Cached, without calls, until a day has passed.
+workflows acme/grouped 52 tests.yaml "${PLAIN_WORKFLOW}"
+: >"${FAKE_GH}/calls"
+run "rebase: cached" 0 '^conflicts-only: a merge queue' rebase acme/grouped main
+test ! -s "${FAKE_GH}/calls" || fail "rebase: cached, but called: $(cat "${FAKE_GH}/calls")"
+jq '.["acme/grouped@main"].at -= 86400000' "${XDG_CACHE_HOME}/upstream-policy/merge-queue.json" >"${WORK}/cache.json"
+mv "${WORK}/cache.json" "${XDG_CACHE_HOME}/upstream-policy/merge-queue.json"
+run "rebase: expired" 0 '^any$' rebase acme/grouped main
+# GitHub failing fails it, rather than looking like no merge queue.
+echo 'gh: Bad Gateway (HTTP 502)' >"${FAKE_GH}/rest/repos/acme/ruled/rules/branches/main.err"
+rm -r "${XDG_CACHE_HOME}"
+run "rebase: rules 502" "${EX_ERROR}" 'HTTP 502' rebase acme/ruled main
+rm "${FAKE_GH}/rest/repos/acme/ruled/rules/branches/main.err"
+# The record restricts on its own, read from the checkout without a
+# call; the gate takes it, and validates it like the rest.
+record bot-ok
+sed -i 's/^checked:.*/&\nrebase: conflicts-only/' "${RECORD}"
+: >"${FAKE_GH}/calls"
+run "rebase: record" 0 "^conflicts-only: the policy record says 'rebase: conflicts-only' \(${RECORD}\)$" rebase acme/proj main
+test ! -s "${FAKE_GH}/calls" || fail "rebase: record, but called: $(cat "${FAKE_GH}/calls")"
+publish "rebase: conflicts-only"
+run "rebase: record passes check" 0 '^bot-ok$' check acme/proj
+sed -i 's/^rebase: conflicts-only$/rebase: always/' "${RECORD}"
+run "rebase: invalid record" "${EX_INVALID}" "'rebase' can only be 'conflicts-only'" rebase acme/proj main
+git -C "${HOMEGIT}" checkout -q -- .
+run "rebase usage" 2 usage rebase acme/plain
 
 run "usage" 2 usage check not-a-repo
 for bad in ../x acme/.. ./proj acme/...; do
