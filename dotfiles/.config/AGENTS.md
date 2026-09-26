@@ -22,6 +22,10 @@ Commit messages keep following "Commit Messages" below.
 - Never run `find /` - e.g. Rust sources are typically ~/.cargo, etc.
 - Prefer `rg` (which honors e.g. .gitignore by default) over raw `grep`
 
+## Skills
+
+Skills are [Agent Skills](https://agentskills.io) in `~/.agents/skills/<name>/SKILL.md` (and `.agents/skills/` in a project), each starting with YAML frontmatter that has a `name` and a `description` saying when to use it. If your agent doesn't load skills natively, list that directory at session start and read each skill's frontmatter; when a task matches a description, or you are told to load a skill by name, read its `SKILL.md` in full and follow it. A skill may refer to sibling files by paths relative to its own directory.
+
 ## Generating code
 
 Write clean, idiomatic code. Avoid lots of duplicate code; e.g. in unit tests, "data driven" tests can be much more concise and understandable. Ensure robust error handling with informative, user-helpful messages, and proactively handle edge cases. Adhere to established style conventions like `rustfmt`, and use constants for "magic" strings or numbers.
