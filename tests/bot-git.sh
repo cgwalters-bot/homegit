@@ -197,19 +197,25 @@ grep -q 'no commits in @{upstream}..HEAD' <<<"${out}" || fail "empty default ran
 
 # --- rework ---
 # build WORD SPEC...: resets REPO to BASE and commits each SPEC,
-# AUTHOR:COMMITTER:SUBJECT:SIGNED (identity keys; SIGNED is y for
-# cgwalters' sign-off), writing WORD to the file SUBJECT so that an old
-# and a reworked branch have different trees and bodies.
+# AUTHOR:COMMITTER:SUBJECT:SIGNED[:FILE:CONTENT] (identity keys; SIGNED
+# is y for cgwalters' sign-off), writing CONTENT (default WORD, - to
+# delete it) to FILE (default SUBJECT), so that an old and a reworked
+# branch have different trees and bodies unless the spec says otherwise.
 build() {
-    local word=$1 spec a c subj signed msg
+    local word=$1 spec a c subj signed file content msg
     shift
     git -C "${REPO}" reset -q --hard "${BASE}"
     for spec in "$@"; do
-        IFS=: read -r a c subj signed <<<"${spec}"
+        IFS=: read -r a c subj signed file content <<<"${spec}"
+        file=${file:-${subj}} content=${content:-${word}}
         msg="${subj}\n\n${word} body\n\n${AI}"
         test "${signed}" = n || msg+="\n${SOB}"
-        echo "${word}" >"${REPO}/${subj}"
-        git -C "${REPO}" add "${subj}"
+        if test "${content}" = -; then
+            git -C "${REPO}" rm -q "${file}"
+        else
+            echo "${content}" >"${REPO}/${file}"
+            git -C "${REPO}" add "${file}"
+        fi
         commit_as "${a}" "${c}" "${msg}"
     done
 }
@@ -305,6 +311,83 @@ commits reordered|bot:human:a:y bot:human:b:y|bot:bot:b:n bot:bot:a:n|'a' moved 
 a subject twice, old|bot:human:a:y bot:bot:a:n|bot:bot:a:n|'a' is the subject of two commits
 a subject twice, new|bot:human:a:y|bot:bot:a:n bot:bot:a:n|'a' is the subject of two commits
 EOF
+
+# --- rework and check with --pair and --patch-id ---
+# sha_of TIP SUBJECT: the commit of BASE..TIP with SUBJECT.
+sha_of() {
+    git -C "${REPO}" log --format='%H %s' "${BASE}..$1" | awk -v s="$2" '$2 == s { print $1 }'
+}
+
+# NAME|OLD SPECS|NEW SPECS|OPTIONS|EXPECT: 'rework --was OLD OPTIONS' on
+# NEW, both built with build; in OPTIONS, o:SUBJECT and n:SUBJECT name the
+# commit with that subject on OLD and NEW. EXPECT is 'kept N' (then
+# 'check' passes with the same OPTIONS, and fails without them), or a
+# REGEX of the refusal.
+while IFS='|' read -r name olds news opts expect; do
+    test -n "${name}" || continue
+    read -ra ospecs <<<"${olds}"
+    read -ra nspecs <<<"${news}"
+    build old "${ospecs[@]}"
+    OLD=$(git -C "${REPO}" rev-parse HEAD)
+    build new "${nspecs[@]}"
+    NEW=$(git -C "${REPO}" rev-parse HEAD)
+    argv=()
+    for o in ${opts}; do
+        while [[ "${o}" =~ ([on]):([a-z]+) ]]; do
+            tip=${OLD}
+            test "${BASH_REMATCH[1]}" = o || tip=${NEW}
+            o=${o/"${BASH_REMATCH[0]}"/$(sha_of "${tip}" "${BASH_REMATCH[2]}")}
+        done
+        argv+=("${o}")
+    done
+    status=0
+    out=$(cd "${REPO}" && "${BOT_GIT}" rework --was "${OLD}" "${argv[@]}" 2>&1) || status=$?
+    after=$(git -C "${REPO}" rev-parse HEAD)
+    if [[ "${expect}" != kept\ * ]]; then
+        test "${status}" -ne 0 || fail "${name}: not refused: ${out}"
+        grep -qE -- "${expect}" <<<"${out}" || fail "${name}: output lacks '${expect}': ${out}"
+        test "${after}" = "${NEW}" || fail "${name}: HEAD changed anyway"
+        continue
+    fi
+    test "${status}" -eq 0 || { fail "${name}: exit status ${status}: ${out}"; continue; }
+    test "$(grep -c "^kept cgwalters' sign-off on" <<<"${out}")" -eq "${expect#kept }" || fail "${name}: expected ${expect}: ${out}"
+    # The check it says to run, with the same pairs.
+    hint=$(sed -n 's/^check it with the same pairs: bot-git check //p' <<<"${out}")
+    test -n "${hint}" || { fail "${name}: no check hint: ${out}"; continue; }
+    test "$(git -C "${REPO}" rev-parse "HEAD^{tree}")" = "$(git -C "${REPO}" rev-parse "${NEW}^{tree}")" || fail "${name}: tree changed"
+    test "$(git -C "${REPO}" log --format='%cn <%ce>' "${BASE}..HEAD" | grep -cxF "${HUMAN}")" -eq "${expect#kept }" ||
+        fail "${name}: not ${expect#kept } commits by cgwalters"
+    read -ra hint <<<"${hint}"
+    out=$(cd "${REPO}" && "${BOT_GIT}" check "${hint[@]}" 2>&1) || fail "${name}: check: ${out}"
+    test "$(grep -c "^    note: kept cgwalters' sign-off" <<<"${out}")" -eq "${expect#kept }" || fail "${name}: check notes: ${out}"
+    out=$(cd "${REPO}" && "${BOT_GIT}" check --was "${OLD}" "${BASE}..HEAD" 2>&1) && fail "${name}: check passed without the pairs: ${out}"
+    grep -q "is gone from .*pair it with --pair [0-9a-f]*=NEW" <<<"${out}" || fail "${name}: check without the pairs: ${out}"
+done <<EOF
+retitled|bot:human:a:y|bot:bot:c:n|--pair o:a=n:c|kept 1
+retitled, --pair=|bot:human:a:y|bot:bot:c:y|--pair=o:a=n:c|kept 1
+one of two retitled|bot:human:a:y bot:human:b:y|bot:bot:a:n bot:bot:c:n|--pair o:b=n:c|kept 2
+two retitled|bot:human:a:y bot:human:b:y|bot:bot:c:n bot:bot:d:n|--pair o:a=n:c --pair o:b=n:d|kept 2
+without a pair|bot:human:a:y|bot:bot:c:n||'a' of .* is gone from .*pair it with --pair [0-9a-f]*=NEW
+not signed|bot:bot:a:n|bot:bot:c:n|--pair o:a=n:c|not a bot commit that cgwalters signed off and committed
+signed, not committed by him|bot:bot:a:y|bot:bot:c:n|--pair o:a=n:c|not a bot commit that cgwalters signed off and committed
+someone else's signed commit|other:human:a:y|other:bot:c:n|--pair o:a=n:c|not a bot commit that cgwalters signed off and committed
+the new commit is not the bot's|bot:human:a:y|other:bot:c:n|--pair o:a=n:c|'c' of --pair .* is not the bot's commit
+the old subject is still there|bot:human:a:y|bot:bot:a:n bot:bot:c:n|--pair o:a=n:c|ambiguous: 'a' of OLD is still the subject
+the new subject is another old commit's|bot:human:a:y bot:human:b:y|bot:bot:b:n|--pair o:a=n:b|ambiguous: 'b' is the subject of another commit
+paired twice|bot:human:a:y|bot:bot:c:n bot:bot:d:n|--pair o:a=n:c --pair o:a=n:d|already paired
+OLD not on the old branch|bot:human:a:y|bot:bot:c:n|--pair n:c=n:c|OLD of --pair .* is not a commit of
+NEW's subject not on the new branch|bot:human:a:y|bot:bot:c:n|--pair o:a=o:a|no commit of .* has the subject 'a'
+not OLD=NEW|bot:human:a:y|bot:bot:c:n|--pair o:a|--pair takes OLD=NEW
+reordered|bot:human:a:y bot:human:b:y|bot:bot:c:n bot:bot:a:n|--pair o:b=n:c|'a' moved before an earlier commit
+patch-id|bot:human:a:y:f:x|bot:bot:c:n:f:x|--patch-id|kept 1
+patch-id next to a subject pair|bot:human:a:y bot:human:b:y:f:x|bot:bot:a:n bot:bot:c:n:f:x|--patch-id|kept 2
+patch-id of a changed commit|bot:human:a:y:f:x|bot:bot:c:n:f:y|--patch-id|'a' of .* is gone from
+patch-id twice|bot:human:a:y:f:x|bot:bot:c:n:f:x bot:bot:e:n:f:- bot:bot:d:n:f:x|--patch-id|'a' of .* is gone from
+patch-id, not signed|bot:bot:a:n:f:x|bot:bot:c:n:f:x|--patch-id|'a' of .* is gone from
+patch-id, not the bot's|bot:human:a:y:f:x|other:bot:c:n:f:x|--patch-id|'a' of .* is gone from
+EOF
+out=$(cd "${REPO}" && "${BOT_GIT}" check --pair a=b "${BASE}..HEAD" 2>&1) && fail "--pair without --was: check passed"
+grep -q -- '--pair needs the published head' <<<"${out}" || fail "--pair without --was: ${out}"
 
 # The main case end to end: a local fixup squashed into the signed commit
 # with 'bot-git rebase', then rework and check against @{upstream}.
