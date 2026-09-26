@@ -72,8 +72,8 @@ target repository is public and redaction takes care of credentials. The
 tar holds
 `raw.jsonl` (the agent CLI's stream-json output), `sessions/` (the
 agent's session files, subagent transcripts included), `token-usage.jsonl`
-(the inference shim's per-request log), `access.log` (the egress proxy's)
-and `test-logs/` (tails of the agent's test logs). Readers also accept
+(the inference shim's per-request log), `access.log` (the egress proxy's,
+once there is one; egress is open for now) and `test-logs/` (tails of the agent's test logs). Readers also accept
 `transcript.tar.zst.age`, encrypted with `age`, should a run ever need it.
 
 **In the job log**, the condensed lines are printed between
@@ -111,7 +111,7 @@ zero.
 | `failures` | array | `{kind, message}`, `kind` one of `tool_error`, `timeout`, `budget`, `validation`, `agent_exit` |
 | `tests` | array | `{command, exit_code, duration_s}` from `outcome.json` |
 | `files` | array | paths the agent changed, relative to the repository |
-| `egress_denied` | array | `{domain, count}` from the proxy log |
+| `egress_denied` | array | `{domain, count}` from the proxy log (empty while egress is open) |
 | `outcome` | object | `status` (`Draft`, `Needs human` or `null`), `url` (the forge PR or write-up, once applied, else `null`) and `why` |
 | `redactions` | integer | how many strings the redaction pass replaced |
 

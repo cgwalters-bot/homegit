@@ -9,10 +9,12 @@ Devspaces are ephemeral GitHub Actions runners from
 `bootc-dev/cgwalters-devspace-sandbox`, reachable over the tailnet. They
 have `/dev/kvm`, ~150G of disk, and podman, buildah, skopeo, gcc, make,
 Rust (rustc, cargo, rustfmt, clippy), bcvk, tmt, python3, git, just, jq
-and tmux. You log in as `agent`, which has **no sudo**: the workflow's own
-`runner` user holds the job's credentials (it can mint the OIDC tokens
-the tailnet login trusts), so nothing run over SSH may become it. (A
-devspace from a workflow revision that predates `agent` logs you in as
+and tmux. You log in as `runner-sandbox`, which has **no sudo** (nothing
+on a devspace keeps a setuid bit but newuidmap/newgidmap): the workflow's
+own `runner` user holds the job's credentials (it can mint the OIDC
+tokens the tailnet login trusts), so nothing run over SSH may become it.
+Network access is open. (A devspace from a workflow revision that
+predates `runner-sandbox` logs you in as
 `runner`, with sudo; `bot-devspace start` says so. Work as if you had no
 sudo there too.)
 `bin/bot-devspace` manages them; run `bot-devspace --help` for the
