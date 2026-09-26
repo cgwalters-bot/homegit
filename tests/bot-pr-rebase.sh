@@ -417,6 +417,11 @@ EOF
 test "$(sort -u "${FAKE_GH}/policy-calls")" = "rebase acme/proj main" ||
     fail "merge queue: upstream-policy calls: $(cat "${FAKE_GH}/policy-calls")"
 test "$(wc -l <"${FAKE_GH}/policy-calls")" -eq 2 || fail "merge queue: upstream-policy not called just for #20, twice: $(cat "${FAKE_GH}/policy-calls")"
+# The record's 'rebase: any' overrides the merge queue, as on bootc.
+echo "any: the policy record says 'rebase: any' (upstream-policy/acme/proj.md)" >"${FAKE_GH}/rebase-mode"
+check_cases <<EOF
+merge queue, rebase: any|${U}/20||rebased 1 commit, no content change|b
+EOF
 touch "${FAKE_GH}/rebase-mode.fail"
 check_cases <<EOF
 merge queue undecided|${U}/24||cannot tell whether acme/proj takes conflict-free rebases.*--force-merge-queue skips that|

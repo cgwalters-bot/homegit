@@ -248,7 +248,8 @@ Commands:
         when every commit keeps its patch-id); a fork PR gets no comment.
         An upstream PR that GitHub doesn't find conflicting is not
         rebased where 'upstream-policy rebase' says conflicts-only (a
-        merge queue, or the policy record's 'rebase: conflicts-only'):
+        merge queue, unless the policy record says 'rebase: any', or
+        the record's 'rebase: conflicts-only'):
         there each push reruns CI a maintainer approves again, and the
         queue tests against the new base anyway. --force-merge-queue
         rebases it regardless.
@@ -2423,7 +2424,7 @@ cmd_rebase() {
         local mode
         mode=$("${UPSTREAM_POLICY}" rebase "${upstream}" "${base}") ||
             fatal "cannot tell whether ${upstream} takes conflict-free rebases ('upstream-policy rebase' failed); --force-merge-queue skips that"
-        test "${mode}" = any ||
+        test "${mode%%:*}" = any ||
             fatal "${url} doesn't conflict with ${base}, and ${upstream} is rebased only on conflicts: ${mode#*: }; not rebasing it (--force-merge-queue does anyway)"
     fi
     info "${head} is $(plural "${behind}" commit) behind ${upstream}:${base}; rebasing$(! ${dry_run} || echo " (dry run)")"

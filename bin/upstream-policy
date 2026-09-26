@@ -38,9 +38,12 @@ const VERDICTS = {
   "no-go": "the bot does not contribute here",
 };
 const REQUIRED_KEYS = ["verdict", "ai-trailer", "dco", "sources", "checked"];
-// The optional 'rebase:' of a record: only ever a restriction, like a
-// maintainer asking the bot not to rebase PRs that don't conflict.
+// The optional 'rebase:' of a record: a maintainer asking the bot not to
+// rebase PRs that don't conflict, or (for repositories cgwalters
+// maintains) wanting them rebased despite a merge queue.
 const REBASE_CONFLICTS_ONLY = "conflicts-only";
+const REBASE_ANY = "any";
+const REBASE_MODES = [REBASE_CONFLICTS_ONLY, REBASE_ANY];
 // Where 'rebase' caches merge queue detection, per repository and branch,
 // and for how long: a repository rarely adds or drops one.
 const CACHE_FILE = path.join(
@@ -98,7 +101,7 @@ Each record starts with a front matter:
       path: CONTRIBUTING.md
       sha: the blob (or tree) id read, on the default branch
   checked: DATE by WHO
-  rebase: ${REBASE_CONFLICTS_ONLY} (optional; see the rebase command)
+  rebase: ${REBASE_MODES.join(" or ")} (optional; see the rebase command)
   ---
 
 and its body quotes what the verdict rests on, with a one-paragraph
@@ -126,15 +129,19 @@ Commands:
         (anywhere in those repositories); it must list all of these.
   rebase OWNER/REPO BRANCH
         Print whether the bot may rebase its PRs onto BRANCH that don't
-        conflict with it: 'any', or '${REBASE_CONFLICTS_ONLY}: WHY' when
-        the record says 'rebase: ${REBASE_CONFLICTS_ONLY}' (a maintainer
-        asked; read from the checkout, as it only restricts) or the
-        repository uses a merge queue, where such a rebase only reruns
-        CI the maintainers then have to approve again. A merge queue is
-        a merge_queue rule in BRANCH's branch rules, or a merge_group
-        trigger in a workflow in ${WORKFLOWS_DIR} there (what shows when
-        the rules don't, to outsiders). Detection is cached for
-        ${CACHE_TTL_MS / 3600000} hours in ${CACHE_FILE}.
+        conflict with it: '${REBASE_ANY}' or '${REBASE_ANY}: WHY', or
+        '${REBASE_CONFLICTS_ONLY}: WHY' when the record says
+        'rebase: ${REBASE_CONFLICTS_ONLY}' (a maintainer asked; read from
+        the checkout, as it only restricts) or the repository uses a
+        merge queue, where such a rebase only reruns CI the maintainers
+        then have to approve again. A merge queue is a merge_queue rule
+        in BRANCH's branch rules, or a merge_group trigger in a workflow
+        in ${WORKFLOWS_DIR} there (what shows when the rules don't, to
+        outsiders). Detection is cached for ${CACHE_TTL_MS / 3600000}
+        hours in ${CACHE_FILE}. A record's 'rebase: ${REBASE_ANY}' (where
+        cgwalters maintains and wants them) overrides detection, but
+        only once committed and what the checkout's ${REMOTE}/${REMOTE_BRANCH}
+        has (not fetched); otherwise it warns and detects.
 
 A record counts only when it is committed and is what ${REMOTE}/${REMOTE_BRANCH}
 has (check fetches it first), as a regular file (no symlinks). Its
@@ -310,8 +317,8 @@ function parseRecord(text, file) {
     throw bad(0, `unknown verdict '${fields.verdict}' (expected one of ${Object.keys(VERDICTS).join(", ")})`);
   }
   if (!/^(yes|no)\b/.test(fields.dco)) throw bad(0, "'dco' starts with yes or no");
-  if ("rebase" in fields && fields.rebase !== REBASE_CONFLICTS_ONLY) {
-    throw bad(0, `'rebase' can only be '${REBASE_CONFLICTS_ONLY}' (leave it out otherwise)`);
+  if ("rebase" in fields && !REBASE_MODES.includes(fields.rebase)) {
+    throw bad(0, `'rebase' can only be ${REBASE_MODES.map((m) => `'${m}'`).join(" or ")} (leave it out otherwise)`);
   }
   for (const s of fields.sources) {
     if (!s.path) throw bad(s.line, "a source has no 'path'");
@@ -521,6 +528,42 @@ function checkHistoryKept(top) {
   };
 }
 
+// checkPushed(name, file, stat, fetch): where NAME's record FILE (lstat
+// STAT) is in git, as {top, rel}, after checking that it is a regular
+// file, committed, and what REMOTE's REMOTE_BRANCH has (fetched first if
+// FETCH); an EX_INVALID failure otherwise.
+function checkPushed(name, file, stat, fetch) {
+  // A symlink would make its target's history the record's.
+  if (!stat.isFile()) throw new Exit(EX_INVALID, `${file} is not a regular file (a symlink?); a record must be one`);
+  // The path in git, unresolved below the records' directory's parent,
+  // so that a symlinked directory there is refused too (see below).
+  const parent = fs.realpathSync(path.dirname(POLICY_DIR));
+  const top = git(parent, ["rev-parse", "--show-toplevel"], `find the git repository of ${file}`);
+  const rel = path.posix.join(path.relative(top, parent).split(path.sep).join("/"), path.basename(POLICY_DIR), `${name}.md`);
+  if (git(top, ["status", "--porcelain", "--", rel], `tell whether ${file} is committed`) !== "") {
+    throw new Exit(EX_INVALID, `${file} has uncommitted changes; commit and push it first`);
+  }
+  const upstream = `${REMOTE}/${REMOTE_BRANCH}`;
+  if (fetch) git(top, ["fetch", "-q", REMOTE, REMOTE_BRANCH], `fetch ${upstream} to check ${file} against it`);
+  // Git's view: a regular file at that very path (a symlink, or a path
+  // through one, doesn't list as 100644), the same at HEAD and upstream.
+  const entry = (rev) => (gitMaybe(top, ["ls-tree", rev, "--", rel]) || "").trim();
+  const pushed = entry(upstream);
+  const local = entry("HEAD");
+  if (!/^100644 blob [0-9a-f]+\t/.test(local)) {
+    throw new Exit(EX_INVALID, `${rel} is not a regular file in git at HEAD (${local || "missing"}); a record must be one`);
+  }
+  if (pushed !== local) {
+    throw new Exit(
+      EX_INVALID,
+      pushed
+        ? `${file} differs from ${upstream}'s; pull (git pull --ff-only) or push, so that the gate reads what ${upstream} has`
+        : `${file} is not on ${upstream}; push it first`,
+    );
+  }
+  return { top, rel };
+}
+
 // readRecord(name): the path and parsed record of NAME. Git is the source
 // of truth: the record must be committed, and be what REMOTE's
 // REMOTE_BRANCH has, which it fetches first, so that a verdict tightened
@@ -539,34 +582,7 @@ function readRecord(name) {
       `${name} has no policy record (${file}); have a policy-check subagent write one (see homegit's dotfiles/.claude/skills/coordinator/policy-check.md)`,
     );
   }
-  // A symlink would make its target's history the record's.
-  if (!stat.isFile()) throw new Exit(EX_INVALID, `${file} is not a regular file (a symlink?); a record must be one`);
-  // The path in git, unresolved below the records' directory's parent,
-  // so that a symlinked directory there is refused too (see below).
-  const parent = fs.realpathSync(path.dirname(POLICY_DIR));
-  const top = git(parent, ["rev-parse", "--show-toplevel"], `find the git repository of ${file}`);
-  const rel = path.posix.join(path.relative(top, parent).split(path.sep).join("/"), path.basename(POLICY_DIR), `${name}.md`);
-  if (git(top, ["status", "--porcelain", "--", rel], `tell whether ${file} is committed`) !== "") {
-    throw new Exit(EX_INVALID, `${file} has uncommitted changes; commit and push it first`);
-  }
-  const upstream = `${REMOTE}/${REMOTE_BRANCH}`;
-  git(top, ["fetch", "-q", REMOTE, REMOTE_BRANCH], `fetch ${upstream} to check ${file} against it`);
-  // Git's view: a regular file at that very path (a symlink, or a path
-  // through one, doesn't list as 100644), the same at HEAD and upstream.
-  const entry = (rev) => (gitMaybe(top, ["ls-tree", rev, "--", rel]) || "").trim();
-  const pushed = entry(upstream);
-  const local = entry("HEAD");
-  if (!/^100644 blob [0-9a-f]+\t/.test(local)) {
-    throw new Exit(EX_INVALID, `${rel} is not a regular file in git at HEAD (${local || "missing"}); a record must be one`);
-  }
-  if (pushed !== local) {
-    throw new Exit(
-      EX_INVALID,
-      pushed
-        ? `${file} differs from ${upstream}'s; pull (git pull --ff-only) or push, so that the gate reads what ${upstream} has`
-        : `${file} is not on ${upstream}; push it first`,
-    );
-  }
+  const { top, rel } = checkPushed(name, file, stat, true);
   const accept = checkHistoryKept(top);
   const record = parseRecord(git(top, ["show", `HEAD:${rel}`], `read ${rel}`), file);
   checkLoosening(top, rel);
@@ -613,8 +629,10 @@ function check(requested, allowHumanText) {
 }
 
 // recordRebase(name): the record's 'rebase:' for NAME, or null without
-// a record. Read from the checkout, not through the gate: it only ever
-// restricts.
+// a record. Read from the checkout, not through the gate: conflicts-only
+// only restricts, and 'any' only lets the bot do what it does where there
+// is no merge queue, and counts only as committed and pushed (checked
+// against the last fetch, as bot-watch asks for every repository).
 function recordRebase(name) {
   const file = path.join(POLICY_DIR, `${name}.md`);
   let text;
@@ -625,6 +643,15 @@ function recordRebase(name) {
     throw new Exit(EX_ERROR, `cannot read ${file}: ${e.message}`);
   }
   const rebase = parseRecord(text, file).rebase;
+  if (rebase === REBASE_ANY) {
+    try {
+      checkPushed(name, file, fs.lstatSync(file), false);
+    } catch (e) {
+      if (!(e instanceof Exit)) throw e;
+      console.error(`warning: ignoring 'rebase: ${REBASE_ANY}': ${e.message}`);
+      return null;
+    }
+  }
   return rebase ? { rebase, file } : null;
 }
 
@@ -684,7 +711,7 @@ function writeCache(cache) {
   }
 }
 
-// rebaseMode(name, branch): 'any', or 'conflicts-only: WHY'.
+// rebaseMode(name, branch): 'any', 'any: WHY' or 'conflicts-only: WHY'.
 function rebaseMode(name, branch) {
   const record = recordRebase(name);
   if (record) return `${record.rebase}: the policy record says 'rebase: ${record.rebase}' (${record.file})`;
@@ -698,7 +725,7 @@ function rebaseMode(name, branch) {
     writeCache(cache);
   }
   const why = cache[key].why;
-  return why ? `${REBASE_CONFLICTS_ONLY}: ${why}` : "any";
+  return why ? `${REBASE_CONFLICTS_ONLY}: ${why}` : REBASE_ANY;
 }
 
 function main(argv) {

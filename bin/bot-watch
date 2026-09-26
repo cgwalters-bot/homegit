@@ -115,7 +115,8 @@ ones, for 'bot-pr rebase', and conflicting ones, for a worker. One
 listed for CI is not listed again once its head moved with CI still
 failing: the rebase didn't fix it.
 Upstream PRs that don't conflict are left out where 'upstream-policy
-rebase' says conflicts-only (a merge queue, or the maintainers asked),
+rebase' says conflicts-only (a merge queue the record doesn't override
+with 'rebase: any', or the maintainers asked),
 as 'bot-pr rebase' refuses them.
 
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
@@ -812,7 +813,7 @@ conflicts_only='[]'
 while IFS=$'\t' read -r repo base; do
     mode=$("${UPSTREAM_POLICY}" rebase "${repo}" "${base}") ||
         { warn "cannot tell whether ${repo} takes conflict-free rebases; listing them"; continue; }
-    test "${mode}" = any || conflicts_only=$(jq -c --arg r "${repo}" --arg b "${base}" '. + [[$r, $b]]' <<<"${conflicts_only}")
+    test "${mode%%:*}" = any || conflicts_only=$(jq -c --arg r "${repo}" --arg b "${base}" '. + [[$r, $b]]' <<<"${conflicts_only}")
 done < <(jq -r --argjson forks "${FORK_OWNERS}" "${REBASE_REPO_JQ}"'
     [.[] | select(.conflicts != true) | [repo, .base] | select(.[0] | split("/")[0] | IN($forks[]) | not)] | unique[] | @tsv' <<<"${needs_rebase}")
 needs_rebase=$(jq -c --argjson co "${conflicts_only}" "${REBASE_REPO_JQ}"'

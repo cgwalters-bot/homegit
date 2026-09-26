@@ -554,6 +554,34 @@ run "rebase: record passes check" 0 '^bot-ok$' check acme/proj
 sed -i 's/^rebase: conflicts-only$/rebase: always/' "${RECORD}"
 run "rebase: invalid record" "${EX_INVALID}" "'rebase' can only be 'conflicts-only'" rebase acme/proj main
 git -C "${HOMEGIT}" checkout -q -- .
+# 'rebase: any' beats a merge queue (where cgwalters maintains), but only
+# as pushed: uncommitted or unpushed, detection decides.
+echo '[{"type": "merge_queue", "parameters": {}}]' | fixture repos/acme/proj/rules/branches/main
+sed -i 's/^rebase: conflicts-only$/rebase: any/' "${RECORD}"
+while IFS='|' read -r name step pattern; do
+    case "${step}" in
+        commit) git -C "${HOMEGIT}" commit -q -am "rebase: any" ;;
+        push) git -C "${HOMEGIT}" push -q origin HEAD:main && vouch ;;
+    esac
+    rm -rf "${XDG_CACHE_HOME}"
+    run "rebase: any, ${name}" 0 "${pattern}" rebase acme/proj main
+done <<EOF
+uncommitted||warning: ignoring 'rebase: any': .*has uncommitted changes
+uncommitted, detected||^conflicts-only: a merge queue \(a merge_queue rule on main\)$
+unpushed|commit|warning: ignoring 'rebase: any': .*differs from origin/main's
+pushed|push|^any: the policy record says 'rebase: any' \(${RECORD}\)$
+EOF
+: >"${FAKE_GH}/calls"
+run "rebase: any, no calls" 0 '^any: the policy record' rebase acme/proj main
+test ! -s "${FAKE_GH}/calls" || fail "rebase: any, but called: $(cat "${FAKE_GH}/calls")"
+run "rebase: any passes check" 0 '^bot-ok$' check acme/proj
+# Both can't be set: a key once.
+sed -i 's/^rebase: any$/&\nrebase: conflicts-only/' "${RECORD}"
+run "rebase: both" "${EX_INVALID}" "'rebase' is set twice" rebase acme/proj main
+sed -i '/^rebase: conflicts-only$/d; s/^rebase: any$/rebase: sometimes/' "${RECORD}"
+run "rebase: invalid" "${EX_INVALID}" "'rebase' can only be 'conflicts-only' or 'any'" rebase acme/proj main
+git -C "${HOMEGIT}" checkout -q -- .
+rm "${FAKE_GH}/rest/repos/acme/proj/rules/branches/main.json"
 run "rebase usage" 2 usage rebase acme/plain
 
 run "usage" 2 usage check not-a-repo

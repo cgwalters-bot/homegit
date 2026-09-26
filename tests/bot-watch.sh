@@ -483,6 +483,28 @@ printf '%s\n' --- 'verdict: bot-ok' 'ai-trailer: none' 'dco: no' 'sources: []' '
     >"${UPSTREAM_POLICY_DIR}/example/rb.md"
 sweep rebase 2026-09-25T16:50:00Z
 expect rebase "record: only the conflicting ones" "${rebase_args[@]}" "${CONFLICTING_JQ}"
+# Like bootc: a workflow runs on merge_group, but cgwalters maintains it
+# and wants conflict-free rebases, so its pushed record says 'rebase: any'.
+readonly WF_TREE=aaaa0000000000000000000000000000000000a1 WF_DIR=aaaa0000000000000000000000000000000000a2
+readonly WF_BLOB=aaaa0000000000000000000000000000000000a3
+put repos/example/rb/git/trees/main "{\"truncated\": false, \"tree\": [{\"path\": \".github\", \"type\": \"tree\", \"sha\": \"${WF_TREE}\"}]}"
+put "repos/example/rb/git/trees/${WF_TREE}" "{\"truncated\": false, \"tree\": [{\"path\": \"workflows\", \"type\": \"tree\", \"sha\": \"${WF_DIR}\"}]}"
+put "repos/example/rb/git/trees/${WF_DIR}" "{\"truncated\": false, \"tree\": [{\"path\": \"ci.yml\", \"type\": \"blob\", \"sha\": \"${WF_BLOB}\"}]}"
+put "repos/example/rb/git/blobs/${WF_BLOB}" "$(jq -nc --arg c "$(printf 'on:\n  pull_request:\n  merge_group:\n' | base64 -w0)" '{content: $c, encoding: "base64"}')"
+export UPSTREAM_POLICY_DIR=${WORK}/homegit/upstream-policy
+mkdir -p "${UPSTREAM_POLICY_DIR}/example"
+sweep rebase 2026-09-25T17:00:00Z
+expect rebase "merge_group: only the conflicting ones" "${rebase_args[@]}" "${CONFLICTING_JQ}"
+printf '%s\n' --- 'verdict: bot-ok' 'ai-trailer: none' 'dco: no' 'sources: []' 'checked: today' 'rebase: any' --- '' 'Maintained.' \
+    >"${UPSTREAM_POLICY_DIR}/example/rb.md"
+git -C "${WORK}/homegit" init -q
+git -C "${WORK}/homegit" add -A
+git -C "${WORK}/homegit" -c user.name=t -c user.email=t@example.com commit -q -m "rebase: any"
+git -C "${WORK}/homegit" update-ref refs/remotes/origin/main HEAD
+rm -r "${XDG_CACHE_HOME}/upstream-policy"
+sweep rebase 2026-09-25T17:10:00Z
+expect rebase "rebase: any: the conflict-free ones listed again" --arg rb "${RB}" '[.needs_rebase[].url] | index("\($rb)/5")'
+grep -qx "  conflict-free:" "${WORK}/rebase.txt" || fail "rebase: any: conflict-free ones not listed: $(cat "${WORK}/rebase.txt")"
 
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
 echo "ok: bot-watch first-sight news, outstanding reviews and PRs that need a rebase as expected"
