@@ -217,6 +217,28 @@ Commands:
         branch as promote does, with a lease on the checked head, records
         that and the approval on the fork PR, and posts nothing upstream.
         Prints the new head.
+  rebase PR_URL [--dry-run] [--no-ai-trailer]
+        Rebase one of ${BOT_LOGIN}'s open PRs onto its base, for a PR that
+        is behind it (CI failures fixed there since, or a required
+        up-to-date branch). PR_URL is an upstream PR from a fork in
+        ${FORGE_ORG} or ${BOT_LOGIN}'s own (onto its base branch), or a
+        fork PR there (onto the upstream base its bot-meta section names,
+        after syncing the fork's copy of it, as fork-pr does). Only PRs
+        opened by ${BOT_LOGIN} whose commits are all by ${BOT_LOGIN} or
+        ${REVIEWER} are touched; a fork PR ${REVIEWER} approved at its
+        head is left to promote, which rebases it itself, and an upstream
+        PR whose latest review of his requests changes to a worker. It
+        refuses on
+        conflicts, listing the conflicting paths (exit status
+        ${EX_CONFLICT}) for a worker to resolve, and if the rebase drops a
+        commit (already upstream). Then 'bot-git rework' keeps
+        ${REVIEWER}'s sign-off where the pushed head had it, 'bot-git
+        check' (--no-ai-trailer is passed on) must pass against the pushed
+        head, and it force-pushes with a lease on that head. On an
+        upstream PR it comments one line saying so ('no content change'
+        when every commit keeps its patch-id); a fork PR gets no comment.
+        --dry-run does the rebase and checks in the cache clone and
+        pushes, syncs and posts nothing.
   set-item FORK_PR_URL PVTI_... [--force]
         Change the board item recorded in a fork PR's bot-meta section,
         which promote moves to In Review, and leave the rest of the body
@@ -1750,18 +1772,16 @@ open_clone() {
     sgit -C "${CLONE}" fetch -q --filter=blob:none "$(git_url "${upstream}")" "+refs/heads/${base}:refs/bot-pr/base" 1>&2 ||
         fatal "fetching ${upstream}:${base} into ${CLONE} failed"
     test "$(sgit -C "${CLONE}" rev-parse refs/bot-pr/head)" = "${old_sha}" ||
-        fatal "${fork}:${branch} moved while promoting; rerun promote"
+        fatal "${fork}:${branch} moved since it was read; rerun"
 }
 
-# rebase_onto_upstream FORK BRANCH OLD_SHA UPSTREAM BASE: rebases the
-# branch in a cached clone, force-pushes it and prints the new head. On
+# rebase_head DIR BRANCH OLD_SHA UPSTREAM BASE: in the clone DIR that
+# open_clone set up, rebases BRANCH (at OLD_SHA) onto UPSTREAM's BASE, as
+# the bot, keeping each commit's author, and leaves it checked out. On
 # conflicts, prints the conflicting paths and returns EX_CONFLICT. Any
-# other failure exits. It runs in a '||' list, where errexit is off, so
-# every step checks for itself.
-rebase_onto_upstream() {
-    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 dir conflicts new_sha CLONE
-    open_clone "$@"
-    dir=${CLONE}
+# other failure exits.
+rebase_head() {
+    local dir=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 conflicts
     sgit -C "${dir}" rebase --abort >/dev/null 2>&1 || true
     sgit -C "${dir}" checkout -q --force --detach refs/bot-pr/head 1>&2 ||
         fatal "checking out ${branch} in ${dir} failed"
@@ -1774,12 +1794,28 @@ rebase_onto_upstream() {
         echo "${conflicts}"
         return "${EX_CONFLICT}"
     fi
-    new_sha=$(sgit -C "${dir}" rev-parse HEAD) || fatal "cannot read the rebased head in ${dir}"
-    sgit -C "${dir}" merge-base --is-ancestor refs/bot-pr/base "${new_sha}" ||
+    sgit -C "${dir}" merge-base --is-ancestor refs/bot-pr/base HEAD ||
         fatal "the rebased ${branch} in ${dir} doesn't contain ${upstream}:${base}; not pushing it"
-    sgit -C "${dir}" push -q --force-with-lease="refs/heads/${branch}:${old_sha}" \
-        "$(git_url "${fork}")" "${new_sha}:refs/heads/${branch}" 1>&2 ||
-        fatal "pushing the rebased ${branch} to ${fork} failed"
+}
+
+# push_rebased DIR FORK BRANCH OLD_SHA NEW_SHA: force-pushes NEW_SHA from
+# DIR to FORK's BRANCH, with a lease on OLD_SHA.
+push_rebased() {
+    sgit -C "$1" push -q --force-with-lease="refs/heads/$3:$4" "$(git_url "$2")" "$5:refs/heads/$3" 1>&2 ||
+        fatal "pushing the rebased $3 to $2 failed"
+}
+
+# rebase_onto_upstream FORK BRANCH OLD_SHA UPSTREAM BASE: rebases the
+# branch in a cached clone, force-pushes it and prints the new head. On
+# conflicts, prints the conflicting paths and returns EX_CONFLICT. Any
+# other failure exits. It runs in a '||' list, where errexit is off, so
+# every step checks for itself.
+rebase_onto_upstream() {
+    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 new_sha CLONE
+    open_clone "$@"
+    rebase_head "${CLONE}" "${branch}" "${old_sha}" "${upstream}" "${base}" || return
+    new_sha=$(sgit -C "${CLONE}" rev-parse HEAD) || fatal "cannot read the rebased head in ${CLONE}"
+    push_rebased "${CLONE}" "${fork}" "${branch}" "${old_sha}" "${new_sha}"
     echo "${new_sha}"
 }
 
@@ -2241,6 +2277,146 @@ EOF
     echo "${upstream_url}"
 }
 
+# plural N WORD: "N WORD", with an s unless N is 1.
+plural() {
+    if test "$1" -eq 1; then echo "$1 $2"; else echo "$1 $2s"; fi
+}
+
+# rebase_pr FORK BRANCH OLD_SHA UPSTREAM BASE DRY_RUN CHECK_ARGS...:
+# rebases BRANCH onto UPSTREAM's BASE in a cached clone (see rebase_head),
+# keeps REVIEWER's sign-offs with 'bot-git rework', runs 'bot-git check'
+# (with CHECK_ARGS) against OLD_SHA, and unless DRY_RUN force-pushes it.
+# Prints "NEW_SHA COMMITS CHANGED", CHANGED being how many commits' patch-id
+# changed; on conflicts, the conflicting paths, returning EX_CONFLICT.
+# Runs in a '||' list, like rebase_onto_upstream.
+rebase_pr() {
+    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 dry_run=$6 CLONE dir new_sha i changed=0
+    shift 6
+    open_clone "${fork}" "${branch}" "${old_sha}" "${upstream}" "${base}"
+    dir=${CLONE}
+    rebase_head "${dir}" "${branch}" "${old_sha}" "${upstream}" "${base}" || return
+    local -a olds news
+    mapfile -t olds < <(sgit -C "${dir}" rev-list --reverse "refs/bot-pr/base..${old_sha}")
+    mapfile -t news < <(sgit -C "${dir}" rev-list --reverse refs/bot-pr/base..HEAD)
+    test "${#news[@]}" -eq "${#olds[@]}" ||
+        fatal "rebasing ${branch} onto ${upstream}:${base} left $(plural "${#news[@]}" commit) of ${#olds[@]}: some are upstream already; that needs a look, nothing was pushed"
+    (cd "${dir}" && "${BOT_GIT}" rework --was "${old_sha}" refs/bot-pr/base) 1>&2 ||
+        fatal "'bot-git rework' refused the rebased ${branch} in ${dir}; nothing was pushed"
+    (cd "${dir}" && "${BOT_GIT}" check "$@" --was "${old_sha}" refs/bot-pr/base..HEAD) 1>&2 ||
+        fatal "'bot-git check' found problems with the rebased ${branch} in ${dir} (see above); nothing was pushed"
+    mapfile -t news < <(sgit -C "${dir}" rev-list --reverse refs/bot-pr/base..HEAD)
+    for i in "${!olds[@]}"; do
+        test "$(sgit -C "${dir}" diff-tree -p "${olds[i]}" | sgit -C "${dir}" patch-id --stable | cut -d' ' -f1)" = \
+            "$(sgit -C "${dir}" diff-tree -p "${news[i]}" | sgit -C "${dir}" patch-id --stable | cut -d' ' -f1)" ||
+            changed=$((changed + 1))
+    done
+    new_sha=$(sgit -C "${dir}" rev-parse HEAD) || fatal "cannot read the rebased head in ${dir}"
+    ${dry_run} || push_rebased "${dir}" "${fork}" "${branch}" "${old_sha}" "${new_sha}"
+    echo "${new_sha} ${#news[@]} ${changed}"
+}
+
+cmd_rebase() {
+    local url="" dry_run=false check_args=()
+    while test $# -gt 0; do
+        case "$1" in
+            --dry-run) dry_run=true; shift ;;
+            --no-ai-trailer) check_args+=(--no-ai-trailer); shift ;;
+            -*) fatal "unknown argument for rebase: $1 (see --help)" ;;
+            *) test -z "${url}" || fatal "rebase takes one PR URL"; url=${1%/}; shift ;;
+        esac
+    done
+    test -n "${url}" || fatal "usage: $(basename "$0") rebase PR_URL [--dry-run] [--no-ai-trailer]"
+    [[ "${url}" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)$ ]] ||
+        fatal "expected a PR URL (https://github.com/OWNER/REPO/pull/N), got '${url}'"
+    local repo=${BASH_REMATCH[1]} number=${BASH_REMATCH[2]}
+    check_login
+
+    local pr author state head head_repo head_sha base_ref base_repo
+    pr=$(ghapi "repos/${repo}/pulls/${number}") || fatal "cannot read ${url}"
+    read -r author state head head_repo head_sha base_ref base_repo < <(jq -r \
+        '"\(.user.login) \(.state) \(.head.ref) \(.head.repo.full_name) \(.head.sha) \(.base.ref) \(.base.repo.full_name)"' <<<"${pr}")
+    test "${author}" = "${BOT_LOGIN}" || fatal "${url} was opened by ${author}, not ${BOT_LOGIN}; rebase never touches anyone else's PR"
+    test "${state}" = open || fatal "${url} is ${state}"
+    [[ "${head_repo}" =~ ^(${FORGE_ORG}|${BOT_LOGIN})/ ]] ||
+        fatal "${url}'s head is in ${head_repo}, not in a fork in ${FORGE_ORG} or ${BOT_LOGIN}'s"
+
+    # A fork PR rebases onto the upstream base, like promote.
+    local upstream=${base_repo} base=${base_ref} fork_pr=false
+    if [[ "${repo}" =~ ^(${FORGE_ORG}|${BOT_LOGIN})/ ]]; then
+        fork_pr=true
+        test "${head_repo}" = "${repo}" || fatal "${url}'s head is in ${head_repo}, not ${repo}"
+        local meta META_UPSTREAM META_BASE META_ITEM
+        meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
+        test -n "${meta}" || fatal "${url} has no complete ${META_START} ... ${META_END} section; was it opened with fork-pr? Restore it in the PR body"
+        parse_meta "${url}" "${meta}"
+        upstream=${META_UPSTREAM} base=${META_BASE}
+        test "${base_ref}" = "${base}" ||
+            warn "the fork PR targets '${base_ref}', but bot-meta says upstream base '${base}'; using '${base}'"
+        # A push voids his approval of the head, and promote rebases.
+        local activity pushed
+        activity=$(reviewer_activity "${repo}" "${number}")
+        push_time "${repo}" "${number}" "${head}"
+        test "$(verdict approved)" != true ||
+            fatal "${REVIEWER} approved ${url} at ${head_sha:0:12}; a push would void that, and 'bot-pr promote' rebases it itself"
+    fi
+
+    # His change request is a worker's to answer, and a rebase's push
+    # would look like an answer to bot-watch.
+    if ! ${fork_pr}; then
+        local last_review
+        last_review=$(ghapi --paginate "repos/${repo}/pulls/${number}/reviews?per_page=100" \
+            --jq ".[] | select(.user.login == \"${REVIEWER}\" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\"))) | .state" |
+            tail -n1) || fatal "cannot list the reviews of ${url}"
+        test "${last_review}" != CHANGES_REQUESTED ||
+            fatal "${REVIEWER} requested changes on ${url}; that's a worker's to address (rebasing on the way), not a bare rebase"
+    fi
+
+    # Only the bot's and his commits: anyone else's are theirs to rebase.
+    local others
+    others=$(ghapi --paginate "repos/${repo}/pulls/${number}/commits?per_page=100" \
+        --jq ".[] | select(.commit.author.email | ascii_downcase | IN(\"${BOT_GIT_EMAIL,,}\", \"${HUMAN_GIT_EMAIL,,}\") | not)
+              | \"  \(.sha[:12]) \(.commit.message | split(\"\\n\")[0]) (\(.commit.author.name) <\(.commit.author.email)>)\"") ||
+        fatal "cannot list the commits of ${url}"
+    test -z "${others}" || fatal "${url} has commits by others than ${BOT_LOGIN} and ${REVIEWER}; not rebasing it:"$'\n'"${others}"
+
+    local behind
+    behind=$(ghapi "repos/${upstream}/compare/${base}...${head_repo%%/*}:${head}" --jq .behind_by) ||
+        fatal "cannot compare ${head} with ${upstream}:${base}"
+    if test "${behind}" -eq 0; then
+        info "${url} is up to date with ${upstream}:${base}; nothing to do"
+        return 0
+    fi
+    info "${head} is $(plural "${behind}" commit) behind ${upstream}:${base}; rebasing$(! ${dry_run} || echo " (dry run)")"
+    if ${fork_pr} && ! ${dry_run}; then
+        sync_base "${upstream}" "${repo}" "${base}"
+    fi
+
+    local out rc=0 new_sha ncommits changed summary
+    out=$(rebase_pr "${head_repo}" "${head}" "${head_sha}" "${upstream}" "${base}" "${dry_run}" "${check_args[@]}") || rc=$?
+    if test "${rc}" -eq "${EX_CONFLICT}"; then
+        echo "error: ${head} conflicts with ${upstream}:${base} in: ${out}; nothing was pushed. Resolving that is a worker's job (or ${REVIEWER}'s)" 1>&2
+        exit "${EX_CONFLICT}"
+    fi
+    test "${rc}" -eq 0 || exit "${rc}"
+    read -r new_sha ncommits changed <<<"${out}"
+    summary="$(plural "${ncommits}" commit), no content change"
+    test "${changed}" -eq 0 || summary="$(plural "${ncommits}" commit), no conflicts (diff context changed in ${changed})"
+    if ${dry_run}; then
+        info "Would push ${head} rebased onto ${upstream}:${base} (${new_sha:0:12}; ${summary})$(${fork_pr} || echo ", and comment on ${url}")"
+        echo "${new_sha}"
+        return 0
+    fi
+    info "Pushed ${head} rebased onto ${upstream}:${base} (${new_sha:0:12}; ${summary})"
+    if ${fork_pr}; then
+        prune_after_push "${repo}" "${new_sha}"
+    else
+        ghapi -X POST "repos/${repo}/issues/${number}/comments" \
+            -f body="Rebased onto ${base}; ${summary}."$'\n\n'"${LLMS_TRAILER}" >/dev/null ||
+            warn "commenting on ${url} failed"
+    fi
+    echo "${new_sha}"
+}
+
 # upstream_approval UPSTREAM NUMBER: prints REVIEWER's latest approving
 # review on UPSTREAM#NUMBER as {url, id, commit_id}, if a later change
 # request or dismissal didn't cancel it; nothing otherwise. It approves
@@ -2546,7 +2722,7 @@ case "${command}" in
     prune-runs) command=prune_runs ;;
     set-item) command=set_item ;;
     refresh-meta) command=refresh_meta ;;
-    promote|signoff|inbox) ;;
+    promote|signoff|inbox|rebase) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
 [[ "${FORGE_ORG}" =~ ^[A-Za-z0-9-]+$ ]] || fatal "BOT_PR_FORGE must be a GitHub organization name, not '${FORGE_ORG}'"
