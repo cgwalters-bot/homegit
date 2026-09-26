@@ -572,8 +572,17 @@ sed -i 's/^rebase: conflicts-only$/rebase: always/' "${RECORD}"
 run "rebase: invalid record" "${EX_INVALID}" "'rebase' can only be 'conflicts-only'" rebase acme/proj main
 git -C "${HOMEGIT}" checkout -q -- .
 # 'rebase: any' beats a merge queue (where cgwalters maintains), but only
-# as pushed: uncommitted or unpushed, detection decides.
+# as pushed: uncommitted or unpushed, detection decides, unless HEAD's or
+# origin/main's record still says conflicts-only.
 echo '[{"type": "merge_queue", "parameters": {}}]' | fixture repos/acme/proj/rules/branches/main
+record bot-ok
+sed -i 's/^checked:.*/&\nrebase: any/' "${RECORD}"
+rm -rf "${XDG_CACHE_HOME}"
+run "rebase: any, uncommitted, detected" 0 '^conflicts-only: a merge queue \(a merge_queue rule on main\)$' rebase acme/proj main
+git -C "${HOMEGIT}" checkout -q -- .
+sed -i 's/^checked:.*/&\nrebase: conflicts-only/' "${RECORD}"
+publish "rebase: conflicts-only"
+echo '[]' | fixture repos/acme/proj/rules/branches/main
 sed -i 's/^rebase: conflicts-only$/rebase: any/' "${RECORD}"
 while IFS='|' read -r name step pattern; do
     case "${step}" in
@@ -584,8 +593,9 @@ while IFS='|' read -r name step pattern; do
     run "rebase: any, ${name}" 0 "${pattern}" rebase acme/proj main
 done <<EOF
 uncommitted||warning: ignoring 'rebase: any': .*has uncommitted changes
-uncommitted, detected||^conflicts-only: a merge queue \(a merge_queue rule on main\)$
+uncommitted, committed restriction||^conflicts-only: the policy record says 'rebase: conflicts-only' \(HEAD:upstream-policy/acme/proj\.md\)$
 unpushed|commit|warning: ignoring 'rebase: any': .*differs from origin/main's
+unpushed, pushed restriction||^conflicts-only: the policy record says 'rebase: conflicts-only' \(origin/main:upstream-policy/acme/proj\.md\)$
 pushed|push|^any: the policy record says 'rebase: any' \(${RECORD}\)$
 EOF
 : >"${FAKE_GH}/calls"
