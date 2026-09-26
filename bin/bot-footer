@@ -169,12 +169,14 @@ function fmtDuration(s) {
 const ids = (list, what) => (list.length ? `${what} ${list[0].slice(0, SHORT_ID)}${list.length > 1 ? ` +${list.length - 1}` : ""}` : null);
 // Model ids come from transcripts; keep the human line plain.
 const safeModel = (m) => m.replace(/[^\w.:/[\]-]/g, "");
+// Task keys can hold a workflow's file name (run:NAME).
+const safeKey = (k) => k.replace(/[^\w.:/-]/g, "");
 
 // humanLine(rec, compute): the one-line summary, in <sub>.
 function humanLine(rec, compute) {
   const parts = [];
   const who = [ids(rec.sessions, "session"), ids(rec.agents, rec.agents.length > 1 ? "agents" : "agent")].filter(Boolean);
-  parts.push(who.length ? who.join(", ") : rec.task);
+  parts.push(who.length ? who.join(", ") : safeKey(rec.task));
   const models = Object.entries(rec.models);
   if (models.length) {
     const shown = models.slice(0, TOP_MODELS).map(([m, { tokens: t }]) => {

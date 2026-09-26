@@ -76,6 +76,13 @@ test("the JSON has per-model tokens and cost, and nothing to end its comment", (
   assert.deepEqual(JSON.parse(MARKER_RE.exec(m)[1]).models, { "a--b--->": {} });
 });
 
+test("the human line keeps task keys and model ids plain", () => {
+  const rec = { task: "run:odd<b>`x`.yml", sessions: [], agents: [], models: { "m<i>1": { tokens: { input: 1, output: 1, cache_read: 0, cache_write_5m: 0, cache_write_1h: 0 } } },
+    usd: { inference: 0, compute: 0 }, duration_s: null, run_urls: [], core_hours: 0 };
+  assert.equal(footer.humanLine(rec, false),
+    "<sub>Bot run: run:oddbx.yml · mi1 1 in / 1 out · ~$0.00 inference (est., list prices)</sub>");
+});
+
 test("durations are wall time, rounded", () => {
   const cases = [[0, "0s"], [59, "59s"], [60, "1m"], [2520, "42m"], [3599, "1h 0m"], [5430, "1h 31m"]];
   for (const [s, want] of cases) assert.equal(footer.fmtDuration(s), want, String(s));
