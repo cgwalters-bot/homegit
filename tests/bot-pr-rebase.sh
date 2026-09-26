@@ -103,6 +103,17 @@ case "${method} ${path}" in
         json=$(git -C "${scratch}" log --reverse -z --format='%H%x00%an%x00%ae%x00%B' refs/b..refs/h |
             jq -Rs 'split("\u0000") | [recurse(.[4:]; length >= 4) | select(length >= 4) | .[:4]
                 | {sha: .[0], commit: {author: {name: .[1], email: .[2]}, message: .[3]}}]') ;;
+    GET\ repos/*/commits/*)
+        # From whichever repository has it; the login by the email.
+        c=${path##*/} json=""
+        for r in "${REMOTES}"/*/*; do
+            git -C "${r}" cat-file -e "${c}^{commit}" 2>/dev/null || continue
+            json=$(TZ=UTC git -C "${r}" show -s --date=format-local:%Y-%m-%dT%H:%M:%SZ --format='%ce%x00%cd' "${c}" |
+                jq -Rc 'split("\u0000") | {committer: {login: ({"walters+llm@verbum.org": "cgwalters-bot", "walters@verbum.org": "cgwalters"}[.[0]])},
+                                          commit: {committer: {date: .[1]}}}')
+            break
+        done
+        test -n "${json}" || notfound ;;
     GET\ repos/*/pulls/*/reviews|GET\ repos/*/pulls/*/comments|GET\ repos/*/issues/*/comments)
         json=$(cat "${store}/rest/${path}.json" 2>/dev/null || echo '[]') ;;
     GET\ repos/*/pulls/*)
@@ -213,6 +224,10 @@ fork|${F}|bot|fork|fork\n\n${AI}|
 approved|${F}|bot|approved|approved\n\n${AI}|
 noai|${F}|bot|noai|no trailer|
 changes|${F}|bot|changes|changes asked\n\n${AI}|
+answered|${F}|bot|answered|changes made\n\n${AI}|
+commented|${F}|bot|commented|changes made\n\n${AI}|
+latecomment|${F}|bot|latecomment|changes made\n\n${AI}|
+question|${F}|bot|question|asked\n\n${AI}|
 EOF
 pr acme/proj 1 "${F}" bot/plain
 pr acme/proj 2 "${F}" bot/signed
@@ -227,8 +242,33 @@ pr "${F}" 10 "${F}" bot/fork
 pr "${F}" 11 "${F}" bot/approved
 pr acme/proj 12 "${F}" bot/noai
 pr acme/proj 14 "${F}" bot/changes
-echo '[{"user": {"login": "cgwalters"}, "state": "APPROVED"}, {"user": {"login": "cgwalters"}, "state": "CHANGES_REQUESTED"},
-       {"user": {"login": "someone"}, "state": "APPROVED"}]' | fixture repos/acme/proj/pulls/14/reviews
+# Reviews and comments on #14 to #18, from before the branches were
+# pushed (PAST) or after (FUTURE): what bot-watch counts as answered by
+# the bot's push, or not, and so 'rebase' too.
+readonly PAST=2020-01-01T00:00:00Z FUTURE=2099-01-01T00:00:00Z
+# review LOGIN STATE AT: a review, as JSON.
+review() {
+    jq -nc --arg l "$1" --arg s "$2" --arg at "$3" '{user: {login: $l}, state: $s, submitted_at: $at, body: "", html_url: "https://github.com/acme/proj/pull/0#r-\($at)"}'
+}
+# #14: his change request after the last push.
+{ review cgwalters APPROVED "${PAST}"; review cgwalters CHANGES_REQUESTED "${FUTURE}"; review someone APPROVED "${FUTURE}"; } |
+    jq -sc . | fixture repos/acme/proj/pulls/14/reviews
+# #15: answered by the bot's push since (bootc-dev/bootc#2500, #2483).
+pr acme/proj 15 "${F}" bot/answered
+review cgwalters CHANGES_REQUESTED "${PAST}" | jq -sc . | fixture repos/acme/proj/pulls/15/reviews
+# #16: a change request, a later review that only comments, and the
+# bot's push after both (bootc-dev/bootc#2470).
+pr acme/proj 16 "${F}" bot/commented
+{ review cgwalters CHANGES_REQUESTED 2019-01-01T00:00:00Z; review cgwalters COMMENTED "${PAST}"; } |
+    jq -sc . | fixture repos/acme/proj/pulls/16/reviews
+# #17: the same, with his comment review after the push.
+pr acme/proj 17 "${F}" bot/latecomment
+{ review cgwalters CHANGES_REQUESTED "${PAST}"; review cgwalters COMMENTED "${FUTURE}"; } |
+    jq -sc . | fixture repos/acme/proj/pulls/17/reviews
+# #18: his question in a comment, not answered.
+pr acme/proj 18 "${F}" bot/question
+jq -nc --arg at "${FUTURE}" '[{user: {login: "cgwalters"}, created_at: $at, body: "Why?", html_url: "https://github.com/acme/proj/pull/18#c1"}]' |
+    fixture repos/acme/proj/issues/18/comments
 jq -n --arg sha "$(git -C "${REMOTES}/${F}" rev-parse bot/approved)" \
     '[{user: {login: "cgwalters"}, state: "APPROVED", id: 7, commit_id: $sha, submitted_at: "2026-09-25T11:00:00Z",
        html_url: "https://github.com/cgwalters-forge/proj/pull/11#pullrequestreview-7", body: ""}]' |
@@ -327,7 +367,11 @@ an approved fork PR|https://github.com/${F}/pull/11||cgwalters approved .* a pus
 no AI trailer|${U}/12||'bot-git check' found problems|
 no AI trailer, allowed|${U}/12|--no-ai-trailer|rebased 1 commit, no content change|b
 up to date|${U}/13||uptodate|
-changes requested|${U}/14||cgwalters requested changes on|
+changes requested|${U}/14||has an unanswered review \(CHANGES_REQUESTED\) by cgwalters|
+change request answered by a push|${U}/15||rebased 1 commit, no content change|b
+replaced by a later comment review, answered|${U}/16||rebased 1 commit, no content change|b
+replaced by a later comment review, unanswered|${U}/17||has an unanswered review \(COMMENTED\) by cgwalters|
+an unanswered comment|${U}/18||has an unanswered comment by cgwalters|
 up to date after the rebase|${U}/1||uptodate|
 EOF
 
