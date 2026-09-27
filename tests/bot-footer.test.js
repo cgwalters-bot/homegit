@@ -83,6 +83,55 @@ test("the human line keeps task keys and model ids plain", () => {
     "<sub>Bot run: run:oddbx.yml · mi1 1 in / 1 out · ~$0.00 inference (est., list prices)</sub>");
 });
 
+test("--details folds the footer in a collapsed block; --json doesn't", () => {
+  const rec = { task: "PVTI_x", sessions: ["s1"], agents: [], models: {}, usd: { inference: 1, compute: 0 },
+    duration_s: 60, run_urls: [], core_hours: 0 };
+  const line = "<sub>Bot run: session s1 · ~$1.00 inference (est., list prices) · 1m wall</sub>";
+  const footerText = `${line}\n${footer.marker(rec)}`;
+  const cases = [
+    [{}, `${footerText}\n`],
+    [{ details: true }, `<details><summary>Run details</summary>\n\n${footerText}\n\n</details>\n`],
+    [{ json: true }, `${JSON.stringify(rec, null, 2)}\n`],
+  ];
+  for (const [opts, want] of cases) {
+    assert.equal(footer.render(rec, { compute: false, json: false, details: false, ...opts }), want, JSON.stringify(opts));
+  }
+  const folded = run(["--item", "PVTI_item1", "--no-compute", "--details"]).split("\n");
+  assert.deepEqual([folded[0], folded[1], folded[4], folded[5]], ["<details><summary>Run details</summary>", "", "", "</details>"]);
+  assert.ok(MARKER_RE.test(folded[3]), folded[3]);
+});
+
+test("--upstream keeps totals only: no ids, links, models or tools", () => {
+  const bot = '<!-- bot-run/v1 {"task":"PVTI_x","sessions":["s1"],"agents":["a1"],"models":{"claude-opus-5-5":{"tokens":'
+    + '{"input":100,"output":2000,"cache_read":50000,"cache_write_5m":6000,"cache_write_1h":4000},"usd":0.1},"mystery-9":{"tokens":'
+    + '{"input":500,"output":500,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0},"usd":0.01}},'
+    + '"usd":{"inference":0.1124,"compute":5.04},"duration_s":10799,"core_hours":32,"run_urls":["https://x/runs/1"]} -->';
+  const agent = '<!-- agent-run-summary/v1 {"run_id":1001,"run_url":"https://x/runs/1001","agent":"claude","model":"claude-sonnet-4-5",'
+    + '"cores":16,"duration_s":2520,"tokens":{"input":1200000,"output":40000,"cache_read":900000,"cache_write":50000},"aic":123.5} -->';
+  const botLine = "<sub>Bot run: 61k tokens in / 3k out · ~$0.11 inference + ~$5.04 compute (est., list prices) · 3h 0m wall · 32.0 core-h</sub>";
+  const agentLine = "<sub>Agent run: 2.1M tokens in / 40k out · ~124 AIC (est.) · 42m wall · 11.2 core-h</sub>";
+  // [input, output, warnings]
+  const cases = [
+    ["", "", []],
+    [`<sub>Bot run: session s1 · claude-opus-5-5 ...</sub>\n${bot}`, botLine, []],
+    [`Agent run [1001](https://x): claude/claude-sonnet-4-5\n${agent}\n\n  ${bot}  `, `${agentLine}\n\n${botLine}`, []],
+    ['<!-- bot-run/v1 {"usd":{"inference":0}} -->', "<sub>Bot run: ~$0.00 inference (est., list prices)</sub>", []],
+    // Lines that aren't footers, say a bot-meta list line, never pass.
+    [`- Board item: \`PVTI_x\`\n${bot}`, botLine, [/not part of a run footer: - Board item/]],
+    ['<!-- bot-run/v2 {"model":"m"} -->', "", [/unknown schema: bot-run\/v2/]],
+    ["<!-- bot-run/v1 {nope} -->", "", [/JSON doesn't parse/]],
+  ];
+  for (const [input, want, warnings] of cases) {
+    const warned = [];
+    assert.equal(footer.upstream(input, (m) => warned.push(m)), want, input);
+    assert.equal(warned.length, warnings.length, `${input}: ${warned.join("; ")}`);
+    warnings.forEach((re, i) => assert.match(warned[i], re));
+    assert.doesNotMatch(want, /claude|sonnet|opus|mystery|s1|a1|https:/);
+  }
+  const out = execFileSync(TOOL, ["--upstream"], { input: `${bot}\n`, encoding: "utf8" });
+  assert.equal(out, `${botLine}\n`);
+});
+
 test("durations are wall time, rounded", () => {
   const cases = [[0, "0s"], [59, "59s"], [60, "1m"], [2520, "42m"], [3599, "1h 0m"], [5430, "1h 31m"]];
   for (const [s, want] of cases) assert.equal(footer.fmtDuration(s), want, String(s));
@@ -99,6 +148,8 @@ test("errors name close matches or how to find the task", () => {
     [["--item", "PVTI_item1", "--scratch", "x"], 2, /give one of --item, --scratch and --task/],
     [["--item", "item1"], 2, /--item takes a board item id/],
     [["--bogus"], 2, /unexpected argument/],
+    [["--item", "PVTI_item1", "--json", "--details"], 2, /give --json or --details, not both/],
+    [["--upstream", "--item", "PVTI_item1"], 2, /--upstream takes no other arguments/],
   ];
   for (const [args, status, want] of cases) {
     assert.throws(() => run([...args, "--no-compute"]), (e) => e.status === status && want.test(e.stderr),

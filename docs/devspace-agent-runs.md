@@ -152,6 +152,32 @@ and `refresh-meta` keeps both kinds:
 <!-- bot-run/v1 {"task":"PVTI_...","item":"PVTI_...","sessions":[...],"agents":[...],"first_message_at":"...","last_message_at":"...","duration_s":2520,"models":{"claude-opus-5-5":{"tokens":{...},"usd":12.3}},"usd":{"inference":12.3,"compute":0.5,"total":12.8},"core_hours":1.3,"run_urls":[...],"window_since":"...","generated_at":"...","estimate":true} -->
 ```
 
+In the section, all footers sit together at its end, folded in one
+collapsed block, since the cost needn't show by default:
+
+```
+<details><summary>Run details</summary>
+
+(each footer, blank-separated)
+
+</details>
+```
+
+`set-body --footer` moves any footer it finds elsewhere in the section
+(say, right after its start) into that block. A footer's summary line is
+the line before its marker only if it starts with `<sub>Bot run: ` or
+`Agent run [`, so nothing else in the section is taken along.
+
+When `bot-pr promote` opens the upstream PR, it strips the bot-meta
+section and appends a folded block of its own after the body, below its
+`Generated-by` line, which stays visible. `bot-footer --upstream`
+rebuilds each footer's line there from its JSON with totals only
+(tokens, cost estimate, wall time, core-hours) and no JSON, ids, links,
+models or tools, which projects such as bootc-dev forbid naming. There
+is no block when the body is cgwalters' own text (human-text), or when
+the project's policy record has an `ai-trailer` of `none`. For a
+comment, `bot-footer --details` prints a footer already folded.
+
 The same rules hold: ids, numbers, timestamps and URLs only, `--`
 escaped. Costs are list-price estimates of the task's messages and
 Actions runs within bot-footer's `--since` window (default 2 days), and

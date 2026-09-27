@@ -110,8 +110,9 @@ and its body quotes what the verdict rests on, with a one-paragraph
 rationale. The verdicts: ${Object.entries(VERDICTS).map(([v, d]) => `${v}: ${d}`).join("; ")}.
 
 Commands:
-  check OWNER/REPO [--allow-human-text]
-        The promote gate: print the verdict and succeed only if the record
+  check OWNER/REPO [--allow-human-text] [--ai-trailer]
+        The promote gate: print the verdict (and with --ai-trailer, the
+        record's ai-trailer on a second line) and succeed only if the record
         exists, is committed to git and valid, is current, and its verdict
         is bot-ok (or human-text, with --allow-human-text, for when
         cgwalters wrote the text himself). Current means that every
@@ -637,7 +638,7 @@ function check(requested, allowHumanText) {
   const why = `${name}'s policy is ${verdict} (${file}, checked ${record.checked}): ${VERDICTS[verdict]}`;
   if (verdict === "human-text" && !allowHumanText) throw new Exit(EX_HUMAN_TEXT, why);
   if (verdict === "human-only" || verdict === "no-go") throw new Exit(EX_REFUSED, why);
-  return verdict;
+  return { verdict, aiTrailer: String(record["ai-trailer"]) };
 }
 
 // recordRebase(name): the record's 'rebase:' for NAME, or null without
@@ -782,9 +783,12 @@ function main(argv) {
   const [command, name, ...rest] = argv;
   if (!command || !name || !REPO_RE.test(name)) throw new Exit(EX_USAGE, `usage: ${PROG} check|scan|rebase OWNER/REPO (see --help)`);
   if (command === "check") {
-    const allow = rest.length === 1 && rest[0] === "--allow-human-text";
-    if (rest.length > (allow ? 1 : 0)) throw new Exit(EX_USAGE, `unknown arguments for check: ${rest.join(" ")}`);
-    console.log(check(name, allow));
+    const flags = new Set(rest);
+    const unknown = rest.filter((a) => a !== "--allow-human-text" && a !== "--ai-trailer");
+    if (unknown.length || flags.size !== rest.length) throw new Exit(EX_USAGE, `unknown arguments for check: ${rest.join(" ")}`);
+    const { verdict, aiTrailer } = check(name, flags.has("--allow-human-text"));
+    console.log(verdict);
+    if (flags.has("--ai-trailer")) console.log(aiTrailer.replace(/\s+/g, " "));
   } else if (command === "rebase") {
     if (rest.length !== 1 || !rest[0] || rest[0].startsWith("-")) throw new Exit(EX_USAGE, `usage: ${PROG} rebase OWNER/REPO BRANCH`);
     console.log(rebaseMode(name, rest[0]));

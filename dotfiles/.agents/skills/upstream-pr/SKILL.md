@@ -225,10 +225,14 @@ section.
 
 Add `--footer <(bot-footer --scratch NAME)` (your scratch dir's name, or
 `--item PVTI_...`; a file works too) to end the bot-meta section with a
-footer recording the run's session, agents, tokens, cost and duration.
-A later run (a review, a rework) adds its own with `bot-pr set-body
-<fork-pr-url> --footer FILE`. Replies you post with gh on forge PRs may
-end with the same footer; never upstream.
+footer recording the run's session, agents, tokens, cost and duration,
+folded in a collapsed `<details>` block. A later run (a review, a
+rework) adds its own with `bot-pr set-body <fork-pr-url> --footer FILE`.
+promote carries them into the upstream PR's body, folded, after its
+`Generated-by` line, as totals only (no models or tools; none at all
+for human-text or a policy whose ai-trailer is none). Replies you post with gh
+on forge PRs may end with `bot-footer --details` output, which is
+folded the same way; never in upstream comments.
 
 ### CI on forge forks
 

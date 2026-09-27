@@ -111,8 +111,9 @@ that may be self-hosted), and inference tokens from the local
 transcripts and agent runs' `token-usage.jsonl`, at the per-model prices
 from [models.dev](https://models.dev). The coordinator puts yesterday's
 estimate in the morning brief. `bot-footer` turns one task's share into
-a run footer that fork PRs carry in their bot-meta section (see "Run
-footer" in the same doc).
+a run footer that fork PRs carry in their bot-meta section, folded in a
+collapsed `<details>` block, and upstream PRs, as totals only, after
+their body (see "Run footer" in the same doc).
 
 `bot-board` is a small CLI over `gh project` for the Workstream board
 (`list`, `show`, `add`, `draft`, `set`, and `state-get`/`state-put` for
@@ -163,7 +164,8 @@ branch, and the board item. On that PR:
   An approval or `/promote` covers the commits pushed before it, so
   changes pushed after it need another one.
 - **Edit** the title and description as you like: they are copied
-  upstream as they stand at approval, minus the bot-meta section.
+  upstream as they stand at approval, minus the bot-meta section (its
+  run footers go along after the body, folded and as totals only).
 - **Close** it to drop the change; the item becomes Done as dropped.
 
 Forge forks start with a clean `main` synced from upstream, and both

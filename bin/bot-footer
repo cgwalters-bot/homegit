@@ -24,6 +24,14 @@ const SHORT_ID = 8;
 // Models shown in the human line; the JSON has them all.
 const TOP_MODELS = 2;
 const CLOSE_MATCHES = 5;
+// --details folds the footer in this block, as bot-pr does in PR bodies.
+const DETAILS_OPEN = "<details><summary>Run details</summary>";
+const DETAILS_CLOSE = "</details>";
+// --upstream: the footers it reads, by their marker's schema, and the
+// summary lines that go with them (dropped: the line is rebuilt).
+const AGENT_SCHEMA = "agent-run-summary/v1";
+const MARKER_LINE_RE = /^<!-- (\S+) (\{.*\}) -->$/;
+const SUMMARY_PREFIXES = ["<sub>Bot run: ", "Agent run ["];
 const EX_ERROR = 1;
 const EX_USAGE = 2;
 
@@ -36,7 +44,8 @@ class Exit extends Error {
 
 function usage() {
   return `Usage: ${PROG} (--item PVTI_... | --scratch NAME | --task KEY) [--since AGE]
-                  [--projects DIR]... [--no-compute] [--json]
+                  [--projects DIR]... [--no-compute] [--json | --details]
+       ${PROG} --upstream < FOOTERS
 
 Prints a footer for a PR body or comment recording the bot run that made
 it: one compact human line, then the same data as JSON in an HTML comment,
@@ -49,13 +58,22 @@ board item (--item), the scratch dir named in a subagent's prompt
 (--scratch, bot-cost's task scratch:NAME), or any bot-cost task key
 (--task). Costs are estimates at list prices; the duration is wall time
 from the task's first to its last message. The JSON has no free text.
---json prints only the JSON. --projects and --no-compute are passed on
-to bot-cost.
+--json prints only the JSON. --details folds the footer in a collapsed
+<details> block, for a comment that posts it as is ('bot-pr fork-pr' and
+'set-body' take the plain footer and fold it themselves). --projects and
+--no-compute are passed on to bot-cost.
+
+--upstream reads run footers (${SCHEMA} and ${AGENT_SCHEMA}, as
+'bot-pr' keeps them) and prints, blank-separated, one line per footer
+for an upstream PR: rebuilt from its JSON with the totals only (tokens,
+cost estimate, wall time, core-hours), and no ids, links, models or
+tools, which some projects forbid naming. Other lines are skipped with
+a warning.
 `;
 }
 
 function parseArgs(argv) {
-  const opts = { task: null, since: DEFAULT_SINCE, projects: [], compute: true, json: false };
+  const opts = { task: null, since: DEFAULT_SINCE, projects: [], compute: true, json: false, details: false, upstream: false };
   const value = (i, name) => {
     if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
     return argv[i + 1];
@@ -90,9 +108,16 @@ function parseArgs(argv) {
       case "--projects": opts.projects.push(value(i++, a)); break;
       case "--no-compute": opts.compute = false; break;
       case "--json": opts.json = true; break;
+      case "--details": opts.details = true; break;
+      case "--upstream": opts.upstream = true; break;
       default:
         throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
     }
+  }
+  if (opts.json && opts.details) throw new Exit(EX_USAGE, "give --json or --details, not both");
+  if (opts.upstream) {
+    if (argv.length > 1) throw new Exit(EX_USAGE, `--upstream takes no other arguments\n\n${usage()}`);
+    return opts;
   }
   if (!opts.task) throw new Exit(EX_USAGE, `name the task with --item, --scratch or --task\n\n${usage()}`);
   return opts;
@@ -201,11 +226,84 @@ function humanLine(rec, compute) {
 // marker(rec): the HTML comment carrying REC; no '--' may end it early.
 const marker = (rec) => `<!-- ${SCHEMA} ${JSON.stringify(rec).replace(/--/g, "-\\u002d")} -->`;
 
+// render(rec, opts): what main prints for REC. The blank lines let the
+// markdown inside the <details> block render.
+function render(rec, opts) {
+  if (opts.json) return `${JSON.stringify(rec, null, 2)}\n`;
+  const footer = `${humanLine(rec, opts.compute)}\n${marker(rec)}`;
+  return opts.details ? `${DETAILS_OPEN}\n\n${footer}\n\n${DETAILS_CLOSE}\n` : `${footer}\n`;
+}
+
+const num = (n) => (Number.isFinite(n) ? n : 0);
+
+// upstreamLine(schema, rec): the line for an upstream PR of the footer
+// whose marker has SCHEMA and REC: totals only.
+function upstreamLine(schema, rec) {
+  const parts = [];
+  let label, tin, tout, cost, coreHours;
+  if (schema === SCHEMA) {
+    label = "Bot run";
+    tin = 0; tout = 0;
+    for (const { tokens: t = {} } of Object.values(rec.models || {})) {
+      tin += num(t.input) + num(t.cache_read) + num(t.cache_write_5m) + num(t.cache_write_1h);
+      tout += num(t.output);
+    }
+    const usd = rec.usd || {};
+    cost = `~$${num(usd.inference).toFixed(2)} inference`;
+    if (num(usd.compute)) cost += ` + ~$${num(usd.compute).toFixed(2)} compute`;
+    cost += " (est., list prices)";
+    coreHours = num(rec.core_hours);
+  } else {
+    label = "Agent run";
+    const t = rec.tokens || {};
+    tin = num(t.input) + num(t.cache_read) + num(t.cache_write);
+    tout = num(t.output);
+    cost = Number.isFinite(rec.aic) ? `~${Math.round(rec.aic)} AIC (est.)` : null;
+    coreHours = (num(rec.cores) * num(rec.duration_s)) / 3600;
+  }
+  if (tin || tout) parts.push(`${fmtTokens(tin)} tokens in / ${fmtTokens(tout)} out`);
+  if (cost) parts.push(cost);
+  if (Number.isFinite(rec.duration_s)) parts.push(`${fmtDuration(rec.duration_s)} wall`);
+  if (coreHours) parts.push(`${coreHours.toFixed(1)} core-h`);
+  return `<sub>${label}: ${parts.join(" · ") || "no totals recorded"}</sub>`;
+}
+
+// upstream(text, warn): the upstream lines of the footers in TEXT,
+// blank-separated; WARN(message) for each line skipped.
+function upstream(text, warn) {
+  const out = [];
+  for (const raw of text.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || SUMMARY_PREFIXES.some((p) => line.startsWith(p))) continue;
+    const m = MARKER_LINE_RE.exec(line);
+    if (!m) {
+      warn(`skipping a line that is not part of a run footer: ${line.slice(0, 60)}`);
+    } else if (m[1] !== SCHEMA && m[1] !== AGENT_SCHEMA) {
+      warn(`skipping a footer with an unknown schema: ${m[1].slice(0, 40)}`);
+    } else {
+      let rec;
+      try {
+        rec = JSON.parse(m[2]);
+      } catch (e) {
+        warn(`skipping a ${m[1]} footer whose JSON doesn't parse: ${e.message}`);
+        continue;
+      }
+      out.push(upstreamLine(m[1], rec));
+    }
+  }
+  return out.join("\n\n");
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
+  if (opts.upstream) {
+    const lines = upstream(fs.readFileSync(0, "utf8"), (msg) => process.stderr.write(`${PROG}: warning: ${msg}\n`));
+    if (lines) process.stdout.write(`${lines}\n`);
+    return;
+  }
   const report = await costReport(opts);
   const rec = record(report, findTask(report, opts.task, opts.since));
-  process.stdout.write(opts.json ? `${JSON.stringify(rec, null, 2)}\n` : `${humanLine(rec, opts.compute)}\n${marker(rec)}\n`);
+  process.stdout.write(render(rec, opts));
 }
 
 if (require.main === module) {
@@ -215,5 +313,5 @@ if (require.main === module) {
     process.exit(e.status);
   });
 } else {
-  module.exports = { parseArgs, findTask, record, humanLine, marker, fmtDuration };
+  module.exports = { parseArgs, findTask, record, humanLine, marker, render, upstream, fmtDuration };
 }
