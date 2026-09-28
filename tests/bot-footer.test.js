@@ -120,6 +120,16 @@ test("--upstream keeps totals only: no ids, links, models or tools", () => {
     [`- Board item: \`PVTI_x\`\n${bot}`, botLine, [/not part of a run footer: - Board item/]],
     ['<!-- bot-run/v2 {"model":"m"} -->', "", [/unknown schema: bot-run\/v2/]],
     ["<!-- bot-run/v1 {nope} -->", "", [/JSON doesn't parse/]],
+    // Nulls, non-objects and out-of-range numbers are skipped, not fatal.
+    ['<!-- bot-run/v1 {"models":{"a":null,"b":{"tokens":null},"c":{"tokens":[1]},"d":"x","e":{"tokens":{"input":2000,"output":-5}}},'
+      + '"usd":null,"duration_s":-1,"core_hours":-5} -->', "<sub>Bot run: 2k tokens in / 0 out · ~$0.00 inference (est., list prices)</sub>", []],
+    ['<!-- bot-run/v1 {"models":null,"usd":{"inference":-1,"compute":"5"},"duration_s":"60","core_hours":null} -->',
+      "<sub>Bot run: ~$0.00 inference (est., list prices)</sub>", []],
+    ['<!-- bot-run/v1 {"models":{"a":{"tokens":{"input":1e308}},"b":{"tokens":{"input":1e308}}},"usd":[],"core_hours":1e400} -->',
+      "<sub>Bot run: ~$0.00 inference (est., list prices)</sub>", []],
+    ['<!-- agent-run-summary/v1 {"tokens":null,"aic":-3,"cores":16,"duration_s":-60} -->', "<sub>Agent run: no totals recorded</sub>", []],
+    ['<!-- agent-run-summary/v1 {"tokens":{"input":"9","output":3000},"aic":null,"cores":1e308,"duration_s":3600} -->',
+      "<sub>Agent run: 0 tokens in / 3k out · 1h 0m wall</sub>", []],
   ];
   for (const [input, want, warnings] of cases) {
     const warned = [];

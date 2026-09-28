@@ -234,7 +234,13 @@ function render(rec, opts) {
   return opts.details ? `${DETAILS_OPEN}\n\n${footer}\n\n${DETAILS_CLOSE}\n` : `${footer}\n`;
 }
 
-const num = (n) => (Number.isFinite(n) ? n : 0);
+// A marker is only JSON, so --upstream must survive nulls, strings,
+// arrays and out-of-range numbers anywhere in it: only finite,
+// non-negative numbers count (num(n): N or 0), and only plain objects
+// are looked into (obj(v): V or {}).
+const isCount = (n) => Number.isFinite(n) && n >= 0;
+const num = (n) => (isCount(n) ? n : 0);
+const obj = (v) => (v !== null && typeof v === "object" && !Array.isArray(v) ? v : {});
 
 // upstreamLine(schema, rec): the line for an upstream PR of the footer
 // whose marker has SCHEMA and REC: totals only.
@@ -244,26 +250,29 @@ function upstreamLine(schema, rec) {
   if (schema === SCHEMA) {
     label = "Bot run";
     tin = 0; tout = 0;
-    for (const { tokens: t = {} } of Object.values(rec.models || {})) {
+    for (const model of Object.values(obj(rec.models))) {
+      const t = obj(obj(model).tokens);
       tin += num(t.input) + num(t.cache_read) + num(t.cache_write_5m) + num(t.cache_write_1h);
       tout += num(t.output);
     }
-    const usd = rec.usd || {};
+    const usd = obj(rec.usd);
     cost = `~$${num(usd.inference).toFixed(2)} inference`;
     if (num(usd.compute)) cost += ` + ~$${num(usd.compute).toFixed(2)} compute`;
     cost += " (est., list prices)";
     coreHours = num(rec.core_hours);
   } else {
     label = "Agent run";
-    const t = rec.tokens || {};
+    const t = obj(rec.tokens);
     tin = num(t.input) + num(t.cache_read) + num(t.cache_write);
     tout = num(t.output);
-    cost = Number.isFinite(rec.aic) ? `~${Math.round(rec.aic)} AIC (est.)` : null;
+    cost = isCount(rec.aic) ? `~${Math.round(rec.aic)} AIC (est.)` : null;
     coreHours = (num(rec.cores) * num(rec.duration_s)) / 3600;
   }
+  // Sums and products of finite numbers can still overflow.
+  [tin, tout, coreHours] = [num(tin), num(tout), num(coreHours)];
   if (tin || tout) parts.push(`${fmtTokens(tin)} tokens in / ${fmtTokens(tout)} out`);
   if (cost) parts.push(cost);
-  if (Number.isFinite(rec.duration_s)) parts.push(`${fmtDuration(rec.duration_s)} wall`);
+  if (isCount(rec.duration_s)) parts.push(`${fmtDuration(rec.duration_s)} wall`);
   if (coreHours) parts.push(`${coreHours.toFixed(1)} core-h`);
   return `<sub>${label}: ${parts.join(" · ") || "no totals recorded"}</sub>`;
 }
