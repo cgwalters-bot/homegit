@@ -5,6 +5,12 @@
 # shellcheck disable=SC2016
 set -euo pipefail
 
+# shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
+    echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
+    exit 1
+}
+
 readonly OWNER=cgwalters-bot
 # The boards this tool can target, by --project name. The Workstream
 # board is the bot's work queue and holds the state items; the others are
@@ -17,7 +23,6 @@ readonly WORKSTREAM=workstream
 NUMBER=
 BOARD_URL=
 BOARD_CACHE=
-readonly ITEM_LIMIT=1000
 readonly TITLE_WIDTH=70
 # Board fields that 'set' can change, and the option that sets each.
 readonly SET_OPTIONS=(--status --priority --workflow --org --why --branch --gist)
@@ -95,10 +100,16 @@ readonly TARGET_COLOR=1d76db
 readonly TARGET_COLOR_OWN=bfd4f2
 readonly OWN_ORGS=(cgwalters-bot cgwalters-forge)
 # Every gh project call spends the bot's GraphQL quota (5000 points/hour),
-# which all agents share, so reads are cached on disk.
+# which all agents share, so reads are cached on disk. The item list
+# comes from the REST API instead, revalidated with ETags once ITEMS_TTL
+# has passed: an unchanged page answers 304, which costs no quota, but
+# the round trips take seconds.
 readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-board
 readonly FIELDS_TTL=3600
-readonly ITEMS_TTL=60
+readonly ITEMS_TTL=30
+readonly REST_PER_PAGE=100
+# Copies of pages not read for this long (their cursor moved) are dropped.
+readonly REST_KEEP_DAYS=14
 # Headroom to keep when checking the quota before a batch of edits.
 readonly QUOTA_MARGIN=20
 # Exit status for an exhausted quota (EX_TEMPFAIL), so callers can retry later.
@@ -245,8 +256,11 @@ BLOCKED and QUESTION are issue/PR URLs or OWNER/REPO#N.
 Valid values for Status, Priority, Workflow and Org are read from the board.
 
 Board calls use the bot's GraphQL quota, shared by all agents, so field
-definitions are cached for ${FIELDS_TTL}s and the item list for ${ITEMS_TTL}s in
-${BOARD_CACHE}; changes made through this tool invalidate the item cache.
+definitions are cached for ${FIELDS_TTL}s in ${BOARD_CACHE}. The item
+list (list, show, fill-org, labels) is read over REST instead: it is
+reused for ${ITEMS_TTL}s (changes made through this tool clear that), then
+revalidated page by page with ETags in ${BOARD_CACHE}/rest, and an
+unchanged page costs no quota.
 state-get is one GraphQL call, and so is state-put on an existing item
 (creating one takes a few); --checked adds a read, unless there is
 nothing to write.
@@ -270,14 +284,15 @@ require_cmd() {
     command -v "$1" >/dev/null 2>&1 || fatal "'$1' not found in PATH; $2"
 }
 
-# rate_limited REASON: fails with the quota state and reset time. rate_limit
-# is a REST endpoint and does not count against the quota.
+# rate_limited REASON [RESOURCE]: fails with the state and reset time of
+# the quota RESOURCE (graphql, or core for REST calls). rate_limit is a
+# REST endpoint and does not count against any quota.
 rate_limited() {
-    local quota
-    quota=$(gh api rate_limit --jq '.resources.graphql
+    local resource=${2:-graphql} quota
+    quota=$(gh api rate_limit --jq ".resources.${resource}"'
         | "\(.remaining)/\(.limit) points left, resets at \(.reset | todate)"' 2>/dev/null) ||
         quota="quota unknown"
-    echo "error: GitHub is rate limiting the bot (${1}; GraphQL: ${quota}); the quota is shared by all agents, so back off and retry later" 1>&2
+    echo "error: GitHub is rate limiting the bot (${1}; ${resource}: ${quota}); the quota is shared by all agents, so back off and retry later" 1>&2
     exit "${EX_RATELIMIT}"
 }
 
@@ -377,11 +392,122 @@ load_fields() {
         fail_after $? "reading the board fields failed (gh needs the project scope)"
 }
 
+# REST items (with field values) in the shape of 'gh project item-list
+# --format json' items, which 'list --json' prints. Labels come in
+# creation order, as there. Reviewers are the board column's (requested
+# reviewers and teams); gh lists something else, with repeats. Like gh,
+# load_items leaves out the title (it is the content's), parent issues
+# and sub-issue progress.
+readonly REST_ITEMS_JQ='
+def value_of:
+  if .value == null or .value == [] then empty
+  elif .data_type == "single_select" then .value.name.raw
+  elif .data_type == "text" then .value.raw
+  elif .data_type == "labels" then .value | sort_by(.id) | map(.name)
+  elif .data_type == "assignees" then .value | map(.login)
+  elif .data_type == "linked_pull_requests" then .value | map(.html_url)
+  elif .data_type == "repository" then .value.html_url
+  elif .data_type == "milestone" then .value | {title, description: (.description // ""), dueOn: (.due_on // "")}
+  elif .data_type == "reviewers" then
+    [(.value.requested_reviewers // [])[].login, (.value.requested_teams // [])[].slug] | select(length > 0)
+  else .value end;
+map(.content_type as $type
+  | {id: .node_id, title: .content.title,
+     content: (.content | if $type == "DraftIssue" then {type: $type, id: .node_id, title, body: (.body // "")}
+       else {type: $type, url: .html_url, number, title, body: (.body // ""),
+             repository: (first(.html_url // "" | capture("^https://github\\.com/(?<r>[^/]+/[^/]+)/").r) // null)} end)}
+    + ([.fields[] | {key: (.name | ascii_downcase), value: value_of}] | from_entries))'
+
+# Set by rest_get.
+REST_OUT=
+REST_NEXT=
+
+# rest_get PATH FILTER: sets REST_OUT to a file holding {etag, next,
+# data}: FILTER applied to the JSON at the REST PATH, and the path of the
+# next page, or "". That file is BOARD_CACHE/rest/KEY.json, whose ETag
+# goes back as If-None-Match, so that an unchanged page answers 304 and
+# costs no quota. A 304 has no Link header, hence 'next'. Written by
+# rename, so that concurrent runs can share it.
+rest_get() {
+    local path=$1 filter=$2 dir=${BOARD_CACHE}/rest file tmp rc=0 status etag
+    file=${dir}/$(printf '%s\n%s' "${path}" "${filter}" | sha256sum | cut -c1-32).json
+    local args=(-i "${path}")
+    # GitHub sends no next link from a full last page, and a 304 answers
+    # for the page alone: after the board grew by a page, that would hide
+    # the new one. So a full page without a next link is refetched.
+    if etag=$(jq -er '.etag | select(. != "")' "${file}" 2>/dev/null) &&
+        jq -e --argjson full "${REST_PER_PAGE}" \
+            '.next != "" or (.data | type != "array" or length != $full)' "${file}" >/dev/null 2>&1; then
+        args+=(-H "If-None-Match: ${etag}")
+    fi
+    tmp=$(mktemp -d)
+    gh api "${args[@]}" >"${tmp}/raw" 2>"${tmp}/err" || rc=$?
+    split_http_response "${tmp}/raw" "${tmp}/headers" "${tmp}/body"
+    status=$(awk 'NR == 1 { print $2 }' "${tmp}/headers")
+    case "${status}" in
+        # Touched as still in use: see the pruning in load_items.
+        304) rc=0; touch -c "${file}" ;;
+        200)
+            rc=0
+            etag=$(awk 'tolower($0) ~ /^etag:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "${tmp}/headers")
+            REST_NEXT=$(awk 'tolower($0) ~ /^link:/ && match($0, /<[^>]*>; rel="next"/) {
+                print substr($0, RSTART + 1, RLENGTH - 14) }' "${tmp}/headers")
+            REST_NEXT=${REST_NEXT#https://api.github.com/}
+            # The copy is made next to FILE, so that the rename is atomic.
+            if ! { mkdir -p "${dir}" &&
+                jq -c --arg etag "${etag}" --arg next "${REST_NEXT}" \
+                    "{etag: \$etag, next: \$next, data: (${filter})}" "${tmp}/body" >"${file}.tmp.$$" &&
+                mv -f "${file}.tmp.$$" "${file}"; }; then
+                rm -f "${file}.tmp.$$"
+                echo "error: caching ${path} in ${dir} failed" >>"${tmp}/err"
+                rc=1
+            fi
+            ;;
+        *) test "${rc}" -ne 0 || rc=1 ;;
+    esac
+    if test "${rc}" -ne 0; then
+        local reason
+        if reason=$(grep -iE -m1 'rate limit|abuse' "${tmp}/err"); then
+            rm -rf "${tmp}"
+            rate_limited "${reason}" core
+        fi
+        cat "${tmp}/err" 1>&2
+        rm -rf "${tmp}"
+        return "${rc}"
+    fi
+    rm -rf "${tmp}"
+    REST_OUT=${file}
+    REST_NEXT=$(jq -r .next "${file}")
+}
+
+# rest_items: prints the board's items as 'gh project item-list --format
+# json' does, reading every page with rest_get.
+rest_items() {
+    local base=users/${OWNER}/projectsV2/${NUMBER} fields path pages=()
+    test ! -d "${BOARD_CACHE}/rest" ||
+        find "${BOARD_CACHE}/rest" -type f -mtime "+${REST_KEEP_DAYS}" -delete ||
+        echo "warning: pruning ${BOARD_CACHE}/rest failed" 1>&2
+    rest_get "${base}/fields?per_page=${REST_PER_PAGE}" \
+        'map(select(.data_type | IN("title", "parent_issue", "sub_issues_progress") | not) | .id) | join(",")' ||
+        fail_after $? "reading the board fields failed (gh needs the project scope)"
+    fields=$(jq -r .data "${REST_OUT}")
+    path="${base}/items?per_page=${REST_PER_PAGE}&fields=${fields}"
+    while test -n "${path}"; do
+        rest_get "${path}" "${REST_ITEMS_JQ}" ||
+            fail_after $? "listing board items failed (gh needs the project scope)"
+        pages+=("${REST_OUT}")
+        path=${REST_NEXT}
+    done
+    jq -sS 'map(.data) | add | {items: ., totalCount: length}' "${pages[@]}" ||
+        fatal "cannot read the cached board pages in ${BOARD_CACHE}/rest; remove them"
+}
+
+# Within ITEMS_TTL of the last listing (unless --refresh or a write
+# through this tool since), its copy is used without asking GitHub.
 load_items() {
     test -n "${ITEMS_JSON}" && return 0
-    ITEMS_JSON=$(cached items.json "${ITEMS_TTL}" \
-        ghq project item-list "${NUMBER}" --owner "${OWNER}" --format json --limit "${ITEM_LIMIT}") ||
-        fail_after $? "listing board items failed (gh needs the project scope)"
+    ITEMS_JSON=$(cached items.json "${ITEMS_TTL}" rest_items) ||
+        fail_after $? "listing board items failed"
 }
 
 project_id() {
@@ -469,7 +595,7 @@ resolve_item() {
     else
         fatal "cannot parse item '${item}'; expected PVTI_..., an issue/PR URL or OWNER/REPO#N"
     fi
-    test -n "${id}" || fatal "'${item}' is not on the board (${BOARD_URL}); if it was just added, retry with --refresh"
+    test -n "${id}" || fatal "'${item}' is not on the board (${BOARD_URL}); if it was just added, GitHub's listing can lag for minutes: use its PVTI_ id"
     test "$(wc -l <<<"${id}")" -eq 1 || fatal "'${item}' matches several board items"
     echo "${id}"
 }
@@ -1026,7 +1152,7 @@ cmd_set() {
     if test -n "${remaining}" && test "${remaining}" -lt $((${#field_ids[@]} + QUOTA_MARGIN)); then
         rate_limited "only ${remaining} GraphQL points left, not starting ${#field_ids[@]} edit(s)"
     fi
-    # Before and after the edits, so a concurrent listing can't cache the
+    # Before and after the edits, so a concurrent listing can't keep the
     # old values for long.
     invalidate_items
     for i in "${!field_ids[@]}"; do

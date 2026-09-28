@@ -248,10 +248,12 @@ bot-board resolve QUESTION "what was done"
 
 ITEM is a project item id (`PVTI_...`), an issue or PR URL, or
 `OWNER/REPO#N`. Invalid field values are rejected with the list of valid
-ones. Reads are cached briefly; pass `--refresh` (before the command) right
-after someone else changed the board. If it reports that the GraphQL quota
-is exhausted (exit status 75), stop touching the board until the reset
-time it prints.
+ones. The item list is read over REST: reused for 30 seconds, then
+revalidated by ETag, which costs no quota while the board is unchanged.
+Field definitions are cached for an hour; `--refresh` (before the
+command) rereads both.
+If it reports that the GraphQL quota is exhausted (exit status 75), stop
+touching the board until the reset time it prints.
 
 GitHub's item listing lags behind writes: a newly added item can
 be missing from `list` (and so from `show`, and URL/title lookups) for

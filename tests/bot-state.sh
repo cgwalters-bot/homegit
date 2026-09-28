@@ -133,7 +133,8 @@ case "$1 $2" in
         exit 0
         ;;
     "project view") echo PVT_fake; exit 0 ;;
-    # Per board NUMBER: $FAKE_GH/fields-NUMBER.json and items-NUMBER.json.
+    # Per board NUMBER: $FAKE_GH/fields-NUMBER.json (items-NUMBER.json
+    # is served over REST below).
     "project field-list")
         if test -e "${store}/fields-$3.json"; then
             cat "${store}/fields-$3.json"
@@ -142,12 +143,12 @@ case "$1 $2" in
         fi
         exit 0
         ;;
-    "project item-list")
-        cat "${store}/items-$3.json" 2>/dev/null || echo '{"items": []}'
-        exit 0
-        ;;
     "project item-edit") exit 0 ;;
 esac
+# Board N's items, from $FAKE_GH/items-N.json, over REST.
+if test "$1 $2" = "api -i" && [[ "$3" =~ ^users/[^/]+/projectsV2/([0-9]+)/ ]]; then
+    exec "${FAKE_BOARD_REST:?}" "${store}/items-${BASH_REMATCH[1]}.json" "$3"
+fi
 # Notifications: nothing new. $FAKE_GH/on-poll runs first, if it exists,
 # to simulate another machine writing meanwhile.
 if test "$1 $2" = "api -i" && [[ "$3" == notifications\?* ]]; then
@@ -358,7 +359,7 @@ JSON
     ! "${BIN}/bot-board" --project composefs-stable set PVTI_a --field Area nope 2>/dev/null ||
         fail "an invalid option was accepted"
     "${BIN}/bot-board" --project=2 show PVTI_a | grep -qx $'area:\tdocs' || fail "show lacks the Area field"
-    test -e "${XDG_CACHE_HOME}/bot-board/project-2/items.json" || fail "board 2 isn't cached apart"
+    test -d "${XDG_CACHE_HOME}/bot-board/project-2/rest" || fail "board 2 isn't cached apart"
     # Board-bound commands and the default board.
     local cmd
     for cmd in "state-get x" "state-put x {}"; do
@@ -372,7 +373,7 @@ JSON
     ! "${BIN}/bot-board" --project nope list 2>/dev/null || fail "an unknown board was accepted"
     reset_calls
     "${BIN}/bot-board" --refresh list >/dev/null
-    grep -qx 'project item-list 1 .*' "${FAKE_GH}/calls" || fail "the default isn't the Workstream board"
+    grep -q '^api -i users/cgwalters-bot/projectsV2/1/items?' "${FAKE_GH}/calls" || fail "the default isn't the Workstream board"
 }
 
 # --- bot-pr -----------------------------------------------------------------
@@ -785,6 +786,7 @@ run_test() {
     write_fake_gh "${WORK}/bin"
     write_fake_policy "${WORK}/bin"
     export FAKE_GH WORK BOT_PR_UPSTREAM_POLICY=${WORK}/bin/upstream-policy
+    export FAKE_BOARD_REST=${BIN}/../tests/fixtures/bot-board/fake-rest
     export PATH=${WORK}/bin:${PATH}
     export HOME=${WORK}/home XDG_STATE_HOME=${WORK}/home/state XDG_CACHE_HOME=${WORK}/home/cache
     export XDG_RUNTIME_DIR=${WORK}/home/run
