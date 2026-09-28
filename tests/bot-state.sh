@@ -807,6 +807,77 @@ test_notify_gists_unchanged() {
     expect_eq "$(graphql_calls)" 1 "GraphQL calls of an unchanged run"
 }
 
+# A gist check position whose listing is not a 304, so the gist is read.
+gist_position() {
+    jq -nc --arg e "$(fake_etag '[]')" '{since: "2026-09-23T22:00:00Z", etag: "W/\"old\"", empty_etag: $e}'
+}
+
+# set_mention REPO PRIVATE: a notification thread for REPO#1, private or
+# not, in which cgwalters mentions the bot; bot-notify reads it from
+# $WORK/threads.json.
+set_mention() {
+    local dir=${FAKE_GH}/rest/repos/$1/issues
+    mkdir -p "${dir}/1"
+    jq -n --arg r "$1" '{number: 1, title: "Issue title", html_url: "https://github.com/\($r)/issues/1", labels: [],
+        body: "", user: {login: "someone", type: "User"}, created_at: "2026-09-20T00:00:00Z"}' >"${dir}/1.json"
+    jq -n --arg r "$1" '[{user: {login: "cgwalters", type: "User"}, body: "@cgwalters-bot Please look at this",
+        html_url: "https://github.com/\($r)/issues/1#issuecomment-9", created_at: "2026-09-23T23:40:00Z",
+        updated_at: "2026-09-23T23:40:00Z"}]' >"${dir}/1/comments.json"
+    jq -n --arg r "$1" --argjson p "$2" '[{id: "42", reason: "mention", unread: true, updated_at: "2026-09-23T23:40:00Z",
+        last_read_at: null, subject: {type: "Issue", title: "Issue title", url: "https://api.github.com/repos/\($r)/issues/1",
+        latest_comment_url: null}, repository: {full_name: $r, owner: {login: ($r | split("/")[0])}, private: $p,
+        html_url: "https://github.com/\($r)"}}]' >"${WORK}/threads.json"
+}
+
+test_notify_private_redacted() {
+    local c kind private out stored want
+    # KIND PRIVATE: whether the stored request keeps its excerpt and title
+    # depends only on whether its source is public; the run that found it
+    # prints them either way.
+    for c in "repo true" "repo false" "gist true" "gist false"; do
+        read -r kind private <<<"${c}"
+        rm -rf "${FAKE_GH}/rest" "${FAKE_GH}/gists.json" "${WORK}/threads.json"
+        echo '[]' >"${WORK}/threads.json"
+        set_notify_state "$(gist_position)"
+        if test "${kind}" = repo; then
+            set_mention o/r "${private}"
+        else
+            set_gist_comments "1 cgwalters 2026-09-23T22:30:00Z @cgwalters-bot Please look at this"
+            jq --argjson p "${private}" '.[0].public = ($p | not)' "${FAKE_GH}/gists.json" >"${WORK}/g" &&
+                mv "${WORK}/g" "${FAKE_GH}/gists.json"
+        fi
+        "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 ||
+            fail "${c}: bot-notify failed: $(cat "${WORK}/out")"
+        out=$(sed -n 's/^request //p' "${WORK}/out")
+        jq -se 'length == 1 and (.[0] | (.excerpt | test("Please look at this")) and .title != null)' <<<"${out}" >/dev/null ||
+            fail "${c}: the run didn't print the request with its text: $(cat "${WORK}/out")"
+        stored=$(project_state notifications | jq -c '.pending | to_entries | map(.value | {private, excerpt, title})')
+        if ${private}; then
+            ! project_state notifications | grep -q 'Please look\|Issue title\|An analysis' ||
+                fail "${c}: the public state quotes a private source: $(project_state notifications)"
+            want='[{"private":true,"excerpt":null,"title":null}]'
+        else
+            want=$(jq -nc --arg t "$(test "${kind}" = repo && echo "Issue title" || echo "An analysis")" \
+                '[{private: false, excerpt: "@cgwalters-bot Please look at this", title: $t}]')
+        fi
+        expect_json "${stored}" "${want}" "${c}: stored request"
+        # A later run prints the stored request as it is.
+        "${BIN}/bot-notify" >"${WORK}/out" 2>&1 || fail "${c}: the second run failed: $(cat "${WORK}/out")"
+        expect_json "$(sed -n 's/^request //p' "${WORK}/out" | jq -sc 'map({private, excerpt, title})')" "${want}" \
+            "${c}: request printed by a later run"
+    done
+}
+
+test_notify_private_scrubbed() {
+    # A private request stored with its text before redaction existed
+    # loses it on the next run, even one with nothing new.
+    set_project_state notifications "$(jq -nc --argjson r "$(request U1 11 | jq -c '.private = true')" \
+        '{since: "2026-09-23T23:30:00Z", last_modified: "LM", pending: {U1: $r}, acked: {}}')"
+    "${BIN}/bot-notify" >"${WORK}/out" 2>&1 || fail "bot-notify failed: $(cat "${WORK}/out")"
+    expect_json "$(project_state notifications | jq -c '.pending.U1 | {excerpt, title, url}')" \
+        '{"excerpt":null,"title":null,"url":"U1"}' "the old private request"
+}
+
 # --- bot-work ---------------------------------------------------------------
 
 # run_bot_work: runs bot-work with a fake agent that saves the lease it

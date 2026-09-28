@@ -148,7 +148,10 @@ team_mention, review_requested, or assign for a private repository),
 `thread_url`, `url` (the triggering comment or event), `excerpt` (what
 cgwalters wrote, or the issue's title and body for an assignment or review
 request), `private`, and `located` (false if the script fell back to the
-latest comment because it couldn't find the trigger itself).
+latest comment because it couldn't find the trigger itself). The
+unacked requests are kept on the public board, so when `private` is not
+false only the run that found one prints its `excerpt` and `title`;
+later runs print it without them, and you read the thread instead.
 
 A gist comment's record (`reason` `gist_comment`) has `gist` (its id)
 instead of `repo` and `number`; `title` is the gist's description,
