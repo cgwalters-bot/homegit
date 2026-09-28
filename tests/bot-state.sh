@@ -878,6 +878,35 @@ test_notify_private_scrubbed() {
         '{"excerpt":null,"title":null,"url":"U1"}' "the old private request"
 }
 
+test_notify_gists_failed() {
+    local c what gists
+    gists=$(gist_position)
+    # What fails, then the gist check's position must stay put, so that
+    # the next run reads the same comments again: reading the gist's
+    # comments (a 404 or a 500), or, with the gist read fine, a thread.
+    cat >"${WORK}/gh-extra" <<'EOF'
+#!/usr/bin/env bash
+echo "gh: HTTP 500: Internal Server Error ($*)" 1>&2
+exit 1
+EOF
+    chmod +x "${WORK}/gh-extra"
+    for what in gist-404 gist-500 thread; do
+        rm -rf "${FAKE_GH}/rest"
+        set_notify_state "${gists}"
+        set_gist_comments "1 cgwalters 2026-09-23T22:30:00Z Please"
+        echo '[]' >"${WORK}/threads.json"
+        case "${what}" in
+            gist-404) mv "${FAKE_GH}/rest/gists/${GIST_ID}/comments."{json,404} ;;
+            gist-500) rm "${FAKE_GH}/rest/gists/${GIST_ID}/comments.json" ;;
+            # The thread's issue has no fixture, so reading it is a 500.
+            thread) set_mention o/r false; rm "${FAKE_GH}/rest/repos/o/r/issues/1.json" ;;
+        esac
+        FAKE_GH_EXTRA=${WORK}/gh-extra "${BIN}/bot-notify" --from-file "${WORK}/threads.json" >"${WORK}/out" 2>&1 &&
+            fail "${what}: a run that failed to read GitHub succeeded: $(cat "${WORK}/out")"
+        expect_json "$(project_state notifications | jq -c .gists)" "${gists}" "${what}: gist state after the failure"
+    done
+}
+
 # --- bot-work ---------------------------------------------------------------
 
 # run_bot_work: runs bot-work with a fake agent that saves the lease it
