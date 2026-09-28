@@ -69,8 +69,9 @@ Prints the next free tmt test number ('# number: N' in a test's header,
 which becomes plan-N and test-N in the generated fmf files) of REPO
 (default ${DEFAULT_REPO}): one more than the highest number taken by
   - the default branch's ${TMT_DIR}/ tree (headers and fmf names);
-  - the lines added by every open PR in REPO and in its fork
-    ${FORGE_ORG}/NAME (read from the PR files API);
+  - the lines added by every open PR in REPO and in its ${FORGE_ORG}
+    fork (read from the PR files API; the fork is found by its parent,
+    since it may be named other than REPO's name);
   - the reservations in the Workstream board state item
     'bot-state: ${STATE_NAME}'.
 
@@ -200,9 +201,10 @@ function splitResponse(raw) {
   return { status: m ? Number(m[1]) : null, headers, body };
 }
 
-// ghGet(ENDPOINT): the JSON of a REST GET, revalidated with its cached
-// ETag, so that an unchanged answer costs no quota.
-async function ghGet(endpoint) {
+// ghGet(ENDPOINT, {missingOk}): the JSON of a REST GET, revalidated with
+// its cached ETag, so that an unchanged answer costs no quota; with
+// missingOk, null for a 404.
+async function ghGet(endpoint, { missingOk = false } = {}) {
   const file = cachePath("http", endpoint);
   const cached = readJson(file, null);
   const args = ["api", "-i", endpoint];
@@ -219,6 +221,7 @@ async function ghGet(endpoint) {
   }
   const res = splitResponse(stdout);
   if (res.status === 304 && cached) return cached.body;
+  if (res.status === 404 && missingOk) return null;
   if (res.status !== 200) {
     throw new Exit(EX_ERROR, `GET ${endpoint} failed (HTTP ${res.status ?? "?"})${stderr ? `: ${stderr}` : ""}`);
   }
@@ -324,15 +327,31 @@ async function scanPrs(repos) {
   }));
 }
 
-function forkOf(repo) {
-  return `${FORGE_ORG}/${repo.split("/")[1]}`;
+// forgeFork(REPO): the forge's fork of REPO, or null. It is usually
+// named after REPO, but may have been renamed to free the name (like
+// bot-pr's forge_fork), so the name is only a first guess before
+// REPO's forks. The name returned is GitHub's, since gh follows the
+// redirect from a renamed repository's old name.
+async function forgeFork(repo) {
+  const guess = `${FORGE_ORG}/${repo.split("/")[1]}`;
+  if (guess.toLowerCase() === repo.toLowerCase()) return null;
+  const r = await ghGet(`repos/${guess}`, { missingOk: true });
+  const network = [r?.parent?.full_name, r?.source?.full_name].map((n) => n?.toLowerCase());
+  if (network.includes(repo.toLowerCase())) return r.full_name;
+  const fork = (await ghPages(`repos/${repo}/forks`)).find((f) => f.owner?.login === FORGE_ORG);
+  return fork ? fork.full_name : null;
+}
+
+// reposOf(REPO): REPO and the forge's fork of it, if any.
+async function reposOf(repo) {
+  const fork = await forgeFork(repo);
+  return fork ? [repo, fork] : [repo];
 }
 
 async function scan(repo) {
-  const repos = [repo];
-  if (forkOf(repo) !== repo) repos.push(forkOf(repo));
+  const repos = await reposOf(repo);
   const [main, prs] = await Promise.all([scanMain(repo), scanPrs(repos)]);
-  return { main, prs };
+  return { main, prs, repos };
 }
 
 // --- Reservations ----------------------------------------------------------
@@ -528,7 +547,7 @@ async function gcReason(scanned, repos, n, entry) {
 
 async function cmdGc(opts) {
   const scanned = await scan(opts.repo);
-  const repos = [opts.repo, forkOf(opts.repo)];
+  const { repos } = scanned;
   const released = await updateReservations(opts.repo, async (entries) => {
     const out = [];
     for (const [n, entry] of Object.entries(entries)) {

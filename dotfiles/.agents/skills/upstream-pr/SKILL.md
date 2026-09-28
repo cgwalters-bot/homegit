@@ -91,9 +91,10 @@ cd REPO
 git switch -c bot/<short-slug> upstream/<default-branch>
 ```
 
-`bot-pr fork-pr` creates the `cgwalters-forge/REPO` fork when the branch
-is ready; after that, `git remote add forge https://github.com/cgwalters-forge/REPO`
-for pushing review fixups. Never commit to a fork's default branch; one
+`bot-pr fork-pr` creates the forge's fork when the branch is ready;
+after that, `git remote add forge "https://github.com/$(bot-pr fork-of OWNER/REPO)"`
+for pushing review fixups. The fork is usually `cgwalters-forge/REPO`,
+but not always (one may be renamed to free its name), so look it up. Never commit to a fork's default branch; one
 topic branch per change.
 
 ## Commits
@@ -213,8 +214,9 @@ bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
   --branch bot/<short-slug> --item PVTI_... --title "..." --body-file pr-body.md
 ```
 
-Run it in the clone that has the branch. It creates `cgwalters-forge/REPO`
-if needed, turns off its CI (`bot-pr fork-setup REPO` redoes just that),
+Run it in the clone that has the branch. It creates the forge's fork
+if needed (`bot-pr fork-of OWNER/REPO` prints it), turns off its CI
+(`bot-pr fork-setup FORK-NAME` redoes just that),
 syncs the fork's copy of the base with upstream,
 pushes the branch there, opens the PR inside the fork, and
 appends a bot-meta section with the upstream target, the board item and
@@ -247,7 +249,7 @@ workflow in on the fork, which enables it and records it in the fork's
 ```bash
 bot-pr fork-pr ... --ci ci.yml      # or: bot-pr fork-setup REPO --ci ci.yml
 # a workflow_dispatch one can also be run on the branch directly:
-gh api -X POST repos/cgwalters-forge/REPO/actions/workflows/ci.yml/dispatches -f ref=bot/<slug>
+gh api -X POST "repos/$(bot-pr fork-of OWNER/REPO)/actions/workflows/ci.yml/dispatches" -f ref=bot/<slug>
 ```
 
 fork-setup warns about an opted-in workflow that can't work on a fork

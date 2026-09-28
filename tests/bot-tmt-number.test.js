@@ -98,7 +98,21 @@ class World {
         serve(`repos/${repo}/pulls/${p.number}/files?per_page=100&page=1`, files);
       }
     }
-    for (const repo of [REPO, FORK]) {
+    // The forge's fork: FORK unless spec.fork names another, or is null
+    // (none: FORK is then missing). For a renamed fork, FORK is a
+    // repository of the forge's own, or with spec.redirect, the old name
+    // GitHub redirects to the fork.
+    const fork = spec.fork === undefined ? FORK : spec.fork;
+    const forks = [{ full_name: "someone/bootc", owner: { login: "someone" } }];
+    if (fork) {
+      const body = { full_name: fork, fork: true, parent: { full_name: REPO }, source: { full_name: REPO } };
+      serve(`repos/${fork}`, body);
+      if (spec.redirect) serve(`repos/${FORK}`, body);
+      else if (fork !== FORK) serve(`repos/${FORK}`, { full_name: FORK, fork: false });
+      forks.push({ full_name: fork, owner: { login: fork.split("/")[0] } });
+    }
+    serve(`repos/${REPO}/forks?per_page=100&page=1`, forks);
+    for (const repo of [REPO, ...(fork ? [fork] : [])]) {
       for (const owner of ["cgwalters-forge", "cgwalters-bot"]) {
         for (const branch of ["bot/a", "bot/b", "bot/c", "bot/d", "bot/e", "bot/thing"]) {
           const q = new URLSearchParams({ state: "closed", head: `${owner}:${branch}` });
@@ -197,6 +211,32 @@ test("the next number is one past everything taken", withWorld((w) => {
 test("an empty world starts at 1", withWorld((w) => {
   w.set({ main: {}, prs: { [REPO]: [], [FORK]: [] }, closed: {} });
   assert.equal(w.ok().stdout, "1\n");
+}));
+
+test("the forge's fork is found by its parent, whatever its name", withWorld((w) => {
+  const renamed = "cgwalters-forge/acme-bootc";
+  const world = defaultWorld();
+  world.prs[renamed] = world.prs[FORK];
+  delete world.prs[FORK];
+  world.fork = renamed;
+  w.set(world);
+  assert.match(w.ok("-v").stderr, /open PR https:\/\/github.com\/cgwalters-forge\/acme-bootc\/pull\/3: 9\n/);
+  assert.ok(w.calls().includes(`repos/${REPO}/forks?per_page=100&page=1`));
+  // Before the old name is reused, GitHub redirects it to the fork: the
+  // PRs are the fork's, under its real name, with no listing.
+  w.set({ ...world, redirect: true });
+  assert.match(w.ok("-v").stderr, /open PR https:\/\/github.com\/cgwalters-forge\/acme-bootc\/pull\/3: 9\n/);
+  assert.ok(!w.calls().some((c) => c.includes("/forks")), w.calls().join("\n"));
+}));
+
+test("without a fork (a 404 for the guess), only upstream's PRs count", withWorld((w) => {
+  const world = defaultWorld();
+  delete world.prs[FORK];
+  world.fork = null;
+  w.set(world);
+  assert.equal(w.ok().stdout, "9\n");
+  assert.ok(w.calls().includes(`repos/${FORK}`));
+  assert.ok(w.calls().includes(`repos/${REPO}/forks?per_page=100&page=1`));
 }));
 
 test("reads are conditional and PRs are rescanned only when their head moves", withWorld((w) => {
