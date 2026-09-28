@@ -157,6 +157,20 @@ if test "$1 $2" = "api -i" && [[ "$3" == notifications\?* ]]; then
     echo "gh: HTTP 304" 1>&2
     exit 1
 fi
+# The bot's gists: $FAKE_GH/gists.json (default none), with an ETag of
+# its content, so a request with that ETag gets a 304.
+if test "$1 $2" = "api -i" && [[ "$3" == gists\?* ]]; then
+    body='[]'
+    test ! -s "${store}/gists.json" || body=$(jq -c . "${store}/gists.json")
+    etag="W/\"$(sha256sum <<<"${body}" | cut -c1-16)\""
+    if test "${4:-} ${5:-}" = "-H If-None-Match: ${etag}"; then
+        printf 'HTTP/2.0 304 Not Modified\r\nDate: Thu, 24 Sep 2026 00:00:00 GMT\r\nEtag: %s\r\n\r\n' "${etag}"
+        echo "gh: HTTP 304" 1>&2
+        exit 1
+    fi
+    printf 'HTTP/2.0 200 OK\r\nDate: Thu, 24 Sep 2026 00:00:00 GMT\r\nEtag: %s\r\n\r\n%s\n' "${etag}" "${body}"
+    exit 0
+fi
 # cgwalters' public events (bot-notify's safety net): none.
 if test "$1 $2" = "api -i" && [[ "$3" == users/*/events/public* ]]; then
     printf 'HTTP/2.0 200 OK\r\nEtag: W/"e"\r\n\r\n[]'
@@ -688,6 +702,109 @@ test_notify_race() {
     # U1 stays acked, and U2 is added.
     expect_json "$(project_state notifications | jq -c '{p: (.pending | keys), a: (.acked | keys)}')" \
         '{"p":["U2"],"a":["U1"]}' "state after the race"
+}
+
+# A secret gist of the bot's, as the fake gh lists it.
+readonly GIST_ID=0123abcd
+readonly GIST_URL=https://gist.github.com/cgwalters-bot/${GIST_ID}
+# The fake gh's Date, the end of the window a gist check routes.
+readonly FAKE_NOW=2026-09-24T00:00:00Z
+
+# fake_etag JSON: the ETag the fake gh gives a gist listing.
+fake_etag() {
+    echo "W/\"$(sha256sum <<<"$(jq -c . <<<"$1")" | cut -c1-16)\""
+}
+
+# set_gist_comments COMMENT...: the gist, listed as updated, holds these
+# comments, each "ID LOGIN CREATED_AT BODY...".
+set_gist_comments() {
+    local c id login at body
+    mkdir -p "${FAKE_GH}/rest/gists/${GIST_ID}"
+    for c in "$@"; do
+        read -r id login at body <<<"${c}"
+        jq -nc --arg id "${id}" --arg l "${login}" --arg at "${at}" --arg b "${body}" \
+            '{id: ($id | tonumber), user: {login: $l, type: "User"}, body: $b, created_at: $at, updated_at: $at}'
+    done | jq -s . >"${FAKE_GH}/rest/gists/${GIST_ID}/comments.json"
+    jq -n --arg id "${GIST_ID}" --arg u "${GIST_URL}" --argjson n "$#" '[{id: $id, html_url: $u, public: false,
+        description: "An analysis", files: {"a.md": {}}, comments: $n, updated_at: "2026-09-23T23:00:00Z"}]' \
+        >"${FAKE_GH}/gists.json"
+}
+
+# set_notify_state GISTS: the notifications state, with a poll position,
+# nothing pending and the gist check at GISTS (null for none yet).
+set_notify_state() {
+    set_project_state notifications "$(jq -nc --argjson g "$1" '{since: "2026-09-23T23:30:00Z",
+        last_modified: "LM", pending: {}, acked: {}} + if $g != null then {gists: $g} else {} end')"
+}
+
+gist_comment_calls() {
+    grep -c "gists/${GIST_ID}/comments" "${FAKE_GH}/calls" 2>/dev/null || true
+}
+
+test_notify_gists_first_run() {
+    set_notify_state null
+    set_gist_comments "1 cgwalters 2026-09-23T22:00:00Z Please redo this"
+    reset_calls
+    "${BIN}/bot-notify" >"${WORK}/out" 2>&1
+    grep -q 'First check of cgwalters-bot.s gists' "${WORK}/out" || fail "no first-check note: $(cat "${WORK}/out")"
+    ! grep -q '^request ' "${WORK}/out" || fail "the first run routed old comments: $(cat "${WORK}/out")"
+    expect_eq "$(gist_comment_calls)" 0 "comment reads on the first run"
+    expect_json "$(project_state notifications | jq -c .gists)" "{\"since\":\"${FAKE_NOW}\"}" "gist state after the first run"
+}
+
+test_notify_gists_route() {
+    local empty
+    empty=$(fake_etag '[]')
+    set_notify_state "$(jq -nc --arg e "${empty}" '{since: "2026-09-23T22:00:00Z", etag: "W/\"old\"", empty_etag: $e}')"
+    # His old comment, a new one of his, someone's, the bot's own, and his
+    # latest, made after the listing (so for the next run).
+    set_gist_comments "1 cgwalters 2026-09-23T21:00:00Z Old" \
+        "2 cgwalters 2026-09-23T22:30:00Z Please also cover @someone's runner" \
+        "3 someone 2026-09-23T22:40:00Z Do something else" \
+        "4 cgwalters-bot 2026-09-23T22:50:00Z Updated" \
+        "5 cgwalters 2026-09-24T00:00:30Z Later"
+    mkdir -p "${FAKE_GH}/rest/repos/cgwalters-bot/cgwalters-bot"
+    echo '[]' >"${FAKE_GH}/rest/repos/cgwalters-bot/cgwalters-bot/issues.json"
+    cat >"${WORK}/gh-extra" <<'EOF'
+#!/usr/bin/env bash
+test "$1 $2 $3 $4" = "api -X POST repos/cgwalters-bot/cgwalters-bot/issues" || { echo "fake gh: unexpected call: $*" 1>&2; exit 1; }
+printf '%s\n' "$@" >>"${FAKE_GH}/filed"
+echo https://github.com/cgwalters-bot/cgwalters-bot/issues/1
+EOF
+    chmod +x "${WORK}/gh-extra"
+    FAKE_GH_EXTRA=${WORK}/gh-extra "${BIN}/bot-notify" >"${WORK}/out" 2>&1
+    local records
+    records=$(sed -n 's/^request //p' "${WORK}/out")
+    jq -se --arg g "${GIST_URL}" 'length == 1 and (.[0] | .reason == "gist_comment" and .author == "cgwalters"
+        and .thread_id == $g and .thread_url == $g and .url == "\($g)#gistcomment-2" and .private
+        and (.excerpt | startswith("Please also cover")) and .title == "An analysis")' <<<"${records}" >/dev/null ||
+        fail "expected one request for comment 2: $(cat "${WORK}/out")"
+    grep -qx "title=Gist comment: @someone on gist ${GIST_ID}" "${FAKE_GH}/filed" ||
+        fail "someone's comment wasn't filed: $(cat "${FAKE_GH}/filed" 2>/dev/null)"
+    ! grep -q 'Do something else' "${FAKE_GH}/filed" || fail "a secret gist's text was filed publicly"
+    test "$(grep -c '^title=' "${FAKE_GH}/filed")" -eq 1 || fail "filed more than someone's comment"
+    expect_json "$(project_state notifications | jq -c '{p: (.pending | keys), g: .gists}')" \
+        "$(jq -nc --arg u "${GIST_URL}#gistcomment-2" --arg n "${FAKE_NOW}" --arg e "${empty}" \
+            '{p: [$u], g: {since: $n, empty_etag: $e, etag: $e}}')" "state after routing"
+    # Acking the gist's URL clears it, and marks no thread read.
+    reset_calls
+    "${BIN}/bot-notify" ack "${GIST_URL}" >/dev/null
+    expect_json "$(project_state notifications | jq -c '{p: (.pending | keys), a: (.acked | keys)}')" \
+        "$(jq -nc --arg u "${GIST_URL}#gistcomment-2" '{p: [], a: [$u]}')" "state after the ack"
+    ! grep -q 'notifications/threads' "${FAKE_GH}/calls" || fail "acking a gist marked a thread read"
+}
+
+test_notify_gists_unchanged() {
+    set_gist_comments "1 cgwalters 2026-09-23T22:30:00Z Please"
+    set_notify_state "$(jq -nc --arg e "$(fake_etag "$(cat "${FAKE_GH}/gists.json")")" \
+        '{since: "2026-09-23T22:00:00Z", etag: $e}')"
+    reset_calls
+    "${BIN}/bot-notify" >"${WORK}/out" 2>&1
+    ! grep -q '^request ' "${WORK}/out" || fail "a 304 routed comments: $(cat "${WORK}/out")"
+    expect_eq "$(gist_comment_calls)" 0 "comment reads after a 304"
+    expect_eq "$(grep -c '^api -i gists?' "${FAKE_GH}/calls")" 1 "gist listings"
+    grep -q 'No changes' "${WORK}/out" || fail "an unchanged run wrote: $(cat "${WORK}/out")"
+    expect_eq "$(graphql_calls)" 1 "GraphQL calls of an unchanged run"
 }
 
 # --- bot-work ---------------------------------------------------------------

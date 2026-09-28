@@ -68,6 +68,7 @@ jq -n '{data: {node: {id: "PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk", isArchived: true,
     content: {id: "DI_lAHOAQ_SPs4Bj2GizgLL1Nk", title: "bot-state: notifications",
               body: "state\n\n```json\n{\"since\": \"2026-09-26T00:00:00Z\"}\n```\n"}}}}' | api graphql
 echo '[]' | api notifications
+echo '[]' | api gists
 echo '[]' | api users/cgwalters/events/public
 echo '{"items": []}' | api search/issues
 echo '[]' | api repos/cgwalters-bot/cgwalters-bot/issues

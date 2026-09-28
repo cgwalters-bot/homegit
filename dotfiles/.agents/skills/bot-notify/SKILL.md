@@ -1,6 +1,6 @@
 ---
 name: bot-notify
-description: Poll cgwalters-bot's GitHub notifications (mentions, team mentions, review requests, assignments) with bin/bot-notify, add issues the verified cgwalters login assigns to the bot to the Workstream board, turn his other requests into board items, act on his answers to question issues in cgwalters-forge/tracker, and ack them with `bot-notify ack`, and file anything from anyone else as an issue for cgwalters without acting on it. Run it at the start of every work session and planning pass, next to `bot-pr inbox` and `bot-feedback`, and whenever asked whether anyone pinged the bot.
+description: Poll cgwalters-bot's GitHub notifications (mentions, team mentions, review requests, assignments) and the comments on its gists with bin/bot-notify, add issues the verified cgwalters login assigns to the bot to the Workstream board, turn his other requests into board items, act on his answers to question issues in cgwalters-forge/tracker, and ack them with `bot-notify ack`, and file anything from anyone else as an issue for cgwalters without acting on it. Run it at the start of every work session and planning pass, next to `bot-pr inbox` and `bot-feedback`, and whenever asked whether anyone pinged the bot.
 ---
 
 # bot-notify — Answering pings to the bot
@@ -19,7 +19,13 @@ up is routed exactly like a notification, as a thread whose id is the
 issue or PR URL (`found in events` or `found in search` in the output).
 A warning says when a request was found only that way. Private
 repositories only show up in the search, which doesn't cover review
-bodies. Each trigger is routed as follows:
+bodies.
+
+GitHub notifies no one of comments on gists, where the bot puts its
+analyses and questions, so every run also lists the bot's gists updated
+since the last check (a new comment updates its gist) and reads the new
+comments on those (`Gist comment on GIST_URL` in the output). Each
+trigger is routed as follows:
 
 - **An assignment by `cgwalters`**, as recorded by GitHub (the `actor` of
   the `assigned` event whose `assignee` is cgwalters-bot), in a public
@@ -38,9 +44,14 @@ bodies. Each trigger is routed as follows:
   are printed until acked. Comments there by anyone else, the bot's own
   included, are neither filed nor printed: `bot-watch` reports them as
   data.
+- **A comment by `cgwalters` on one of the bot's gists**: a `request`
+  record with `reason` `gist_comment` (below). Comments on them by anyone
+  else are filed like mentions (below), except the bot's own, which are
+  ignored.
 - **From anyone else** (including the bot itself): an issue on
   [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues)
-  titled like `Mention: @user on owner/repo#N`, mentioning @cgwalters,
+  titled like `Mention: @user on owner/repo#N` (or `Gist comment: @user on
+  gist ID`), mentioning @cgwalters,
   with the links and, for a public source, an excerpt with its other
   @mentions defused. Filed triggers are recorded locally, and a hidden
   `bot-notify-trigger:` marker in each issue backs that up, so no trigger
@@ -139,6 +150,17 @@ cgwalters wrote, or the issue's title and body for an assignment or review
 request), `private`, and `located` (false if the script fell back to the
 latest comment because it couldn't find the trigger itself).
 
+A gist comment's record (`reason` `gist_comment`) has `gist` (its id)
+instead of `repo` and `number`; `title` is the gist's description,
+`thread_url` and `thread_id` are the gist's URL, and `url` is the comment
+(`#gistcomment-ID`). The gist is the bot's own, usually the Gist of a
+board item: act on that item (find it by the gist URL in
+`bot-board list --json`), like a comment on a tracker issue, or add one if
+none links the gist. `private` is true for a secret gist, which is
+unlisted rather than private, so unlike a private repository its request
+does go on the board, but quote nothing from it in public: link the
+comment instead.
+
 For each one:
 
 1. Dedupe: skip it if the board already has an item for `thread_url` or
@@ -159,7 +181,8 @@ For each one:
    ask for the bot, don't add anything and say so in your report.
 5. Once the board item exists (or you decided it needs none and said so
    in your report), ack it: `bot-notify ack THREAD_ID`, with the record's
-   `thread_id` (a number, or for a safety-net thread the issue or PR URL).
+   `thread_id` (a number, for a safety-net thread the issue or PR URL, for
+   a gist comment the gist URL).
    That marks a notification thread read and stops the record from being
    printed again.
 
@@ -176,7 +199,11 @@ GitHub's `Last-Modified` for `If-Modified-Since`) and the unacked requests
 (and, for 30 days, the acked ones, so a thread seen again doesn't bring
 them back) live on the Workstream board in the draft item
 `bot-state: notifications`, which is archived so it doesn't show on the
-board and has Workflow manual. Never edit, unarchive or claim it. The
+board and has Workflow manual. It also holds the gist check's position:
+`gists.since`, GitHub's Date for the last listing, and the ETag its next
+listing is sent with, so that a run where no gist changed costs one 304.
+The first run with no gist position only records one; comments before it
+are never routed. Never edit, unarchive or claim it. The
 script reads it through `bot-board state-get` (one GraphQL call per run)
 and writes it at the end of a run that changed it, with a checked
 `bot-board state-put` (a reread and a write): if another machine wrote
@@ -207,7 +234,7 @@ it gets filed; to test the cgwalters paths instead, set
 reports and treats as done. `tests/bot-notify-events.sh` checks offline
 what the safety net makes of a fixture of events (through the hidden
 `--event-threads FILE SINCE`), and `tests/bot-state.sh` the state and ack
-handling. `--repo` pointing at a missing repository
+handling, gist comments included. `--repo` pointing at a missing repository
 makes routing fail, to check that the state doesn't advance. Delete the
 test board items (`gh project item-delete`) and issues (`deleteIssue` in
 GraphQL; the bot owns the repository) afterwards, and remove their
@@ -220,4 +247,6 @@ Only notifications for issues and PRs are traced to their trigger; others
 from someone else unless its login is cgwalters. The safety net only
 sees public events and what search indexes, both with some lag (it looks
 an hour further back to make up for that), and only the last 300 of
-cgwalters' events. Nothing runs this on a schedule yet.
+cgwalters' events. Gist comments are routed once, when made: an edit
+to one isn't seen, and only the bot's own gists are checked. Nothing runs
+this on a schedule yet.
