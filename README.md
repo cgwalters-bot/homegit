@@ -235,9 +235,9 @@ tests the tool offline.
 
 The bot's own repositories (this one, cgwalters-bot/cgwalters-bot,
 debug-bootc-to-disk-virtiofsd, ostree-missing-refs and
-praxis-credential-broker, plus cgwalters-forge/review and
-cgwalters-forge/.github) take changes only as pull requests: a ruleset
-on main requires one with a green `ci` check, up to date with main,
+praxis-credential-broker, plus cgwalters-forge/review,
+cgwalters-forge/agentic-job and cgwalters-forge/.github) take changes
+only as pull requests: a ruleset on main requires one with a green `ci` check, up to date with main,
 and linear history, with no bypass, and blocks force-pushes and
 deleting main. They only allow rebase merges, to keep the commits as
 written, with auto-merge on and branches deleted on merge. `bot-land`
