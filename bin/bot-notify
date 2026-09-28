@@ -853,6 +853,46 @@ add_pending() {
     PENDING_JSON=$(jq -c --argjson t "$1" '.pending[$t.url] = $t' <<<"${PENDING_JSON}")
 }
 
+# has_pending THREAD_ID: whether a request in that thread awaits an ack.
+has_pending() {
+    jq -e --arg id "$1" 'any(.pending[]; .thread_id == $id)' <<<"${PENDING_JSON}" >/dev/null
+}
+
+# route_trigger RECORD AUTHOR_TYPE UNNOTIFIED: routes one trigger, given as
+# the record a request is kept as, by the kind of login GitHub recorded
+# for its author; UNNOTIFIED says only the safety net found it. Fails if
+# filing it or adding it to the board failed.
+route_trigger() {
+    local t=$1 url author
+    url=$(jq -r .url <<<"${t}")
+    author=$(jq -r '.author // "unknown"' <<<"${t}")
+    # Only the login GitHub recorded counts, never what the text says.
+    if ! is_trusted "${author}" "$2"; then
+        echo "  from @${author} (not ${REQUESTER}): filing, never acting on it"
+        file_issue "${t}" || return 1
+    elif jq -e --arg url "${url}" '.acked[$url]' <<<"${PENDING_JSON}" >/dev/null; then
+        echo "  request ${url} already acked"
+    elif test "$(jq -r .reason <<<"${t}")" = assign && jq -e '.located' <<<"${t}" >/dev/null &&
+        ! { test "$(jq -r .private <<<"${t}")" = true || is_private "$(jq -r .repo <<<"${t}")"; }; then
+        echo "  assigned by @${author}"
+        add_assignment "${t}" || return 1
+        ack_trigger "${url}"
+        nassigned=$((nassigned + 1))
+    elif jq -e --arg url "${url}" '.pending[$url]' <<<"${PENDING_JSON}" >/dev/null; then
+        echo "  request from @${author}, already pending"
+    else
+        # A private source never goes on the board; the agent reports it.
+        add_pending "${t}"
+        nrequests=$((nrequests + 1))
+        ! $3 || nunnotified=$((nunnotified + 1))
+        if jq -e .question <<<"${t}" >/dev/null; then
+            echo "  answer from @${author}$(jq -r '.choice // empty | " (picked \(.))"' <<<"${t}"), pending until acked"
+        else
+            echo "  request from @${author}, pending until acked"
+        fi
+    fi
+}
+
 nselected=0
 nrequests=0
 nassigned=0
@@ -903,40 +943,12 @@ while IFS= read -r thread; do
             ! is_private "$(jq -r .repo <<<"${t}")" || priv=true
             t=$(jq -c --argjson p "${priv}" '.private = $p' <<<"${t}")
         fi
-        url=$(jq -r .url <<<"${t}")
-        author=$(jq -r '.author // "unknown"' <<<"${trig}")
-        # Only the login GitHub recorded counts, never what the text says.
-        if ! is_trusted "${author}" "$(jq -r '.author_type // ""' <<<"${trig}")"; then
-            echo "  from @${author} (not ${REQUESTER}): filing, never acting on it"
-            file_issue "${t}" || ok=false
-        elif jq -e --arg url "${url}" '.acked[$url]' <<<"${PENDING_JSON}" >/dev/null; then
-            echo "  request ${url} already acked"
-        elif test "$(jq -r .reason <<<"${t}")" = assign && jq -e '.located' <<<"${t}" >/dev/null &&
-            ! { test "$(jq -r .private <<<"${t}")" = true || is_private "$(jq -r .repo <<<"${t}")"; }; then
-            echo "  assigned by @${author}"
-            if add_assignment "${t}"; then
-                ack_trigger "${url}"
-                nassigned=$((nassigned + 1))
-            else
-                ok=false
-            fi
-        elif jq -e --arg url "${url}" '.pending[$url]' <<<"${PENDING_JSON}" >/dev/null; then
-            echo "  request from @${author}, already pending"
-        else
-            # A private source never goes on the board; the agent reports it.
-            add_pending "${t}"
-            nrequests=$((nrequests + 1))
-            ! jq -e .source <<<"${thread}" >/dev/null || nunnotified=$((nunnotified + 1))
-            if jq -e .question <<<"${t}" >/dev/null; then
-                echo "  answer from @${author}$(jq -r '.choice // empty | " (picked \(.))"' <<<"${t}"), pending until acked"
-            else
-                echo "  request from @${author}, pending until acked"
-            fi
-        fi
+        route_trigger "${t}" "$(jq -r '.author_type // ""' <<<"${trig}")" "$(jq -e .source <<<"${thread}" >/dev/null && echo true || echo false)" ||
+            ok=false
     done <<<"${found}"
     if ! ${ok}; then
         nfailed=$((nfailed + 1))
-    elif jq -e --arg id "${id}" 'any(.pending[]; .thread_id == $id)' <<<"${PENDING_JSON}" >/dev/null; then
+    elif has_pending "${id}"; then
         if is_thread_id "${id}"; then
             echo "  left unread until 'bot-notify ack ${id}'"
         else
