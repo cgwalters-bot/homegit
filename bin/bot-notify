@@ -76,6 +76,11 @@ readonly DEFAULT_ISSUE_REPO=cgwalters-bot/cgwalters-bot
 readonly MARKER_PREFIX='bot-notify-trigger:'
 # jq def naming where a trigger is, in an issue filed about it.
 readonly WHERE_JQ='def where: if .gist then "gist \(.gist)" else "\(.repo)#\(.number // "?")" end;'
+# jq def for a request record as the state keeps it: the state is on the
+# public board, so a record from a source not known to be public (a
+# private repository, a secret gist) is kept without the text it quotes.
+# Only a run's own output shows that text.
+readonly REDACT_JQ='def redact: if .private == false then . else del(.excerpt, .title) end;'
 # jq def that keeps "@login" in text from notifying anyone.
 readonly UNMENTION_JQ='def unmention: gsub("@(?=[A-Za-z0-9])"; "@​");'
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
@@ -131,8 +136,10 @@ inbox' covers them. Other threads are marked read once routed, unless
 they hold unacked requests.
 The poll state (since, Last-Modified, and the gist check's since and
 ETags) and the unacked requests are kept in the archived
-'bot-state: ${STATE_NAME}' draft item on the board,
-shared by every machine. The poll state only advances when every thread,
+'bot-state: ${STATE_NAME}' draft item on the public board,
+shared by every machine; a request from a non-public source is kept
+there without its excerpt and title, which only the run that found it
+prints. The poll state only advances when every thread,
 safety net included, was routed, so a failed run is retried. It is
 written once, at the end of a run, and only if something changed (a 304
 from GitHub means nothing new, though 'since' still moves up hourly),
@@ -405,15 +412,17 @@ if test -s "${LEGACY_PENDING_FILE}"; then
         fatal "cannot parse ${LEGACY_PENDING_FILE}, the old unacked requests; fix it or move it away"
 fi
 
-# save_state [SINCE LAST_MODIFIED]: writes PENDING_JSON's requests,
-# GIST_STATE_NEW if set, and the new poll position if given, unless
-# nothing changed (or in a dry run). Changes that an earlier run on this machine failed to write are
-# part of STATE_JSON already, so the checked write is made anyway; with
-# nothing to write it costs no call.
+# save_state [SINCE LAST_MODIFIED]: writes PENDING_JSON's requests
+# (redacted, see REDACT_JQ), GIST_STATE_NEW if set, and the new poll
+# position if given, unless nothing changed (or in a dry run). Changes
+# that an earlier run on this machine failed to write are part of
+# STATE_JSON already, so the checked write is made anyway; with nothing
+# to write it costs no call.
 save_state() {
     local new failed="recording the state failed; the next run will redo this poll"
     test $# -gt 0 || failed="recording the requests failed; they are kept locally for the next run"
-    new=$(jq -c --argjson p "${PENDING_JSON}" --argjson g "${GIST_STATE_NEW:-null}" '. + $p
+    new=$(jq -c --argjson p "${PENDING_JSON}" --argjson g "${GIST_STATE_NEW:-null}" "${REDACT_JQ}"'. + $p
+        | .pending |= map_values(redact)
         | if $g != null then .gists = $g else . end
         | if $ARGS.positional != [] then .since = $ARGS.positional[0] | .last_modified = $ARGS.positional[1] else . end' \
         --args "$@" <<<"${STATE_JSON}")
