@@ -576,10 +576,12 @@ test "$(all_refs)" = "${REFS_BEFORE}" || fail "policy: the remotes changed"
 test -z "$(opened bot/plain)" || fail "policy: an upstream PR was opened"
 
 # --- A project that takes no AI trailer gets no run details ---
-policy nodco bot-ok "none (no AI metadata, says the test)"
-if run "no AI trailer" ok promote "${URL}/nodco/pull/2" --dry-run; then
-    expect "no AI trailer" '!<details>' "!${MODEL_RE}" "Leaving the run footers out of the upstream PR: the policy's ai-trailer is 'none"
-fi
+for trailer in "none (no AI metadata, says the test)" "None" "NONE; say so in the body"; do
+    policy nodco bot-ok "${trailer}"
+    if run "no AI trailer: ${trailer}" ok promote "${URL}/nodco/pull/2" --dry-run; then
+        expect "no AI trailer: ${trailer}" '!<details>' "!${MODEL_RE}" "Leaving the run footers out of the upstream PR: the policy's ai-trailer is '${trailer%% *}"
+    fi
+done
 policy nodco bot-ok
 
 # --- No DCO: nothing to sign off ---

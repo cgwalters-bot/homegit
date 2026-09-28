@@ -986,7 +986,7 @@ footer_block() {
 upstream_run_details() {
     local footers lines
     ! $2 || return 0
-    if [[ "${POLICY_AI_TRAILER}" == none* ]]; then
+    if [[ "${POLICY_AI_TRAILER,,}" == none* ]]; then
         info "Leaving the run footers out of the upstream PR: the policy's ai-trailer is '${POLICY_AI_TRAILER}'"
         return 0
     fi
