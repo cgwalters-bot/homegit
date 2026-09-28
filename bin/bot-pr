@@ -70,6 +70,8 @@ readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-pr
 readonly LEGACY_STATE_FILE=${STATE_DIR}/inbox.json
 readonly STATE_VERSION=2
 readonly CLONE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-pr/clones
+# The forge's fork of each upstream, when not named after it (forge_fork).
+readonly FORK_CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-pr/forks
 # Prefix of the URLs git fetches from and pushes to, followed by OWNER/REPO.
 readonly GIT_URL_PREFIX=${BOT_PR_GIT_URL:-https://github.com/}
 readonly DEFAULT_LOOKBACK_DAYS=7
@@ -146,6 +148,11 @@ Commands:
         another open fork PR in the fork already records that item, which
         is usually a copied id (after splitting a PR, the new part needs
         its own item); --force allows that.
+  fork-of OWNER/REPO [--create]
+        Print the ${FORGE_ORG} fork of OWNER/REPO (fails if there is
+        none; --create forks it, as fork-pr does). A fork may be named
+        other than REPO, e.g. when renamed to free the name, so scripts
+        look forks up with this rather than assume ${FORGE_ORG}/REPO.
   fork-setup REPO [--ci WORKFLOW]... [--no-ci]
         Turn off CI on the fork ${FORGE_ORG}/REPO: Actions stays enabled,
         but every workflow is disabled, and the queued and running runs of
@@ -403,23 +410,87 @@ ref_sha() {
     echo "${sha}"
 }
 
-# ensure_fork UPSTREAM: prints the forge's fork of UPSTREAM, creating it
-# if needed, and waits until it is usable.
-# GitHub names the fork after UPSTREAM's repository, with a suffix if the
-# forge already has an unrelated repository of that name.
+# fork_name REPO UPSTREAM: prints REPO's name if it exists and is a fork
+# of UPSTREAM (its parent, or the root of its network), else nothing;
+# fails if reading it failed. The name is GitHub's: gh follows the
+# redirect from a renamed repository's old name, so REPO may be that.
+fork_name() {
+    local answer network rc=0
+    answer=$(ghapi "repos/$1" --jq '"\(.full_name) \(.parent.full_name // "-") \(.source.full_name // "-")"') || rc=$?
+    test "${rc}" -ne "${EX_NOTFOUND}" || return 0
+    test "${rc}" -eq 0 || fatal "cannot read $1"
+    network=" ${answer#* } "
+    [[ "${network,,}" == *" ${2,,} "* ]] || return 0
+    echo "${answer%% *}"
+}
+
+# cache_fork UPSTREAM FORK: records FORK for forge_fork, atomically.
+cache_fork() {
+    local cache=${FORK_CACHE_DIR}/${1/\//_}
+    mkdir -p "${FORK_CACHE_DIR}"
+    echo "$2" >"${cache}.tmp.$$"
+    mv -f "${cache}.tmp.$$" "${cache}"
+}
+
+# forge_fork UPSTREAM: prints the forge's fork of UPSTREAM, or nothing if
+# it has none. Forks are usually named after UPSTREAM's repository, but
+# one may have been renamed to free its name for a repository of the
+# forge's own (cgwalters-forge/actions, a fork of bootc-dev/actions, is
+# cgwalters-forge/bootc-dev-actions), so the name is only a first guess:
+# then the one found among UPSTREAM's forks, which is cached, since
+# listing them takes a call per 100 forks. Having no fork isn't cached:
+# it only happens before the first fork-pr, which creates one, and a
+# cached "none" would hide a fork made meanwhile by hand.
+forge_fork() {
+    local upstream=$1 cache guess cached="" fork
+    cache=${FORK_CACHE_DIR}/${upstream/\//_}
+    guess=${FORGE_ORG}/${upstream#*/}
+    test ! -s "${cache}" || cached=$(<"${cache}")
+    for fork in ${cached:+"${cached}"} "${guess}"; do
+        fork=$(fork_name "${fork}" "${upstream}")
+        if test -n "${fork}"; then
+            test "${fork}" = "${cached}" || cache_fork "${upstream}" "${fork}"
+            echo "${fork}"
+            return 0
+        fi
+    done
+    fork=$(ghapi --paginate "repos/${upstream}/forks?per_page=100" \
+        --jq ".[] | select(.owner.login == \"${FORGE_ORG}\") | .full_name") ||
+        fatal "cannot list the forks of ${upstream}"
+    fork=$(head -n1 <<<"${fork}")
+    test -n "${fork}" || return 0
+    cache_fork "${upstream}" "${fork}"
+    echo "${fork}"
+}
+
+# ensure_fork UPSTREAM: prints the forge's fork of UPSTREAM (see
+# forge_fork), creating it if needed, and waits until it is usable.
+# A new fork is named after UPSTREAM's repository, or OWNER-REPO if the
+# forge already has a repository of that name: GitHub would otherwise
+# pick REPO-1, which nothing would recognize.
 ensure_fork() {
-    local upstream=$1 fork network rc=0
-    fork=${FORGE_ORG}/${upstream#*/}
-    network=$(ghapi "repos/${fork}" --jq '"\(.parent.full_name) \(.source.full_name)"') || rc=$?
-    test "${rc}" -eq 0 || test "${rc}" -eq "${EX_NOTFOUND}" || fatal "cannot read ${fork}"
-    if test "${rc}" -eq 0 && [[ " ${network} " == *" ${upstream} "* ]]; then
+    local upstream=$1 fork name rc=0
+    fork=$(forge_fork "${upstream}")
+    if test -n "${fork}"; then
         echo "${fork}"
         return 0
     fi
+    name=${upstream#*/}
+    ghapi "repos/${FORGE_ORG}/${name}" --jq .full_name >/dev/null || rc=$?
+    if test "${rc}" -eq 0; then
+        name=${upstream%%/*}-${name}
+        rc=0
+        ghapi "repos/${FORGE_ORG}/${name}" --jq .full_name >/dev/null || rc=$?
+        test "${rc}" -ne 0 || fatal "${FORGE_ORG} has repositories named ${upstream#*/} and ${name}, neither a fork of ${upstream}; fork it by hand under another name"
+    fi
+    test "${rc}" -eq 0 || test "${rc}" -eq "${EX_NOTFOUND}" || fatal "cannot read ${FORGE_ORG}/${name}"
     # Only the default branch: other bases are copied by sync_base.
-    fork=$(ghapi -X POST "repos/${upstream}/forks" -f organization="${FORGE_ORG}" -F default_branch_only=true --jq .full_name) ||
+    fork=$(ghapi -X POST "repos/${upstream}/forks" -f organization="${FORGE_ORG}" -f name="${name}" \
+        -F default_branch_only=true --jq .full_name) ||
         fatal "forking ${upstream} into ${FORGE_ORG} failed"
     info "Forking ${upstream} as ${fork}"
+    # So that the next lookup needs no listing, should the name be taken.
+    cache_fork "${upstream}" "${fork}"
     # Forking is asynchronous; the fork is usable once it has its branch.
     local default waited=0
     default=$(ghapi "repos/${upstream}" --jq .default_branch) || fatal "cannot read ${upstream}"
@@ -429,6 +500,27 @@ ensure_fork() {
         sleep "${FORK_READY_POLL}"
         waited=$((waited + FORK_READY_POLL))
     done
+    echo "${fork}"
+}
+
+cmd_fork_of() {
+    local upstream="" create=false fork
+    while test $# -gt 0; do
+        case "$1" in
+            --create) create=true ;;
+            -*) fatal "unknown argument for fork-of: $1 (see --help)" ;;
+            *) test -z "${upstream}" || fatal "fork-of takes one OWNER/REPO"; upstream=$1 ;;
+        esac
+        shift
+    done
+    valid_repo "${upstream}" || fatal "fork-of takes OWNER/REPO, not '${upstream}'"
+    if ${create}; then
+        check_login
+        ensure_fork "${upstream}"
+        return
+    fi
+    fork=$(forge_fork "${upstream}")
+    test -n "${fork}" || { info "${FORGE_ORG} has no fork of ${upstream}"; return 1; }
     echo "${fork}"
 }
 
@@ -2762,6 +2854,7 @@ case "${command}" in
     -h|--help|help) usage; exit 0 ;;
     fork-pr) command=fork_pr ;;
     fork-setup) command=fork_setup ;;
+    fork-of) command=fork_of ;;
     set-body) command=set_body ;;
     get-body) command=get_body ;;
     prune-runs) command=prune_runs ;;
