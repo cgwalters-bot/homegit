@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# fake-rest ITEMS PATH: answers 'gh api -i PATH' for bot-board's REST
+# reads of a board: its fields (none, as bot-board only passes their ids
+# back) and its items, all on one page, from ITEMS as rest-items.jq
+# takes them (none if ITEMS doesn't exist). No ETags.
+set -euo pipefail
+items=$1 path=$2
+case "${path%%\?*}" in
+    users/*/projectsV2/*/fields) body='[]' ;;
+    users/*/projectsV2/*/items)
+        body='[]'
+        test ! -e "${items}" || body=$(jq -f "$(dirname "$0")/rest-items.jq" "${items}")
+        ;;
+    *) echo "fake gh: unexpected REST path ${path}" 1>&2; exit 1 ;;
+esac
+printf 'HTTP/2.0 200 OK\r\n\r\n%s\n' "${body}"

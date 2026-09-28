@@ -143,7 +143,7 @@ only when something changed), and must stay under the ~64KB a draft
 body holds (a few hundred URLs). It advances per URL: one that could
 not be read keeps its last-seen state, so a later sweep reports its
 changes, and the sweep exits nonzero. The board listing comes from
-bot-board's cache (refreshed for --apply); everything else is REST, with
+bot-board (revalidated for --apply); everything else is REST, with
 ETags.
 EOF
 }

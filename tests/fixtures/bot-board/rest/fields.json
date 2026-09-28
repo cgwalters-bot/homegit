@@ -1,0 +1,14 @@
+[
+  {"id": 1, "node_id": "PVTF_title", "name": "Title", "data_type": "title"},
+  {"id": 2, "node_id": "PVTF_assignees", "name": "Assignees", "data_type": "assignees"},
+  {"id": 3, "node_id": "PVTSSF_status", "name": "Status", "data_type": "single_select"},
+  {"id": 4, "node_id": "PVTF_labels", "name": "Labels", "data_type": "labels"},
+  {"id": 5, "node_id": "PVTF_linked", "name": "Linked pull requests", "data_type": "linked_pull_requests"},
+  {"id": 6, "node_id": "PVTF_milestone", "name": "Milestone", "data_type": "milestone"},
+  {"id": 7, "node_id": "PVTF_repository", "name": "Repository", "data_type": "repository"},
+  {"id": 8, "node_id": "PVTF_reviewers", "name": "Reviewers", "data_type": "reviewers"},
+  {"id": 9, "node_id": "PVTF_parent", "name": "Parent issue", "data_type": "parent_issue"},
+  {"id": 10, "node_id": "PVTF_progress", "name": "Sub-issues progress", "data_type": "sub_issues_progress"},
+  {"id": 11, "node_id": "PVTF_why", "name": "Why", "data_type": "text"},
+  {"id": 12, "node_id": "PVTSSF_priority", "name": "Priority", "data_type": "single_select"}
+]

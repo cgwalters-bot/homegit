@@ -19,12 +19,14 @@ trap 'rm -rf "${WORK}"' EXIT
 export FAKE_GH=${WORK}/gh-store
 mkdir -p "${FAKE_GH}" "${WORK}/bin"
 export PATH=${WORK}/bin:${PATH} HOME=${WORK}/home XDG_CACHE_HOME=${WORK}/home/cache
+export FAKE_BOARD_REST=${BIN}/../tests/fixtures/bot-board/fake-rest
 unset GH_TOKEN GITHUB_TOKEN
 
-# The fake gh serves $FAKE_GH/{fields,items}.json and appends each write
-# to $FAKE_GH/log, one line each: "issue PAYLOAD" for a new issue (which
-# becomes tracker#42, REST id 900), "sub REPO#N ID", "add URL", "edit
-# ITEM FIELD VALUE", "comment REPO#N BODY", "close REPO#N".
+# The fake gh serves $FAKE_GH/{fields,items}.json (the items over REST,
+# through fake-rest) and appends each write to $FAKE_GH/log, one line
+# each: "issue PAYLOAD" for a new issue (which becomes tracker#42, REST
+# id 900), "sub REPO#N ID", "add URL", "edit ITEM FIELD VALUE", "comment
+# REPO#N BODY", "close REPO#N".
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -36,7 +38,9 @@ arg() { # arg NAME ARGS...: the value after NAME
 }
 case "$1 $2" in
     "project field-list") cat "${store}/fields.json" ;;
-    "project item-list") echo list >>"${store}/lists"; cat "${store}/items.json" ;;
+    "api -i")
+        [[ "$3" != */items\?* ]] || echo list >>"${store}/lists"
+        exec "${FAKE_BOARD_REST:?}" "${store}/items.json" "$3" ;;
     "project view") echo PVT_fake ;;
     "project item-add") url=$(arg --url "$@"); log "add ${url}"; echo "PVTI_new" ;;
     "project item-edit")

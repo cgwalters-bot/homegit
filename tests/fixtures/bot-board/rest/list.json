@@ -1,0 +1,17 @@
+[
+  {"id": "PVTI_pr", "title": "ci: Drop fedora-43",
+   "content": {"type": "PullRequest", "url": "https://github.com/bootc-dev/bootc/pull/2482", "number": 2482,
+               "title": "ci: Drop fedora-43", "body": "", "repository": "bootc-dev/bootc"},
+   "assignees": ["cgwalters"], "status": "In Review", "milestone": {"title": "1.17", "description": "", "dueOn": ""},
+   "repository": "https://github.com/bootc-dev/bootc", "reviewers": ["jeckersb", "maintainers"],
+   "why": "Waiting on https://x", "priority": "P0"},
+  {"id": "PVTI_draft", "title": "A draft",
+   "content": {"type": "DraftIssue", "id": "DI_1", "title": "A draft", "body": ""},
+   "priority": "P1"},
+  {"id": "PVTI_issue", "title": "tracker: an issue",
+   "content": {"type": "Issue", "url": "https://github.com/cgwalters-forge/tracker/issues/7", "number": 7,
+               "title": "tracker: an issue", "body": "Body\r\nwith CRLF", "repository": "cgwalters-forge/tracker"},
+   "status": "Todo", "labels": ["P2", "target:bootc-dev"],
+   "linked pull requests": ["https://github.com/cgwalters-forge/bootc/pull/3"],
+   "repository": "https://github.com/cgwalters-forge/tracker", "priority": "P2"}
+]

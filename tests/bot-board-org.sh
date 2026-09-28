@@ -18,12 +18,13 @@ trap 'rm -rf "${WORK}"' EXIT
 export FAKE_GH=${WORK}/gh-store
 mkdir -p "${FAKE_GH}" "${WORK}/bin"
 export PATH=${WORK}/bin:${PATH} HOME=${WORK}/home XDG_CACHE_HOME=${WORK}/home/cache
+export FAKE_BOARD_REST=${BIN}/../tests/fixtures/bot-board/fake-rest
 unset GH_TOKEN GITHUB_TOKEN
 
-# The fake gh: the board is $FAKE_GH/{fields,items}.json, and 'gh api
-# repos/OWNER/REPO' answers from $FAKE_GH/sources (lines "OWNER/REPO
-# SOURCE", SOURCE '-' for a repository that isn't a fork; other
-# repositories are a 404). GraphQL calls are appended to
+# The fake gh: the board is $FAKE_GH/{fields,items}.json (fake-rest
+# serves the items over REST), and 'gh api repos/OWNER/REPO' answers
+# from $FAKE_GH/sources (lines "OWNER/REPO SOURCE", SOURCE '-' for a
+# repository that isn't a fork; other repositories are a 404). GraphQL calls are appended to
 # $FAKE_GH/mutations, one line each.
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -31,7 +32,7 @@ set -euo pipefail
 store=${FAKE_GH:?}
 case "$1 $2" in
     "project field-list") cat "${store}/fields.json" ;;
-    "project item-list") cat "${store}/items.json" ;;
+    "api -i") exec "${FAKE_BOARD_REST:?}" "${store}/items.json" "$3" ;;
     "project view") echo PVT_fake ;;
     "api rate_limit") echo 5000 ;;
     "api graphql") { printf '%s' "$*" | tr -s '\n ' ' '; echo; } >>"${store}/mutations"; echo '{}' ;;

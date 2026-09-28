@@ -1,0 +1,8 @@
+[
+  {"id": 103, "node_id": "PVTI_draft", "content_type": "DraftIssue",
+   "content": {"id": 5, "node_id": "DI_1", "title": "A draft", "body": ""},
+   "fields": [
+     {"id": 1, "name": "Title", "data_type": "title", "value": {"raw": "A draft", "html": "A draft"}},
+     {"id": 3, "name": "Status", "data_type": "single_select", "value": null},
+     {"id": 12, "name": "Priority", "data_type": "single_select", "value": {"id": "p1", "name": {"raw": "P1", "html": "P1"}}}]}
+]
