@@ -41,6 +41,14 @@ readonly SAFETY_LOOKBACK_SECS=3600
 # The events API serves at most 300 events, 100 per page.
 readonly EVENTS_PER_PAGE=100
 readonly EVENTS_MAX_PAGES=3
+# GitHub notifies no one of comments on gists, and the bot's gists hold
+# its analyses and questions, so every run lists the gists updated since
+# the last check (a new comment updates its gist) and reads the new
+# comments on them, which are routed as reason GIST_REASON.
+readonly GIST_REASON=gist_comment
+readonly GISTS_PER_PAGE=100
+# A gist's URL, which stands for its thread.
+readonly GIST_URL_RE='^https://gist\.github\.com/([A-Za-z0-9-]+/)?[0-9a-f]+$'
 # The poll state and the requests printed but not acked yet (plus
 # recently acked ones, so they aren't printed again) live on the Workstream
 # board, in the archived draft item 'bot-state: notifications' (see
@@ -66,6 +74,8 @@ readonly DEFAULT_ISSUE_REPO=cgwalters-bot/cgwalters-bot
 # Hidden marker in each filed issue's body, keyed by the trigger's URL, so
 # a retried run never files the same trigger twice.
 readonly MARKER_PREFIX='bot-notify-trigger:'
+# jq def naming where a trigger is, in an issue filed about it.
+readonly WHERE_JQ='def where: if .gist then "gist \(.gist)" else "\(.repo)#\(.number // "?")" end;'
 # jq def that keeps "@login" in text from notifying anyone.
 readonly UNMENTION_JQ='def unmention: gsub("@(?=[A-Za-z0-9])"; "@​");'
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
@@ -86,8 +96,9 @@ Usage: $(basename "$0") [--dry-run] [--repo OWNER/REPO] [--no-mention]
        $(basename "$0") ack THREAD_ID...
 
 Poll ${BOT_LOGIN}'s GitHub notifications once, and route every new
-mention, team mention, review request and assignment. GitHub doesn't
-reliably notify the bot, so every run also looks for them in
+mention, team mention, review request and assignment, and every new
+comment on ${BOT_LOGIN}'s gists (GitHub notifies no one of those).
+GitHub doesn't reliably notify the bot, so every run also looks for them in
 ${REQUESTER}'s public events (his reviews, comments, assignments and
 review requests that mention or name @${BOT_LOGIN}, and his comments in
 ${TRACKER_REPO}) and searches for
@@ -106,6 +117,10 @@ the same way, as threads whose THREAD_ID is the issue or PR URL:
     he picked (a first line that is just the letter) in 'choice'; elsewhere
     there a 'request'. Both stay until acked, like requests. Comments by
     anyone else there, the bot's own included, are left to bot-watch;
+  - a comment on one of ${BOT_LOGIN}'s gists: by ${REQUESTER}, a 'request'
+    (reason ${GIST_REASON}) whose THREAD_ID is the gist's URL; by anyone
+    else but the bot, filed like a mention. The first run only notes
+    where to start, so older comments are never routed;
   - from anyone else: file an issue in ${DEFAULT_ISSUE_REPO} mentioning
     @${REQUESTER}, once per trigger (deduped locally, then by a hidden
     marker in the issues); the bot never acts on it. For a non-public
@@ -114,8 +129,9 @@ the same way, as threads whose THREAD_ID is the issue or PR URL:
 Threads in ${FORGE_ORG} other than ${TRACKER_REPO} are skipped: 'bot-pr
 inbox' covers them. Other threads are marked read once routed, unless
 they hold unacked requests.
-The poll state (since, Last-Modified) and the unacked requests are kept
-in the archived 'bot-state: ${STATE_NAME}' draft item on the board,
+The poll state (since, Last-Modified, and the gist check's since and
+ETags) and the unacked requests are kept in the archived
+'bot-state: ${STATE_NAME}' draft item on the board,
 shared by every machine. The poll state only advances when every thread,
 safety net included, was routed, so a failed run is retried. It is
 written once, at the end of a run, and only if something changed (a 304
@@ -136,7 +152,9 @@ minimum time to wait before polling again. The token needs the classic
 'notifications' scope. REST is used for everything but the state (one
 GraphQL read per run, and a reread and a write per run that changed it);
 the safety net adds a conditional events request (free when it is a
-304) and a search request per run.
+304) and a search request per run, and the gist check a conditional
+listing (a 304 when no gist changed), plus a request per changed gist
+that has comments.
 EOF
 }
 
@@ -280,7 +298,8 @@ if test "${1:-}" = ack; then
     test $# -gt 0 || fatal "usage: $(basename "$0") ack THREAD_ID..."
     for id in "$@"; do
         is_thread_id "${id}" || [[ "${id}" =~ ^https://github\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+$ ]] ||
-            fatal "not a notification thread id, nor an issue or PR URL: '${id}'"
+            [[ "${id}" =~ ${GIST_URL_RE} ]] ||
+            fatal "not a notification thread id, nor an issue, PR or gist URL: '${id}'"
     done
     ack_ids=("$@")
     set --
@@ -371,26 +390,31 @@ board_failed() {
 }
 
 # {since, last_modified, pending: {TRIGGER_URL: record},
-#  acked: {TRIGGER_URL: time}, updated_at, host}
+#  acked: {TRIGGER_URL: time}, gists: {since, etag, empty_etag}, updated_at, host}
 track=(--track)
 ! ${dry_run} || track=()
 STATE_JSON=$("${BOT_BOARD}" state-get "${track[@]}" "${STATE_NAME}") || board_failed $? "reading the state failed"
 # {pending, acked}, changed as the run goes and written by save_state.
 PENDING_JSON=$(jq -c '{pending: (.pending // {}), acked: (.acked // {})}' <<<"${STATE_JSON}")
+# The gist check's position, and the one it advances to, which is written
+# only by a run that routed everything.
+GIST_STATE=$(jq -c '.gists // {}' <<<"${STATE_JSON}")
+GIST_STATE_NEW=
 if test -s "${LEGACY_PENDING_FILE}"; then
     PENDING_JSON=$(jq -c --slurpfile old "${LEGACY_PENDING_FILE}" '($old[0] | {pending, acked}) * .' <<<"${PENDING_JSON}") ||
         fatal "cannot parse ${LEGACY_PENDING_FILE}, the old unacked requests; fix it or move it away"
 fi
 
-# save_state [SINCE LAST_MODIFIED]: writes PENDING_JSON's requests, and
-# the new poll position if given, unless nothing changed (or in a dry
-# run). Changes that an earlier run on this machine failed to write are
+# save_state [SINCE LAST_MODIFIED]: writes PENDING_JSON's requests,
+# GIST_STATE_NEW if set, and the new poll position if given, unless
+# nothing changed (or in a dry run). Changes that an earlier run on this machine failed to write are
 # part of STATE_JSON already, so the checked write is made anyway; with
 # nothing to write it costs no call.
 save_state() {
     local new failed="recording the state failed; the next run will redo this poll"
     test $# -gt 0 || failed="recording the requests failed; they are kept locally for the next run"
-    new=$(jq -c --argjson p "${PENDING_JSON}" '. + $p
+    new=$(jq -c --argjson p "${PENDING_JSON}" --argjson g "${GIST_STATE_NEW:-null}" '. + $p
+        | if $g != null then .gists = $g else . end
         | if $ARGS.positional != [] then .since = $ARGS.positional[0] | .last_modified = $ARGS.positional[1] else . end' \
         --args "$@" <<<"${STATE_JSON}")
     if jq -e --argjson new "${new}" 'del(.updated_at, .host) == ($new | del(.updated_at, .host))' <<<"${STATE_JSON}" >/dev/null; then
@@ -413,7 +437,7 @@ save_state() {
     if test $# -gt 0; then
         echo "State advanced to since=$1."
     else
-        echo "Recorded the requests; the poll state is unchanged."
+        echo "Recorded the requests and the gist check; the notifications poll state is unchanged."
     fi
 }
 
@@ -732,6 +756,74 @@ triggers() {
     printf '%s\n' "${found}"
 }
 
+# --- Gists ----------------------------------------------------------------
+
+# gist_triggers: prints a record, as routing takes it, per new comment on
+# the bot's gists (plus its author_type), and sets GIST_STATE_NEW; fails
+# if GitHub can't be read. Only comments up to the listing's Date count,
+# and the next check lists the gists updated since then, so comments
+# made meanwhile come with the next run. The listing is conditional on
+# an ETag, so a run with nothing new costs a 304. GitHub's ETags are of
+# the content, so after a listing of changed gists the next one, of
+# none, is expected to match an empty listing's ETag, which is kept.
+gist_triggers() {
+    local since etag status now gists next new_state first=false self=true
+    since=$(jq -r '.since // empty' <<<"${GIST_STATE}")
+    etag=$(jq -r '.etag // empty' <<<"${GIST_STATE}")
+    if test -z "${since}"; then
+        # Nothing to compare with: start now, rather than route every
+        # comment ever made on the bot's gists.
+        first=true
+        since=${poll_start}
+        etag=
+    fi
+    status=$(fetch_page "gists?since=${since}&per_page=${GISTS_PER_PAGE}" "${etag:+If-None-Match: ${etag}}") || return 1
+    case "${status}" in
+        304) return 0 ;;
+        200) ;;
+        *) warn "unexpected HTTP status '${status}' listing the bot's gists"; return 1 ;;
+    esac
+    now=$(header Date)
+    if test -n "${now}"; then
+        now=$(date -u -d "${now}" +%FT%TZ)
+    else
+        now=$(iso_now)
+    fi
+    new_state=$(jq -c --arg s "${now}" --arg e "$(header ETag)" --slurpfile body "${scratch}/body" '
+        {since: $s, empty_etag}
+        | if $e == "" then . elif $body[0] == [] then .empty_etag = $e else . end
+        | .etag = .empty_etag | with_entries(select(.value != null))' <<<"${GIST_STATE}")
+    if ${first}; then
+        echo "First check of ${BOT_LOGIN}'s gists: comments on them from ${now} on will be routed." 1>&2
+        GIST_STATE_NEW=${new_state}
+        return 0
+    fi
+    gists=$(jq -c '.[]' "${scratch}/body")
+    next=$(header Link | grep -oP '<\K[^>]+(?=>; rel="next")' || true)
+    while test -n "${next}"; do
+        status=$(fetch_page "${next#"${API}"/}") || return 1
+        gists+=$'\n'$(jq -c '.[]' "${scratch}/body")
+        next=$(header Link | grep -oP '<\K[^>]+(?=>; rel="next")' || true)
+    done
+    # The bot's own comments are never routed (unless it is trusted, to test).
+    is_trusted "${BOT_LOGIN}" User || self=false
+    local gist
+    while IFS= read -r gist; do
+        test -n "${gist}" || continue
+        jq -e '.comments > 0' <<<"${gist}" >/dev/null || continue
+        ghapi --paginate "gists/$(jq -r .id <<<"${gist}")/comments?per_page=100" --jq '.[]' |
+            jq -c --argjson g "${gist}" --arg since "${since}" --arg now "${now}" --arg reason "${GIST_REASON}" \
+                --argjson self "${self}" --arg bot "${BOT_LOGIN}" '
+                select(.created_at >= $since and .created_at <= $now and ($self or .user.login != $bot))
+                | {reason: $reason, repo: null, private: ($g.public | not), number: null, gist: $g.id,
+                   title: ($g.description // "" | if . == "" then ($g.files | keys | first) else . end),
+                   thread_url: $g.html_url, thread_id: $g.html_url, author: .user.login, author_type: .user.type,
+                   url: "\($g.html_url)#gistcomment-\(.id)", excerpt: (.body | '"${excerpt_jq}"'),
+                   located: true, question: false, choice: null}' || return 1
+    done <<<"${gists}"
+    GIST_STATE_NEW=${new_state}
+}
+
 # --- Route ----------------------------------------------------------------
 
 declare -A private_repo=()
@@ -778,8 +870,8 @@ file_issue() {
         echo "  already filed as ${existing}"
         return 0
     fi
-    title=$(jq -r '"\({mention: "Mention", team_mention: "Team mention", review_requested: "Review request",
-                       assign: "Assignment"}[.reason] // "Notification"): \(if .author then "@" + .author else "someone" end) on \(.repo)#\(.number // "?")"' <<<"${t}")
+    title=$(jq -r "${WHERE_JQ}"'"\({mention: "Mention", team_mention: "Team mention", review_requested: "Review request",
+                       assign: "Assignment", '"${GIST_REASON}"': "Gist comment"}[.reason] // "Notification"): \(if .author then "@" + .author else "someone" end) on \(where)"' <<<"${t}")
     if ${dry_run}; then
         echo "  would file: ${title}"
         nfiled=$((nfiled + 1))
@@ -789,11 +881,13 @@ file_issue() {
     # Only REQUESTER is to be notified, so every other '@' is defused.
     local what='"\(if .author then "@" + .author | unmention else "Someone (author unknown)" end) \({mention: "mentioned the bot",
         team_mention: "mentioned a team the bot is in", review_requested: "requested a review from the bot",
-        assign: "assigned the bot"}[.reason] // "notified the bot (\(.reason))") in \(.repo)#\(.number // "?"): \(.url)\n\nThread: \(.thread_url)"'
-    if test "$(jq -r .private <<<"${t}")" = true || is_private "$(jq -r .repo <<<"${t}")"; then
-        body=$(jq -r "${UNMENTION_JQ} ${what}"' + "\n\nThe source repository is not public, so there is no excerpt here; read the thread."' <<<"${t}")
+        assign: "assigned the bot", '"${GIST_REASON}"': "commented on a gist of the bot"}[.reason]
+        // "notified the bot (\(.reason))") in \(where): \(.url)\n\nThread: \(.thread_url)"'
+    if test "$(jq -r .private <<<"${t}")" = true ||
+        { test "$(jq -r .repo <<<"${t}")" != null && is_private "$(jq -r .repo <<<"${t}")"; }; then
+        body=$(jq -r "${UNMENTION_JQ} ${WHERE_JQ} ${what}"' + "\n\nThe source is not public, so there is no excerpt here; read the thread."' <<<"${t}")
     else
-        body=$(jq -r "${UNMENTION_JQ} ${what}"' + " (\(.title | unmention))"
+        body=$(jq -r "${UNMENTION_JQ} ${WHERE_JQ} ${what}"' + " (\(.title | unmention))"
             + (if .excerpt != "" then "\n\n> \(.excerpt | unmention)" else "" end)
             + (if .located then "" else "\n\nThe trigger could not be located; this is the latest comment in the thread." end)' <<<"${t}")
     fi
@@ -894,6 +988,7 @@ route_trigger() {
 }
 
 nselected=0
+ngist_comments=0
 nrequests=0
 nassigned=0
 nfiled=0
@@ -963,9 +1058,28 @@ done < <(jq -c --argjson reasons "${SELECT_REASONS}" --arg tracker "${tracker_re
     | if $asks then . else .reason = $comment end' <<<"${threads_all}")
 ! ${safety_failed} || nfailed=$((nfailed + 1))
 
+# Each gist is a thread, whose id is its URL.
+if gist_triggers >"${scratch}/gist-triggers"; then
+    while IFS= read -r trig; do
+        test -n "${trig}" || continue
+        ngist_comments=$((ngist_comments + 1))
+        t=$(jq -c 'del(.author_type)' <<<"${trig}")
+        id=$(jq -r .thread_id <<<"${t}")
+        echo "Gist comment on ${id}: $(jq -r .title <<<"${t}")"
+        if ! route_trigger "${t}" "$(jq -r '.author_type // ""' <<<"${trig}")" false; then
+            nfailed=$((nfailed + 1))
+        elif has_pending "${id}"; then
+            echo "  kept until 'bot-notify ack ${id}'"
+        fi
+    done <"${scratch}/gist-triggers"
+else
+    warn "reading the comments on ${BOT_LOGIN}'s gists failed"
+    nfailed=$((nfailed + 1))
+fi
+
 filed_verb=filed
 ! ${dry_run} || filed_verb="to file"
-echo "Routed ${nselected} threads: ${nrequests} new requests and ${nassigned} assignments from ${REQUESTER}, ${nfiled} triggers by others ${filed_verb}, ${nskipped} skipped."
+echo "Routed ${nselected} threads and ${ngist_comments} gist comments: ${nrequests} new requests and ${nassigned} assignments from ${REQUESTER}, ${nfiled} triggers by others ${filed_verb}, ${nskipped} skipped."
 print_pending
 if test "${nunnotified}" -gt 0; then
     warn "${nunnotified} new requests were only found by the safety net, not in ${BOT_LOGIN}'s notifications; check that its notification settings deliver 'On GitHub' for participating and watched activity"
@@ -975,6 +1089,7 @@ fi
 
 if test "${nfailed}" -gt 0; then
     echo "${nfailed} threads failed; the poll state stays at since=${since} so the next run retries them." 1>&2
+    GIST_STATE_NEW=
     save_state
     exit 1
 fi
