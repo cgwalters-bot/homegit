@@ -412,6 +412,9 @@ if test -s "${LEGACY_PENDING_FILE}"; then
         fatal "cannot parse ${LEGACY_PENDING_FILE}, the old unacked requests; fix it or move it away"
 fi
 
+# The state and the requests grow with every request kept, so they go to
+# jq and bot-board through pipes: an argument is limited to 128KiB.
+
 # save_state [SINCE LAST_MODIFIED]: writes PENDING_JSON's requests
 # (redacted, see REDACT_JQ), GIST_STATE_NEW if set, and the new poll
 # position if given, unless nothing changed (or in a dry run). Changes
@@ -421,13 +424,15 @@ fi
 save_state() {
     local new failed="recording the state failed; the next run will redo this poll"
     test $# -gt 0 || failed="recording the requests failed; they are kept locally for the next run"
-    new=$(jq -c --argjson p "${PENDING_JSON}" --argjson g "${GIST_STATE_NEW:-null}" "${REDACT_JQ}"'. + $p
+    new=$(jq -c --slurpfile p <(printf '%s\n' "${PENDING_JSON}") --argjson g "${GIST_STATE_NEW:-null}" \
+        '$p[0] as $p | '"${REDACT_JQ}"'. + $p
         | .pending |= map_values(redact)
         | if $g != null then .gists = $g else . end
         | if $ARGS.positional != [] then .since = $ARGS.positional[0] | .last_modified = $ARGS.positional[1] else . end' \
         --args "$@" <<<"${STATE_JSON}")
-    if jq -e --argjson new "${new}" 'del(.updated_at, .host) == ($new | del(.updated_at, .host))' <<<"${STATE_JSON}" >/dev/null; then
-        ${dry_run} || "${BOT_BOARD}" state-put --checked "${STATE_NAME}" "${STATE_JSON}" || board_failed $? "${failed}"
+    if jq -e --slurpfile new <(printf '%s\n' "${new}") 'del(.updated_at, .host) == ($new[0] | del(.updated_at, .host))' \
+        <<<"${STATE_JSON}" >/dev/null; then
+        ${dry_run} || "${BOT_BOARD}" state-put --checked "${STATE_NAME}" - <<<"${STATE_JSON}" || board_failed $? "${failed}"
         echo "No changes; state unchanged."
         return 0
     fi
@@ -436,7 +441,7 @@ save_state() {
         return 0
     fi
     new=$(jq -c --arg now "$(iso_now)" --arg host "$(hostname)" '.updated_at = $now | .host = $host' <<<"${new}")
-    "${BOT_BOARD}" state-put --checked "${STATE_NAME}" "${new}" || board_failed $? "${failed}"
+    "${BOT_BOARD}" state-put --checked "${STATE_NAME}" - <<<"${new}" || board_failed $? "${failed}"
     STATE_JSON=${new}
     if test -e "${LEGACY_PENDING_FILE}"; then
         mv -f "${LEGACY_PENDING_FILE}" "${LEGACY_PENDING_FILE}.migrated" ||
@@ -627,9 +632,9 @@ safety_threads() {
     hits+=$'\n'$(ghapi -X GET search/issues -f q="mentions:${BOT_LOGIN} updated:>${window} -user:${FORGE_ORG}" \
         -f sort=updated -f per_page=100 --jq "${SEARCH_HITS_JQ}") || return 1
     known=$(jq -c '[.pending, .acked | keys[]]' <<<"${PENDING_JSON}")
-    jq -sc --arg window "${window}" --argjson known "${known}" "${HITS_TO_THREADS_JQ}" <<<"${hits}" |
-        jq -sc --argjson threads "${threads}" '
-            ($threads | map("\(.repository.full_name)#\(.subject.url // "" | capture("/(?<n>[0-9]+)$").n // "")")) as $seen
+    jq -sc --arg window "${window}" --slurpfile known <(printf '%s\n' "${known}") '$known[0] as $known | '"${HITS_TO_THREADS_JQ}" <<<"${hits}" |
+        jq -sc --slurpfile threads <(printf '%s\n' "${threads}") '
+            ($threads[0] | map("\(.repository.full_name)#\(.subject.url // "" | capture("/(?<n>[0-9]+)$").n // "")")) as $seen
             | map(select("\(.repository.full_name)#\(.subject.url | capture("/(?<n>[0-9]+)$").n)" as $k | $seen | index($k) | not))'
 }
 
@@ -637,7 +642,7 @@ safety_failed=false
 if extra=$(safety_threads); then
     if test "$(jq length <<<"${extra}")" -gt 0; then
         echo "The safety net found $(jq length <<<"${extra}") issues and PRs that may hold asks the notifications lack."
-        threads_all=$(jq -c --argjson extra "${extra}" '. + $extra' <<<"${threads}")
+        threads_all=$(jq -c --slurpfile extra <(printf '%s\n' "${extra}") '. + $extra[0]' <<<"${threads}")
     else
         threads_all=${threads}
     fi
