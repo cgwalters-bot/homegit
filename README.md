@@ -19,7 +19,9 @@ the operator config (`~/.config/bot-harness/operator.json`, printed by
 `bot-operator`); another operator sets up their own as
 [docs/bootstrap.md](docs/bootstrap.md) describes.
 
-Install with `make install` as usual. The shared agent prompt is still
+Install with `make install` as usual; it also builds the Rust tools in
+`crates/` with `cargo install` (among them `bot-meta`, which `bot-pr` uses
+to edit the run footers in fork PR bodies). The shared agent prompt is still
 [AGENTS.md](AGENTS.md). The skills are plain [Agent Skills](https://agentskills.io)
 in `dotfiles/.agents/skills`, installed as `~/.agents/skills` where
 opencode, Codex, Gemini CLI and Cursor look; Claude Code reads only

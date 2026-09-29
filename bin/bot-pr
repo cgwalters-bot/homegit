@@ -40,10 +40,6 @@ readonly BRANCH_PREFIX=bot/
 readonly ITEM_ID_RE='PVTI_[A-Za-z0-9_-]+'
 readonly META_START='<!-- bot-meta -->'
 readonly META_END='<!-- /bot-meta -->'
-# The last line of a run footer (bot-footer's bot-run/v1, or an agent.yml
-# run's agent-run-summary/v1), after its summary line; footers accumulate
-# at the end of the bot-meta section.
-readonly FOOTER_MARKER_RE='^<!-- (bot-run|agent-run-summary)/v1 [{].*[}] -->$'
 readonly LLMS_TRAILER="Generated-by: ${OP_GENERATED_BY_URL}"
 # A line consisting of this, in a comment or review by REVIEWER, asks for
 # the upstream PR to be opened as a draft.
@@ -116,6 +112,10 @@ readonly SIGNOFF_RECORD_RE='<!-- bot-pr signoff approved=(?<approved>[0-9a-f]{40
 readonly EX_OTHERS=11
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
+# Reads and edits the run footers in bot-meta sections (bot-footer's, or
+# an agent.yml run's summary): homegit's crates/bot-meta, installed with
+# 'cargo install --path crates/bot-meta'.
+readonly BOT_META=${BOT_META:-bot-meta}
 # The contribution policy gate that promote and signoff pass first. The
 # override is for tests only: the gate is homegit's upstream-policy.
 UPSTREAM_POLICY=${BOT_PR_UPSTREAM_POLICY:-$(dirname "$(readlink -f "$0")")/upstream-policy}
@@ -1010,43 +1010,28 @@ ${footers}${META_END}
 EOF
 }
 
-# meta_footers < META: prints the run footers in a bot-meta section (see
-# FOOTER_MARKER_RE), each its summary line and marker, blank-separated.
+# bot_meta ARGS...: runs bot-meta.
+bot_meta() {
+    require_cmd "${BOT_META}" "build and install it from homegit with 'cargo install --path crates/bot-meta'"
+    "${BOT_META}" "$@"
+}
+
+# meta_footers < META: prints the run footers in a bot-meta section, each
+# its summary line and marker, blank-separated.
 meta_footers() {
-    awk -v re="${FOOTER_MARKER_RE}" '
-        $0 ~ re {
-            if (n++) print ""
-            if (prev != "" && prev !~ re && prev !~ /^<!-- \/?bot-meta -->$/) print prev
-            print
-        }
-        { prev = $0 }'
+    bot_meta footers
 }
 
 # read_footer FILE: prints the run footer in FILE (a pipe works too),
-# failing unless it is one, as bot-footer prints it: a summary line, then
-# a marker line.
+# failing unless it is one, as bot-footer prints it.
 read_footer() {
-    local file=$1 footer human marker
-    test -r "${file}" || fatal "--footer '${file}' is missing"
-    footer=$(tr -d '\r' <"${file}" | sed '/^[[:space:]]*$/d')
-    test -n "${footer}" || fatal "--footer '${file}' is empty; did bot-footer fail?"
-    human=${footer%$'\n'*}
-    marker=${footer##*$'\n'}
-    if [[ "${footer}" != *$'\n'* || "${human}" == *$'\n'* || "${human}" == *'<!--'* || "${footer}" == *bot-meta* ]] ||
-        ! [[ "${marker}" =~ ${FOOTER_MARKER_RE} ]]; then
-        fatal "--footer '${file}' doesn't look like bot-footer output: a summary line, then a '<!-- bot-run/v1 {...} -->' line"
-    fi
-    printf '%s\n' "${footer}"
+    bot_meta check-footer "$1" || fatal "--footer '$1' was refused"
 }
 
 # add_footer META FOOTER: prints the bot-meta section META with FOOTER
 # after its other footers, as meta_section lays them out.
 add_footer() {
-    local prefix=${1%"${META_END}"}
-    while [[ "${prefix}" == *$'\n' ]]; do
-        prefix=${prefix%$'\n'}
-    done
-    printf '%s\n\n%s\n%s\n' "${prefix}" "$2" "${META_END}"
+    bot_meta add-footer "$2" <<<"$1"
 }
 
 # jq definitions for fork PR bodies. Bodies edited in the web UI use CRLF.
