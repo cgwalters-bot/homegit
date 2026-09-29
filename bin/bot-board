@@ -232,10 +232,13 @@ Commands:
                               draft item '${STATE_PREFIX}NAME' ({} if it
                               doesn't exist yet). --track records it as
                               the base for 'state-put --checked'
-  state-put [--checked [--strict]] NAME JSON
+  state-put [--checked [--strict]] NAME JSON|-
                               Replace that state, creating (and archiving)
                               the item if needed; the compact JSON must
                               stay under ~64KB (a draft body's limit).
+                              JSON '-' reads it from standard input,
+                              which the scripts use: an argument is
+                              limited to 128KiB.
                               --checked writes nothing if JSON is the
                               tracked base, and otherwise rereads the
                               item first: if another machine changed it
@@ -1451,23 +1454,29 @@ read_mirror() {
         fatal "cannot parse ${file}; if it holds changes to the state '$1' that are still wanted, write them with state-put, then remove it"
 }
 
+# States go to jq through pipes (--slurpfile, then [0]) rather than
+# --argjson: an argument is limited to 128KiB, and a state can outgrow it
+# before check_state_size gets to say so.
+
 # write_mirror NAME BASE STATE
 write_mirror() {
     local file
     file=$(mirror_file "$1")
     mkdir -p "${STATE_MIRROR_DIR}" || fatal "cannot create ${STATE_MIRROR_DIR}"
-    jq -nc --argjson b "$2" --argjson s "$3" '{base: $b, state: $s}' >"${file}.tmp.$$" ||
+    jq -nc --slurpfile b <(printf '%s\n' "$2") --slurpfile s <(printf '%s\n' "$3") \
+        '{base: $b[0], state: $s[0]}' >"${file}.tmp.$$" ||
         fatal "cannot write ${file}.tmp.$$"
     mv -f "${file}.tmp.$$" "${file}" || fatal "cannot replace ${file}"
 }
 
 # merge3 BASE OURS THEIRS: prints the three-way merge (see MERGE3_JQ).
 merge3() {
-    jq -nc --argjson b "$1" --argjson o "$2" --argjson t "$3" "${MERGE3_JQ} merge3(\$b; \$o; \$t)"
+    jq -nc --slurpfile b <(printf '%s\n' "$1") --slurpfile o <(printf '%s\n' "$2") \
+        --slurpfile t <(printf '%s\n' "$3") "${MERGE3_JQ} merge3(\$b[0]; \$o[0]; \$t[0])"
 }
 
 same_json() {
-    jq -ne --argjson a "$1" --argjson b "$2" '$a == $b' >/dev/null
+    jq -ne --slurpfile a <(printf '%s\n' "$1") --slurpfile b <(printf '%s\n' "$2") '$a[0] == $b[0]' >/dev/null
 }
 
 cmd_state_get() {
@@ -1594,15 +1603,17 @@ cmd_state_put() {
         case "$1" in
             --checked) checked=true; shift ;;
             --strict) strict=true; shift ;;
+            -) args+=("$1"); shift ;;
             -*) fatal "unknown argument for state-put: $1 (see --help)" ;;
             *) args+=("$1"); shift ;;
         esac
     done
-    test "${#args[@]}" -eq 2 || fatal "usage: $(basename "$0") state-put [--checked [--strict]] NAME JSON"
+    test "${#args[@]}" -eq 2 || fatal "usage: $(basename "$0") state-put [--checked [--strict]] NAME JSON|-"
     ! ${strict} || ${checked} || fatal "--strict needs --checked"
-    local name=${args[0]} json
+    local name=${args[0]} input=${args[1]} json
     state_name_ok "${name}"
-    json=$(jq -ce 'if type == "object" then . else error("not an object") end' <<<"${args[1]}" 2>/dev/null) ||
+    test "${input}" != - || input=$(cat) || fatal "cannot read the state from standard input"
+    json=$(jq -ce 'if type == "object" then . else error("not an object") end' <<<"${input}" 2>/dev/null) ||
         fatal "state-put expects a JSON object"
     if ${checked}; then
         checked_put "${name}" "${json}" "${strict}"

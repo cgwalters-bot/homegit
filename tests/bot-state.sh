@@ -331,6 +331,15 @@ test_size_cap() {
     got=$("${BIN}/bot-board" state-get notifications 2>"${WORK}/err")
     grep -q 'could not write' "${WORK}/err" || fail "no note about the unwritten change"
     expect_eq "$(jq -r '.big | length' <<<"${got}")" 70000 "unwritten change merged back"
+    # One over the 128KiB an argument holds (and ARG_MAX), on stdin as
+    # the scripts pass it, gets the same error, not E2BIG.
+    "${BIN}/bot-board" state-get --track notifications >/dev/null 2>&1
+    rc=0
+    jq -nc '{a: 1, big: ("x" * 3000000)}' |
+        "${BIN}/bot-board" state-put --checked notifications - 2>"${WORK}/err" || rc=$?
+    test "${rc}" -ne 0 || fail "an oversized state on stdin was accepted"
+    grep -q 'over the 65536' "${WORK}/err" || fail "no size error for a state on stdin: $(cat "${WORK}/err")"
+    expect_json "$(project_state notifications)" '{"a":1}' "state after an oversized put on stdin"
 }
 
 test_failed_write_kept() {
