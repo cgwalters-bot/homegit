@@ -33,6 +33,7 @@ so no polling is needed to find the run. The inputs are all strings:
 | `cores`    | `4`, `16` or `64` |
 | `timeout`  | minutes, at most 330 |
 | `budget`   | the spend cap in AIC (1 AIC = $0.01) |
+| `max_tokens` | optional: a token cap for inference through the praxis broker, which can only lower the broker's per-run cap; empty (the default) keeps it |
 | `workflow` | `branch` or `analysis` |
 | `brief`    | the task text |
 
@@ -103,9 +104,11 @@ zero.
 | `result` | string | `success`, `failure`, `timeout`, `budget` (cut off by the budget), `cancelled` or `noop` (stopped with nothing to do) |
 | `turns` | integer | model turns |
 | `tokens` | object | `input`, `output`, `cache_read`, `cache_write`: integers |
+| `tokens_source` | string | where `tokens` come from: `praxis` (the broker's record of the run), `proxy` (the job's inference proxy log) or `unverified` (the agent's own report); `null` with no counts |
+| `praxis` | object | for runs through the praxis broker, its usage record's numbers, else `null`: `schema` (`praxis-run-usage/v1`), `state` (`active`, `finished` or `expired`), `max_tokens` (the run's cap), `requests`, `refused` (by a cap), `estimated` (charged without reported usage), and `tokens` with `input` (uncached), `cache_read`, `output`, `reasoning` (within `output`) and `total` (what the cap counts): integers |
 | `aic` | number | estimated cost in AIC |
 | `aic_budget` | number | the dispatched budget |
-| `aic_pricing` | string | `api` (billed), `api-equivalent` (a subscription run priced at API rates) or `mock` |
+| `aic_pricing` | string | `api` (billed), `api-equivalent` (a subscription run priced at API rates), `subscription` (no per-token price; the praxis broker caps tokens instead) or `mock` |
 | `tools` | object | per tool name: `calls`, `errors` and `duration_s` (integers) |
 | `slowest` | array | at most 10 of `{tool, summary, duration_s}`, slowest first |
 | `failures` | array | `{kind, message}`, `kind` one of `tool_error`, `timeout`, `budget`, `validation`, `agent_exit` |
