@@ -3,7 +3,7 @@
   // OpenAI only, authenticated via `opencode auth login` (ChatGPT subscription).
   // Anthropic subscription OAuth must not be used through opencode; use Claude Code for that.
   "enabled_providers": ["openai"],
-  "model": "openai/gpt-5.6-sol",
+  "model": "openai/gpt-6.1-sol",
   "small_model": "openai/gpt-5.6-luna",
   "formatter": false,
   "autoupdate": false,
@@ -13,11 +13,11 @@
   "provider": {
     "openai": {
       "models": {
-        // Under ChatGPT OAuth the codex plugin sets limit.input to 272k for
-        // gpt-5.6, and compaction triggers off input when it is set, so the
+        // Under ChatGPT OAuth the codex plugin may set limit.input to 272k,
+        // and compaction triggers off input when it is set, so the
         // 200k cap needs "input" as well as "context" to take effect.
-        // Sol is the GPT-5.6 frontier tier — cap at 200k
-        "gpt-5.6-sol": { "limit": { "context": 200000, "input": 200000, "output": 128000 } },
+        // Sol is the GPT-6.1 frontier tier — cap at 200k
+        "gpt-6.1-sol": { "limit": { "context": 200000, "input": 200000, "output": 128000 } },
         // Luna is the GPT-5.6 cost-sensitive/nano tier — cheap/fast execution model
         "gpt-5.6-luna": { "limit": { "context": 200000, "input": 200000, "output": 65536 } }
       }
@@ -28,12 +28,12 @@
       "prompt": "For non-trivial tasks, first use @architect to draft an implementation plan or sketch, then dispatch @general subagents to implement and verify the result. Have another subagent review the work before considering the task complete."
     },
     "plan": {
-      "model": "openai/gpt-5.6-sol"
+      "model": "openai/gpt-6.1-sol"
     },
     "general": {
       "description": "General-purpose subagent for multi-step tasks.",
       "mode": "subagent",
-      "model": "openai/gpt-5.6-sol"
+      "model": "openai/gpt-6.1-sol"
     },
     "explore": {
       "description": "Fast read-only codebase exploration.",
@@ -46,7 +46,7 @@
       "model": "openai/gpt-5.6-luna"
     },
     "compaction": {
-      "model": "openai/gpt-5.6-sol"
+      "model": "openai/gpt-6.1-sol"
     },
     "title": {
       "model": "openai/gpt-5.6-luna"
@@ -54,7 +54,7 @@
     "architect": {
       "description": "Architect for hard problems: planning, design, complex debugging, architectural decisions, tricky refactors.",
       "mode": "subagent",
-      "model": "openai/gpt-5.6-sol",
+      "model": "openai/gpt-6.1-sol",
       "color": "#10a37f"
     }
   }
