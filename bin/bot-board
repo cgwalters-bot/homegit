@@ -221,9 +221,11 @@ Commands:
                               that PR at that head) or a '${CHORE_LABEL}' (rerun
                               the failed jobs of those runs, or --chore:
                               anything else); QUESTION is then the ask.
-                              A PR that is itself an item on the board
-                              is no review ask: request his review on
-                              the PR instead
+                              Review and rerun asks, and chores about a
+                              PR, are deprecated: the review app lists
+                              the PR itself. A review ask for a PR that
+                              is itself an item on the board is refused:
+                              request their review on the PR instead
   resolve QUESTION TEXT       After acting on an answer: comment TEXT (one
                               line saying what was done) on the question
                               (an issue in ${TRACKER_REPO} labelled
@@ -1027,6 +1029,15 @@ cmd_question() {
         ASK_KIND=${kind}
         test "${#lines[@]}" -eq 0 || ASK_LINES=$(printf '%s\n' "${lines[@]}")
     fi
+    # Once a PR is open, everything about it happens on the PR, which the
+    # review app lists by itself (see "The operator's queue" in workstream).
+    local deprecated=""
+    if test "${kind}" = "${REVIEW_LABEL}"; then deprecated="a review ask"
+    elif test "${#lines[@]}" -gt 0; then deprecated="a rerun ask"
+    elif test "${kind}" = "${CHORE_LABEL}" && [[ "${blocked}" == */pull/* ]]; then deprecated="a chore ask about a pull request"
+    fi
+    test -z "${deprecated}" ||
+        echo "warning: ${deprecated} is deprecated: its pull request is ${OP_OPERATOR_POSSESSIVE} queue entry (the review app lists the bot's PRs with their review requested, a failing DCO check or checks to rerun), so request ${OP_OPERATOR_POSSESSIVE} review on it, or put the action in the item's Why" 1>&2
     local blocked_repo blocked_number blocked_url ref
     ref=$(issue_ref "${blocked}") || exit
     read -r blocked_repo blocked_number <<<"${ref}"
