@@ -562,15 +562,15 @@ probe() {
                     local line_comments
                     line_comments=$(rest_pages "repos/${repo}/pulls/${number}/comments?since=${report_since}") ||
                         return "$(sub_status $?)"
-                    found=$(printf '%s\n' "${line_comments}" | jq -sc --argjson found "${found}" \
+                    found=$(printf '%s\n' "${line_comments}" | jq -sc --slurpfile found <(printf '%s\n' "${found}") \
                         --argjson len "${EXCERPT_LEN}" "${EXCERPT_JQ}"'
                         sort_by(.id) as $lc
-                        | $found | map(if .type == "review" and .excerpt == "" then
+                        | $found[0] | map(if .type == "review" and .excerpt == "" then
                               .id as $id | .excerpt = ([$lc[] | select(.pull_request_review_id == $id) | .body | excerpt
                                                         | select(. != "")] | first // "")
                           else . end)')
                 fi
-                changes=$(jq -c --argjson f "${found}" '. + ($f | map(del(.id)))' <<<"${changes}")
+                changes=$(jq -c --slurpfile f <(printf '%s\n' "${found}") '. + ($f[0] | map(del(.id)))' <<<"${changes}")
             fi
             edge=$(jq -sc --arg updated "${updated}" '[.[] | select(.at >= $updated) | .key]' "${scratch}/notes")
         fi
@@ -636,9 +636,9 @@ probe() {
         # Closed: nothing runs any more; keep what was last seen.
         cur=$(jq -c --arg c "$(jq -r '.checks // empty' <<<"${prev}")" '.checks = (if $c == "" then null else $c end)' <<<"${cur}")
     fi
-    jq -cn --argjson cur "${cur}" --argjson changes "${changes}" --argjson info "${info}" --arg prev_state "${prev_state}" \
+    jq -c --argjson cur "${cur}" --argjson info "${info}" --arg prev_state "${prev_state}" \
         --argjson outstanding "${outstanding}" --argjson rebase "${rebase}" \
-        '{cur: $cur, changes: $changes, info: $info, prev_state: $prev_state, outstanding: $outstanding, rebase: $rebase}'
+        '{cur: $cur, changes: ., info: $info, prev_state: $prev_state, outstanding: $outstanding, rebase: $rebase}' <<<"${changes}"
 }
 
 results='{}'
@@ -657,9 +657,8 @@ while IFS= read -r url; do
     wait "$!" || rc=$?
     case "${rc}" in
         0)
-            r=$(<"${scratch}/probe.json")
-            results=$(jq -c --arg u "${url}" --argjson r "${r}" '.[$u] = $r' <<<"${results}")
-            new_seen=$(jq -c --arg u "${url}" --argjson r "${r}" '.[$u] = $r.cur' <<<"${new_seen}")
+            results=$(jq -c --arg u "${url}" --slurpfile r "${scratch}/probe.json" '.[$u] = $r[0]' <<<"${results}")
+            new_seen=$(jq -c --arg u "${url}" --slurpfile r "${scratch}/probe.json" '.[$u] = $r[0].cur' <<<"${new_seen}")
             test "${prev}" != null || new_urls=$(jq -c --arg u "${url}" '. + [$u]' <<<"${new_urls}")
             ;;
         "${EX_RATELIMIT}") exit "${EX_RATELIMIT}" ;;
@@ -731,8 +730,8 @@ off_board() {
     if test "$(jq .total_count <<<"${search}")" -gt "${PER_PAGE}"; then
         warn "the bot has over ${PER_PAGE} open upstream PRs; only the first ${PER_PAGE} have their reviews checked"
     fi
-    extra=$(jq -r --argjson watch "${watch}" --argjson forks "${FORK_OWNERS}" '
-        [$watch[].url] as $swept
+    extra=$(jq -r --slurpfile watch <(printf '%s\n' "${watch}") --argjson forks "${FORK_OWNERS}" '
+        [$watch[0][].url] as $swept
         | .items[] | .html_url
         | select(IN($swept[]) | not)
         | select(capture("^https://github\\.com/(?<o>[^/]+)/").o as $o | $forks | index($o) | not)' <<<"${search}")
@@ -761,7 +760,7 @@ wait "$!" || rc=$?
 case "${rc}" in
     0)
         cat "${scratch}/extra.err" 1>&2
-        outstanding=$(jq -sc --argjson o "${outstanding}" '$o + [.[] | select(.outstanding != null) | {url, items} + .outstanding]' "${scratch}/extra.json")
+        outstanding=$(jq -sc --slurpfile o <(printf '%s\n' "${outstanding}") '$o[0] + [.[] | select(.outstanding != null) | {url, items} + .outstanding]' "${scratch}/extra.json")
         ;;
     "${EX_RATELIMIT}")
         warn "GitHub is rate limiting the bot's search (or its reads of PRs off the board); only the board's PRs were checked for outstanding reviews"
@@ -790,9 +789,11 @@ candidates=$(jq -c --slurpfile results "${scratch}/results.json" --slurpfile ext
     | [(.[] | select($results[.url].rebase != null)
         | {url, items: [.items[] | {id, title}]} + $results[.url].rebase),
        (if $search_failed then empty else $extra[] | select(.rebase != null) | {url, items} + .rebase end)]' <<<"${watch}")
-{ read -r needs_rebase; read -r new_rebase; } < <(jq -r --argjson prev "${prev_rebase}" --argjson failed "${failed}" \
-    --argjson search_failed "${search_failed}" --argjson watch "${watch}" --argjson outstanding "${outstanding}" '
-    reduce .[] as $c ({list: [], keep: {}};
+{ read -r needs_rebase; read -r new_rebase; } < <(jq -r --argjson prev "${prev_rebase}" \
+    --slurpfile failed <(printf '%s\n' "${failed}") --argjson search_failed "${search_failed}" \
+    --slurpfile watch <(printf '%s\n' "${watch}") --slurpfile outstanding <(printf '%s\n' "${outstanding}") '
+    $failed[0] as $failed | $watch[0] as $watch | $outstanding[0] as $outstanding
+    | reduce .[] as $c ({list: [], keep: {}};
         $prev[$c.url] as $p
         | if $c.reason == "ci" then
               if $p != null and $p != $c.head then .keep[$c.url] = $p
@@ -823,8 +824,8 @@ needs_rebase=$(jq -c --argjson co "${conflicts_only}" "${REBASE_REPO_JQ}"'
 # state, so that the next sweep sees their transitions again (and
 # reports their other changes again, also for other items sharing them).
 keep_last_seen() {
-    new_seen=$(jq -c --arg id "$1" --argjson seen "${seen}" --argjson watch "${watch}" \
-        'reduce ($watch[] | select(any(.items[]; .id == $id)) | .url) as $u (.;
+    new_seen=$(jq -c --arg id "$1" --slurpfile seen <(printf '%s\n' "${seen}") --slurpfile watch <(printf '%s\n' "${watch}") \
+        '$seen[0] as $seen | $watch[0] as $watch | reduce ($watch[] | select(any(.items[]; .id == $id)) | .url) as $u (.;
             if $seen | has($u) then .[$u] = $seen[$u] else del(.[$u]) end)' <<<"${new_seen}")
 }
 while IFS= read -r id; do
@@ -878,9 +879,10 @@ nfailed=$(jq length <<<"${failed}")
 # URLs that left the sweep, with when they were last seen (by the last
 # sweep that wrote the state: nothing changed on them since). Back in
 # the sweep, or older than DROPPED_KEEP_DAYS, they are forgotten.
-new_dropped=$(jq -c --argjson seen "${seen}" --argjson new "${new_seen}" --arg last "${last_swept:-${swept_at}}" \
-    --arg cutoff "$(date -u -d "${swept_at} -${DROPPED_KEEP_DAYS} days" +%FT%TZ)" '
-    . + ($seen | with_entries(select((.key as $u | $new | has($u)) | not) | .value = $last))
+new_dropped=$(jq -c --slurpfile seen <(printf '%s\n' "${seen}") --slurpfile new <(printf '%s\n' "${new_seen}") \
+    --arg last "${last_swept:-${swept_at}}" --arg cutoff "$(date -u -d "${swept_at} -${DROPPED_KEEP_DAYS} days" +%FT%TZ)" '
+    $seen[0] as $seen | $new[0] as $new
+    | . + ($seen | with_entries(select((.key as $u | $new | has($u)) | not) | .value = $last))
     | with_entries(select(.value >= $cutoff and ((.key as $u | $new | has($u)) | not)))' <<<"${dropped}")
 # Written unless it's a dry run or nothing changed: a board write costs
 # GraphQL quota, and the state's timestamp alone isn't worth it.
@@ -888,7 +890,7 @@ advance=true
 if ${dry_run}; then
     advance=false
     why_kept="dry run"
-elif jq -e --argjson new "${new_seen}" '. == $new' <<<"${seen}" >/dev/null &&
+elif jq -e --slurpfile new <(printf '%s\n' "${new_seen}") '. == $new[0]' <<<"${seen}" >/dev/null &&
     test "$(jq -S . <<<"${dropped}")" = "$(jq -S . <<<"${new_dropped}")" &&
     test "$(jq -S . <<<"${prev_rebase}")" = "$(jq -S . <<<"${new_rebase}")"; then
     advance=false
@@ -896,12 +898,14 @@ elif jq -e --argjson new "${new_seen}" '. == $new' <<<"${seen}" >/dev/null &&
 fi
 
 if ${json}; then
-    jq --argjson new "${new_urls}" --argjson failed "${failed}" \
-        --argjson gone "${gone}" --argjson nurls "${nurls}" --argjson nitems "${nitems}" \
+    jq --slurpfile new <(printf '%s\n' "${new_urls}") --slurpfile failed <(printf '%s\n' "${failed}") \
+        --slurpfile gone <(printf '%s\n' "${gone}") --argjson nurls "${nurls}" --argjson nitems "${nitems}" \
         --argjson advance "${advance}" \
-        --argjson outstanding "${outstanding}" --argjson needs_rebase "${needs_rebase}" \
+        --slurpfile outstanding <(printf '%s\n' "${outstanding}") --slurpfile needs_rebase <(printf '%s\n' "${needs_rebase}") \
         --argjson search_failed "${search_failed}" \
-        '{swept: {urls: $nurls, items: $nitems}, items: ., outstanding_reviews: $outstanding, needs_rebase: $needs_rebase, new_urls: $new,
+        '$new[0] as $new | $failed[0] as $failed | $gone[0] as $gone
+         | $outstanding[0] as $outstanding | $needs_rebase[0] as $needs_rebase
+         | {swept: {urls: $nurls, items: $nitems}, items: ., outstanding_reviews: $outstanding, needs_rebase: $needs_rebase, new_urls: $new,
           failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news.
@@ -954,14 +958,15 @@ fi
 if ! ${advance}; then
     echo "State unchanged (${why_kept})." 1>&2
 else
-    new_state=$(jq -nc --argjson v "${STATE_VERSION}" --argjson items "${new_seen}" --argjson dropped "${new_dropped}" \
-        --arg now "$(date -u +%FT%TZ)" --arg swept "${swept_at}" --arg host "$(hostname)" --argjson rebase "${new_rebase}" \
-        '{version: $v, updated_at: $now, swept_at: $swept, host: $host, items: $items, dropped: $dropped}
+    new_state=$(jq -nc --argjson v "${STATE_VERSION}" --slurpfile items <(printf '%s\n' "${new_seen}") \
+        --slurpfile dropped <(printf '%s\n' "${new_dropped}") --arg now "$(date -u +%FT%TZ)" --arg swept "${swept_at}" \
+        --arg host "$(hostname)" --argjson rebase "${new_rebase}" \
+        '{version: $v, updated_at: $now, swept_at: $swept, host: $host, items: $items[0], dropped: $dropped[0]}
          + if $rebase == {} then {} else {rebase: $rebase} end')
     if test -n "${state_file}"; then
         printf '%s\n' "${new_state}" >"${state_file}"
     else
-        "${BOT_BOARD}" state-put "${STATE_NAME}" "${new_state}" || board_failed $? "recording the last-seen state failed; the next sweep reports these changes again"
+        "${BOT_BOARD}" state-put "${STATE_NAME}" - <<<"${new_state}" || board_failed $? "recording the last-seen state failed; the next sweep reports these changes again"
     fi
     echo "State advanced; ${napplied} item(s) updated on the board." 1>&2
 fi
