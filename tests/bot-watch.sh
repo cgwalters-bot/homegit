@@ -562,5 +562,37 @@ sweep rebase 2026-09-25T17:10:00Z
 expect rebase "rebase: any: the conflict-free ones listed again" --arg rb "${RB}" '[.needs_rebase[].url] | index("\($rb)/5")'
 grep -qx "  conflict-free:" "${WORK}/rebase.txt" || fail "rebase: any: conflict-free ones not listed: $(cat "${WORK}/rebase.txt")"
 
+# --- Priority health ---
+# A P0 PR whose integration job fails on its head, as bootc#2516's did,
+# and one on the P0 epic's board: listed first, on every sweep
+# (bot-priority-health's own tests cover the rest).
+readonly PH=${GH}/example/ph/pull PH_HEAD=bbbb000000000000000000000000000000000001
+readonly PH_JOB="test-integration (fedora-44, composefs, ext4, grub, bls, unsealed)"
+for n in 1 2; do
+    pr example/ph "${n}" "${PH_HEAD}" 2026-09-25T17:00:00Z
+    : | reviews "repos/example/ph/pulls/${n}"
+    : | comments "repos/example/ph/issues/${n}"
+done
+commit example/ph "${PH_HEAD}" 2026-09-25T16:00:00Z
+put "repos/example/ph/commits/${PH_HEAD}/check-runs" "$(jq -nc --arg job "${PH_JOB}" \
+    '{total_count: 1, check_runs: [{name: $job, status: "completed", conclusion: "failure", check_suite: {id: 1}}]}')"
+put repos/example/ph/actions/runs '{"workflow_runs": []}'
+put repos/example/ph/actions/workflows '{"workflows": []}'
+jq -n --arg pr "${PH}/1" '[{id: "PVTI_ph", title: "Fix composefs", status: "In Review", priority: "P0",
+    content: {type: "PullRequest", url: $pr}}]' >"${WORK}/board.json"
+jq -n --arg pr "${PH}/2" '[{id: "PVTI_epic", title: "Epic PR", status: "In Review", priority: "P0",
+    content: {type: "PullRequest", url: $pr}}]' >"${WORK}/epic.json"
+for mode in --json --dry-run; do
+    "${BOT_WATCH}" "${mode}" --now 2026-09-25T18:00:00Z --board-file "${WORK}/board.json" --epic-board-file "${WORK}/epic.json" \
+        --state-file "${WORK}/ph.state" >"${WORK}/ph${mode}" 2>"${WORK}/ph.err" || { cat "${WORK}/ph.err" 1>&2; fail "ph ${mode}: sweep failed"; }
+done
+jq -e --arg a "P0 ci-failing ${PH}/1 ${PH_HEAD:0:12}: ${PH_JOB}" --arg b "P0 ci-failing ${PH}/2 ${PH_HEAD:0:12}: ${PH_JOB}" \
+    '[.priority_health[].line] == [$a, $b] and (.priority_health_failed | not)' "${WORK}/ph--json" >/dev/null ||
+    fail "ph: the priority health section: $(jq -c . "${WORK}/ph--json")"
+test "$(head -3 "${WORK}/ph--dry-run")" = "Priority health:
+  P0 ci-failing ${PH}/1 ${PH_HEAD:0:12}: ${PH_JOB}
+  P0 ci-failing ${PH}/2 ${PH_HEAD:0:12}: ${PH_JOB}" ||
+    fail "ph: the text report doesn't start with the section: $(cat "${WORK}/ph--dry-run")"
+
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
-echo "ok: bot-watch first-sight news, outstanding reviews and PRs that need a rebase as expected"
+echo "ok: bot-watch first-sight news, outstanding reviews, PRs that need a rebase and priority health as expected"

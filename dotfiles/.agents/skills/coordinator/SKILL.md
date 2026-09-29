@@ -107,7 +107,31 @@ closed.
 
 ## Acting on it
 
-- **Outstanding reviews first.** The "Outstanding reviews by cgwalters"
+- **Priority health before anything else.** `bot-watch` starts every
+  sweep with a "Priority health" section (from `bot-priority-health`):
+  the open PRs of P0 and P1 board items, and of the Composefs Stable
+  board, whose CI fails on the current head (naming the failing jobs),
+  whose checks have been pending over 4h, that conflict or are behind a
+  base that must be up to date, whose DCO check fails, or that have had
+  no activity for over 24h (P0) or 72h (P1). One line per problem, P0
+  first:
+
+  ```
+  Priority health:
+    P0 ci-failing https://github.com/bootc-dev/bootc/pull/2516 12fe99311b45: required-checks, test-integration (...)
+  ```
+
+  The first four fields (priority, reason, URL, head) identify a
+  problem and stay the same until it is fixed or the head moves, so a
+  news-gated poll wakes on each new one once: keep the set of those
+  keys from the last wake and wake on any key not in it. Handle a new
+  P0 line first, before other news: find out why (the failing job's
+  log, the conflict, who it waits on) and dispatch a worker or fix it,
+  or, when it waits on a human (a review, a rerun, a sign-off), make
+  sure there is an ask for it (see `workstream`). P1 lines come after
+  the outstanding reviews below. A line that stays while someone is
+  on it needs nothing more.
+- **Outstanding reviews first** (after P0 health). The "Outstanding reviews by cgwalters"
   section `bot-watch` prints on every sweep is P0: dispatch a worker for
   each listed PR, unless a live worker is already on it (check it's
   still running). It stays listed on every sweep until the bot pushes or

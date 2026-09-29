@@ -59,6 +59,8 @@ BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
 UPSTREAM_POLICY=$(dirname "$(readlink -f "$0")")/upstream-policy
 readonly UPSTREAM_POLICY
+PRIORITY_HEALTH=$(dirname "$(readlink -f "$0")")/bot-priority-health
+readonly PRIORITY_HEALTH
 # shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
@@ -102,6 +104,12 @@ issue or PR the bot opened, the comments and reviews since it was opened
 are new; on anything else, only those by ${REQUESTER} since the last
 sweep. A URL that left the sweep and came back within ${DROPPED_KEEP_DAYS} days
 counts from when it was last seen.
+
+Every sweep starts with the "Priority health" section of
+'bot-priority-health' (see its --help): the open PRs of the P0 and P1
+work whose CI fails or is stuck, that conflict or are behind, lack a
+sign-off, or have seen no activity for too long, P0 first. Its lines
+stay the same until the problem is fixed or the PR's head moves.
 
 Apart from those changes, every sweep lists the "Outstanding reviews by
 ${REQUESTER}" on the bot's open PRs other than fork PRs (upstream ones
@@ -199,8 +207,10 @@ json=false
 # Hidden test hooks: sweep the items of a 'bot-board list --json' array in
 # a file instead of the board (--apply then only prints the bot-board
 # calls), keep the state in a file instead of on the board, and take
-# another time for now.
+# another time for now. With --board-file, the P0 epic's board is empty
+# unless --epic-board-file gives one.
 board_file=
+epic_board_file=
 state_file=
 now=
 while test $# -gt 0; do
@@ -210,6 +220,7 @@ while test $# -gt 0; do
         --json) json=true; shift ;;
         --board-file) test $# -ge 2 || fatal "--board-file requires a file"; board_file=$2; shift 2 ;;
         --state-file) test $# -ge 2 || fatal "--state-file requires a file"; state_file=$2; shift 2 ;;
+        --epic-board-file) test $# -ge 2 || fatal "--epic-board-file requires a file"; epic_board_file=$2; shift 2 ;;
         --now) test $# -ge 2 || fatal "--now requires a time"; now=$(date -u -d "$2" +%FT%TZ) || fatal "bad --now: $2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) fatal "unknown argument: $1 (see --help)" ;;
@@ -844,6 +855,31 @@ done < <(jq -r --argjson forks "${FORK_OWNERS}" "${REBASE_REPO_JQ}"'
 needs_rebase=$(jq -c --argjson co "${conflicts_only}" "${REBASE_REPO_JQ}"'
     map(select(.conflicts == true or ([repo, .base] | IN($co[]) | not)))' <<<"${needs_rebase}")
 
+# The P0 and P1 PRs that need a look, whatever changed or not: like the
+# sections above, a to-do on every sweep. Its failing costs only the
+# section, with a warning and a nonzero exit.
+health_failed=false
+printf '%s\n' "${board}" >"${scratch}/board.json"
+health_args=(--json --board-file "${scratch}/board.json")
+test -z "${now}" || health_args+=(--now "${now}")
+if test -n "${epic_board_file}"; then
+    health_args+=(--epic-board-file "${epic_board_file}")
+elif test -n "${board_file}"; then
+    echo '[]' >"${scratch}/epic-board.json"
+    health_args+=(--epic-board-file "${scratch}/epic-board.json")
+fi
+rc=0
+"${PRIORITY_HEALTH}" "${health_args[@]}" >"${scratch}/health.json" || rc=$?
+# With PRs that could not be read (status 1), it still lists the others.
+if ! health=$(jq -ce 'arrays' "${scratch}/health.json" 2>/dev/null); then
+    health='[]'
+    health_failed=true
+fi
+if test "${rc}" -ne 0; then
+    warn "the priority health sweep failed (status ${rc}); its section is incomplete"
+    health_failed=true
+fi
+
 # keep_last_seen ITEM: puts the URLs of ITEM back to their last-seen
 # state, so that the next sweep sees their transitions again (and
 # reports their other changes again, also for other items sharing them).
@@ -926,13 +962,17 @@ if ${json}; then
         --slurpfile gone <(printf '%s\n' "${gone}") --argjson nurls "${nurls}" --argjson nitems "${nitems}" \
         --argjson advance "${advance}" \
         --slurpfile outstanding <(printf '%s\n' "${outstanding}") --slurpfile needs_rebase <(printf '%s\n' "${needs_rebase}") \
-        --argjson search_failed "${search_failed}" \
+        --argjson search_failed "${search_failed}" --slurpfile health <(printf '%s\n' "${health}") \
+        --argjson health_failed "${health_failed}" \
         '$new[0] as $new | $failed[0] as $failed | $gone[0] as $gone
          | $outstanding[0] as $outstanding | $needs_rebase[0] as $needs_rebase
-         | {swept: {urls: $nurls, items: $nitems}, items: ., outstanding_reviews: $outstanding, needs_rebase: $needs_rebase, new_urls: $new,
-          failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed, state_advanced: $advance}' <<<"${report}"
+         | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], items: ., outstanding_reviews: $outstanding,
+          needs_rebase: $needs_rebase, new_urls: $new, failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed,
+          priority_health_failed: $health_failed, state_advanced: $advance}' <<<"${report}"
 else
-    # First: these are to-dos, the items below only news.
+    # First: these are to-dos, the items below only news. The P0 and P1
+    # health lines come first of all.
+    jq -r 'if length == 0 then empty else "Priority health:", (.[] | "  \(.line)"), "" end' <<<"${health}"
     jq -r --arg req "${REQUESTER}" "${REPO_REF_JQ}"'
         if length == 0 then empty else
             "Outstanding reviews by \($req):",
@@ -974,7 +1014,7 @@ else
               elif .allowed then " (with --apply)"
               else " (not applied from \($status // "no status"); a human decides)" end),
         ""' <<<"${report}"
-    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
 # Failed URLs kept their last-seen state in new_seen, so their changes
@@ -1000,3 +1040,4 @@ if test "${nfailed}" -gt 0; then
 fi
 test "${napply_failed}" -eq 0 || exit 1
 ! ${search_failed} || exit 1
+! ${health_failed} || exit 1
