@@ -202,7 +202,10 @@ Commands:
                               isn't a decision is a '${REVIEW_LABEL}' (approve
                               that PR at that head) or a '${CHORE_LABEL}' (rerun
                               the failed jobs of those runs, or --chore:
-                              anything else); QUESTION is then the ask
+                              anything else); QUESTION is then the ask.
+                              A PR that is itself an item on the board
+                              is no review ask: request his review on
+                              the PR instead
   resolve QUESTION TEXT       After acting on an answer: comment TEXT (one
                               line saying what was done) on the question
                               (an issue in ${TRACKER_REPO} labelled
@@ -951,12 +954,12 @@ ASK_KIND=
 ASK_LINES=
 cmd_question() {
     local blocked="" question="" context="" recommend="" title="" priority="" options=() have_question=false
-    local kind=${QUESTION_LABEL} lines=() line
+    local kind=${QUESTION_LABEL} lines=() line review_prs=()
     while test $# -gt 0; do
         case "$1" in
             --review) test $# -ge 2 || fatal "--review requires PR_URL@SHA"
                 test "${kind}" != "${CHORE_LABEL}" || fatal "an ask is a review or a chore, not both"
-                kind=${REVIEW_LABEL}; line=$(review_line "$2") || exit; lines+=("${line}"); shift 2 ;;
+                kind=${REVIEW_LABEL}; line=$(review_line "$2") || exit; lines+=("${line}"); review_prs+=("${2%@*}"); shift 2 ;;
             --rerun) test $# -ge 2 || fatal "--rerun requires a run URL"
                 test "${kind}" != "${REVIEW_LABEL}" || fatal "an ask is a review or a chore, not both"
                 kind=${CHORE_LABEL}; line=$(rerun_line "$2") || exit; lines+=("${line}"); shift 2 ;;
@@ -996,8 +999,17 @@ cmd_question() {
     # Settle everything the board decides before anything is created.
     load_fields
     test -z "${priority}" || option_id Priority "${priority}" >/dev/null
-    local blocked_item org
+    local blocked_item org pr pr_item pr_api
     blocked_item=$(lookup_item "${blocked_url}") || exit
+    # A PR that is itself a board item (not one in an item's Branch, like
+    # an upstream PR promote recorded) is tracked there, and bot-watch
+    # reports his review of it: an ask would only duplicate that.
+    for pr in "${review_prs[@]}"; do
+        if test "${pr}" = "${blocked_url}"; then pr_item=${blocked_item}; else pr_item=$(lookup_item "${pr}") || exit; fi
+        pr_api=repos/${pr#https://github.com/}
+        test -z "${pr_item}" ||
+            fatal "${pr} is on the board already; request a review by ${OPERATOR} on the PR instead: gh api -X POST ${pr_api/\/pull\//\/pulls\/}/requested_reviewers -f 'reviewers[]=${OPERATOR}'"
+    done
     test -n "${blocked_item}" ||
         echo "warning: ${blocked_url} is not on the board (or the listing lags); only the question goes on it" 1>&2
     test -n "${priority}" || priority=$(jq -r '.priority // empty' <<<"${blocked_item:-{\}}")
