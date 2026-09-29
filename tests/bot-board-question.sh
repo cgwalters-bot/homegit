@@ -212,20 +212,21 @@ echo "ok: question on an item missing from the board"
 readonly HEAD=aec657dd0123456789abcdef0123456789abcdef
 echo "{\"sha\": \"${HEAD}\"}" >"${FAKE_GH}/api/repos_bootc-dev_bootc_commits_aec657dd"
 readonly DONE_LINE="When it's done, say so in a comment on this issue; the bot then closes it. Only comments by the cgwalters login count."
-run question https://github.com/bootc-dev/bootc/pull/9 "Re-approve bootc#9 at its new head" \
-    --review https://github.com/bootc-dev/bootc/pull/9@aec657dd --context "Squashed the fix into your commit."
+# bootc#10 is not on the board (bootc#9 is: see the refusals).
+run question "${TRACKER}/issues/5" "Approve bootc#10 at its head" \
+    --review https://github.com/bootc-dev/bootc/pull/10@aec657dd --context "The varlink client it needs."
 payload=$(sed -n 's/^issue //p' "${FAKE_GH}/log")
-want_body="Blocks: \`https://github.com/bootc-dev/bootc/pull/9\`
+want_body="Blocks: ${TRACKER}/issues/5
 
-Squashed the fix into your commit.
+The varlink client it needs.
 
-Ask: Re-approve bootc#9 at its new head
-Review: \`https://github.com/bootc-dev/bootc/pull/9\` at ${HEAD}
+Ask: Approve bootc#10 at its head
+Review: \`https://github.com/bootc-dev/bootc/pull/10\` at ${HEAD}
 
 ${DONE_LINE}"
 test "$(jq -r .body <<<"${payload}")" = "${want_body}" || fail "review body:"$'\n'"$(jq -r .body <<<"${payload}")"
 jq -e '.labels[0] == "review"' <<<"${payload}" >/dev/null || fail "review label: ${payload}"
-expect_log "edit PVTI_new F_Why Review: Re-approve bootc#9 at its new head"
+expect_log "edit PVTI_new F_Why Review: Approve bootc#10 at its head"
 echo "ok: review"
 
 run question https://github.com/bootc-dev/bootc/pull/9 "Rerun the legs that lost their runner" \
@@ -257,6 +258,9 @@ readonly REFUSALS=(
     "not both|question	${TRACKER}/issues/5	X	--chore	--review	https://github.com/bootc-dev/bootc/pull/9@aec657dd"
     "takes a workflow run URL|question	${TRACKER}/issues/5	X	--rerun	https://github.com/bootc-dev/bootc/pull/9"
     "takes PR_URL@SHA|question	${TRACKER}/issues/5	X	--review	https://github.com/bootc-dev/bootc/issues/9@aec657dd"
+    # A PR on the board gets a review request on the PR instead, blocked or not.
+    "request a review by cgwalters on the PR instead: gh api -X POST repos/bootc-dev/bootc/pulls/9/requested_reviewers|question	https://github.com/bootc-dev/bootc/pull/9	Re-approve	--review	https://github.com/bootc-dev/bootc/pull/9@aec657dd"
+    "is on the board already|question	${TRACKER}/issues/5	Approve	--review	https://github.com/bootc-dev/bootc/pull/9@aec657dd"
     "no commit 0badc0de|question	${TRACKER}/issues/5	X	--review	https://github.com/bootc-dev/bootc/pull/9@0badc0de"
 )
 for c in "${REFUSALS[@]}"; do
