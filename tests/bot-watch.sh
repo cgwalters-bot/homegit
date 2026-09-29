@@ -21,6 +21,11 @@ readonly ISSUE=${GH}/example/proj/issues/5
 readonly BOT_ISSUE=${GH}/example/proj/issues/6
 readonly FORK_PR=${GH}/cgwalters-forge/bootc/pull/19
 readonly OFF_BOARD_PR=${GH}/bootc-dev/bootc/pull/2600
+# PRs of the bot's own repositories, which are not fork PRs: on the board
+# and off it.
+readonly OWN_PR=${GH}/cgwalters-forge/actions/pull/6
+readonly OWN_OFF_BOARD_PR=${GH}/cgwalters-bot/homegit/pull/27
+readonly FORK_BODY=$'Why.\n\n<!-- bot-meta -->\n<!-- /bot-meta -->'
 readonly OLD_HEAD=1111111111111111111111111111111111111111
 readonly NEW_HEAD=2222222222222222222222222222222222222222
 readonly FORK_HEAD=3333333333333333333333333333333333333333
@@ -98,10 +103,11 @@ put() {
     printf '%s\n' "$2" >"${REST}/$1.json"
 }
 
-# pr REPO NUMBER HEAD UPDATED_AT: an open PR, opened by the bot at 13:17.
+# pr REPO NUMBER HEAD UPDATED_AT [BODY]: an open PR, opened by the bot at
+# 13:17.
 pr() {
-    put "repos/$1/pulls/$2" "$(jq -nc --arg head "$3" --arg updated "$4" '
-        {state: "open", merged: false, title: "Fix the thing", updated_at: $updated,
+    put "repos/$1/pulls/$2" "$(jq -nc --arg head "$3" --arg updated "$4" --arg body "${5:-}" '
+        {state: "open", merged: false, title: "Fix the thing", updated_at: $updated, body: $body,
          created_at: "2026-09-25T13:17:00Z", user: {login: "cgwalters-bot"},
          head: {sha: $head, repo: {owner: {login: "cgwalters-forge"}}}}')"
     put "repos/$1/issues/$2/events" '[]'
@@ -166,7 +172,7 @@ put repos/example/proj/issues/6 '{"state": "open", "title": "Bot bug", "updated_
 } | comments repos/example/proj/issues/6
 # The bot's fork PR, which cgwalters asked changes of: 'bot-pr inbox'
 # business, neither news nor outstanding here.
-pr cgwalters-forge/bootc 19 "${FORK_HEAD}" 2026-09-25T13:00:00Z
+pr cgwalters-forge/bootc 19 "${FORK_HEAD}" 2026-09-25T13:00:00Z "${FORK_BODY}"
 commit cgwalters-forge/bootc "${FORK_HEAD}" 2026-09-25T12:50:00Z
 review 1 cgwalters CHANGES_REQUESTED 2026-09-25T13:00:00Z "No." | reviews repos/cgwalters-forge/bootc/pulls/19
 : | comments repos/cgwalters-forge/bootc/issues/19
@@ -181,10 +187,28 @@ commit bootc-dev/bootc "${OFF_BOARD_HEAD}" 2026-09-25T12:00:00Z
 review 2 cgwalters CHANGES_REQUESTED 2026-09-25T13:00:00Z "Off the board." |
     jq -c --arg u "${OFF_BOARD_PR}" '.html_url = "\($u)#pullrequestreview-2"' | reviews repos/bootc-dev/bootc/pulls/2600
 : | comments repos/bootc-dev/bootc/issues/2600
+# The bot's own repositories' PRs, which bot-pr inbox doesn't cover
+# (no bot-meta section), with his change requests: news, and
+# outstanding, like upstream ones. The one off the board is found by the
+# search too.
+readonly OWN_HEAD=5555555555555555555555555555555555555555
+pr cgwalters-forge/actions 6 "${OWN_HEAD}" 2026-09-25T13:40:00Z
+commit cgwalters-forge/actions "${OWN_HEAD}" 2026-09-25T13:20:00Z
+review 6 cgwalters CHANGES_REQUESTED 2026-09-25T13:40:00Z "Not like this." |
+    jq -c --arg u "${OWN_PR}" '.html_url = "\($u)#pullrequestreview-6"' | reviews repos/cgwalters-forge/actions/pulls/6
+: | comments repos/cgwalters-forge/actions/issues/6
+pr cgwalters-bot/homegit 27 "${OWN_HEAD}" 2026-09-25T13:00:00Z
+commit cgwalters-bot/homegit "${OWN_HEAD}" 2026-09-25T12:00:00Z
+review 27 cgwalters CHANGES_REQUESTED 2026-09-25T13:00:00Z "Own repo, off the board." |
+    jq -c --arg u "${OWN_OFF_BOARD_PR}" '.html_url = "\($u)#pullrequestreview-27"' | reviews repos/cgwalters-bot/homegit/pulls/27
+: | comments repos/cgwalters-bot/homegit/issues/27
 put search/issues "$(jq -nc --arg a "${PR}" --arg b "${OFF_BOARD_PR}" --arg c "${FORK_PR}" --arg d "${UNREADABLE_PR}" \
-    '{total_count: 5, items: [{html_url: $a}, {html_url: $b}, {html_url: $c},
-                              {html_url: "https://github.com/cgwalters-forge/bootc/pull/20"},
-                              {html_url: $d, body: ("x" * 1000000)}]}')"
+    --arg own "${OWN_PR}" --arg own_off "${OWN_OFF_BOARD_PR}" --arg meta "${FORK_BODY}" '
+    [{html_url: $a}, {html_url: $b}, {html_url: $c, body: $meta},
+     {html_url: "https://github.com/cgwalters-forge/bootc/pull/20", body: $meta},
+     {html_url: $own}, {html_url: $own_off, body: "No bot-meta here."},
+     {html_url: $d, body: ("x" * 1000000)}]
+    | {total_count: length, items: map({user: {login: "cgwalters-bot"}} + .)}')"
 
 # board [URL...]: the board, with the main PR (unless "no-pr" comes
 # first), the two issues, and the fork PR in the Branch field of the
@@ -192,13 +216,16 @@ put search/issues "$(jq -nc --arg a "${PR}" --arg b "${OFF_BOARD_PR}" --arg c "$
 board() {
     local with_pr=true
     test "${1:-}" != no-pr || with_pr=false
-    jq -n --argjson with_pr "${with_pr}" --arg pr "${PR}" --arg issue "${ISSUE}" --arg bot_issue "${BOT_ISSUE}" --arg fork "${FORK_PR}" '
+    jq -n --argjson with_pr "${with_pr}" --arg pr "${PR}" --arg issue "${ISSUE}" --arg bot_issue "${BOT_ISSUE}" --arg fork "${FORK_PR}" \
+        --arg own "${OWN_PR}" '
         [if $with_pr then {id: "PVTI_pr", title: "Fix the thing", status: "In Review", workflow: "fork",
                           content: {type: "PullRequest", url: $pr}} else empty end,
          {id: "PVTI_issue", title: "Old bug", status: "Draft", workflow: "fork", branch: $fork,
           content: {type: "Issue", url: $issue}},
          {id: "PVTI_bot_issue", title: "Bot bug", status: "Todo", workflow: "fork",
-          content: {type: "Issue", url: $bot_issue}}]' >"${WORK}/board.json"
+          content: {type: "Issue", url: $bot_issue}},
+         {id: "PVTI_own", title: "Fix the thing", status: "Draft", workflow: "pr",
+          content: {type: "PullRequest", url: $own}}]' >"${WORK}/board.json"
 }
 board
 
@@ -227,27 +254,32 @@ expect() {
 # (a) First sight of the bot's PR and issue: what came after they were
 # opened is news, their own comments aren't. (b) First sight of someone
 # else's issue: only cgwalters' comment since the last sweep is news.
-# Nothing is from the fork PR.
+# Nothing is from the fork PR, but the bot's own repository's PR is like
+# an upstream one.
 readonly FIRST_SIGHT_JQ='
     [.items[].changes[] | [.url, .type, .author, .at]] | sort == ([
         [$pr, "review", "cgwalters", "2026-09-25T13:29:02Z"],
+        [$own, "review", "cgwalters", "2026-09-25T13:40:00Z"],
         [$issue, "comment", "cgwalters", "2026-09-25T13:05:00Z"],
         [$bot_issue, "comment", "cgwalters", "2026-09-25T12:30:00Z"],
         [$bot_issue, "comment", "someone", "2026-09-25T12:40:00Z"]] | sort)'
-first_sight_args=(--arg pr "${PR}" --arg issue "${ISSUE}" --arg bot_issue "${BOT_ISSUE}")
+first_sight_args=(--arg pr "${PR}" --arg issue "${ISSUE}" --arg bot_issue "${BOT_ISSUE}" --arg own "${OWN_PR}")
 sweep watch 2026-09-25T14:00:00Z "${EARLIER}"
 expect watch "first-sight news" "${first_sight_args[@]}" "${FIRST_SIGHT_JQ}"
-expect watch "all URLs are newly tracked" '.new_urls | length == 4'
+expect watch "all URLs are newly tracked" '.new_urls | length == 5'
 grep -q "review CHANGES_REQUESTED by @cgwalters (operator): Please split this commit." "${WORK}/watch.txt" ||
     fail "watch: the text report lacks the review: $(cat "${WORK}/watch.txt")"
 
 # (c) The unanswered reviews are listed on every sweep, also the second,
-# with no news: the board's PR, and the one off the board, not the fork
+# with no news: the board's PRs, and the ones off the board, not the fork
 # PR. The second sweep's reads are all answered 304.
 readonly OUTSTANDING_JQ='[.outstanding_reviews[] | {url, review_state, link, items: [.items[].id]}] == [
     {url: $pr, review_state: "CHANGES_REQUESTED", link: $link, items: ["PVTI_pr"]},
-    {url: $off, review_state: "CHANGES_REQUESTED", link: "\($off)#pullrequestreview-2", items: []}]'
-outstanding_args=(--arg pr "${PR}" --arg link "${REVIEW_LINK}" --arg off "${OFF_BOARD_PR}")
+    {url: $own, review_state: "CHANGES_REQUESTED", link: "\($own)#pullrequestreview-6", items: ["PVTI_own"]},
+    {url: $off, review_state: "CHANGES_REQUESTED", link: "\($off)#pullrequestreview-2", items: []},
+    {url: $own_off, review_state: "CHANGES_REQUESTED", link: "\($own_off)#pullrequestreview-27", items: []}]'
+outstanding_args=(--arg pr "${PR}" --arg link "${REVIEW_LINK}" --arg off "${OFF_BOARD_PR}" --arg own "${OWN_PR}"
+    --arg own_off "${OWN_OFF_BOARD_PR}")
 expect watch "the reviews are outstanding" "${outstanding_args[@]}" "${OUTSTANDING_JQ}"
 sweep watch 2026-09-25T14:10:00Z
 # Once more, with every resource read before.
@@ -311,13 +343,32 @@ for failure in "502 Bad Gateway|HTTP 502: Bad Gateway" "403 Forbidden|API rate l
     test "${rc}" -eq 1 || fail "search ${failure%%|*}: exit status ${rc}, not 1: $(cat "${WORK}/search.err")"
     expect search "search ${failure%%|*}: the board's news and outstanding review" "${first_sight_args[@]}" \
         --arg link "${REVIEW_LINK}" "(${FIRST_SIGHT_JQ})"' and .search_failed and .state_advanced
-        and ([.outstanding_reviews[].link] == [$link])'
+        and ([.outstanding_reviews[].link] == [$link, "\($own)#pullrequestreview-6"])'
     jq -e .swept_at "${WORK}/search.state" >/dev/null ||
         fail "search ${failure%%|*}: the state wasn't written: $(cat "${WORK}/search.state")"
     grep -q "only the board's PRs were checked" "${WORK}/search.err" ||
         fail "search ${failure%%|*}: no warning: $(cat "${WORK}/search.err")"
 done
 rm "${REST}/search/issues.fail"
+
+# Paging: over a page of results takes another request, and a PR seen on
+# two pages (the fake answers every page alike) is read and listed once.
+# The search API stops at 1000 results, with a warning.
+cp "${REST}/search/issues.json" "${WORK}/search.json.orig"
+# sweep runs the tool twice (text and JSON): twice the requests.
+for c in "150|4|" "5000|20|over 1000 open PRs"; do
+    IFS='|' read -r total calls warning <<<"${c}"
+    jq -c --argjson n "${total}" '.total_count = $n' "${WORK}/search.json.orig" >"${REST}/search/issues.json"
+    : >"${FAKE_GH}/calls"
+    sweep paging 2026-09-25T14:00:00Z "${EARLIER}"
+    test "$(grep -c ' search/issues$' "${FAKE_GH}/calls")" -eq "${calls}" ||
+        fail "paging ${total}: not ${calls} search requests: $(grep search "${FAKE_GH}/calls" | sort | uniq -c)"
+    expect paging "paging ${total}: each PR listed once" "${outstanding_args[@]}" "${OUTSTANDING_JQ}"
+    if test -n "${warning}"; then
+        grep -q "${warning}" "${WORK}/paging.err" || fail "paging ${total}: no warning: $(cat "${WORK}/paging.err")"
+    fi
+done
+cp "${WORK}/search.json.orig" "${REST}/search/issues.json"
 
 # What answers his review, or doesn't. After a push, answering needs the
 # head commit's committer to be the bot or him.
@@ -419,6 +470,11 @@ rb_ci aaaa000000000000000000000000000000000006 failure
 review 60 cgwalters CHANGES_REQUESTED 2026-09-25T11:10:00Z "Fix it." | reviews repos/example/rb/pulls/6
 put repos/cgwalters-forge/bootc/pulls/19 "$(jq -c '.mergeable = false | .mergeable_state = "dirty" | .base.ref = "main" | .body = "Why.\n\n<!-- bot-meta -->\n<!-- /bot-meta -->"' \
     "${REST}/repos/cgwalters-forge/bootc/pulls/19.json")"
+# The bot's own repository's PR conflicts, without a review: 'bot-pr
+# rebase' can't take it, so it isn't listed.
+put repos/cgwalters-bot/homegit/pulls/27 "$(jq -c '.mergeable = false | .mergeable_state = "dirty" | .base.ref = "main"' \
+    "${REST}/repos/cgwalters-bot/homegit/pulls/27.json")"
+: | reviews repos/cgwalters-bot/homegit/pulls/27
 put repos/bootc-dev/bootc/pulls/2600 "$(jq -c '.mergeable = true | .mergeable_state = "behind" | .base.ref = "main"' \
     "${REST}/repos/bootc-dev/bootc/pulls/2600.json")"
 jq -n --arg rb "${RB}" --arg fork "${FORK_PR}" '

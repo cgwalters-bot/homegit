@@ -11,11 +11,20 @@ shopt -s inherit_errexit
 readonly BOT_LOGIN=cgwalters-bot
 # Comments by this login are flagged: they may be requests.
 readonly REQUESTER=cgwalters
-# The bot's PRs in repositories of these owners are its fork PRs, the ones
-# 'bot-pr inbox' searches: cgwalters' comments and reviews on them, and
-# his closing them, are for inbox; here they only get their head and CI
-# watched. Anything else there (issues, PRs by others) is swept in full.
+# The bot's PRs in repositories of these owners with a bot-meta section
+# (which 'bot-pr fork-pr' writes) are its fork PRs, the ones 'bot-pr
+# inbox' searches: cgwalters' comments and reviews on them, and his
+# closing them, are for inbox; here they only get their head and CI
+# watched. Anything else there (the bot's own repositories' PRs, issues,
+# PRs by others) is swept in full.
 readonly FORK_OWNERS='["cgwalters-forge", "cgwalters-bot"]'
+readonly FORK_META='<!-- bot-meta -->'
+# fork_pr(OWNER): whether a PR (REST pull or search item) in a repository
+# of OWNER is one of the bot's fork PRs; takes $bot, $forks and $meta.
+readonly FORK_PR_JQ='def fork_pr($owner): .user.login == $bot and ($forks | index($owner)) != null
+    and ((.body // "") | contains($meta));'
+# The search API returns at most 1000 results.
+readonly SEARCH_MAX_PAGES=10
 readonly STATE_NAME=watch
 readonly STATE_VERSION=1
 # Items in these statuses or workflows are not swept.
@@ -83,7 +92,8 @@ sweep saw and report:
     cgwalters-forge, where devspace testing is the CI, so the runs
     cancelled then (whose summary jobs fail) aren't news.
 
-On the bot's fork PRs (its PRs in ${FORK_OWNERS}) only pushes and CI
+On the bot's fork PRs (its PRs in ${FORK_OWNERS} with a
+bot-meta section; not its own repositories' PRs) only pushes and CI
 are reported; 'bot-pr inbox' covers cgwalters' review there. Most have
 no CI at all, which is expected and not reported. A URL seen for the
 first time is only recorded, unless CI on the bot's branch fails, with
@@ -94,8 +104,9 @@ sweep. A URL that left the sweep and came back within ${DROPPED_KEEP_DAYS} days
 counts from when it was last seen.
 
 Apart from those changes, every sweep lists the "Outstanding reviews by
-${REQUESTER}" on the bot's open upstream PRs (board items or not: one
-search finds them), until they are answered: a review requesting
+${REQUESTER}" on the bot's open PRs other than fork PRs (upstream ones
+and its own repositories'; board items or not: one search finds them),
+until they are answered: a review requesting
 changes by a push of the bot's or his own (one by anyone else, like
 GitHub's "Update branch", answers nothing), or by his own later review;
 his other reviews and comments by such a push or a reply of the bot's.
@@ -104,7 +115,8 @@ mention @${BOT_LOGIN} count. So nothing the edge-triggered report
 missed is lost.
 
 Also on every sweep, "Needs rebase" lists the bot's open PRs (upstream
-ones, on the board or not, and its fork PRs on the board) that need
+ones, on the board or not, and its fork PRs on the board; not its own
+repositories' PRs, which 'bot-pr rebase' can't take) that need
 rebasing onto their base: GitHub finds them conflicting
 (mergeable_state dirty), or behind a base that must be up to date
 (behind), or their CI fails while their base has moved on (by the
@@ -121,8 +133,8 @@ as 'bot-pr rebase' refuses them.
 
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
-lists (fork PRs included) is open: with one of its upstream PRs merged
-it is ${MERGED_STATUS}; with all of them closed unmerged it needs a human.
+lists (fork PRs included) is open: with one of its other PRs (upstream
+ones, or the bot's own repositories') merged it is ${MERGED_STATUS}; with all of them closed unmerged it needs a human.
 Only --apply makes these changes, through bot-board (on a fresh board
 listing), and only for items in ${APPLY_FROM}. Each change is suggested
 once: the next sweep sees no transition any more.
@@ -445,11 +457,12 @@ pr_off_board() {
 # or null (GitHub hasn't computed it yet). A PR whose CI fails or is
 # still running that needs none of this prints reason null, so that the
 # sweep keeps remembering it (a rebase's CI runs at first); any other
-# prints null. So does a fork PR without a bot-meta section (the bot's
-# own repositories' PRs), which 'bot-pr rebase' can't take. Only a failing CI costs a request, the compare.
+# prints null. So does a PR of the bot's own repositories (in
+# FORK_OWNERS, but not a fork PR), which 'bot-pr rebase' can't take:
+# 'bot-land' rebases those. Only a failing CI costs a request, the compare.
 rebase_candidate() {
     local repo=$1 data=$2 ci=$3 fork=$4 mstate checks reason="" behind=null head_repo
-    if ${fork} && ! jq -e '(.body // "") | contains("<!-- bot-meta -->")' <<<"${data}" >/dev/null; then
+    if ! ${fork} && jq -en --arg o "${repo%%/*}" --argjson forks "${FORK_OWNERS}" '$forks | index($o) != null' >/dev/null; then
         echo null
         return 0
     fi
@@ -495,8 +508,8 @@ probe() {
     local fork=false
     if test "${kind}" = pull; then
         data=$(rest_get "repos/${repo}/pulls/${number}") || return
-        fork=$(jq --arg bot "${BOT_LOGIN}" --arg owner "${repo%%/*}" --argjson forks "${FORK_OWNERS}" \
-            '.user.login == $bot and ($forks | index($owner)) != null' <<<"${data}") || return
+        fork=$(jq --arg bot "${BOT_LOGIN}" --argjson forks "${FORK_OWNERS}" --arg meta "${FORK_META}" \
+            --arg owner "${repo%%/*}" "${FORK_PR_JQ}"' fork_pr($owner)' <<<"${data}") || return
         cur=$(jq -c '{updated_at, state: (if .merged then "merged" else .state end), head_sha: .head.sha}' <<<"${data}")
         info=$(jq -c --arg bot "${BOT_LOGIN}" --argjson fork "${fork}" --argjson forks "${FORK_OWNERS}" '
             {kind: "pr", fork: $fork, title, author: .user.login, created_at,
@@ -717,24 +730,35 @@ outstanding=$(jq -c --slurpfile results "${scratch}/results.json" '
     | [.[] | select($results[.url].outstanding != null)
        | {url, items: [.items[] | {id, title}]} + $results[.url].outstanding]' <<<"${watch}")
 # off_board: prints the outstanding reviews and rebase candidates (see
-# pr_off_board) of the bot's open upstream PRs that the sweep doesn't
-# probe (not on the board, or not any more), as JSON lines {url, items,
-# outstanding, rebase}: one search, which has no ETags, then their
-# reviews and CI. Fails if the search does; a PR that can't be read is
-# skipped with a warning.
+# pr_off_board) of the bot's open PRs other than fork PRs that the sweep
+# doesn't probe (not on the board, or not any more), as JSON lines {url,
+# items, outstanding, rebase}: one search (a page per ${PER_PAGE} PRs, fork
+# PRs included, as it can't tell them apart), which has no ETags, then
+# their reviews and CI. Fails if the search does; a PR that can't be read
+# is skipped with a warning.
 off_board() {
-    local search_q search extra url o rc
-    search_q="is:pr+is:open+author:${BOT_LOGIN}$(jq -r 'map("+-user:" + .) | join("")' <<<"${FORK_OWNERS}")"
-    search=$(rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}") ||
-        { rc=$?; warn "the search for the bot's open PRs failed (status ${rc})"; return "${rc}"; }
-    if test "$(jq .total_count <<<"${search}")" -gt "${PER_PAGE}"; then
-        warn "the bot has over ${PER_PAGE} open upstream PRs; only the first ${PER_PAGE} have their reviews checked"
-    fi
-    extra=$(jq -r --slurpfile watch <(printf '%s\n' "${watch}") --argjson forks "${FORK_OWNERS}" '
+    local search_q search found='' page=1 total extra url o rc
+    # Oldest first: a PR opened during the paging lands on the last page
+    # rather than shifting the others (duplicates are dropped below).
+    search_q="is:pr+is:open+author:${BOT_LOGIN}&sort=created&order=asc"
+    while :; do
+        search=$(rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}&page=${page}") ||
+            { rc=$?; warn "the search for the bot's open PRs failed (status ${rc})"; return "${rc}"; }
+        found+=$(jq -c '.items[]' <<<"${search}")$'\n'
+        total=$(jq -e '.total_count | numbers' <<<"${search}") ||
+            { warn "the search for the bot's open PRs answered without a total_count"; return 1; }
+        test $((page * PER_PAGE)) -lt "${total}" || break
+        if test "${page}" -ge "${SEARCH_MAX_PAGES}"; then
+            warn "the bot has over $((page * PER_PAGE)) open PRs; only the first $((page * PER_PAGE)) found have their reviews checked"
+            break
+        fi
+        page=$((page + 1))
+    done
+    extra=$(jq -rs --slurpfile watch <(printf '%s\n' "${watch}") --arg bot "${BOT_LOGIN}" --argjson forks "${FORK_OWNERS}" \
+        --arg meta "${FORK_META}" "${FORK_PR_JQ}"'
         [$watch[0][].url] as $swept
-        | .items[] | .html_url
-        | select(IN($swept[]) | not)
-        | select(capture("^https://github\\.com/(?<o>[^/]+)/").o as $o | $forks | index($o) | not)' <<<"${search}")
+        | [.[] | select(fork_pr(.html_url | capture("^https://github\\.com/(?<o>[^/]+)/").o) | not) | .html_url
+           | select(IN($swept[]) | not)] | unique[]' <<<"${found}")
     while IFS= read -r url; do
         test -n "${url}" || continue
         # pr_off_board checks every step itself, as errexit is off here.
