@@ -148,9 +148,11 @@ closed.
   that fork PR after he does. For human-only or no-go,
   set the item Needs human with the record's link. Never edit a record's
   verdict to get past the gate; only cgwalters loosens one: when he asks
-  for that, open the pull request with `bot-land --no-auto`, and enable
-  auto-merge (`gh pr merge N --auto --rebase`) only once he approved it,
-  since the gate counts his approval of the merged head.
+  for that, open the pull request with `bot-land --ask TEXT --blocks
+  ITEM_URL` (no auto-merge, and a review ask that puts it in his queue;
+  a bare `--no-auto` reaches nobody), and enable auto-merge (`gh pr merge
+  N --auto --rebase`) only once he approved it, since the gate counts
+  his approval of the merged head.
 - **Own repositories take pull requests only.** homegit and the bot's
   other own repositories (listed in `worker-preamble.md`) require a pull
   request with a green `ci` check on main, rebase-merged; workers land
