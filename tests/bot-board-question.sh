@@ -227,6 +227,7 @@ ${DONE_LINE}"
 test "$(jq -r .body <<<"${payload}")" = "${want_body}" || fail "review body:"$'\n'"$(jq -r .body <<<"${payload}")"
 jq -e '.labels[0] == "review"' <<<"${payload}" >/dev/null || fail "review label: ${payload}"
 expect_log "edit PVTI_new F_Why Review: Approve bootc#10 at its head"
+grep -q "warning: a review ask is deprecated" "${WORK}/err" || fail "review: no deprecation warning: $(cat "${WORK}/err")"
 echo "ok: review"
 
 run question https://github.com/bootc-dev/bootc/pull/9 "Rerun the legs that lost their runner" \
@@ -234,7 +235,13 @@ run question https://github.com/bootc-dev/bootc/pull/9 "Rerun the legs that lost
 payload=$(sed -n 's/^issue //p' "${FAKE_GH}/log")
 jq -e --arg tail "${DONE_LINE}" '.labels[0] == "chore" and (.body | endswith("\n\nAsk: Rerun the legs that lost their runner\nRerun: `https://github.com/bootc-dev/bootc/actions/runs/123`\nRerun: `https://github.com/bootc-dev/bootc/actions/runs/124`\n\n" + $tail))' \
     <<<"${payload}" >/dev/null || fail "rerun chore: $(jq .body <<<"${payload}")"
+grep -q "warning: a rerun ask is deprecated" "${WORK}/err" || fail "rerun chore: no deprecation warning: $(cat "${WORK}/err")"
+run question "${TRACKER}/issues/5" "Rerun the legs" --rerun https://github.com/bootc-dev/bootc/actions/runs/124
+grep -q "warning: a rerun ask is deprecated" "${WORK}/err" || fail "rerun on an issue: no deprecation warning: $(cat "${WORK}/err")"
+run question https://github.com/bootc-dev/bootc/pull/9 "Merge it" --chore
+grep -q "warning: a chore ask about a pull request is deprecated" "${WORK}/err" || fail "chore on a PR: no deprecation warning: $(cat "${WORK}/err")"
 run question "${TRACKER}/issues/5" "Save the view's sort" --chore
+! grep -q "deprecated" "${WORK}/err" || fail "plain chore: deprecation warning: $(cat "${WORK}/err")"
 payload=$(sed -n 's/^issue //p' "${FAKE_GH}/log")
 jq -e --arg tail "${DONE_LINE}" '.labels[0] == "chore" and (.body == "Blocks: https://github.com/cgwalters-forge/tracker/issues/5\n\nAsk: Save the view'"'"'s sort\n\n" + $tail)' \
     <<<"${payload}" >/dev/null || fail "plain chore: $(jq .body <<<"${payload}")"
