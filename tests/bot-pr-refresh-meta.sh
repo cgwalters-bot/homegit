@@ -41,7 +41,7 @@ cat >"${WORK}/bin/bot-board" <<'EOF'
 set -euo pipefail
 case "$1" in
     state-get) cat "${FAKE_GH}/state.json" 2>/dev/null || echo '{}' ;;
-    state-put) printf '%s\n' "${@: -1}" >"${FAKE_GH}/state.json" ;;
+    state-put) if test "${@: -1}" = -; then cat; else printf '%s\n' "${@: -1}"; fi >"${FAKE_GH}/state.json" ;;
     *) echo "fake bot-board: unexpected: $*" 1>&2; exit 1 ;;
 esac
 EOF

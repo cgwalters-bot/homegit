@@ -1109,7 +1109,8 @@ load_state() {
 # unless it is unchanged.
 save_state() {
     local rc=0
-    "${BOT_BOARD}" state-put --checked "${STATE_NAME}" "$1" || rc=$?
+    # Through stdin: the state can outgrow an argument (128KiB).
+    "${BOT_BOARD}" state-put --checked "${STATE_NAME}" - <<<"$1" || rc=$?
     test "${rc}" -eq 0 ||
         board_failed "${rc}" "writing the inbox state (bot-state: ${STATE_NAME}) failed; bot-board keeps the changes locally for the next run"
     if test -e "${LEGACY_STATE_FILE}"; then
@@ -2838,8 +2839,11 @@ cmd_inbox() {
         local forget_closed forget_prs
         forget_closed=$(date -u -d "${now} - ${SEARCH_OVERLAP}" +%FT%TZ)
         forget_prs=$(date -u -d "${now} - ${DEFAULT_LOOKBACK_DAYS} days" +%FT%TZ)
-        save_state "$(jq -c --arg now "${now}" --arg fc "${forget_closed}" --arg fp "${forget_prs}" --argjson open "${open}" '
-            ([$open[].url]) as $urls
+        # The open PRs through a pipe: with their bodies, they outgrow an
+        # argument (128KiB).
+        save_state "$(jq -c --arg now "${now}" --arg fc "${forget_closed}" --arg fp "${forget_prs}" \
+            --slurpfile open <(printf '%s\n' "${open}") '
+            ([$open[0][].url]) as $urls
             | .last_check = $now
             | .closed |= with_entries(select(.value | type == "string" and . >= $fc))
             | .prs |= with_entries(select(.key as $u | ($urls | index($u)) or (.value.seen // "") >= $fp))' <<<"${state}")"
