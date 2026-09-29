@@ -31,7 +31,11 @@ Workflows without its inner sandbox: task definitions compiled to
 Actions, digest-pinned task containers, an ACP agent wrapper
 (`bot-harness`, proposed in cgwalters-forge/cgwalters-devspace-sandbox#3)
 whose transcripts land as
-run artifacts, and comments that carry run metadata and cost. Then the
+run artifacts, and comments that carry run metadata and cost.
+Prompt-injection defense is a top-level concern of that harness: a
+multi-model intake review before untrusted text reaches Todo, and
+workers writing only through capped, separately applied safe outputs
+(cgwalters-forge/tracker#225). Then the
 review app (<https://cgwalters-forge.github.io/review/>) growing into
 cgwalters' one inbox, a github.com-like dashboard with the queue, news,
 run history and eventually chat; shared GitHub API caching; cheaper
