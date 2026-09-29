@@ -9,7 +9,12 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const PROG = path.basename(process.argv[1]);
-const BOT_GIT = path.join(path.dirname(fs.realpathSync(process.argv[1])), "bot-git");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1]));
+const BOT_GIT = path.join(BIN_DIR, "bot-git");
+const BOT_BOARD = path.join(BIN_DIR, "bot-board");
+// The Status on the board of a pull request that waits for cgwalters'
+// approval (--no-auto).
+const WAITING_STATUS = "Draft";
 const REMOTE = "origin";
 // The job the main branch rulesets require.
 const CHECK_NAME = "ci";
@@ -48,7 +53,8 @@ up to date with main, rebase-merged:
      subjects, plus '${AI_TRAILER}';
   4. enables auto-merge by rebase, unless --no-auto (for a pull request
      that waits for cgwalters' approval, such as one loosening an
-     upstream-policy verdict);
+     upstream-policy verdict: that one goes on the Workstream board
+     with Status ${WAITING_STATUS}, so that bot-watch reports his review);
   5. unless --no-wait (or --no-auto), waits until it merges: when main
      moved on, it rebases the branch with bot-git and pushes it again;
      when '${CHECK_NAME}' fails or the pull request closes, it stops. Then it
@@ -164,6 +170,20 @@ function openPull(repo, owner, branch, base, opts) {
   return pr;
 }
 
+// trackOnBoard(pr): puts PR on the board with Status WAITING_STATUS.
+// Failing only warns: the pull request is open either way.
+function trackOnBoard(pr) {
+  const url = pr.html_url;
+  try {
+    const id = run(BOT_BOARD, ["add", url], `add ${url} to the board`).split("\n").pop();
+    run(BOT_BOARD, ["set", id, "--status", WAITING_STATUS], `set ${id} to ${WAITING_STATUS}`);
+    log(`on the board as ${id}, ${WAITING_STATUS}`);
+  } catch (e) {
+    if (!(e instanceof Exit)) throw e;
+    log(`warning: ${e.message}; put it on the board by hand: bot-board add ${url}, then set its Status ${WAITING_STATUS}`);
+  }
+}
+
 // checkFailed(repo, sha): the URL of a failed CHECK_NAME run on SHA, if any.
 function checkFailed(repo, sha) {
   const runs = ghJSON([`repos/${repo}/commits/${sha}/check-runs?check_name=${CHECK_NAME}`], `read the ${CHECK_NAME} check`);
@@ -229,6 +249,7 @@ function main() {
   push(branch);
   const pr = openPull(repo, owner, branch, base, opts);
   if (!opts.auto) {
+    trackOnBoard(pr);
     console.log(pr.html_url);
     return;
   }

@@ -10,7 +10,7 @@ shopt -s inherit_errexit
 
 TESTS=$(cd "$(dirname "$0")" && pwd)
 readonly TESTS
-readonly TOOL=${TESTS}/../bin/bot-land BOT_GIT=${TESTS}/../bin/bot-git
+readonly BOT_GIT=${TESTS}/../bin/bot-git
 readonly REPO=acme/proj BRANCH=bot/topic URL=https://github.com/acme/proj/pull/5
 readonly EX_USAGE=2 EX_FAILED=3 EX_TIMEOUT=4
 
@@ -29,6 +29,22 @@ git config --global commit.gpgSign false
 export BOT_GIT_SHARED_CLONES=${WORK}/shared-clones
 unset BOT_GIT_ALLOW_SHARED_CLONE
 echo "${WORK}/shared" >"${BOT_GIT_SHARED_CLONES}"
+
+# bot-land runs the bot-board next to it: a copy of it sits next to a
+# fake one, which logs its calls to $FAKE_GH/board and fails if
+# $FAKE_GH/board-fails exists.
+readonly TOOL=${WORK}/land/bot-land
+mkdir -p "${WORK}/land"
+cp "${TESTS}/../bin/bot-land" "${TOOL}"
+ln -s "$(cd "${TESTS}/../bin" && pwd)/bot-git" "${WORK}/land/bot-git"
+cat >"${WORK}/land/bot-board" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+test ! -e "${FAKE_GH}/board-fails" || { echo "error: rate limited" 1>&2; exit 75; }
+printf '%s\n' "$*" >>"${FAKE_GH}/board"
+test "$1" != add || echo PVTI_land
+EOF
+chmod +x "${WORK}/land/bot-board"
 
 failures=0
 fail() {
@@ -157,12 +173,24 @@ closed ${EX_FAILED} ${URL}.was.closed.without.merging closed -
 timeout ${EX_TIMEOUT} still.open.after open success
 EOF
 
-# An open pull request for the branch is reused; --no-auto only opens.
+# An open pull request for the branch is reused; --no-auto doesn't merge,
+# but puts it on the board as waiting for review.
 setup
 echo "[{\"number\": 5, \"html_url\": \"${URL}\"}]" >"${FAKE_GH}/open.json"
 run "reused" 0 "reusing ${URL}" --no-auto
 ! called "POST" || fail "reused: opened another"
 ! called "pr merge" || fail "--no-auto: enabled auto-merge"
+test "$(cat "${FAKE_GH}/board")" = "add ${URL}"$'\n'"set PVTI_land --status Draft" ||
+    fail "--no-auto: board calls: $(cat "${FAKE_GH}/board")"
+# The board failing only warns: the pull request is open.
+setup
+touch "${FAKE_GH}/board-fails"
+run "board fails" 0 "warning: cannot add ${URL} to the board: error: rate limited; put it on the board by hand" --no-auto
+# Auto-merged ones stay off the board.
+setup
+poll 1 merged
+run "merged, off the board" 0 "merged ${URL}"
+test ! -e "${FAKE_GH}/board" || fail "auto-merge: board calls: $(cat "${FAKE_GH}/board")"
 
 # Refusals: several commits without a title, main itself, nothing to land.
 setup 2
