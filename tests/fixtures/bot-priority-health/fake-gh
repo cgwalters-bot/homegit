@@ -1,0 +1,44 @@
+#!/usr/bin/env node
+// A stand-in for gh in tests/bot-priority-health.test.js: answers
+// 'gh api -i PATH [-H "If-None-Match: ETAG"]' with the file
+// $FAKE_GH_DIR/PATH.json (query string ignored), its checksum as the
+// ETag, and 304 for a matching If-None-Match. With PATH.fail instead, it
+// fails with that file's first line as the HTTP status and its second as
+// gh's error. Logs "STATUS PATH" per answer to $FAKE_GH_DIR/calls.
+"use strict";
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const args = process.argv.slice(2);
+if (args[0] !== "api" || args[1] !== "-i" || !args[2]) {
+  process.stderr.write(`fake gh: unexpected arguments ${args.join(" ")}\n`);
+  process.exit(2);
+}
+const endpoint = args[2].split("?")[0];
+const ifNoneMatch = args[3] === "-H" ? args[4].replace(/^If-None-Match: /, "") : null;
+const dir = process.env.FAKE_GH_DIR;
+const log = (status) => fs.appendFileSync(path.join(dir, "calls"), `${status} ${endpoint}\n`);
+const file = path.join(dir, `${endpoint}.json`);
+if (fs.existsSync(path.join(dir, `${endpoint}.fail`))) {
+  const [status, message] = fs.readFileSync(path.join(dir, `${endpoint}.fail`), "utf8").split("\n");
+  log(status.split(" ")[0]);
+  process.stdout.write(`HTTP/2.0 ${status}\r\n\r\n`);
+  process.stderr.write(`gh: ${message}\n`);
+  process.exit(1);
+}
+if (!fs.existsSync(file)) {
+  log(404);
+  process.stdout.write("HTTP/2.0 404 Not Found\r\n\r\n");
+  process.stderr.write(`gh: Not Found (HTTP 404)\n`);
+  process.exit(1);
+}
+const body = fs.readFileSync(file, "utf8");
+const etag = `"${crypto.createHash("sha256").update(body).digest("hex").slice(0, 16)}"`;
+if (ifNoneMatch === etag) {
+  log(304);
+  process.stdout.write(`HTTP/2.0 304 Not Modified\r\nEtag: ${etag}\r\n\r\n`);
+  process.exit(1);
+}
+log(200);
+process.stdout.write(`HTTP/2.0 200 OK\r\nEtag: ${etag}\r\n\r\n${body}`);
