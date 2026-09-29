@@ -35,6 +35,12 @@
       "mode": "subagent",
       "model": "openai/gpt-6.1-sol"
     },
+    "general-sol": {
+      "description": "General-purpose subagent for multi-step tasks using GPT-6 Sol.",
+      "mode": "subagent",
+      "model": "openai/gpt-6-sol",
+      "prompt": " "
+    },
     "explore": {
       "description": "Fast read-only codebase exploration.",
       "mode": "subagent",
