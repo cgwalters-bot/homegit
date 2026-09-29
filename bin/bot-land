@@ -9,11 +9,19 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const PROG = path.basename(process.argv[1]);
-const BOT_GIT = path.join(path.dirname(fs.realpathSync(process.argv[1])), "bot-git");
+const BIN = path.dirname(fs.realpathSync(process.argv[1]));
+const BOT_GIT = path.join(BIN, "bot-git");
+const BOT_BOARD = process.env.BOT_LAND_BOT_BOARD || path.join(BIN, "bot-board");
 const REMOTE = "origin";
 // The job the main branch rulesets require.
 const CHECK_NAME = "ci";
 const AI_TRAILER = "Generated-by: AI";
+// Where cgwalters' review queue lives (as in bot-board): open issues
+// labelled REVIEW_LABEL whose 'Review:' line pins a pull request's head.
+const TRACKER_REPO = "cgwalters-forge/tracker";
+const REVIEW_LABEL = "review";
+const OPERATOR = "cgwalters";
+const REVIEW_LINE_RE = /^Review: `(\S+)` at ([0-9a-f]{40})\s*$/m;
 const DEFAULT_TIMEOUT_MIN = 30;
 const POLL_SECONDS = Number(process.env.BOT_LAND_POLL_SECONDS || 20);
 // A GitHub remote URL: https://github.com/O/R(.git), git@github.com:O/R(.git), ssh://git@github.com/O/R.
@@ -33,7 +41,8 @@ class Exit extends Error {
 
 function usage() {
   return `Usage: ${PROG} [--title TITLE] [--body BODY] [--repo OWNER/REPO]
-                [--no-auto] [--no-wait] [--timeout MINUTES]
+                [--no-auto [--ask TEXT --blocks ISSUE_URL | --no-ask]]
+                [--no-wait] [--timeout MINUTES]
 
 Lands the current branch of this worktree on one of the bot's own
 repositories (homegit, cgwalters-bot/*, cgwalters-forge's own), whose
@@ -46,9 +55,17 @@ up to date with main, rebase-merged:
      open one for this branch. TITLE defaults to the subject of a single
      commit (it is required for more); BODY to a list of the commits'
      subjects, plus '${AI_TRAILER}';
-  4. enables auto-merge by rebase, unless --no-auto (for a pull request
-     that waits for cgwalters' approval, such as one loosening an
-     upstream-policy verdict);
+  4. enables auto-merge by rebase, unless --no-auto, for a pull request
+     that waits for an approval: a reviewer's (pass --no-ask), or
+     cgwalters' (architecture, security, the bot's rules). For the
+     latter, --ask TEXT --blocks ISSUE_URL (implying --no-auto) puts it
+     in his review queue: 'bot-board question ISSUE_URL TEXT --review
+     PR_URL@HEAD --title "Review OWNER/REPO#N: PR TITLE"', ISSUE_URL
+     being the ${TRACKER_REPO} issue it blocks. --no-auto with neither
+     warns. On a pull request already open, an open review ask that pins
+     HEAD is kept, and one that pins an older head is reported stale
+     (bot-board can't re-pin it; --ask then opens a new one). Without
+     --no-auto, it refuses a pull request that has an open review ask;
   5. unless --no-wait (or --no-auto), waits until it merges: when main
      moved on, it rebases the branch with bot-git and pushes it again;
      when '${CHECK_NAME}' fails or the pull request closes, it stops. Then it
@@ -65,7 +82,7 @@ ${EX_USAGE} usage, ${EX_ERROR} anything else.
 }
 
 function parseArgs(argv) {
-  const opts = { title: null, body: null, repo: null, auto: true, wait: true, timeout: DEFAULT_TIMEOUT_MIN };
+  const opts = { title: null, body: null, repo: null, auto: true, ask: null, blocks: null, noAsk: false, wait: true, timeout: DEFAULT_TIMEOUT_MIN };
   const value = (i, name) => {
     if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
     return argv[i + 1];
@@ -89,6 +106,16 @@ function parseArgs(argv) {
       case "--no-auto":
         opts.auto = false;
         break;
+      case "--ask":
+        opts.ask = value(i++, a);
+        if (!/\S/.test(opts.ask)) throw new Exit(EX_USAGE, `--ask needs a text: what ${OPERATOR} is asked to approve`);
+        break;
+      case "--blocks":
+        opts.blocks = value(i++, a);
+        break;
+      case "--no-ask":
+        opts.noAsk = true;
+        break;
       case "--no-wait":
         opts.wait = false;
         break;
@@ -100,6 +127,13 @@ function parseArgs(argv) {
         throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
     }
   }
+  if ((opts.ask === null) !== (opts.blocks === null)) {
+    throw new Exit(EX_USAGE, `--ask and --blocks go together: the ask's text, and the ${TRACKER_REPO} issue it blocks`);
+  }
+  if (opts.ask !== null && opts.noAsk) throw new Exit(EX_USAGE, `--ask and --no-ask contradict each other`);
+  if (opts.noAsk && opts.auto) throw new Exit(EX_USAGE, `--no-ask goes with --no-auto: an auto-merged pull request needs no ask`);
+  // A pull request waiting for cgwalters' approval must not merge before it.
+  if (opts.ask !== null) opts.auto = false;
   if (opts.repo !== null && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(opts.repo)) {
     throw new Exit(EX_USAGE, `--repo takes OWNER/REPO, not '${opts.repo}'`);
   }
@@ -139,12 +173,12 @@ function push(branch) {
 }
 
 // openPull(repo, owner, branch, base, opts): the open pull request of
-// BRANCH into BASE, opened now if there is none.
+// BRANCH into BASE, opened now if there is none, and whether it existed.
 function openPull(repo, owner, branch, base, opts) {
   const open = ghJSON([`repos/${repo}/pulls?state=open&base=${encodeURIComponent(base)}&head=${encodeURIComponent(`${owner}:${branch}`)}`], "list pull requests");
   if (Array.isArray(open) && open.length > 0) {
     log(`reusing ${open[0].html_url}`);
-    return open[0];
+    return { pr: open[0], reused: true };
   }
   const subjects = git(["log", "--reverse", "--format=%s", `${REMOTE}/${base}..HEAD`], "list the commits").split("\n");
   let title = opts.title;
@@ -161,7 +195,67 @@ function openPull(repo, owner, branch, base, opts) {
   );
   const pr = JSON.parse(out);
   log(`opened ${pr.html_url}`);
-  return pr;
+  return { pr, reused: false };
+}
+
+// openAsks(prURL): the open review asks in TRACKER_REPO for PRURL, as
+// {url, sha} (the head each pins). Every page: one JSON line per issue.
+function openAsks(prURL) {
+  const lines = run(
+    "gh",
+    ["api", "--paginate", `repos/${TRACKER_REPO}/issues?labels=${REVIEW_LABEL}&state=open&per_page=100`, "--jq", ".[] | {html_url, body} | tojson"],
+    `list the review asks in ${TRACKER_REPO}`,
+  );
+  const asks = [];
+  for (const line of lines.split("\n").filter(Boolean)) {
+    const issue = JSON.parse(line);
+    const m = (issue.body || "").match(REVIEW_LINE_RE);
+    if (m && m[1] === prURL) asks.push({ url: issue.html_url, sha: m[2] });
+  }
+  return asks;
+}
+
+// ask(repo, pr, head, opts, reused): put PR, at HEAD, in cgwalters'
+// review queue with a review ask (--ask), or say why nothing does. On a
+// REUSED pull request, an open ask at HEAD is enough, and one at an older
+// head is stale: bot-board has no way to re-pin it.
+function ask(repo, pr, head, opts, reused) {
+  const asks = reused ? openAsks(pr.html_url) : [];
+  const current = asks.filter((a) => a.sha === head);
+  for (const a of asks.filter((a) => a.sha !== head)) {
+    log(
+      `warning: the review ask ${a.url} is stale: it pins ${a.sha.slice(0, 12)}, and ${pr.html_url} is now at ${head.slice(0, 12)}. ` +
+        `Close it with 'bot-board resolve ${a.url} "Superseded: the pull request moved to ${head.slice(0, 12)}"'` +
+        (opts.ask !== null ? "; a new one follows" : `, and ask again with --ask TEXT --blocks ISSUE_URL`),
+    );
+  }
+  if (current.length > 0) {
+    log(`${pr.html_url} is in ${OPERATOR}' review queue: ${current.map((a) => a.url).join(" ")}`);
+    return;
+  }
+  if (opts.ask === null) {
+    if (!opts.noAsk) {
+      log(
+        `warning: nothing puts ${pr.html_url} in ${OPERATOR}' review queue. If it waits for his approval (architecture, security, the bot's rules), ` +
+          `run this again with --ask TEXT --blocks ISSUE_URL; if a reviewer approves it and the coordinator auto-merges it, pass --no-ask`,
+      );
+    }
+    return;
+  }
+  const args = ["question", opts.blocks, opts.ask, "--review", `${pr.html_url}@${head}`, "--title", `Review ${repo}#${pr.number}: ${pr.title}`];
+  let out;
+  try {
+    out = execFileSync(BOT_BOARD, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] }).trim();
+  } catch {
+    // Not bot-board again: it may have opened the ask before failing, and
+    // a re-run of bot-land keeps an open one at HEAD instead of adding one.
+    throw new Exit(EX_ERROR, `opened ${pr.html_url}, but not its review ask; retry: ${[PROG, ...process.argv.slice(2)].map(shellQuote).join(" ")}`);
+  }
+  log(`asked ${OPERATOR} to review it: ${out}`);
+}
+
+function shellQuote(s) {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`;
 }
 
 // checkFailed(repo, sha): the URL of a failed CHECK_NAME run on SHA, if any.
@@ -227,10 +321,20 @@ function main() {
     throw new Exit(EX_ERROR, `bot-git check failed; fix the commits first`);
   }
   push(branch);
-  const pr = openPull(repo, owner, branch, base, opts);
+  const { pr, reused } = openPull(repo, owner, branch, base, opts);
   if (!opts.auto) {
+    ask(repo, pr, git(["rev-parse", "HEAD"], "read HEAD"), opts, reused);
     console.log(pr.html_url);
     return;
+  }
+  // One that waits for cgwalters must not merge before he approves it.
+  const asks = reused ? openAsks(pr.html_url) : [];
+  if (asks.length > 0) {
+    throw new Exit(
+      EX_USAGE,
+      `${pr.html_url} waits for ${OPERATOR}' approval (${asks.map((a) => a.url).join(" ")}), so not enabling auto-merge: ` +
+        `re-push it with --no-auto (--ask to keep the ask at the new head), and enable auto-merge only once he approved it`,
+    );
   }
   run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--auto", "--rebase"], "enable auto-merge");
   if (!opts.wait) {
