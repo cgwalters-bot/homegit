@@ -2,8 +2,9 @@
 # Offline tests of bin/bot-land: it opens (or reuses) the pull request,
 # enables auto-merge, waits, rebases when main moved on, stops on a
 # failed ci check or a closed pull request, and fast-forwards the shared
-# clone once merged. A local bare repository is origin, and a fake gh
-# answers from files. No network.
+# clone once merged; with --no-auto, it requests cgwalters' review
+# instead, unless he approved the head. A local bare repository is
+# origin, and a fake gh answers from files. No network.
 #   tests/bot-land.sh
 set -euo pipefail
 shopt -s inherit_errexit
@@ -36,6 +37,8 @@ echo "${WORK}/shared" >"${BOT_GIT_SHARED_CLONES}"
 readonly TOOL=${WORK}/land/bot-land
 mkdir -p "${WORK}/land"
 cp "${TESTS}/../bin/bot-land" "${TOOL}"
+# It loads the operator config (the default one here) from ../lib.
+mkdir -p "${WORK}/lib" && cp "${TESTS}/../lib/operator.js" "${WORK}/lib/"
 ln -s "$(cd "${TESTS}/../bin" && pwd)/bot-git" "${WORK}/land/bot-git"
 cat >"${WORK}/land/bot-board" <<'EOF'
 #!/usr/bin/env bash
@@ -55,8 +58,9 @@ fail() {
 # The fake gh. $FAKE_GH holds: open.json (the open pull requests for the
 # branch), polls/ (the successive answers for pull request 5, the last
 # one repeating; a poll whose answer is merged runs on-merge first),
-# checks.json (the ci check runs), body (the body of the pull request
-# opened) and calls (every call).
+# checks.json (the ci check runs), reviews.json (the reviews of pull
+# request 5), body (the body of the pull request opened) and calls (every
+# call); requesting a review fails when request-fails exists.
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -77,6 +81,9 @@ case "$*" in
         if jq -e .merged "${FAKE_GH}/answer" >/dev/null; then "${FAKE_GH}/on-merge"; fi
         cat "${FAKE_GH}/answer" ;;
     "api repos/acme/proj/commits/"*"/check-runs?check_name=ci") cat "${FAKE_GH}/checks.json" ;;
+    "api --paginate repos/acme/proj/pulls/5/reviews?per_page=100 --jq "*) jq -r "${!#}" "${FAKE_GH}/reviews.json" ;;
+    "api --silent -X POST repos/acme/proj/pulls/5/requested_reviewers -f reviewers[]=cgwalters")
+        test ! -e "${FAKE_GH}/request-fails" || { echo "Reviews may only be requested from collaborators." 1>&2; exit 1; } ;;
     *) echo "fake gh: unexpected: $*" 1>&2; exit 1 ;;
 esac
 EOF
@@ -104,6 +111,7 @@ setup() {
     mkdir -p "${FAKE_GH}/polls"
     echo '[]' >"${FAKE_GH}/open.json"
     echo '{"check_runs": []}' >"${FAKE_GH}/checks.json"
+    echo '[]' >"${FAKE_GH}/reviews.json"
     printf '#!/bin/sh\ngit -C "%s" push -q origin HEAD:main\n' "${WORK}/worktree" >"${FAKE_GH}/on-merge"
     chmod +x "${FAKE_GH}/on-merge"
     git init -q --bare "${WORK}/origin.git"
@@ -173,12 +181,12 @@ closed ${EX_FAILED} ${URL}.was.closed.without.merging closed -
 timeout ${EX_TIMEOUT} still.open.after open success
 EOF
 
-# An open pull request for the branch is reused; --no-auto doesn't merge,
-# but puts it on the board as waiting for review.
+# --no-auto opens without auto-merge and requests cgwalters' review...
+readonly REQUEST="requested_reviewers -f reviewers[]=cgwalters"
 setup
-echo "[{\"number\": 5, \"html_url\": \"${URL}\"}]" >"${FAKE_GH}/open.json"
-run "reused" 0 "reusing ${URL}" --no-auto
-! called "POST" || fail "reused: opened another"
+run "no-auto" 0 "requested cgwalters' review of ${URL}" --no-auto
+called "POST repos/acme/proj/pulls -f" || fail "no-auto: didn't open"
+called "${REQUEST}" || fail "no-auto: no review request"
 ! called "pr merge" || fail "--no-auto: enabled auto-merge"
 test "$(cat "${FAKE_GH}/board")" = "add ${URL}"$'\n'"set PVTI_land --status Draft" ||
     fail "--no-auto: board calls: $(cat "${FAKE_GH}/board")"
@@ -192,6 +200,87 @@ poll 1 merged
 run "merged, off the board" 0 "merged ${URL}"
 test ! -e "${FAKE_GH}/board" || fail "auto-merge: board calls: $(cat "${FAKE_GH}/board")"
 
+# open_pr [LOGIN]: pull request 5 is already open for the branch, with
+# LOGIN's review requested.
+open_pr() {
+    jq -n --arg url "${URL}" --arg r "${1:-}" \
+        '[{number: 5, html_url: $url, requested_reviewers: [$r | select(. != "") | {login: .}]}]' >"${FAKE_GH}/open.json"
+}
+# reviewed STATE@SHA...: cgwalters' reviews of pull request 5, oldest
+# first (SHA "head" is the worktree's HEAD), plus one by someone else.
+reviewed() {
+    local r head
+    head=$(git -C "${WORKTREE}" rev-parse HEAD)
+    for r in "$@"; do
+        jq -n --arg s "${r%@*}" --arg c "${r#*@}" --arg head "${head}" \
+            '{user: {login: "cgwalters"}, state: $s, commit_id: (if $c == "head" then $head else $c end)}'
+    done | jq -s '. + [{user: {login: "someone"}, state: "APPROVED", commit_id: "x"}]' >"${FAKE_GH}/reviews.json"
+}
+readonly OLD=1111111111111111111111111111111111111111
+
+# ... on a reused pull request too, again after a push: GitHub dropped
+# the request when he reviewed an older head or asked for changes, ...
+while read -r name reviews; do
+    setup
+    open_pr
+    # shellcheck disable=SC2086 # several reviews, or none
+    reviewed ${reviews}
+    run "reused, ${name}" 0 "reusing ${URL}" --no-auto
+    ! called "POST repos/acme/proj/pulls -f" || fail "reused, ${name}: opened another"
+    called "${REQUEST}" || fail "reused, ${name}: no review request"
+done <<EOF
+unreviewed
+approved-older APPROVED@${OLD}
+changes-requested-older CHANGES_REQUESTED@${OLD}
+dismissed APPROVED@head DISMISSED@head
+EOF
+# ... but not once he approved the head (a later comment doesn't count),
+setup
+open_pr
+reviewed APPROVED@head COMMENTED@head
+run "approved" 0 "cgwalters already approved [0-9a-f]{12}; not requesting their review" --no-auto
+! called "${REQUEST}" || fail "approved: requested a review"
+# ... or asked for changes on it (the bot's turn),
+setup
+open_pr
+reviewed APPROVED@${OLD} CHANGES_REQUESTED@head
+run "changes requested" 0 "cgwalters requested changes on [0-9a-f]{12}; not requesting their review" --no-auto
+! called "${REQUEST}" || fail "changes requested: requested a review"
+# ... nor with --no-review.
+setup
+open_pr
+run "--no-review" 0 "reusing ${URL}" --no-auto --no-review
+! called "${REQUEST}" || fail "--no-review: requested a review"
+
+# A failed request says why and what to retry.
+setup
+touch "${FAKE_GH}/request-fails"
+run "request fails" 1 "is open, but couldn't request cgwalters' review \(are they a collaborator on acme/proj\?\): Reviews may only be requested from collaborators.\. Retry: bot-land --repo acme/proj --no-auto$" --no-auto
+
+# Without --no-auto, a pull request waiting for his review isn't auto-merged.
+setup
+open_pr cgwalters
+run "auto, review requested" "${EX_USAGE}" "${URL} waits for cgwalters' review, so not enabling auto-merge"
+! called "pr merge" || fail "auto, review requested: enabled auto-merge"
+# ... nor one he asked changes on, at any head (GitHub dropped the request),
+setup
+open_pr
+reviewed CHANGES_REQUESTED@${OLD}
+run "auto, changes requested" "${EX_USAGE}" "${URL} has changes requested in cgwalters' review, so not enabling auto-merge"
+! called "pr merge" || fail "auto, changes requested: enabled auto-merge"
+# ... while one he approved, or never reviewed, auto-merges.
+while read -r name reviews; do
+    setup
+    open_pr
+    # shellcheck disable=SC2086 # several reviews, or none
+    reviewed ${reviews}
+    poll 1 merged
+    run "auto, ${name}" 0 "merged ${URL}"
+done <<EOF
+unreviewed
+approved CHANGES_REQUESTED@${OLD} APPROVED@head
+EOF
+
 # Refusals: several commits without a title, main itself, nothing to land.
 setup 2
 run "no title" "${EX_USAGE}" "2 commits: pass --title"
@@ -201,6 +290,7 @@ run "on main" "${EX_USAGE}" "on main itself"
 setup 0
 run "empty" "${EX_USAGE}" "has no commits over origin/main"
 run "usage" "${EX_USAGE}" "unexpected argument" --bogus
+run "--no-review with auto-merge" "${EX_USAGE}" "--no-review goes with --no-auto" --no-review
 
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: bot-land opens or reuses the pull request, auto-merges and waits, rebases when main moves, stops on failures, and fast-forwards the shared clone"
+echo "ok: bot-land opens or reuses the pull request, auto-merges and waits, rebases when main moves, stops on failures, fast-forwards the shared clone, and requests cgwalters' review"

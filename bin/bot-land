@@ -19,6 +19,12 @@ const REMOTE = "origin";
 // The job the main branch rulesets require.
 const CHECK_NAME = "ci";
 const AI_TRAILER = "Generated-by: AI";
+// Whose approval a --no-auto pull request waits for, the operator (see
+// lib/operator.js): requesting their review puts it in their queue (the
+// review app lists the bot's pull requests with review-requested:OPERATOR).
+const operatorConfig = require(path.join(BIN_DIR, "..", "lib", "operator.js"));
+const OPERATOR = operatorConfig.loadOrExit(PROG).operator.login;
+const OPERATOR_S = operatorConfig.possessive(OPERATOR);
 const DEFAULT_TIMEOUT_MIN = 30;
 const POLL_SECONDS = Number(process.env.BOT_LAND_POLL_SECONDS || 20);
 // A GitHub remote URL: https://github.com/O/R(.git), git@github.com:O/R(.git), ssh://git@github.com/O/R.
@@ -38,7 +44,7 @@ class Exit extends Error {
 
 function usage() {
   return `Usage: ${PROG} [--title TITLE] [--body BODY] [--repo OWNER/REPO]
-                [--no-auto] [--no-wait] [--timeout MINUTES]
+                [--no-auto [--no-review]] [--no-wait] [--timeout MINUTES]
 
 Lands the current branch of this worktree on one of the bot's own
 repositories (homegit, and the bot's and the forge org's own), whose
@@ -51,10 +57,18 @@ up to date with main, rebase-merged:
      open one for this branch. TITLE defaults to the subject of a single
      commit (it is required for more); BODY to a list of the commits'
      subjects, plus '${AI_TRAILER}';
-  4. enables auto-merge by rebase, unless --no-auto (for a pull request
-     that waits for the operator's approval, such as one loosening an
-     upstream-policy verdict: that one goes on the Workstream board
-     with Status ${WAITING_STATUS}, so that bot-watch reports his review);
+  4. enables auto-merge by rebase, unless --no-auto, for a pull request
+     that waits for ${OPERATOR_S} approval (architecture, security, the
+     bot's own rules, loosening an upstream-policy verdict): then it
+     requests their review, which puts it in their review queue, unless
+     they already approved HEAD or requested changes on it, and puts it
+     on the Workstream board with Status ${WAITING_STATUS}, so that
+     bot-watch reports their review. A re-run after a push requests it
+     again, since GitHub drops the request once they review. --no-review
+     skips the request, for one that waits only for another reviewer.
+     Without --no-auto, it refuses a pull request whose review by
+     ${OPERATOR} is requested, or whose latest review by them requested
+     changes;
   5. unless --no-wait (or --no-auto), waits until it merges: when main
      moved on, it rebases the branch with bot-git and pushes it again;
      when '${CHECK_NAME}' fails or the pull request closes, it stops. Then it
@@ -71,7 +85,7 @@ ${EX_USAGE} usage, ${EX_ERROR} anything else.
 }
 
 function parseArgs(argv) {
-  const opts = { title: null, body: null, repo: null, auto: true, wait: true, timeout: DEFAULT_TIMEOUT_MIN };
+  const opts = { title: null, body: null, repo: null, auto: true, review: true, wait: true, timeout: DEFAULT_TIMEOUT_MIN };
   const value = (i, name) => {
     if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
     return argv[i + 1];
@@ -95,6 +109,9 @@ function parseArgs(argv) {
       case "--no-auto":
         opts.auto = false;
         break;
+      case "--no-review":
+        opts.review = false;
+        break;
       case "--no-wait":
         opts.wait = false;
         break;
@@ -106,6 +123,7 @@ function parseArgs(argv) {
         throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
     }
   }
+  if (!opts.review && opts.auto) throw new Exit(EX_USAGE, `--no-review goes with --no-auto: an auto-merged pull request requests no review`);
   if (opts.repo !== null && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(opts.repo)) {
     throw new Exit(EX_USAGE, `--repo takes OWNER/REPO, not '${opts.repo}'`);
   }
@@ -184,6 +202,49 @@ function trackOnBoard(pr) {
   }
 }
 
+// decision(repo, pr): OPERATOR's latest deciding review of PR, as
+// {state, sha}, or null if they never approved or requested changes.
+function decision(repo, pr) {
+  const last = run(
+    "gh",
+    ["api", "--paginate", `repos/${repo}/pulls/${pr.number}/reviews?per_page=100`, "--jq", `.[] | select(.user.login == "${OPERATOR}" and (.state | IN(\"APPROVED\", \"CHANGES_REQUESTED\", \"DISMISSED\"))) | "\\(.state) \\(.commit_id)"`],
+    `read the reviews of ${pr.html_url}`,
+  )
+    .split("\n")
+    .at(-1);
+  if (!last) return null;
+  const [state, sha] = last.split(" ");
+  return { state, sha };
+}
+
+// requestReview(repo, pr, head): request OPERATOR's review of PR, unless
+// they already approved HEAD, or requested changes on it (the bot's turn:
+// a request would put either back in their queue).
+function requestReview(repo, pr, head) {
+  const d = decision(repo, pr);
+  if (d && d.sha === head && d.state !== "DISMISSED") {
+    const what = d.state === "APPROVED" ? "already approved" : "requested changes on";
+    log(`${OPERATOR} ${what} ${head.slice(0, 12)}; not requesting their review`);
+    return;
+  }
+  try {
+    execFileSync("gh", ["api", "--silent", "-X", "POST", `repos/${repo}/pulls/${pr.number}/requested_reviewers`, "-f", `reviewers[]=${OPERATOR}`], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+  } catch (e) {
+    throw new Exit(
+      EX_ERROR,
+      `${pr.html_url} is open, but couldn't request ${OPERATOR_S} review (are they a collaborator on ${repo}?): ${String(e.stderr || e.message).trim()}. ` +
+        `Retry: ${[PROG, ...process.argv.slice(2)].map(shellQuote).join(" ")}`,
+    );
+  }
+  log(`requested ${OPERATOR_S} review of ${pr.html_url}`);
+}
+
+function shellQuote(s) {
+  return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 // checkFailed(repo, sha): the URL of a failed CHECK_NAME run on SHA, if any.
 function checkFailed(repo, sha) {
   const runs = ghJSON([`repos/${repo}/commits/${sha}/check-runs?check_name=${CHECK_NAME}`], `read the ${CHECK_NAME} check`);
@@ -250,8 +311,23 @@ function main() {
   const pr = openPull(repo, owner, branch, base, opts);
   if (!opts.auto) {
     trackOnBoard(pr);
+    if (opts.review) requestReview(repo, pr, git(["rev-parse", "HEAD"], "read HEAD"));
     console.log(pr.html_url);
     return;
+  }
+  // One that waits for their approval must not merge before it: their
+  // review is requested, or they asked for changes (GitHub then drops the
+  // request). Most never see their review, and those auto-merge.
+  const why = (pr.requested_reviewers || []).some((u) => u.login === OPERATOR)
+    ? "waits for"
+    : decision(repo, pr)?.state === "CHANGES_REQUESTED"
+      ? "has changes requested in"
+      : null;
+  if (why) {
+    throw new Exit(
+      EX_USAGE,
+      `${pr.html_url} ${why} ${OPERATOR_S} review, so not enabling auto-merge: re-push it with --no-auto, and enable auto-merge only once they approved it`,
+    );
   }
   run("gh", ["pr", "merge", String(pr.number), "--repo", repo, "--auto", "--rebase"], "enable auto-merge");
   if (!opts.wait) {
