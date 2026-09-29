@@ -226,6 +226,33 @@ workers are running or news is coming in, 30 minutes when idle. Worker
 completions wake the session too; handle them as they arrive, and poll
 again when the sleep ends.
 
+## Heartbeat
+
+The review app's ops view can't see the workers on this machine, so
+publish them: on each loop wake (after polling) and whenever a worker
+starts or finishes, pipe the current state to `bot-heartbeat publish`:
+
+```bash
+jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
+  updated_at: $now,
+  coordinator: {session: "SESSION", loop_state: "sleeping", next_wake_at: "2026-09-28T20:30:00Z"},
+  workers: [{name: "ops-v2", item_url: "https://github.com/OWNER/REPO/issues/N",
+             started_at: "2026-09-28T19:40:00Z", devspace: "ops-v2", status: "testing"}]
+}' | bot-heartbeat publish
+```
+
+`session` is this session's id, `loop_state` what the loop does next
+(`polling`, `working`, `sleeping`, or `stopped` when cgwalters says to
+stop), `next_wake_at` when the background sleep ends, and each running worker is listed by the name, board item and
+devspace in its brief, with the `status` it last reported (`starting`,
+`working`, `testing`, `reviewing`, `landing`, `waiting`); a finished one
+is left out. The heartbeat is public: names and links only, never task
+text. The tool drops workers on private repositories' items, and edits
+one pinned comment on cgwalters-forge/tracker#176 in place, which
+notifies no one. The view warns when `updated_at` is more than 15
+minutes old and `next_wake_at` (if given) has passed by more than a few
+minutes, which means the session is gone or stuck.
+
 ## Morning brief
 
 Each morning, open an issue on

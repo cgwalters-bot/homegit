@@ -1,0 +1,373 @@
+#!/usr/bin/env node
+// Publish the coordinator's heartbeat, which the review app's ops view
+// shows as "Local agents"; see --help. Node's standard library only, and
+// gh (REST only: the GraphQL quota is shared with the board tooling).
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1]);
+// The pinned, locked "Bot heartbeat" issue, whose one comment by the bot
+// holds the heartbeat. The review app reads it from the same place.
+const TRACKER_REPO = "cgwalters-forge/tracker";
+const HEARTBEAT_ISSUE = 176;
+const BOT_LOGIN = "cgwalters-bot";
+// The comment's first line; the JSON follows in a ```json fence.
+const MARKER = "<!-- bot-heartbeat v1 -->";
+const SCHEMA = "bot-heartbeat/v1";
+
+// Limits: the input, the workers listed and the comment written.
+const MAX_INPUT_BYTES = 16 * 1024;
+const MAX_WORKERS = 32;
+// GitHub takes up to 65536 characters; stay well below.
+const MAX_BODY_CHARS = 32 * 1024;
+// How far a timestamp may be ahead of this machine's clock.
+const MAX_SKEW_MS = 5 * 60 * 1000;
+// The longest the coordinator says it will sleep (its loop sleeps 20-30
+// minutes).
+const MAX_SLEEP_MS = 2 * 60 * 60 * 1000;
+
+const LOOP_STATES = ["polling", "working", "sleeping", "stopped"];
+const STATUSES = ["starting", "working", "testing", "reviewing", "landing", "waiting"];
+const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+const WORKER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
+// bot-devspace's rule for NAME.
+const DEVSPACE_RE = /^[a-z0-9][a-z0-9_.-]{0,62}$/;
+// A board item: an issue or pull request on github.com.
+const ITEM_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})\/(issues|pull)\/([1-9][0-9]{0,9})$/;
+const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
+
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+const EX_INVALID = 3;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} publish [--dry-run] < HEARTBEAT.json
+       ${PROG} show
+
+publish writes the coordinator's heartbeat to the one comment the bot
+keeps on ${TRACKER_REPO}#${HEARTBEAT_ISSUE} ("Bot heartbeat", pinned and
+locked), editing it in place (creating it the first time), which sends
+no notifications. The review app's ops view reads it as "Local agents":
+the workers the coordinator runs on its own machine, which the browser
+can't see. The coordinator publishes on each poll-loop wake and when a
+worker starts or finishes (see the coordinator skill).
+
+The input, on stdin, is at most ${MAX_INPUT_BYTES} bytes of JSON:
+
+  {"updated_at": "2026-09-28T20:00:00Z",
+   "coordinator": {"session": "SESSION", "loop_state": "sleeping",
+                   "next_wake_at": "2026-09-28T20:30:00Z"},
+   "workers": [{"name": "ops-v2",
+                "item_url": "https://github.com/OWNER/REPO/issues/N",
+                "started_at": "2026-09-28T19:40:00Z",
+                "devspace": "ops-v2", "status": "testing"}]}
+
+updated_at defaults to now, and neither it nor started_at may be in the
+future. next_wake_at is optional: when the loop wakes next, at most
+${MAX_SLEEP_MS / 3600000} hours after updated_at; the review app doesn't call a heartbeat
+stale before then. loop_state is one of ${LOOP_STATES.join(", ")}; status one of
+${STATUSES.join(", ")}. Names and sessions are 1-64 of [A-Za-z0-9_.-],
+a devspace is a bot-devspace NAME, item_url a github.com issue or pull
+request, devspace is optional, and no other keys are allowed: the
+comment is public, so it carries names and links only. At most
+${MAX_WORKERS} workers, with distinct names. A worker whose item is in a
+private (or unreadable) repository is dropped, and said so on stderr.
+
+The comment names items only inside code, so that editing it never
+adds a "mentioned this" event to them.
+
+  --dry-run   validate and filter, then print the comment instead of
+              writing it (still reads the repositories' visibility)
+
+show prints the published heartbeat's JSON.
+
+Exit status: 0 done, ${EX_INVALID} invalid input, ${EX_USAGE} usage, ${EX_ERROR} anything else.
+`;
+}
+
+function log(msg) {
+  process.stderr.write(`${PROG}: ${msg}\n`);
+}
+
+// Now, in ms; BOT_HEARTBEAT_NOW (ISO time) overrides it for tests.
+function now() {
+  const fake = process.env.BOT_HEARTBEAT_NOW;
+  if (!fake) return Date.now();
+  const t = Date.parse(fake);
+  if (Number.isNaN(t)) throw new Exit(EX_USAGE, `BOT_HEARTBEAT_NOW is not a time: ${fake}`);
+  return t;
+}
+
+// gh(args, what, input): gh's stdout; a 404 throws an Exit whose
+// notFound is set.
+function gh(args, what, input) {
+  try {
+    return execFileSync("gh", args, { encoding: "utf8", input, stdio: ["pipe", "pipe", "pipe"], maxBuffer: 16 * 1024 * 1024 });
+  } catch (e) {
+    const detail = String(e.stderr || e.message).trim();
+    const err = new Exit(EX_ERROR, `cannot ${what}: ${detail}`);
+    err.notFound = /HTTP 404/.test(detail);
+    throw err;
+  }
+}
+
+// --- Validation ---------------------------------------------------------
+
+function invalid(where, msg) {
+  return new Exit(EX_INVALID, `invalid heartbeat: ${where}: ${msg}`);
+}
+
+function isObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+function checkKeys(obj, where, required, optional) {
+  if (!isObject(obj)) throw invalid(where, "must be an object");
+  for (const k of Object.keys(obj)) {
+    if (!required.includes(k) && !optional.includes(k)) {
+      throw invalid(where, `unknown key '${k}' (allowed: ${[...required, ...optional].join(", ")})`);
+    }
+  }
+  for (const k of required) if (!(k in obj)) throw invalid(where, `'${k}' is missing`);
+}
+
+function checkString(v, where, re, what) {
+  if (typeof v !== "string" || !re.test(v)) throw invalid(where, `must be ${what}, not ${JSON.stringify(v)}`);
+  return v;
+}
+
+function checkEnum(v, where, choices) {
+  if (typeof v !== "string" || !choices.includes(v)) throw invalid(where, `must be one of ${choices.join(", ")}, not ${JSON.stringify(v)}`);
+  return v;
+}
+
+// A UTC timestamp, normalized to whole seconds, at most MAXMS (default:
+// the clock skew allowed) after NOWMS.
+function checkTime(v, where, nowMs, maxMs = MAX_SKEW_MS) {
+  checkString(v, where, TIME_RE, "a UTC time like 2026-09-28T20:00:00Z");
+  const t = Date.parse(v);
+  if (Number.isNaN(t)) throw invalid(where, `is not a valid time: ${v}`);
+  if (t > nowMs + maxMs) throw invalid(where, maxMs === MAX_SKEW_MS ? `${v} is in the future` : `${v} is more than ${maxMs / 60000} minutes ahead`);
+  return new Date(Math.floor(t / 1000) * 1000).toISOString().replace(".000Z", "Z");
+}
+
+// validate(input, nowMs): the heartbeat, normalized, with the schema tag.
+function validate(input, nowMs) {
+  checkKeys(input, "heartbeat", ["coordinator", "workers"], ["updated_at"]);
+  const updatedAt = input.updated_at === undefined ? checkTime(new Date(nowMs).toISOString(), "updated_at", nowMs) : checkTime(input.updated_at, "updated_at", nowMs);
+  checkKeys(input.coordinator, "coordinator", ["session", "loop_state"], ["next_wake_at"]);
+  const coordinator = {
+    session: checkString(input.coordinator.session, "coordinator.session", SESSION_RE, "1-64 of [A-Za-z0-9_.-]"),
+    loop_state: checkEnum(input.coordinator.loop_state, "coordinator.loop_state", LOOP_STATES),
+  };
+  const wake = input.coordinator.next_wake_at;
+  if (wake !== undefined && wake !== null) {
+    const updated = Date.parse(updatedAt);
+    coordinator.next_wake_at = checkTime(wake, "coordinator.next_wake_at", updated, MAX_SLEEP_MS);
+    if (Date.parse(coordinator.next_wake_at) < updated) throw invalid("coordinator.next_wake_at", "is before updated_at");
+  }
+  if (!Array.isArray(input.workers)) throw invalid("workers", "must be an array");
+  if (input.workers.length > MAX_WORKERS) throw invalid("workers", `${input.workers.length} workers; at most ${MAX_WORKERS}`);
+  const names = new Set();
+  const workers = input.workers.map((w, i) => {
+    const where = `workers[${i}]`;
+    checkKeys(w, where, ["name", "item_url", "started_at", "status"], ["devspace"]);
+    const worker = {
+      name: checkString(w.name, `${where}.name`, WORKER_NAME_RE, "1-64 of [A-Za-z0-9_.-]"),
+      item_url: checkString(w.item_url, `${where}.item_url`, ITEM_URL_RE, "a github.com issue or pull request URL"),
+      started_at: checkTime(w.started_at, `${where}.started_at`, nowMs),
+      status: checkEnum(w.status, `${where}.status`, STATUSES),
+    };
+    if (w.devspace !== undefined && w.devspace !== null) {
+      worker.devspace = checkString(w.devspace, `${where}.devspace`, DEVSPACE_RE, "a bot-devspace NAME");
+    }
+    if (names.has(worker.name)) throw invalid(`${where}.name`, `'${worker.name}' is listed twice`);
+    names.add(worker.name);
+    return worker;
+  });
+  return { schema: SCHEMA, updated_at: updatedAt, coordinator, workers };
+}
+
+// --- Privacy ------------------------------------------------------------
+
+// OWNER/REPO of an item URL (already validated).
+function repoOf(url) {
+  const m = ITEM_URL_RE.exec(url);
+  return `${m[1]}/${m[2]}`;
+}
+
+// publicRepos(repos): the ones among REPOS GitHub says are public. One
+// it can't find (private and invisible to us, or gone) counts as
+// private; any other failure is an error, rather than a heartbeat that
+// silently lost workers.
+function publicRepos(repos) {
+  const out = new Set();
+  for (const repo of repos) {
+    try {
+      if (gh(["api", `repos/${repo}`, "--jq", ".private"], `read ${repo}'s visibility`).trim() === "false") out.add(repo);
+    } catch (e) {
+      if (!e.notFound) throw e;
+    }
+  }
+  return out;
+}
+
+// dropPrivate(hb): HB without the workers on items in non-public
+// repositories.
+function dropPrivate(hb) {
+  const visible = publicRepos(new Set(hb.workers.map((w) => repoOf(w.item_url).toLowerCase())));
+  const workers = hb.workers.filter((w) => visible.has(repoOf(w.item_url).toLowerCase()));
+  const dropped = hb.workers.length - workers.length;
+  if (dropped) log(`left out ${dropped} worker(s) on items in private repositories`);
+  return { ...hb, workers };
+}
+
+// --- The comment --------------------------------------------------------
+
+// OWNER/REPO#N of an item URL.
+function itemRef(url) {
+  const m = ITEM_URL_RE.exec(url);
+  return `${m[1]}/${m[2]}#${m[4]}`;
+}
+
+const code = (s) => `\`${s}\``;
+
+// render(hb): the comment's body. Items appear only in code, where
+// GitHub neither links them nor records a cross-reference on them.
+function render(hb) {
+  const lines = [
+    MARKER,
+    `Coordinator ${code(hb.coordinator.session)} is ${hb.coordinator.loop_state}, as of ${hb.updated_at}; ${hb.workers.length} local worker(s). Written by ${code(`${PROG} publish`)} in cgwalters-bot/homegit; the review app's ops view reads the JSON below.`,
+    "",
+  ];
+  if (hb.workers.length) {
+    lines.push("| Worker | Item | Status | Started | Devspace |", "|---|---|---|---|---|");
+    for (const w of hb.workers) {
+      lines.push(`| ${code(w.name)} | ${code(itemRef(w.item_url))} | ${w.status} | ${w.started_at} | ${w.devspace ? code(w.devspace) : ""} |`);
+    }
+    lines.push("");
+  }
+  lines.push("```json", JSON.stringify(hb, null, 2), "```", "");
+  const body = lines.join("\n");
+  if (body.length > MAX_BODY_CHARS) throw new Exit(EX_INVALID, `the comment would be ${body.length} characters; at most ${MAX_BODY_CHARS}`);
+  return body;
+}
+
+// heartbeatComment(): the bot's heartbeat comment on the issue, if any.
+// The issue is locked, so its comments are few.
+function heartbeatComment() {
+  const out = gh(
+    ["api", "--paginate", `repos/${TRACKER_REPO}/issues/${HEARTBEAT_ISSUE}/comments?per_page=100`, "--jq", ".[] | {id, html_url, login: .user.login, body} | @json"],
+    `list the comments of ${TRACKER_REPO}#${HEARTBEAT_ISSUE}`,
+  );
+  for (const line of out.split("\n")) {
+    if (!line) continue;
+    const c = JSON.parse(line);
+    if (c.login === BOT_LOGIN && typeof c.body === "string" && c.body.startsWith(MARKER)) return c;
+  }
+  return null;
+}
+
+// parseComment(body): the heartbeat JSON in a comment's body.
+function parseComment(body) {
+  const m = /^```json\n([\s\S]*?)\n```$/m.exec(body);
+  if (!m) throw new Exit(EX_ERROR, "the heartbeat comment has no JSON block");
+  try {
+    return JSON.parse(m[1]);
+  } catch (e) {
+    throw new Exit(EX_ERROR, `the heartbeat comment's JSON block is malformed: ${e.message}`);
+  }
+}
+
+// --- Commands -----------------------------------------------------------
+
+function readInput() {
+  let raw;
+  try {
+    raw = fs.readFileSync(0);
+  } catch (e) {
+    throw new Exit(EX_USAGE, `cannot read the heartbeat from stdin: ${e.message}`);
+  }
+  if (raw.length > MAX_INPUT_BYTES) throw invalid("input", `${raw.length} bytes; at most ${MAX_INPUT_BYTES}`);
+  try {
+    return JSON.parse(raw.toString("utf8"));
+  } catch (e) {
+    throw invalid("input", `not JSON: ${e.message}`);
+  }
+}
+
+function cmdPublish(args) {
+  let dryRun = false;
+  for (const a of args) {
+    if (a === "--dry-run") dryRun = true;
+    else throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+  }
+  const hb = dropPrivate(validate(readInput(), now()));
+  const body = render(hb);
+  if (dryRun) {
+    process.stdout.write(body);
+    return;
+  }
+  const existing = heartbeatComment();
+  if (existing && existing.body === body) {
+    log(`unchanged: ${existing.html_url}`);
+    return;
+  }
+  // The lookup only finds BOT_LOGIN's comment: under another login,
+  // every publish would create one more.
+  if (!existing) {
+    const login = gh(["api", "user", "--jq", ".login"], "read gh's login").trim();
+    if (login !== BOT_LOGIN) throw new Exit(EX_ERROR, `gh is authenticated as '${login}', not ${BOT_LOGIN}; not creating a heartbeat comment it would never find again`);
+  }
+  const payload = JSON.stringify({ body });
+  const out = existing
+    ? gh(["api", "-X", "PATCH", `repos/${TRACKER_REPO}/issues/comments/${existing.id}`, "--input", "-", "--jq", ".html_url"], "edit the heartbeat comment", payload)
+    : gh(["api", "-X", "POST", `repos/${TRACKER_REPO}/issues/${HEARTBEAT_ISSUE}/comments`, "--input", "-", "--jq", ".html_url"], "create the heartbeat comment", payload);
+  log(`${existing ? "updated" : "created"} ${out.trim()} (${hb.workers.length} worker(s))`);
+}
+
+function cmdShow(args) {
+  if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
+  const c = heartbeatComment();
+  if (!c) throw new Exit(EX_ERROR, `no heartbeat comment on ${TRACKER_REPO}#${HEARTBEAT_ISSUE} yet`);
+  process.stdout.write(`${JSON.stringify(parseComment(c.body), null, 2)}\n`);
+}
+
+function main() {
+  const [cmd, ...args] = process.argv.slice(2);
+  switch (cmd) {
+    case "-h":
+    case "--help":
+    case "help":
+      process.stdout.write(usage());
+      return;
+    case "publish":
+      return cmdPublish(args);
+    case "show":
+      return cmdShow(args);
+    default:
+      throw new Exit(EX_USAGE, `${cmd === undefined ? "missing command" : `unknown command '${cmd}'`}\n\n${usage()}`);
+  }
+}
+
+if (require.main === module) {
+  try {
+    main();
+  } catch (e) {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  }
+} else {
+  module.exports = { validate, render, parseComment, SCHEMA, MARKER };
+}
