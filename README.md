@@ -114,6 +114,13 @@ estimate in the morning brief. `bot-footer` turns one task's share into
 a run footer that fork PRs carry in their bot-meta section (see "Run
 footer" in the same doc).
 
+`bot-heartbeat publish` puts the coordinator's loop state and its local
+workers (names, board item links, devspaces) in one pinned comment on
+the "Bot heartbeat" issue in cgwalters-forge/tracker, edited in place,
+where the review app's ops view reads them as "Local agents"; it
+validates the input against a strict schema and leaves out items in
+private repositories. `tests/bot-heartbeat.sh` tests it offline.
+
 `bot-board` is a small CLI over `gh project` for the Workstream board
 (`list`, `show`, `add`, `draft`, `set`, and `state-get`/`state-put` for
 the scripts' state items), which caches reads because the
