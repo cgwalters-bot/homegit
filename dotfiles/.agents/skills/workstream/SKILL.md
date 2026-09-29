@@ -71,17 +71,31 @@ review app (cgwalters-forge/review) is the UI over this same view.
   sub-issue of the work item it blocks when that is a tracker issue.
   Several questions about one item are several question issues, so they
   can answer each with one comment.
-- **An action the operator must take is an ask issue too**, of another kind:
-  `--review PR_URL@SHA` (approve that PR at that head, e.g. a re-approval
-  before `bot-pr signoff`), `--rerun RUN_URL` (rerun the failed jobs of
-  that run; repeatable) or `--chore` (anything else: push, merge, click
-  in a UI). The review app acts on each: a review opens the PR at the
-  expected head, a rerun offers its failed jobs, a chore takes a comment.
-  One ask per issue: an item with a re-approval and a rerun gets two.
-- **Every Needs human item has at least one open ask issue.** The review
-  app shows one without as a bot bug. `bot-watch --apply` only suggests
-  Done for a Needs human item whose PR merged, so apply it (and resolve
-  its asks) yourself once they are moot.
+- **Once there is an open PR, everything about it happens on the PR**,
+  in cgwalters' words: "once we have an active open PR, we don't
+  interact anymore via a tracker issue but only focus on the PR". The
+  review app lists the PRs waiting on them directly: the bot's draft PRs
+  on the forge; the bot's PRs anywhere that request their review
+  (`is:pr is:open author:cgwalters-bot review-requested:cgwalters`;
+  GitHub drops the request once they review); and the bot's upstream PRs
+  that need what only they can do: a failing DCO check on commits lacking
+  their sign-off (they approve, then `bot-pr signoff`), or required checks
+  that need a maintainer's rerun. One where they requested changes and
+  the bot hasn't pushed or replied since is listed as waiting on the
+  bot. So for an own-repository PR needing their approval, request their
+  review (`bot-land --no-auto` does); for an upstream PR needing their
+  re-sign-off or a rerun, say so in the item's Why and let the app's
+  check detection surface it; answer their review in the PR's thread.
+- **An action they must take without a PR is an ask issue too**: `--chore`
+  (push, click in a UI, change a setting). `--review PR_URL@SHA` and
+  `--rerun RUN_URL`, and a `--chore` about a PR, are deprecated: the PR
+  itself is their queue entry. One ask per issue.
+- **Every Needs human item has an open ask issue, or a PR the app
+  lists for them** (in its Branch; a PR waiting on the bot doesn't
+  count: then the item shouldn't be Needs human). The review app shows
+  one with neither as a bot bug. `bot-watch --apply` only suggests Done for a Needs human
+  item whose PR merged, so apply it (and resolve its asks) yourself once
+  they are moot.
 - For a Draft, Why says in one line what to review; a side question they
   can answer in their review goes there too. Only a decision that blocks
   the review makes it Needs human.
@@ -543,15 +557,30 @@ bot-board set "$ITEM_URL" --why "<short rationale>. Q: $Q"
 
 For an upstream item (an issue or PR the bot can't add sub-issues to),
 the question is a standalone tracker issue; its `Blocks:` line is the
-link. An action only the operator can take (rerun, re-review, sign off, merge) is
-not a question but a review or chore ask, the same command:
+link. An action only the operator can take on an open PR (re-review, sign off,
+rerun, merge) is never a tracker issue: it happens on the PR (see
+"The operator's queue"). Set the item Needs human with the action in Why:
 
-```bash
-bot-board question "$ITEM_URL" "Re-approve bootc#2500 at its new head, then the bot runs bot-pr signoff" \
-  --review https://github.com/bootc-dev/bootc/pull/2500@aec657dd
-bot-board question "$ITEM_URL" "Rerun the two composefs UKI legs that lost their runner" \
-  --rerun https://github.com/bootc-dev/bootc/actions/runs/123456
-```
+- **An upstream PR needing their re-sign-off**: Why only. The app lists
+  it from its failing DCO check; after their approval, `bot-pr signoff`.
+
+  ```bash
+  bot-board set "$ITEM_URL" --status "Needs human" \
+    --why "<short rationale>. Needs: re-approve at the new head, then bot-pr signoff"
+  ```
+- **An upstream PR needing a maintainer's rerun**: Why too. The app
+  reads required checks from the repository's rulesets only (classic
+  branch protection needs admin access to read), and only on PRs
+  without conflicts; where that won't surface it, say so in Why.
+- **A PR on the bot's own repositories** needing their approval:
+  `bot-land --no-auto` puts it on the board as Draft and requests their
+  review, which lists it. Any other PR awaiting their approval likewise
+  goes on the board (`bot-board add PR_URL`) with their review requested
+  on it; never a `--review` ask, which `bot-board question` refuses for
+  a PR on the board.
+
+Only an action with no PR behind it is a chore ask, the same command
+with `--chore`.
 
 Ask upstream (an issue or PR comment) only when the question is genuinely for
 that project's maintainers, such as which of two approaches they would

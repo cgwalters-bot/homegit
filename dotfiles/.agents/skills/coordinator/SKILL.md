@@ -272,9 +272,10 @@ or in their open PR, or their PR closed.
   that fork PR after they do. For human-only or no-go,
   set the item Needs human with the record's link. Never edit a record's
   verdict to get past the gate; only the operator loosens one: when they ask
-  for that, open the pull request with `bot-land --no-auto`, and enable
-  auto-merge (`gh pr merge N --auto --rebase`) only once they approved it,
-  since the gate counts their approval of the merged head.
+  for that, open the pull request with `bot-land --no-auto` (which
+  puts it on the board and requests their review, putting it in their queue), and enable auto-merge
+  (`gh pr merge N --auto --rebase`) only once they approved it, since the
+  gate counts their approval of the merged head.
 - **Own repositories take pull requests only.** homegit and the bot's
   other own repositories (listed in `worker-preamble.md`) require a pull
   request with a green `ci` check on main, rebase-merged; workers land
@@ -380,12 +381,15 @@ or in their open PR, or their PR closed.
   comment on it: `bot-notify` prints an `answer` record, which you act
   on (or dispatch), then close with `bot-board resolve` and ack. When they
   answer one in the session instead, act on it the same way and put
-  their answer in the question issue's closing comment.
-  A question or decision for the operator belongs on the PR it concerns (a
-  PR comment or review reply) when there is one, or else as the tracker
-  question above — never only in the coordinator's terminal chat with
-  them. Keep chat replies to brief status, pointing at where it was
-  posted rather than restating the options.
+  their answer in the question issue's closing comment. Questions are only
+  for decisions with no open PR: once a PR is open, a question or
+  decision about it belongs on the PR (a PR comment or review reply),
+  never only in the coordinator's terminal chat with them, and never a
+  separate `--review`, `--rerun` or `--chore` ask about that PR (if a
+  worker opened one, request their review on the PR instead, or note the
+  action in Why, and resolve the ask). Keep chat replies to brief
+  status, pointing at where each question or reply was posted rather
+  than restating the options.
 - **Reply where the operator tagged the bot**, per the rule in `workstream`:
   their own @-mentions only, one concise answer in the same thread, once
   the work behind it is reviewed.
