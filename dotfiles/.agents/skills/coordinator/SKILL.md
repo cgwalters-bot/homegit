@@ -69,6 +69,16 @@ job of turning Draft items into review-ready forge PRs, also point the
 worker at `forge-migrate.md` in the same directory and list its batch of
 items.
 
+For purely mechanical work (loop until a branch compiles, clippy/fmt
+fix-ups, a named failing test with a local fix, bisecting a build
+break, first-pass classification of CI failures), dispatch the
+`builder` agent type, or have a worker dispatch it: it is pinned to
+Sonnet 5.5 and costs about half as much. It never commits or pushes (a
+hook refuses it); it leaves its changes uncommitted and reports the
+diff, which the caller reviews and commits through `bin/bot-git`. Don't pass `model`, which
+would override the pin. Reviews, design, security and root-causing a
+failure it reports as "unexplained" stay on the default model.
+
 ## Polling
 
 At session start, and on every loop iteration, in this order (`$SCRATCH`
