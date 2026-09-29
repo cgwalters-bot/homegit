@@ -203,9 +203,13 @@ is_active_status() {
     esac
 }
 
-# Prints "id status" for the recent runs titled for NAME.
+# Prints "id status" for the recent runs titled for NAME. devspace.yml's
+# run-name is "Devspace NAME (16c, 120m)", its size and duration, and
+# "Devspace NAME" in revisions from before those were added. NAME is
+# validated, so it is safe in the filter; the " (" keeps it from also
+# matching a longer NAME.
 titled_runs() {
-    api "${RUNS_API}" --jq ".workflow_runs[] | select(.display_title == \"Devspace $1\") | \"\(.id) \(.status)\""
+    api "${RUNS_API}" --jq ".workflow_runs[] | select(.display_title == \"Devspace $1\" or (.display_title | startswith(\"Devspace $1 (\"))) | \"\(.id) \(.status)\""
 }
 
 # new_runs DIR RUNS: prints the ids in RUNS ("id status" lines) that are
