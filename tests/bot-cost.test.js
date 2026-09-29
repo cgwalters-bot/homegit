@@ -103,6 +103,19 @@ test("devspace names come from start commands, not prose", () => {
   for (const [cmd, want] of cases) assert.deepEqual(cost.devspacesStarted(cmd), want, cmd);
 });
 
+test("devspace names come from run titles, with or without the size", () => {
+  const cases = [
+    ["Devspace cfs-x", "cfs-x"],
+    ["Devspace cfs-x (16c, 120m)", "cfs-x"],
+    ["Devspace a.b_c (4c, 30m)", "a.b_c"],
+    ["Devspace two words", null],
+    ["Devspace cfs-x (16c)", null],
+    ["agent PVTI_item1 bootc-dev/bootc", null],
+    [undefined, null],
+  ];
+  for (const [title, want] of cases) assert.equal(cost.devspaceName({ display_title: title }), want, String(title));
+});
+
 test("the fixture window adds up per day, per model and per task", async () => {
   const s = JSON.parse(run([...ARGS, "--json"]));
   assert.equal(s.schema, "bot-cost/v1");

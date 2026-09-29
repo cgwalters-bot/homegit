@@ -5,7 +5,8 @@
 # revisions that predate it, only 'runner' (sudo; provision installs it).
 # A fake gh keeps one dispatched run in a temporary directory, and a fake
 # ssh admits the users in $FAKE_SSH_USERS and records what it was asked to
-# run. No network.
+# run. Then which runs of another start count as the same devspace, by
+# their titles. No network.
 #   tests/bot-devspace.sh
 set -euo pipefail
 
@@ -28,23 +29,32 @@ fail() {
 }
 
 # The fake gh, for the REST calls bot-devspace makes. $FAKE/runs.json is
-# the workflow's run listing: empty until a dispatch adds run RUN_ID.
+# the workflow's run listing: empty (or what a test seeds) until a
+# dispatch adds run RUN_ID, titled like devspace.yml's run-name.
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 test "$1" = api || { echo "fake gh: unexpected: $*" 1>&2; exit 1; }
 shift
-method=GET path="" filter="." title=""
+method=GET path="" filter="." name="" cores="" duration=""
 while test $# -gt 0; do
     case "$1" in
         -X) method=$2; shift 2 ;;
-        -f) [[ "$2" == "inputs[session_name]="* ]] && title="Devspace ${2#*=}"; shift 2 ;;
+        -f)
+            case "$2" in
+                "inputs[session_name]="*) name=${2#*=} ;;
+                "inputs[cores]="*) cores=${2#*=} ;;
+                "inputs[duration]="*) duration=${2#*=} ;;
+            esac
+            shift 2 ;;
         --jq) filter=$2; shift 2 ;;
         *) path=$1; shift ;;
     esac
 done
 runs=${FAKE}/runs.json
 test -e "${runs}" || echo '{"workflow_runs": []}' >"${runs}"
+# devspace.yml's run-name
+title="Devspace ${name} (${cores}c, ${duration}m)"
 case "${method} ${path%%\?*}" in
     "POST repos/"*/dispatches)
         jq --arg t "${title}" --argjson id "${RUN_ID}" \
@@ -56,7 +66,7 @@ case "${method} ${path%%\?*}" in
         mv "${runs}.new" "${runs}" ;;
     "GET repos/"*/workflows/devspace.yml/runs) jq -r "${filter}" "${runs}" ;;
     "GET repos/"*"/runs/${RUN_ID}")
-        jq -r ".workflow_runs[0] | {path: \".github/workflows/devspace.yml\", status,
+        jq -r ".workflow_runs[] | select(.id == ${RUN_ID}) | {path: \".github/workflows/devspace.yml\", status,
             conclusion: (if .status == \"completed\" then \"cancelled\" else null end)} | ${filter}" "${runs}" ;;
     *) echo "fake gh: unexpected: ${method} ${path}" 1>&2; exit 1 ;;
 esac
@@ -131,8 +141,32 @@ for case in "${cases[@]}"; do
     "${BOT_DEVSPACE}" stop "${name}" 2>/dev/null || fail "[${admitted}] stop failed"
 done
 
+# Which active runs start takes for another devspace of the same name:
+# titles with and without the size, never a longer name that shares the
+# prefix. (seeded title, whether start must refuse)
+title_cases=(
+    "Devspace t-title (16c, 120m)|refuse"
+    "Devspace t-title|refuse"
+    "Devspace t-title-2 (16c, 120m)|start"
+    "Devspace t-title-2|start"
+    "Devspace t-titl (4c, 30m)|start"
+)
+for case in "${title_cases[@]}"; do
+    IFS='|' read -r title want <<<"${case}"
+    export XDG_STATE_HOME=${WORK}/state FAKE_SSH_USERS=runner-sandbox
+    rm -rf "${XDG_STATE_HOME}" "${FAKE:?}"/*
+    jq -n --arg t "${title}" '{workflow_runs: [{id: 1, display_title: $t, status: "in_progress"}]}' >"${FAKE}/runs.json"
+    if "${BOT_DEVSPACE}" start --no-provision --duration 30 t-title >/dev/null 2>"${WORK}/err"; then
+        test "${want}" = start || fail "[${title}] start ignored the active run"
+        "${BOT_DEVSPACE}" stop t-title 2>/dev/null || fail "[${title}] stop failed"
+    else
+        test "${want}" = refuse || fail "[${title}] start failed: $(cat "${WORK}/err")"
+        grep -q 'already exists' "${WORK}/err" || fail "[${title}] start failed otherwise: $(cat "${WORK}/err")"
+    fi
+done
+
 if test "${failures}" -ne 0; then
     echo "${failures} failure(s)" 1>&2
     exit 1
 fi
-echo "ok: bot-devspace SSH user detection and provision modes"
+echo "ok: bot-devspace SSH user detection, provision modes and run titles"

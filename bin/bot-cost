@@ -279,8 +279,10 @@ async function jobsOf(repo, run) {
   return jobs;
 }
 
-// devspaceName(run): the NAME of a devspace run titled 'Devspace NAME'.
-const devspaceName = (run) => (/^Devspace (\S+)$/.exec(run.display_title || "") || [])[1] || null;
+// devspaceName(run): the NAME of a devspace run titled 'Devspace NAME
+// (16c, 120m)', or 'Devspace NAME' from before devspace.yml's run-name
+// carried the size and duration.
+const devspaceName = (run) => (/^Devspace (\S+?)(?: \(\d+c, \d+m\))?$/.exec(run.display_title || "") || [])[1] || null;
 const agentRunItem = (run) => (/^agent (PVTI_\S+)/.exec(run.display_title || "") || [])[1] || null;
 
 // computeOf(repo, run, jobs, window): the run's runner time inside the window.
@@ -861,5 +863,5 @@ if (require.main === module) {
     process.exit(e.status);
   });
 } else {
-  module.exports = { parseTime, splitByDay, runnerOf, usdPerMinute, modelPrice, usdOf, devspacesStarted, render, scan };
+  module.exports = { parseTime, splitByDay, runnerOf, usdPerMinute, modelPrice, usdOf, devspaceName, devspacesStarted, render, scan };
 }
