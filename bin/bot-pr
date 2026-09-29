@@ -146,7 +146,8 @@ Commands:
         tested, caveats, ending with '${LLMS_TRAILER}'.
         A trailing ${META_START} section records the upstream target
         and board item, with instructions for the reviewer, and ends with
-        the run footer in --footer's FILE (bot-footer's output). It refuses if
+        the run footer in --footer's FILE (bot-footer's output), folded in
+        a collapsed '<details>' block. It refuses if
         another open fork PR in the fork already records that item, which
         is usually a copied id (after splitting a PR, the new part needs
         its own item); --force allows that.
@@ -214,8 +215,11 @@ Commands:
         section, plus, for DCO, a line naming the approval behind his
         sign-off (with --no-signoff, one telling maintainers to comment
         '/signoff', or how to sign off by hand where ${SIGNOFF_WORKFLOW}
-        doesn't exist), link and close the fork PR, and set the board item In
-        Review with Branch = the upstream PR (and Why = TEXT, if given).
+        doesn't exist), and after it the section's run footers, folded
+        as in the section (none if the text is his, per human-text, or
+        the policy's ai-trailer is none), link and close the fork PR, and
+        set the board item In Review with Branch = the upstream PR (and
+        Why = TEXT, if given).
         The upstream PR is a draft with --draft, or when ${REVIEWER}'s latest
         '${DRAFT_COMMAND}' or '${READY_COMMAND}' comment line is '${DRAFT_COMMAND}'. --dry-run checks
         everything and prints what would happen without changing anything.
@@ -298,7 +302,8 @@ Commands:
   set-body FORK_PR_URL [--body-file FILE] [--footer FILE] [--force]
         Replace a fork PR's description with FILE, keeping its bot-meta
         section, and add the run footer in --footer's FILE (bot-footer's
-        output) to the end of that section, after any earlier ones; with
+        output) to the folded block of footers at the end of that section,
+        after any earlier ones (moving any found elsewhere there); with
         only --footer, the description stays as is. Record the new body
         as the bot's, so that inbox doesn't report
         it as an edit. Use this for every change the bot makes to a fork
@@ -976,7 +981,7 @@ push_branch() {
 meta_section() {
     local upstream=$1 base=$2 item=$3 footers=${4:-} notes list
     # After a blank line, so that the markdown ends the list before them.
-    test -z "${footers}" || footers=$'\n'"${footers}"$'\n'
+    test -z "${footers}" || footers=$'\n'"$(bot_meta footers --fold <<<"${footers}")"$'\n'
     if test "${#CI_ACTIVE[@]}" -eq 0; then
         notes=$'\n'"- Fork CI: off; the devspace testing described above is this PR's CI, and upstream CI runs once it is opened there"
     else
@@ -1029,9 +1034,27 @@ read_footer() {
 }
 
 # add_footer META FOOTER: prints the bot-meta section META with FOOTER
-# after its other footers, as meta_section lays them out.
+# after its other footers, all folded in the block at its end, as
+# meta_section lays them out; footers elsewhere in META move there too.
 add_footer() {
     bot_meta add-footer "$2" <<<"$1"
+}
+
+# upstream_run_details META HUMAN_TEXT: prints the run footers of the
+# bot-meta section META as they go upstream, after the body (so its
+# '${LLMS_TRAILER}' line stays visible): folded as in the section, and
+# after a blank line; nothing when there are none, the text is REVIEWER's
+# (HUMAN_TEXT true), or the policy record (POLICY_AI_TRAILER, from
+# policy_gate) says the project takes no AI trailer.
+upstream_run_details() {
+    local block
+    ! $2 || return 0
+    if [[ "${POLICY_AI_TRAILER,,}" == none* ]]; then
+        info "Leaving the run footers out of the upstream PR: the policy's ai-trailer is '${POLICY_AI_TRAILER}'"
+        return 0
+    fi
+    block=$(bot_meta footers --fold <<<"$1")
+    test -z "${block}" || printf '\n\n%s' "${block}"
 }
 
 # jq definitions for fork PR bodies. Bodies edited in the web UI use CRLF.
@@ -1734,15 +1757,22 @@ dco_note() {
 
 # policy_gate UPSTREAM HUMAN_TEXT FORK_PR_URL: sets POLICY_VERDICT to
 # UPSTREAM's contribution policy verdict per 'upstream-policy check'
-# (which says what's wrong on stderr), and POLICY_REFUSAL to why the
+# (which says what's wrong on stderr), POLICY_AI_TRAILER to its record's
+# ai-trailer, and POLICY_REFUSAL to why the
 # bot's work may not go there, or to nothing if it may: bot-ok, or
 # human-text when HUMAN_TEXT is true (REVIEWER's approval says he wrote
 # the text). Exits with EX_RATELIMIT when rate limited.
 policy_gate() {
     local args=(check "$1") rc=0
     ! $2 || args+=(--allow-human-text)
+    args+=(--ai-trailer)
     POLICY_REFUSAL=""
     POLICY_VERDICT=$("${UPSTREAM_POLICY}" "${args[@]}") || rc=$?
+    POLICY_AI_TRAILER=""
+    if [[ "${POLICY_VERDICT}" == *$'\n'* ]]; then
+        POLICY_AI_TRAILER=${POLICY_VERDICT#*$'\n'}
+        POLICY_VERDICT=${POLICY_VERDICT%%$'\n'*}
+    fi
     case "${rc}" in
         0) ;;
         "${EX_RATELIMIT}") exit "${EX_RATELIMIT}" ;;
@@ -2229,6 +2259,8 @@ cmd_promote() {
         ${dry_run} || fatal "not promoting ${url}: ${POLICY_REFUSAL}"
         warn "${POLICY_REFUSAL}; a real promote would stop here"
     fi
+    local run_details
+    run_details=$(upstream_run_details "${meta}" "${human_text}")
     local approval_url approved_head
     approval_url=$(verdict 'approval.url // empty')
     approved_head=$(verdict 'approval.commit_id // empty')
@@ -2284,7 +2316,7 @@ EOF
             dco_line=$(signoff_note "${approval_url:-<approval>}")
         fi
         ! ${human_text} || dco_line=""
-        printf '\nTitle: %s\n\n%s\n' "${title}" "$(with_note "${body}" "${dco_line}")"
+        printf '\nTitle: %s\n\n%s\n' "${title}" "$(with_note "${body}" "${dco_line}")${run_details}"
         return 0
     fi
 
@@ -2345,7 +2377,7 @@ EOF
         info "Not adding to ${REVIEWER}'s text of the upstream PR: ${dco_line}"
         dco_line=""
     fi
-    body=$(with_note "${body}" "${dco_line}")
+    body=$(with_note "${body}" "${dco_line}")${run_details}
     # Nothing unreviewed may go upstream: fail if anything was pushed since.
     test "$(ref_sha "${FORK}" "${head}")" = "${expected_head}" ||
         fatal "${FORK}:${head} moved while promoting; not opening the upstream PR"

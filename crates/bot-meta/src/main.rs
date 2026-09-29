@@ -19,12 +19,17 @@ struct Cli {
 enum Command {
     /// Print the run footers in the bot-meta section on stdin,
     /// blank-separated.
-    Footers,
+    Footers {
+        /// Fold them in the collapsed block, as the section and the
+        /// upstream PR carry them (nothing if there are none).
+        #[arg(long)]
+        fold: bool,
+    },
     /// Print the run footer in FILE, failing unless it is one as
     /// bot-footer prints it: a summary line, then a marker line.
     CheckFooter { file: PathBuf },
     /// Print the bot-meta section on stdin with the run FOOTER added
-    /// after its other footers.
+    /// after its other footers, all folded in the block at its end.
     AddFooter { footer: String },
 }
 
@@ -38,17 +43,22 @@ fn stdin() -> Result<String> {
 
 fn run(cli: Cli) -> Result<String> {
     Ok(match cli.command {
-        Command::Footers => bot_meta::join_footers(bot_meta::footers(&stdin()?)),
+        Command::Footers { fold } => {
+            let meta = stdin()?;
+            let footers = bot_meta::footers(&meta);
+            if fold {
+                bot_meta::fold(footers)
+            } else {
+                bot_meta::join_footers(footers)
+            }
+        }
         Command::CheckFooter { file } => {
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("reading the footer '{}'", file.display()))?;
             bot_meta::parse_footer(&text)
                 .with_context(|| format!("the footer '{}'", file.display()))?
         }
-        Command::AddFooter { footer } => {
-            let footer = bot_meta::parse_footer(&footer).context("the footer to add")?;
-            bot_meta::add_footer(&stdin()?, &footer)?
-        }
+        Command::AddFooter { footer } => bot_meta::add_footer(&stdin()?, &footer)?,
     })
 }
 

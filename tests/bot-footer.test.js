@@ -83,6 +83,24 @@ test("the human line keeps task keys and model ids plain", () => {
     "<sub>Bot run: run:oddbx.yml · mi1 1 in / 1 out · ~$0.00 inference (est., list prices)</sub>");
 });
 
+test("--details folds the footer in a collapsed block; --json doesn't", () => {
+  const rec = { task: "PVTI_x", sessions: ["s1"], agents: [], models: {}, usd: { inference: 1, compute: 0 },
+    duration_s: 60, run_urls: [], core_hours: 0 };
+  const line = "<sub>Bot run: session s1 · ~$1.00 inference (est., list prices) · 1m wall</sub>";
+  const footerText = `${line}\n${footer.marker(rec)}`;
+  const cases = [
+    [{}, `${footerText}\n`],
+    [{ details: true }, `<details><summary>Run details</summary>\n\n${footerText}\n\n</details>\n`],
+    [{ json: true }, `${JSON.stringify(rec, null, 2)}\n`],
+  ];
+  for (const [opts, want] of cases) {
+    assert.equal(footer.render(rec, { compute: false, json: false, details: false, ...opts }), want, JSON.stringify(opts));
+  }
+  const folded = run(["--item", "PVTI_item1", "--no-compute", "--details"]).split("\n");
+  assert.deepEqual([folded[0], folded[1], folded[4], folded[5]], ["<details><summary>Run details</summary>", "", "", "</details>"]);
+  assert.ok(MARKER_RE.test(folded[3]), folded[3]);
+});
+
 test("durations are wall time, rounded", () => {
   const cases = [[0, "0s"], [59, "59s"], [60, "1m"], [2520, "42m"], [3599, "1h 0m"], [5430, "1h 31m"]];
   for (const [s, want] of cases) assert.equal(footer.fmtDuration(s), want, String(s));
@@ -99,6 +117,7 @@ test("errors name close matches or how to find the task", () => {
     [["--item", "PVTI_item1", "--scratch", "x"], 2, /give one of --item, --scratch and --task/],
     [["--item", "item1"], 2, /--item takes a board item id/],
     [["--bogus"], 2, /unexpected argument/],
+    [["--item", "PVTI_item1", "--json", "--details"], 2, /give --json or --details, not both/],
   ];
   for (const [args, status, want] of cases) {
     assert.throws(() => run([...args, "--no-compute"]), (e) => e.status === status && want.test(e.stderr),

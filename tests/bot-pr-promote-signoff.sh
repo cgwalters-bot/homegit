@@ -20,6 +20,18 @@ readonly HUMAN_NAME="Colin Walters" HUMAN_EMAIL=walters@verbum.org
 readonly OTHER_NAME="Other Person" OTHER_EMAIL=other@example.com
 readonly SOB="Signed-off-by: ${HUMAN_NAME} <${HUMAN_EMAIL}>"
 readonly TRAILER='Generated-by: https://github.com/cgwalters/#llms'
+# A run footer as the fork PRs' bot-meta sections carry it. FOLDED is how
+# fork-pr lays it out, at the section's end, and UNFOLDED how it did
+# before. RUN_DETAILS is what promote puts after the upstream body from
+# either: the same footer, folded the same way; LEGACY_DETAILS, from a
+# footer without its summary line, just the marker.
+# shellcheck disable=SC2016 # literal $s
+readonly FOOTER='<sub>Bot run: session aaaaaaaa · claude-opus-5-5 60k in / 2k out · ~$1.00 inference (est., list prices) · 5m wall</sub>
+<!-- bot-run/v1 {"task":"PVTI_x","sessions":["aaaaaaaa"],"models":{"claude-opus-5-5":{"tokens":{"input":100,"output":2000,"cache_read":50000,"cache_write_5m":6000,"cache_write_1h":4000},"usd":1}},"usd":{"inference":1,"compute":0},"duration_s":300,"core_hours":0,"estimate":true} -->'
+readonly RUN_DETAILS=$'<details><summary>Run details</summary>\n\n'"${FOOTER}"$'\n\n</details>'
+readonly LEGACY_DETAILS=$'<details><summary>Run details</summary>\n\n'"${FOOTER#*$'\n'}"$'\n\n</details>'
+readonly FOLDED=$'\n\n'"${RUN_DETAILS}"
+readonly UNFOLDED=$'\n\n'"${FOOTER}"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/bot-pr-promote-test.XXXXXX")
 readonly WORK
@@ -242,16 +254,17 @@ all_refs() {
     done
 }
 
-# fork_pr REPO N BRANCH APPROVED_SHA: the fixtures of fork PR
+# fork_pr REPO N BRANCH APPROVED_SHA [FOOTERS]: the fixtures of fork PR
 # cgwalters-forge/REPO#N from BRANCH, into acme/REPO main, with an
-# approving review by cgwalters of APPROVED_SHA.
+# approving review by cgwalters of APPROVED_SHA, and FOOTERS (default:
+# FOLDED) after the bot-meta section's Upstream line.
 fork_pr() {
     local fork=cgwalters-forge/$1
-    jq -n --arg repo "$1" --argjson n "$2" --arg ref "$3" --arg trailer "${TRAILER}" '
+    jq -n --arg repo "$1" --argjson n "$2" --arg ref "$3" --arg trailer "${TRAILER}" --arg footers "${5-${FOLDED}}" '
         {number: $n, state: "open", title: "Change \($n)", user: {login: "cgwalters-bot"},
          html_url: "https://github.com/cgwalters-forge/\($repo)/pull/\($n)",
          base: {ref: "main"}, head: {ref: $ref, repo: {full_name: "cgwalters-forge/\($repo)"}},
-         body: "Why it matters.\n\n\($trailer)\n\n<!-- bot-meta -->\n---\n- Upstream: `acme/\($repo)`, base `main`\n<!-- /bot-meta -->"}' |
+         body: "Why it matters.\n\n\($trailer)\n\n<!-- bot-meta -->\n---\n- Upstream: `acme/\($repo)`, base `main`\($footers)\n<!-- /bot-meta -->"}' |
         fixture "repos/${fork}/pulls/$2"
     jq -n --arg repo "$1" --argjson n "$2" --arg sha "$4" '
         [{user: {login: "someone"}, state: "APPROVED", id: 1, commit_id: $sha, submitted_at: "2026-09-25T10:00:00Z",
@@ -349,13 +362,13 @@ git -C "${SRC}" push -q app bot/app bot/late bot/moved bot/unapproved bot/others
 
 fork_pr proj 1 bot/sign "${S3}"
 fork_pr nodco 2 bot/plain "${N1}"
-fork_pr proj 3 bot/signed "${D1}"
+fork_pr proj 3 bot/signed "${D1}" "${UNFOLDED}"
 fork_pr proj 4 bot/mixed "${M2}"
 fork_pr proj 5 bot/lease "${L1}"
 fork_pr proj 6 bot/stale "${T1}"
-fork_pr proj 7 bot/rebased "${R1}"
+fork_pr proj 7 bot/rebased "${R1}" ""
 fork_pr proj 8 bot/forged "${F1}"
-fork_pr proj 9 bot/legacy "${G2}"
+fork_pr proj 9 bot/legacy "${G2}" $'\n'"${FOOTER#*$'\n'}"
 fork_pr dcoapp 11 bot/app "${A1}"
 fork_pr dcoapp 12 bot/late "${LA1}"
 fork_pr dcoapp 13 bot/moved "${MV1}"
@@ -392,7 +405,8 @@ readonly CONTRIB_SHA=cccccccccccccccccccccccccccccccccccccccc
 git init -q --bare "${WORK}/homegit.git"
 git init -q "${WORK}/homegit"
 git -C "${WORK}/homegit" remote add origin "${WORK}/homegit.git"
-# policy REPO VERDICT: commit and push acme/REPO's record with VERDICT,
+# policy REPO VERDICT [AI_TRAILER]: commit and push acme/REPO's record
+# with VERDICT (and AI_TRAILER, default Generated-by),
 # vouched for as cgwalters' (so it may loosen one), and a CONTRIBUTING.md
 # on GitHub that matches it.
 policy() {
@@ -400,8 +414,8 @@ policy() {
     jq -n --arg s "${CONTRIB_SHA}" '{truncated: false, tree: [{path: "CONTRIBUTING.md", type: "blob", sha: $s}]}' |
         fixture "repos/acme/$1/git/trees/main"
     mkdir -p "${UPSTREAM_POLICY_DIR}/acme"
-    printf -- '---\nverdict: %s\nai-trailer: Generated-by\ndco: yes (test)\nsources:\n  - path: CONTRIBUTING.md\n    sha: %s\nchecked: today by the test\n---\n\nRationale.\n' \
-        "$2" "${CONTRIB_SHA}" >"${UPSTREAM_POLICY_DIR}/acme/$1.md"
+    printf -- '---\nverdict: %s\nai-trailer: %s\ndco: yes (test)\nsources:\n  - path: CONTRIBUTING.md\n    sha: %s\nchecked: today by the test\n---\n\nRationale.\n' \
+        "$2" "${3:-Generated-by}" "${CONTRIB_SHA}" >"${UPSTREAM_POLICY_DIR}/acme/$1.md"
     git -C "${WORK}/homegit" add -A
     git -C "${WORK}/homegit" -c core.hooksPath=/dev/null -c commit.gpgSign=false commit -q --allow-empty -m "$1: $2"
     "${REAL_GIT}" -C "${WORK}/homegit" -c core.hooksPath=/dev/null push -q origin HEAD:main
@@ -507,6 +521,7 @@ test "$(remote_ref "${FORGE}" bot/stale)" = "${T2}" || fail "stale: the branch m
 if run "dry run" ok promote "${URL}/proj/pull/1" --dry-run; then
     expect "dry run" "add '${SOB}' to the commits lacking it" \
         "on cgwalters's approval of the review draft: ${URL}/proj/pull/1#pullrequestreview-100" '!/signoff'
+    [[ "${OUT}" == *"${TRAILER}"$'\n\n'"${RUN_DETAILS}"* ]] || fail "dry run: no run details after the trailer:"$'\n'"${OUT}"
 fi
 test "$(all_refs)" = "${REFS_BEFORE}" || fail "dry run: the remotes changed"
 
@@ -534,6 +549,7 @@ body=$(jq -r .body <<<"${pr}")
 grep -qFx "The \`${SOB}\` on these commits was added on cgwalters's approval of the review draft: ${URL}/proj/pull/1#pullrequestreview-100" <<<"${body}" ||
     fail "rerun #1: the body doesn't name the approval:"$'\n'"${body}"
 grep -qF '/signoff' <<<"${body}" && fail "rerun #1: the body still asks maintainers for /signoff"
+[[ "${body}" == *$'\n\n'"${TRAILER}"$'\n\n'"${RUN_DETAILS}" ]] || fail "rerun #1: the run details don't follow the trailer:"$'\n'"${body}"
 test -e "${FAKE_GH}/closed_repos_${FORGE//\//_}_pulls_1" || fail "rerun #1: the fork PR wasn't closed"
 
 # --- The policy gate: nothing moves unless the record says bot-ok ---
@@ -554,6 +570,13 @@ policy nodco bot-ok
 test "$(all_refs)" = "${REFS_BEFORE}" || fail "policy: the remotes changed"
 test -z "$(opened bot/plain)" || fail "policy: an upstream PR was opened"
 
+# --- A project that takes no AI trailer gets no run details ---
+policy nodco bot-ok "none (no AI metadata, says the test)"
+if run "no AI trailer" ok promote "${URL}/nodco/pull/2" --dry-run; then
+    expect "no AI trailer" '!<details>' '!bot-run/v1' "Leaving the run footers out of the upstream PR: the policy's ai-trailer is 'none"
+fi
+policy nodco bot-ok
+
 # --- No DCO: nothing to sign off ---
 if run "no DCO" ok promote "${URL}/nodco/pull/2"; then
     expect "no DCO" '!Added'
@@ -562,6 +585,8 @@ test "$(remote_ref cgwalters-forge/nodco bot/plain)" = "${N1}" || fail "no DCO: 
 body=$(opened bot/plain | jq -r .body)
 test -n "${body}" || fail "no DCO: no upstream PR"
 grep -qE 'Signed-off-by|DCO' <<<"${body}" && fail "no DCO: the body mentions DCO:"$'\n'"${body}"
+test "${body}" = "Why it matters."$'\n\n'"${TRAILER}"$'\n\n'"${RUN_DETAILS}" ||
+    fail "no DCO: not the fork PR's body plus its run details:"$'\n'"${body}"
 
 # --- Already signed off ---
 if run "signed" ok promote "${URL}/proj/pull/3"; then
@@ -570,6 +595,8 @@ fi
 test "$(remote_ref "${FORGE}" bot/signed)" = "${D1}" || fail "signed: the branch was rewritten"
 test "$(opened bot/signed | jq -r .head_sha)" = "${D1}" || fail "signed: no upstream PR from the original head"
 opened bot/signed | jq -r .body | grep -qE 'Signed-off-by|DCO|/signoff' && fail "signed: the body has a DCO line, though nothing was signed off"
+[[ "$(opened bot/signed | jq -r .body)" == *"${TRAILER}"$'\n\n'"${RUN_DETAILS}" ]] ||
+    fail "signed: the unfolded footer isn't folded after the trailer: $(opened bot/signed | jq -r .body)"
 
 # --- Signed off, but the bot's rebase made it fail DCO ---
 if run "rebased" ok promote "${URL}/proj/pull/7"; then
@@ -580,6 +607,7 @@ test "${rebased}" != "${R1}" || fail "rebased: not recommitted"
 same_but_signed "rebased" "${R1}" "${rebased}"
 opened bot/rebased | jq -r .body | grep -qF "approval of the review draft: ${URL}/proj/pull/7#pullrequestreview-700" ||
     fail "rebased: the body doesn't name the approval"
+opened bot/rebased | jq -r .body | grep -qF '<details>' && fail "rebased: an empty run details block, without footers"
 
 # --- The bot's old name: normalized where rewritten, and the record of
 # that rewrite still checks out on a rerun ---
@@ -597,6 +625,8 @@ if run "legacy name, rerun" ok promote "${URL}/proj/pull/9"; then
     expect "legacy name, rerun" '!Added' 'plus his sign-off, per the bot.s record; checking that'
 fi
 test "$(opened bot/legacy | jq -r .head_sha)" = "${legacy}" || fail "legacy name: no upstream PR from the signed-off head"
+[[ "$(opened bot/legacy | jq -r .body)" == *"${TRAILER}"$'\n\n'"${LEGACY_DETAILS}" ]] ||
+    fail "legacy name: the footer without a summary line isn't carried alone: $(opened bot/legacy | jq -r .body)"
 
 # --- A forged record: the head isn't the approved one plus the sign-off ---
 REFS_BEFORE=$(all_refs)
@@ -648,6 +678,8 @@ upstream_url() {
 for pr in 12:bot/late 13:bot/moved 14:bot/unapproved 15:bot/others; do
     if run "promote ${pr#*:}" ok promote "${URL}/dcoapp/pull/${pr%%:*}" --no-signoff; then
         test -n "$(upstream_url "${pr#*:}")" || fail "promote ${pr#*:}: no upstream PR"
+        [[ "$(opened "${pr#*:}" | jq -r .body)" == *"requires DCO"*"${TRAILER}"$'\n\n'"${RUN_DETAILS}" ]] ||
+            fail "promote ${pr#*:}: not the DCO note, trailer, then run details: $(opened "${pr#*:}" | jq -r .body)"
     fi
 done
 LATE=$(upstream_url bot/late)
@@ -758,7 +790,7 @@ echo '[{"event": "renamed", "actor": {"login": "cgwalters"}, "rename": {"from": 
 if run "promote, human-text" ok promote "${URL}/dcoapp/pull/17" --no-signoff; then
     body=$(opened bot/human | jq -r .body)
     test -n "${body}" || fail "promote, human-text: no upstream PR"
-    grep -qE 'Generated-by|Signed-off-by|/signoff' <<<"${body}" && fail "promote, human-text: the bot added to his body:"$'\n'"${body}"
+    grep -qE 'Generated-by|Signed-off-by|/signoff|bot-run|<details>' <<<"${body}" && fail "promote, human-text: the bot added to his body:"$'\n'"${body}"
 fi
 HUMAN=$(upstream_url bot/human)
 pushed_by cgwalters-bot
@@ -784,6 +816,12 @@ jq -n '[{user: {login: "someone"}, created_at: "2026-09-25T12:00:00Z", html_url:
 signoff_refused "signoff, not promoted" "no PR in ${APP} says 'bot-pr promote' opened" https://github.com/acme/dcoapp/pull/90
 upstream_pr 91 someone bot/unpromoted
 signoff_refused "signoff, not the bot's PR" "was opened by someone, not cgwalters-bot" https://github.com/acme/dcoapp/pull/91
+
+# Whatever promote opened, nothing else from the bot-meta section went up.
+while read -r pr; do
+    ! grep -qE -- "Upstream:|Board item:|bot-meta" <<<"$(jq -r .body <<<"${pr}")" ||
+        fail "upstream body of $(jq -r .head <<<"${pr}") leaks bot-meta: $(jq -r .body <<<"${pr}")"
+done < <(find "${FAKE_GH}/opened" -name '*.json' -exec cat {} + | jq -c .)
 
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
 echo "ok: promote passes the policy gate only with a current bot-ok record, signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases; signoff signs off promoted PRs only on that approval or cgwalters' upstream approval of the current head, with the same refusals"
