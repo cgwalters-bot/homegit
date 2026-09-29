@@ -43,7 +43,8 @@ draft_of() { # draft_of ITEM_ID
 }
 # REST fixtures: a GET of PATH (query string ignored) answers with
 # $FAKE_GH/rest/PATH.json, if it exists, filtered by --jq like gh does,
-# or with a 404 if $FAKE_GH/rest/PATH.404 exists.
+# or with a 404 if $FAKE_GH/rest/PATH.404 exists. A search for open
+# issues or PRs answers with $FAKE_GH/rest/search/issues-open.json.
 if test "$1" = api && test -d "${store}/rest"; then
     method=GET path="" filter="" args=("${@:2}")
     while test "${#args[@]}" -gt 0; do
@@ -56,6 +57,10 @@ if test "$1" = api && test -d "${store}/rest"; then
         esac
     done
     fixture=${store}/rest/${path}.json
+    if test "${path}" = search/issues; then
+        fixture=/nonexistent
+        [[ " $(arg q "$@") " != *" is:open "* ]] || fixture=${store}/rest/search/issues-open.json
+    fi
     if test "${method}" = GET && test -e "${fixture}"; then
         jq -rc "${filter:-.}" "${fixture}"
         exit 0
@@ -431,6 +436,27 @@ test_pr_inbox_migration() {
     "${BIN}/bot-pr" inbox 2>"${WORK}/err"
     ! grep -q 'Moved' "${WORK}/err" || fail "migrated twice"
     expect_json "$(project_state pr-inbox | jq -c '.prs | keys')" '["A","B"]' "inbox state after the next run"
+}
+
+# An open fork PR whose body alone is over ARG_MAX: the inbox run that
+# records it passes the open PRs to jq, and the state to bot-board,
+# without exceeding an argument's size.
+test_pr_inbox_big() {
+    local url=https://github.com/cgwalters-forge/big/pull/1 body pr
+    body=$'Why.\n\n<!-- bot-meta -->\n- Upstream: `up/big`, base `main`\n<!-- /bot-meta -->\n'$(head -c 3000000 /dev/zero | tr '\0' x)
+    pr=$(jq -nc --rawfile b <(printf '%s' "${body}") --arg u "${url}" '{html_url: $u, number: 1, title: "Big", body: $b, state: "open",
+        repository_url: "https://api.github.com/repos/cgwalters-forge/big",
+        head: {ref: "bot/big", sha: "3333333333333333333333333333333333333333"}}')
+    set_project_state pr-inbox '{}'
+    rest search/issues-open "$(jq -c '{items: [.]}' <<<"${pr}")"
+    rest repos/cgwalters-forge/big/pulls/1 "${pr}"
+    local ep
+    for ep in pulls/1/reviews pulls/1/comments issues/1/comments issues/1/timeline activity; do
+        rest "repos/cgwalters-forge/big/${ep}" '[]'
+    done
+    "${BIN}/bot-pr" inbox 2>"${WORK}/err" || fail "inbox failed: $(cat "${WORK}/err")"
+    project_state pr-inbox | jq -e --arg u "${url}" '.prs[$u].body | length == 64' >/dev/null ||
+        fail "the big PR is not in the state: $(project_state pr-inbox)"
 }
 
 # --- bot-pr promote ----------------------------------------------------------
