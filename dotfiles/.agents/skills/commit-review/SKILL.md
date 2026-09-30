@@ -41,7 +41,7 @@ git commit --fixup=<hash>           # local only, never pushed
 git rebase --autosquash main        # fold it into place
 ```
 
-Pushed history never contains `fixup!`/`squash!` or "Address review feedback" commits. Commits by cgwalters are squashed into too, keeping his Signed-off-by; commits by anyone else are never rewritten and get a separate, normal commit instead. See "Fixes and review feedback" in the shared AGENTS.md.
+Pushed history never contains `fixup!`/`squash!` or "Address review feedback" commits. Commits by the operator are squashed into too, keeping their Signed-off-by; commits by anyone else are never rewritten and get a separate, normal commit instead. See "Fixes and review feedback" in the shared AGENTS.md.
 
 ---
 
@@ -60,7 +60,7 @@ Specifically avoid in the body:
 
 Trailers to check:
 - AI trailer present: `Generated-by: AI` by default, `Assisted-by: AI` if a human wrote a substantial part (unless the project says otherwise)
-- No `Signed-off-by:` (that's for the human to add manually before push; the only exception is cgwalters' own, added by `bot-pr promote` after his approval)
+- No `Signed-off-by:` (that's for the human to add manually before push; the only exception is the operator's own, added by `bot-pr promote` after their approval)
 - `Closes: #N` if the commit resolves a tracked issue
 
 ### Commit Organization

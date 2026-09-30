@@ -1,9 +1,17 @@
 ---
 name: coordinator
-description: Run cgwalters-bot as the top-level coordinator session - poll bot-notify, bot-pr inbox and bot-watch on a loop, promote approved fork PRs, dispatch worker subagents for Todo items and cgwalters' asks, have an independent reviewer check every result, and post the morning brief. Load this when asked to run or coordinate the bot; workers and reviewers read the preambles next to it instead.
+description: Run the bot (cgwalters-bot) as the top-level coordinator session - poll bot-notify, bot-pr inbox and bot-watch on a loop, promote approved fork PRs, dispatch worker subagents for Todo items and the operator's asks, have an independent reviewer check every result, and post the morning brief. Load this when asked to run or coordinate the bot; workers and reviewers read the preambles next to it instead.
 ---
 
 # coordinator — Running the bot as a coordinator
+
+Names: *the operator* is the human who runs this bot (`operator.login` in
+the operator config, see `bot-operator` and docs/bootstrap.md; cgwalters by
+default). The bot account, forge org, tracker and board below are the default
+config's (cgwalters-bot, cgwalters-forge, cgwalters-forge/tracker,
+orgs/cgwalters-forge/projects/1); under another operator config, read them as
+that config's values (`bot-operator --json`). The goals in the next section
+are cgwalters'.
 
 The coordinator is the long-lived top-level session. It does little work
 itself: it watches for news, keeps the board moving, and briefs subagents
@@ -25,7 +33,7 @@ path needs come first. The [Composefs Stable](https://github.com/users/cgwalters
 board tracks it.
 
 Within P1 (see "Priority" in the workstream skill, which also counts
-backlog burn-down and cgwalters' direct requests), the main thread is
+backlog burn-down and the operator's direct requests), the main thread is
 the bot's own harness, aiming at something like GitHub Agentic
 Workflows without its inner sandbox: task definitions compiled to
 Actions, digest-pinned task containers, an ACP agent wrapper
@@ -37,12 +45,12 @@ multi-model intake review before untrusted text reaches Todo, and
 workers writing only through capped, separately applied safe outputs
 (cgwalters-forge/tracker#225). Then the
 review app (<https://cgwalters-forge.github.io/review/>) growing into
-cgwalters' one inbox, a github.com-like dashboard with the queue, news,
+the operator's one inbox, a github.com-like dashboard with the queue, news,
 run history and eventually chat; shared GitHub API caching; cheaper
 models only where an eval shows they hold up.
 
 The interactive coordinator session is itself temporary. The target is a coordinator launched
-from a scheduled workflow, with an interactive ACP session cgwalters
+from a scheduled workflow, with an interactive ACP session the operator
 can drive from the review app (design:
 <https://gist.github.com/cgwalters-bot/0a42c8916ac9a82f90e601576fe4c90b>),
 and the coordinator moving out of homegit into a repository of its own.
@@ -104,7 +112,7 @@ bot-tmt-number --gc
 
 saving each one's whole output under `~/.local/state/bot-poll/runs/`,
 and compares what they list against what it has already reported:
-approvals, cgwalters' activity on fork PRs, outstanding reviews,
+approvals, the operator's activity on fork PRs, outstanding reviews,
 rebase needs, priority health lines (a new P0 one is its own kind),
 sign-offs, requests and answers from `bot-notify`, and item news other
 than bots'. On the first new item it exits printing
@@ -122,7 +130,7 @@ but don't rebuild it, so after a pull that changes `crates/bot-poll`,
 run `make install-crates` again before restarting it.
 
 `bot-notify` routes new pings (see its skill; ack requests once they're on
-the board). `bot-pr inbox --dry-run` shows cgwalters' review activity on
+the board). `bot-pr inbox --dry-run` shows the operator's review activity on
 fork PRs without consuming it, so the worker who picks up a fork PR still
 sees it. `bot-watch --apply` consumes its news (the next sweep won't
 report it again), which is why `bot-poll` keeps its whole output: read
@@ -157,14 +165,14 @@ or in their open PR, or their PR closed.
   on it needs nothing more.
 - **Sign-offs.** `bot-watch --apply` runs `bot-pr signoff` itself on
   each of the bot's upstream PRs whose DCO check fails although
-  cgwalters approved its current head (`bot-signoff-due`), and lists
+  the operator approved its current head (`bot-signoff-due`), and lists
   the result under "Sign-offs": `Signed off: URL (NEW-HEAD)`, or why
   `bot-pr signoff` refused. A refusal needs a look (a stale policy
   record, say): once its cause is fixed, run `bot-pr signoff URL` by
   hand, since the sweeps only retry a refused head after 6h. A sign-off
   needs nothing more.
-- **Outstanding reviews first** (after P0 health). The "Outstanding reviews by cgwalters"
-  section `bot-watch` prints on every sweep is P0: dispatch a worker for
+- **Outstanding reviews first** (after P0 health). The "Outstanding reviews by LOGIN"
+  section (LOGIN being the operator's login) `bot-watch` prints on every sweep is P0: dispatch a worker for
   each listed PR, unless a live worker is already on it (check it's
   still running). It stays listed on every sweep until the bot pushes or
   replies, so a listing alone isn't a reason for another worker.
@@ -175,18 +183,18 @@ or in their open PR, or their PR closed.
   conflict-free ones, unless the failing checks look caused by the PR
   itself (a lint, build or unit test failure in code it touches: that's
   a fix for a worker, not a rebase), or it has maintainers' approvals
-  that a force-push would make stale (ask cgwalters instead). PRs with
-  an outstanding review by cgwalters aren't listed there: the worker
+  that a force-push would make stale (ask the operator instead). PRs with
+  an outstanding review by the operator aren't listed there: the worker
   answering it rebases on the way. Nor are conflict-free upstream PRs
   in repositories with a merge queue (unless the policy record says
   `rebase: any`) or a policy record saying `rebase: conflicts-only`:
   there a rebase only reruns CI that the maintainers
   must approve again, and `bot-pr rebase` refuses it. It refuses
   anything that isn't a clean, rebase-only change of the bot's own
-  commits (and his), keeps cgwalters' sign-off, and comments one line on an upstream PR. When it
+  commits (and the operator's), keeps the operator's sign-off, and comments one line on an upstream PR. When it
   exits 10 (conflicts), or for the conflicting ones, dispatch a worker
   to resolve the conflicts, retest and push, per `upstream-pr` (on an
-  upstream PR his sign-off then stays only on commits whose resolution
+  upstream PR the operator's sign-off then stays only on commits whose resolution
   changed nothing beyond context; the others need `bot-pr signoff`). A
   PR the sweep listed for CI isn't listed again once rebased: if CI
   still fails, it's real, and the next "CI failing" news is work for a
@@ -195,8 +203,8 @@ or in their open PR, or their PR closed.
   review, or a `/promote` line): run the `bot-pr promote` command it
   prints. A go-ahead in other words only gets its `-> hint:` passed on;
   never promote on your own reading. For a DCO repository, promote adds
-  his sign-off; if it stops over someone else's commits, ask him, and pass
-  `--include-others` only if he says so.
+  the operator's sign-off; if it stops over someone else's commits, ask them, and pass
+  `--include-others` only if they say so.
 - **Policy gate.** Promote and `bot-pr signoff` first run
   `upstream-policy check OWNER/REPO`, which needs a record of the upstream
   repository's contribution policy in homegit
@@ -208,19 +216,19 @@ or in their open PR, or their PR closed.
   the worker who wrote the change. Once it's merged (bot-land
   fast-forwards the shared clone; otherwise `git -C
   ~/src/github/cgwalters-bot/homegit pull --ff-only`) so the gate sees
-  it, promote. For a human-text verdict, tell cgwalters the text must be
-  his: he retitles the fork PR, edits its body (dropping the bot's
-  `Generated-by` line), rewords the commits and pushes them himself, then
-  comments a `/promote --human-text` line (or opens the upstream PR
-  himself); inbox then shows `[APPROVED, text by cgwalters]`. Promote
+  it, promote. For a human-text verdict, tell the operator the text must be
+  theirs: they retitle the fork PR, edit its body (dropping the bot's
+  `Generated-by` line), reword the commits and push them themselves, then
+  comment a `/promote --human-text` line (or open the upstream PR
+  themselves); inbox then shows `[APPROVED, text by LOGIN]` with the operator's login. Promote
   checks GitHub's record of who pushed the approved head, who edited the
   body last and who set the title, so the bot must not push to or edit
-  that fork PR after he does. For human-only or no-go,
+  that fork PR after they do. For human-only or no-go,
   set the item Needs human with the record's link. Never edit a record's
-  verdict to get past the gate; only cgwalters loosens one: when he asks
+  verdict to get past the gate; only the operator loosens one: when they ask
   for that, open the pull request with `bot-land --no-auto`, and enable
-  auto-merge (`gh pr merge N --auto --rebase`) only once he approved it,
-  since the gate counts his approval of the merged head.
+  auto-merge (`gh pr merge N --auto --rebase`) only once they approved it,
+  since the gate counts their approval of the merged head.
 - **Own repositories take pull requests only.** homegit and the bot's
   other own repositories (listed in `worker-preamble.md`) require a pull
   request with a green `ci` check on main, rebase-merged; workers land
@@ -235,7 +243,7 @@ or in their open PR, or their PR closed.
 - **Review feedback** on a fork PR goes to a worker, preferably the one
   that wrote it if it's still around.
 - **Dispatch** workers for Todo items (by priority, per `workstream`) and
-  for cgwalters' asks from `bot-notify`. Composefs stability comes
+  for the operator's asks from `bot-notify`. Composefs stability comes
   first: fill free worker slots with P0 (composefs-stable) items before
   any P1 own-infra or backlog item, and only then P2. Scale the number of concurrent
   workers with the load: more when the queue is deep and items are
@@ -252,31 +260,31 @@ or in their open PR, or their PR closed.
   independent reviewer subagent on its branch or gist, and send the
   findings to the same worker (resuming it, so it keeps its context) to
   fix. Repeat until the reviewer says it can ship before pointing
-  cgwalters at it. For a forge PR, the reviewer also posts a review
+  the operator at it. For a forge PR, the reviewer also posts a review
   guide (`bin/bot-review-guide`, see `reviewer-preamble.md`): the
   hotspots to read closely and what to skim, which the review app
   (<https://cgwalters-forge.github.io/review/>) walks and tints in the
   diff. After a fix is pushed, the next review round posts a new guide
   for the new head; the app shows the old one as stale.
-- **Questions for cgwalters are question issues** in
+- **Questions for the operator are question issues** in
   cgwalters-forge/tracker (`bot-board question`, one per question, the
   recommendation first as A), never a separate list (a claude.ai
-  artifact, a local file): his queue is the board's "Needs cgwalters"
-  view (Needs human and Draft, by Priority; see "cgwalters' queue" in
-  `workstream`), which GitHub keeps current as he answers, approves,
+  artifact, a local file): their queue is the board's "Needs cgwalters"
+  view (Needs human and Draft, by Priority; see "The operator's queue" in
+  `workstream`), which GitHub keeps current as they answer, approves,
   promotes and merges. When a worker reports a question, make sure it
-  landed as a question issue blocking the right item. He answers with a
+  landed as a question issue blocking the right item. They answer with a
   comment on it: `bot-notify` prints an `answer` record, which you act
-  on (or dispatch), then close with `bot-board resolve` and ack. When he
-  answers one in the session instead, act on it the same way and put
-  his answer in the question issue's closing comment.
-  A question or decision for cgwalters belongs on the PR it concerns (a
+  on (or dispatch), then close with `bot-board resolve` and ack. When they
+  answer one in the session instead, act on it the same way and put
+  their answer in the question issue's closing comment.
+  A question or decision for the operator belongs on the PR it concerns (a
   PR comment or review reply) when there is one, or else as the tracker
   question above — never only in the coordinator's terminal chat with
-  him. Keep chat replies to brief status, pointing at where it was
+  them. Keep chat replies to brief status, pointing at where it was
   posted rather than restating the options.
-- **Reply where cgwalters tagged the bot**, per the rule in `workstream`:
-  his own @-mentions only, one concise answer in the same thread, once
+- **Reply where the operator tagged the bot**, per the rule in `workstream`:
+  their own @-mentions only, one concise answer in the same thread, once
   the work behind it is reviewed.
 
 ## Loop cadence
@@ -302,7 +310,7 @@ jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
 ```
 
 `session` is this session's id, `loop_state` what the loop does next
-(`polling`, `working`, `sleeping`, or `stopped` when cgwalters says to
+(`polling`, `working`, `sleeping`, or `stopped` when the operator says to
 stop), `next_wake_at` when the running `bot-poll` gives up (its start plus
 12h; it wakes the session sooner on news), and each running worker is listed by the name, board item and
 devspace in its brief, with the `status` it last reported (`starting`,
@@ -318,7 +326,7 @@ minutes, which means the session is gone or stuck.
 
 Each morning, open an issue on
 [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues)
-that mentions @cgwalters, with a link to the "Needs cgwalters" view
+that mentions the operator, with a link to the "Needs cgwalters" view
 (<https://github.com/orgs/cgwalters-forge/projects/1/views/2>) and a
 summary of it:
 
@@ -331,9 +339,9 @@ summary of it:
   the top few tasks, labeled as an estimate at list prices.
 
 Keep it scannable, and end it with
-`Generated-by: https://github.com/cgwalters/#llms`.
+`Generated-by: https://github.com/cgwalters/#llms` (the config's `generated_by_url`).
 
 ## Stopping
 
 There is no programmatic readout of the weekly usage left, so don't try
-to ration it or guess. Keep looping until cgwalters says to stop.
+to ration it or guess. Keep looping until the operator says to stop.

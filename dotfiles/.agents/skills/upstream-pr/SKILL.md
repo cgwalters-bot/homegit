@@ -1,9 +1,15 @@
 ---
 name: upstream-pr
-description: How cgwalters-bot contributes changes to upstream repositories - topic branch, follow project policy, test, self-review, push the tested branch to the project's cgwalters-forge fork and propose it as a draft PR there (bot-pr fork-pr); upstream PRs are opened only by bot-pr promote after cgwalters approves, or for Workflow=pr items. Use whenever making code changes to a repository the bot does not own, and when responding to review on such a PR.
+description: How the bot (cgwalters-bot) contributes changes to upstream repositories - topic branch, follow project policy, test, self-review, push the tested branch to the project's cgwalters-forge fork and propose it as a draft PR there (bot-pr fork-pr); upstream PRs are opened only by bot-pr promote after the operator approves, or for Workflow=pr items. Use whenever making code changes to a repository the bot does not own, and when responding to review on such a PR.
 ---
 
 # upstream-pr — Contributing upstream as cgwalters-bot
+
+Names: *the operator* is the human who runs this bot (`operator.login` in
+the operator config, see `bot-operator` and docs/bootstrap.md; cgwalters by
+default). The bot account, forge org and identities below are the default
+config's (cgwalters-bot, cgwalters-forge); under another operator config,
+read them as that config's values (`bot-operator --json`).
 
 You are acting as the `cgwalters-bot` GitHub account. Changes to other people's
 repositories always go through a topic branch on a fork in the
@@ -14,14 +20,14 @@ covered by the `workstream` skill.
 **By default the result is a tested branch and a draft PR on the forge
 fork, not an upstream PR.** Items with Workflow `branch` (or no Workflow)
 end with the branch pushed to the fork as `bot/<short-slug>` and proposed
-with `bot-pr fork-pr`, where cgwalters reviews it (see "Review loop" in
+with `bot-pr fork-pr`, where the operator reviews it (see "Review loop" in
 `workstream`). **Upstream PRs are opened only by `bot-pr promote`**, after
-he approves the fork PR, or directly when the item's Workflow is `pr`,
+the operator approves the fork PR, or directly when the item's Workflow is `pr`,
 which only a human sets. Updating the bot's own existing PRs (e.g.
-addressing review, or a rebase cgwalters asked for) is fine under either.
+addressing review, or a rebase the operator asked for) is fine under either.
 
 This skill is for changes the bot proposes as its own. For items that are
-cgwalters' own PRs or review requests, follow the "PR items" section of
+the operator's own PRs or review requests, follow the "PR items" section of
 `workstream` instead: push only a follow-up branch to the bot's fork and open no
 PR. The commit, test and review guidance below still applies, but skip
 "Check for existing work first" (the existing PR is the point) and "Open the
@@ -76,11 +82,11 @@ Before any promote, a separate, read-only policy-check subagent
 (`coordinator/policy-check.md`) quotes the project's policy files, its
 org's `.github` defaults included, into `upstream-policy/OWNER/REPO.md`
 in homegit, with a verdict: `bot-ok`, `human-text` (code by the bot is
-fine, but the PR text, commit messages and comments must be cgwalters'
+fine, but the PR text, commit messages and comments must be the operator's
 own), `human-only` or `no-go`. `bot-pr promote` and `bot-pr signoff`
 refuse unless that record exists, every source's blob id still matches
 upstream's default branch, and the verdict is `bot-ok`, or `human-text`
-with his `/promote --human-text` (see "Open the upstream PR"). Don't
+with their `/promote --human-text` (see "Open the upstream PR"). Don't
 write or edit records while working on a change.
 
 ## Setup
@@ -102,23 +108,23 @@ topic branch per change.
 - Follow the project's commit style; otherwise Linux kernel style subjects
   with a body explaining why (see the shared AGENTS.md guidance).
 - **Never add `Signed-off-by`.** That is for a human to add. If the project
-  requires DCO sign-off, leave it out anyway: cgwalters' approval of the
-  fork PR is his sign-off, and `bot-pr promote` adds his
-  `Signed-off-by: Colin Walters <walters@verbum.org>` to the commits (with
-  him as committer, which the DCO check wants) and names that approval in
+  requires DCO sign-off, leave it out anyway: the operator's approval of the
+  fork PR is their sign-off, and `bot-pr promote` adds their
+  `Signed-off-by` (`Colin Walters <walters@verbum.org>` by default) to the commits (with
+  them as committer, which the DCO check wants) and names that approval in
   the upstream PR body. Promote and `bot-pr signoff UPSTREAM_PR_URL` (for
   a PR promote opened without it, on the same approval of the same head,
-  or, after rework pushed since promote, on his approving review of the
-  current head on the upstream PR itself) are the only ways his sign-off
+  or, after rework pushed since promote, on their approving review of the
+  current head on the upstream PR itself) are the only ways their sign-off
   gets added; never add it by hand.
-  Commits by anyone else get it only if he asks
+  Commits by anyone else get it only if the operator asks
   (`promote --include-others`); with `--no-signoff`, promote instead
   tells the maintainers to comment `/signoff` where the repository has
   that command (bootc-dev/actions' pr-signoff workflow,
   `.github/workflows/signoff.yml`), or how to sign off by hand. So fork PR
   bodies don't need a DCO note; only an upstream PR opened without promote
   (Workflow `pr`) needs one written by hand. If DCO isn't required, don't
-  mention it. For the bot's PRs opened without promote, cgwalters can sign
+  mention it. For the bot's PRs opened without promote, the operator can sign
   off with `bin/dco-signoff`, which refuses to run as the bot;
   `dco-signoff --list-only` shows which open PRs still wait on it.
 - **Whether DCO is required** comes from what GitHub enforces or runs,
@@ -149,9 +155,10 @@ topic branch per change.
   a substantial part of the change).
 - Keep commits well-scoped; prep commits are welcome.
 - **Identity.** Every commit the bot creates or rewrites must say so:
-  author and committer `Colin Walters <walters+llm@verbum.org>`, where the
+  author and committer `Colin Walters <walters+llm@verbum.org>` (the default
+  `bot.git_name`/`bot.git_email`), where the
   `+llm` email is what marks it as the bot's (older ones are named
-  `cgwalters-bot`). On a machine whose global git identity is cgwalters'
+  `cgwalters-bot`). On a machine whose global git identity is the operator's
   own (not a devspace with the bot's dotfiles), run every git command that
   creates or rewrites commits through homegit's `bin/bot-git`
   (`bot-git commit ...`, `bot-git rebase ...`), which sets that identity,
@@ -163,10 +170,10 @@ topic branch per change.
   to add one).
 - **Fixes go into the commit they belong to**, per "Fixes and review
   feedback" in the shared AGENTS.md; pushed history never has `fixup!` or
-  `squash!` commits. Commits by cgwalters are the one exception to the
-  next rule: squash into them, keep his author, `Signed-off-by` and other
+  `squash!` commits. Commits by the operator are the one exception to the
+  next rule: squash into them, keep their author, `Signed-off-by` and other
   trailers, and name the commits you changed in the PR reply or body so
-  he re-reviews them.
+  they re-review them.
 - **Never change the content of anyone else's commits.** Especially a
   signed-off one: its `Signed-off-by` would then vouch for code its author
   never saw, and on an approved PR it silently changes what was approved.
@@ -269,11 +276,11 @@ bot-pr get-body <fork-pr-url> > pr-body.md   # without the bot-meta section
 bot-pr set-body <fork-pr-url> --body-file pr-body.md
 ```
 
-cgwalters edits these descriptions before approving. set-body keeps the
+The operator edits these descriptions before approving. set-body keeps the
 bot-meta section, keeps `bot-pr inbox` from reporting the bot's own
-rewrites as his edits, and refuses if the body changed since get-body
-(or, without get-body, if he edited it since the bot last wrote it).
-When it refuses, run get-body again, redo the change on top of his text,
+rewrites as their edits, and refuses if the body changed since get-body
+(or, without get-body, if they edited it since the bot last wrote it).
+When it refuses, run get-body again, redo the change on top of their text,
 and rerun set-body; `--force` skips the checks and is for when you
 already did that.
 
@@ -282,11 +289,11 @@ already did that.
 Whether it goes on the fork first or (Workflow `pr`) straight upstream,
 the body is short, per "Upstream-facing text" in the shared AGENTS.md:
 a brief what and why, how it was tested, the
-`<!-- cgwalters: context/rationale -->` placeholder for a nontrivial
+`<!-- LOGIN: context/rationale -->` placeholder (LOGIN being the operator's login) for a nontrivial
 change, the issue link
 (`Fixes OWNER/REPO#N` when it fully resolves it) and caveats (such as
 someone else's commits that still need their DCO sign-off). It follows any PR
-template and ends with:
+template and ends with the config's `generated_by_url`:
 
 ```
 Generated-by: https://github.com/cgwalters/#llms
@@ -296,21 +303,21 @@ Generated-by: https://github.com/cgwalters/#llms
 
 Only two ways, never anything else:
 
-- **Promotion.** When cgwalters approved the fork PR (a review, or a
+- **Promotion.** When the operator approved the fork PR (a review, or a
   `/promote` comment line; never other wording),
   `bot-pr promote <fork-pr-url>` opens the upstream PR (ready for review,
-  or a draft if he commented `/draft`), closes the fork PR and updates the
+  or a draft if they commented `/draft`), closes the fork PR and updates the
   board; see "Review loop" in `workstream`. It first passes the policy
-  gate (see "Project policy wins"). For a `human-text` repository, he
-  takes over the text: he retitles the fork PR, edits its body (removing
-  the bot's `Generated-by` line), rewords the commits and pushes them to
-  the branch himself, then approves with a comment line that is exactly
+  gate (see "Project policy wins"). For a `human-text` repository, the operator
+  takes over the text: they retitle the fork PR, edits its body (removing
+  the bot's `Generated-by` line), reword the commits and push them to
+  the branch themselves, then approve with a comment line that is exactly
   `/promote --human-text` (or puts it in an approving review's body).
-  Promote and signoff check that GitHub shows him as the pusher of the
+  Promote and signoff check that GitHub shows them as the pusher of the
   approved head, the body's last editor and the title's last setter,
-  and that the bot's line is gone; promote adds nothing to his body, not
+  and that the bot's line is gone; promote adds nothing to their body, not
   even the DCO approval note. So never push to or edit such a fork PR
-  after he took it over. Or he opens the upstream PR himself.
+  after they took it over. Or they open the upstream PR themselves.
 - **Workflow `pr`**, set by a human: open a draft PR directly, then set
   the item In Review with the PR URL in Branch:
 
@@ -325,7 +332,7 @@ Only two ways, never anything else:
 ## Responding to review
 
 Squash each fix into the commit it belongs to (see "Commits" above for
-cgwalters' and others' commits), never a standalone "address review"
+the operator's and others' commits), never a standalone "address review"
 commit; `--fixup` is only a local step:
 
 ```bash
@@ -339,10 +346,10 @@ someone else's commits**: if a maintainer pushed to your branch, fetch and
 rebase on top of their work first, and never force-push to branches you
 did not create. Reply to each review comment saying what changed, or why
 you disagree, in a few lines. If a comment on an upstream PR needs a
-judgment call from Colin, ask him with a question issue (`bot-board question`, see
+judgment call from the operator, ask them with a question issue (`bot-board question`, see
 `workstream`) rather than on the PR; ask on the PR only when the
 question is for the maintainers.
 
-cgwalters' comments on a fork PR are handled the same way, and the reply
-goes in the fork PR thread, which is also the place to ask him about that
+The operator's comments on a fork PR are handled the same way, and the reply
+goes in the fork PR thread, which is also the place to ask them about that
 change: the item stays Draft.
