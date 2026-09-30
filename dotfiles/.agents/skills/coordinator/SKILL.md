@@ -317,6 +317,34 @@ or in their open PR, or their PR closed.
   mention it in passing. The operator doesn't want to be asked about these.
 - **Review feedback** on a fork PR goes to a worker, preferably the one
   that wrote it if it's still around.
+- **Triage requests.** A `request` from `bot-notify` with `reason`
+  `triage` is a note the operator filed in the tracker, labelled
+  `needs-triage` (the review app's capture bar files these, and adds
+  them to the board). The label means "not yet triaged": handle it
+  in the same wake, before dispatching other Todo work.
+  1. Read the issue and what it links. Make sure it is on the board:
+     `bot-board add URL` (the app's own add can fail; adding it again
+     returns the existing item).
+  2. Set its fields: `bot-board set ITEM --priority P --org O --field
+     Theme T --why "LOGIN: '<short quote>' URL, <why this priority>"`,
+     with Priority per `workstream` (their direct requests are at
+     least P1), Org from what it targets, and the Theme it belongs to
+     (the board lists the options).
+  3. Turn it into work: Status Todo (and Workflow, when the note says
+     what's wanted), then dispatch a worker for it by priority like any
+     Todo item. If it's unclear what they want, ask on the issue itself
+     instead: one short comment mentioning them, the question with your
+     recommendation first, and set Status Needs human with a Why
+     pointing at that comment. Their reply there comes back as a
+     `request` on that item.
+  4. Remove the label, which is the "not yet triaged" signal, once the
+     fields are set and the item is Todo or asked about: `gh api -X
+     DELETE repos/cgwalters-forge/tracker/issues/N/labels/needs-triage`.
+     Then `bot-notify ack https://github.com/cgwalters-forge/tracker/issues/N`
+     (the record's `thread_id`, not its `url`, which names the labeling
+     event). Labelling it again later is a new request. A note that
+     also mentions the bot comes as a mention request too: handle both
+     as this one triage.
 - **Dispatch** workers for Todo items (by priority, per `workstream`) and
   for the operator's asks from `bot-notify`. Composefs stability comes
   first: fill free worker slots with P0 (composefs-stable) items before

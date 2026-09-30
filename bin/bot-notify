@@ -30,6 +30,15 @@ readonly TRACKER_REPO=${OP_TRACKER_REPO}
 # Asks for REQUESTER: a question, a PR to review, or a chore.
 readonly ASK_LABELS='["question", "review", "chore"]'
 readonly COMMENT_REASON=comment
+# REQUESTER's notes for the bot (the review app's capture bar files
+# them): an open TRACKER_REPO issue he opened that carries TRIAGE_LABEL
+# hasn't been triaged yet. Each time it gets the label is one request,
+# reason TRIAGE_REASON, keyed by that labeling event, so it wakes the
+# coordinator once; the bot removes the label when it has triaged it.
+# The same label on anyone else's issue is ignored. An acked labeling is
+# remembered for ACKED_KEEP_DAYS, so a label left on after that asks again.
+readonly TRIAGE_LABEL=needs-triage
+readonly TRIAGE_REASON=triage
 readonly API=https://api.github.com
 readonly DEFAULT_LOOKBACK_DAYS=7
 readonly PER_PAGE=50
@@ -125,6 +134,10 @@ the same way, as threads whose THREAD_ID is the issue or PR URL:
     he picked (a first line that is just the letter) in 'choice'; elsewhere
     there a 'request'. Both stay until acked, like requests. Comments by
     anyone else there, the bot's own included, are left to bot-watch;
+  - an open issue ${REQUESTER} opened in ${TRACKER_REPO} labelled
+    '${TRIAGE_LABEL}': a 'request' (reason ${TRIAGE_REASON}) to triage it, once per
+    labeling, whose THREAD_ID is the issue's URL. The label on anyone
+    else's issue is ignored;
   - a comment on one of ${BOT_LOGIN}'s gists: by ${REQUESTER}, a 'request'
     (reason ${GIST_REASON}) whose THREAD_ID is the gist's URL; by anyone
     else but the bot, filed like a mention. The first run only notes
@@ -841,6 +854,39 @@ gist_triggers() {
     GIST_STATE_NEW=${new_state}
 }
 
+# --- Issues to triage -----------------------------------------------------
+
+# triage_triggers: prints a record, as routing takes it (plus its
+# author_type), per open TRACKER_REPO issue by a trusted login labelled
+# TRIAGE_LABEL that has no pending request yet; fails if GitHub can't be
+# read. The trigger is the latest labeling event, so a triaged issue
+# labelled again later is a new request, and an acked one isn't.
+triage_triggers() {
+    local issues issue number html event trusted_json
+    trusted_json=$(printf '%s\n' "${trusted[@]}" | jq -Rsc 'split("\n") | map(select(. != ""))')
+    # Not filtered by creator, which would miss a trusted test login;
+    # the labelled issues are few.
+    issues=$(ghapi --paginate "repos/${tracker_repo}/issues?labels=${TRIAGE_LABEL}&state=open&per_page=100" --jq '.[]' |
+        jq -c --arg label "${TRIAGE_LABEL}" --argjson trusted "${trusted_json}" '
+            select(.pull_request == null and .state == "open" and .user.type == "User"
+                and (.user.login | IN($trusted[])) and any(.labels[]?; .name == $label))') || return 1
+    while IFS= read -r issue; do
+        test -n "${issue}" || continue
+        html=$(jq -r .html_url <<<"${issue}")
+        ! has_pending "${html}" || continue
+        number=$(jq -r .number <<<"${issue}")
+        event=$(ghapi --paginate "repos/${tracker_repo}/issues/${number}/events?per_page=100" \
+            --jq ".[] | select(.event == \"labeled\" and .label.name == \"${TRIAGE_LABEL}\") | .id" |
+            jq -sc 'last // null') || return 1
+        jq -c --argjson e "${event}" --arg reason "${TRIAGE_REASON}" --arg repo "${tracker_repo}" '
+            {reason: $reason, repo: $repo, private: false, number: (.number | tostring), title,
+             thread_url: .html_url, thread_id: .html_url, author: .user.login, author_type: .user.type,
+             url: (if $e then "\(.html_url)#event-\($e)" else .html_url end),
+             excerpt: ("\(.title)\n\n\(.body // "")" | '"${excerpt_jq}"'),
+             located: ($e != null), question: false, choice: null}' <<<"${issue}"
+    done <<<"${issues}"
+}
+
 # --- Route ----------------------------------------------------------------
 
 declare -A private_repo=()
@@ -1006,6 +1052,7 @@ route_trigger() {
 
 nselected=0
 ngist_comments=0
+ntriage=0
 nrequests=0
 nassigned=0
 nfiled=0
@@ -1094,9 +1141,22 @@ else
     nfailed=$((nfailed + 1))
 fi
 
+if triage_triggers >"${scratch}/triage-triggers"; then
+    while IFS= read -r trig; do
+        test -n "${trig}" || continue
+        ntriage=$((ntriage + 1))
+        t=$(jq -c 'del(.author_type)' <<<"${trig}")
+        echo "To triage: $(jq -r '"\(.title) [\(.thread_id)]"' <<<"${t}")"
+        route_trigger "${t}" "$(jq -r '.author_type // ""' <<<"${trig}")" false || nfailed=$((nfailed + 1))
+    done <"${scratch}/triage-triggers"
+else
+    warn "listing the ${tracker_repo} issues labelled ${TRIAGE_LABEL} failed"
+    nfailed=$((nfailed + 1))
+fi
+
 filed_verb=filed
 ! ${dry_run} || filed_verb="to file"
-echo "Routed ${nselected} threads and ${ngist_comments} gist comments: ${nrequests} new requests and ${nassigned} assignments from ${REQUESTER}, ${nfiled} triggers by others ${filed_verb}, ${nskipped} skipped."
+echo "Routed ${nselected} threads, ${ngist_comments} gist comments and ${ntriage} issues labelled ${TRIAGE_LABEL}: ${nrequests} new requests and ${nassigned} assignments from ${REQUESTER}, ${nfiled} triggers by others ${filed_verb}, ${nskipped} skipped."
 print_pending
 if test "${nunnotified}" -gt 0; then
     warn "${nunnotified} new requests were only found by the safety net, not in ${BOT_LOGIN}'s notifications; check that its notification settings deliver 'On GitHub' for participating and watched activity"

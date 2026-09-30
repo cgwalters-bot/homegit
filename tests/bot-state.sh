@@ -188,6 +188,10 @@ fi
 if [[ " $* " == *" search/issues "* ]]; then
     exit 0
 fi
+# No tracker issues labelled needs-triage (bot-notify's quick captures).
+if [[ " $* " == *" repos/"*"/issues?labels=needs-triage&"* ]]; then
+    exit 0
+fi
 if test -n "${FAKE_GH_EXTRA:-}" && test -x "${FAKE_GH_EXTRA}"; then
     exec "${FAKE_GH_EXTRA}" "$@"
 fi
