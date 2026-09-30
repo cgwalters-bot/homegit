@@ -14,6 +14,11 @@ organization and proposes them there as draft PRs (Draft),
 and only once cgwalters approves one does it go upstream (In Review);
 only a human's acceptance makes something Done.
 
+The accounts, org, board and identities named here are the defaults of
+the operator config (`~/.config/bot-harness/operator.json`, printed by
+`bot-operator`); another operator sets up their own as
+[docs/bootstrap.md](docs/bootstrap.md) describes.
+
 Install with `make install` as usual. The shared agent prompt is still
 [AGENTS.md](AGENTS.md). The skills are plain [Agent Skills](https://agentskills.io)
 in `dotfiles/.agents/skills`, installed as `~/.agents/skills` where
