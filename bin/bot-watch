@@ -870,6 +870,8 @@ elif test -n "${board_file}"; then
 fi
 rc=0
 "${PRIORITY_HEALTH}" "${health_args[@]}" >"${scratch}/health.json" || rc=$?
+# An exhausted quota is the whole sweep's problem, not just this section's.
+test "${rc}" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
 # With PRs that could not be read (status 1), it still lists the others.
 if ! health=$(jq -ce 'arrays' "${scratch}/health.json" 2>/dev/null); then
     health='[]'
