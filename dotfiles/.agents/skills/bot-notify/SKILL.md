@@ -55,6 +55,12 @@ trigger is routed as follows:
   record with `reason` `gist_comment` (below). Comments on them by anyone
   else are filed like mentions (below), except the bot's own, which are
   ignored.
+- **An open issue the operator login opened in the tracker labelled
+  `needs-triage`**: their note for the bot, usually filed from the
+  review app's capture bar. It is a `request` record with `reason`
+  `triage` (below), one per time the issue gets the label (its `url`
+  is that labeling event), so it wakes the coordinator once. The label
+  on anyone else's issue is ignored, and nothing about it is filed.
 - **From anyone else** (including the bot itself): an issue on
   [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues)
   titled like `Mention: @user on owner/repo#N` (or `Gist comment: @user on
@@ -170,6 +176,15 @@ none links the gist. `private` is true for a secret gist, which is
 unlisted rather than private, so unlike a private repository its request
 does go on the board, but quote nothing from it in public: link the
 comment instead.
+
+A triage record (`reason` `triage`) is the operator's note in the
+tracker, labelled `needs-triage`: `thread_url` and `thread_id` are the
+issue's URL, and `excerpt` its title and body. It is already an issue
+and needs triage, not the steps below: follow "Triage requests" in the
+coordinator skill, which ends by removing the label and acking its
+`thread_id`. An acked labeling is remembered for 30 days like any
+request, so an issue that still carries the label after that (its
+removal failed, say) comes back as a reminder every 30 days.
 
 For each one:
 

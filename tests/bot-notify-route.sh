@@ -4,7 +4,9 @@
 # reads). No network, no quota. The cases: answers to a question in the
 # tracker (only cgwalters' comment counts, the bot's own and others'
 # don't, and nothing about them is filed), a request on another tracker
-# issue, a thread whose trigger has no text at all, and a forge fork PR.
+# issue, a thread whose trigger has no text at all, a forge fork PR, and
+# issues labelled needs-triage (only his open issues count, once per
+# labeling).
 #   tests/bot-notify-route.sh
 set -euo pipefail
 
@@ -64,9 +66,12 @@ api() { # api PATH: stdin becomes the answer to 'gh api PATH'
 
 echo '{"login": "cgwalters-bot"}' | api user
 # bot-board state-get reads the state item with one GraphQL query.
-jq -n '{data: {node: {id: "PVTI_lADOE9oHIs4BlJLczg9kJYo", isArchived: true,
-    content: {id: "DI_lADOE9oHIs4BlJLczgLPK1o", title: "bot-state: notifications",
-              body: "state\n\n```json\n{\"since\": \"2026-09-26T00:00:00Z\"}\n```\n"}}}}' | api graphql
+# #22's labeling was triaged (acked) already.
+jq -n --arg t "${TRACKER}" --arg now "$(date -u +%FT%TZ)" '{since: "2026-09-26T00:00:00Z",
+    acked: {"https://github.com/\($t)/issues/22#event-901": $now}} | tojson as $state
+    | {data: {node: {id: "PVTI_lADOE9oHIs4BlJLczg9kJYo", isArchived: true,
+       content: {id: "DI_lADOE9oHIs4BlJLczgLPK1o", title: "bot-state: notifications",
+                 body: "state\n\n```json\n\($state)\n```\n"}}}}' | api graphql
 echo '[]' | api notifications
 echo '[]' | api gists
 echo '[]' | api users/cgwalters/events/public
@@ -110,6 +115,31 @@ jq -n '{number: 5, title: "Some issue", html_url: "https://github.com/example/re
     api repos/example/repo/issues/5
 echo '[]' | api repos/example/repo/issues/5/events
 
+# Issues labelled needs-triage (the fake ignores the query, so the
+# listing holds unlabelled ones too): #20 is his, #21 someone else's,
+# #22 his and acked, #23 his PR, #24 his without the label.
+# tissue NUMBER LOGIN LABEL [EXTRA]
+tissue() {
+    jq -nc --arg t "${TRACKER}" --arg n "$1" --arg login "$2" --arg label "$3" --argjson extra "${4:-null}" '{
+        number: ($n | tonumber), title: "Look at \($n)", html_url: "https://github.com/\($t)/issues/\($n)",
+        state: "open", user: {login: $login, type: "User"}, body: "note \($n)",
+        labels: ([{name: "P1"}] + if $label == "" then [] else [{name: $label}] end)} + ($extra // {})'
+}
+{
+    tissue 20 cgwalters needs-triage
+    tissue 21 someone needs-triage
+    tissue 22 cgwalters needs-triage
+    tissue 23 cgwalters needs-triage '{"pull_request": {}}'
+    tissue 24 cgwalters ""
+} | jq -s . | api "repos/${TRACKER}/issues"
+# labeled N ID LABEL: a labeling event
+labeled() {
+    jq -nc --arg id "$2" --arg label "$3" '{id: ($id | tonumber), event: "labeled", label: {name: $label},
+        actor: {login: "cgwalters"}, created_at: "2026-09-26T10:00:00Z"}'
+}
+{ labeled 20 899 needs-triage; labeled 20 900 needs-triage; labeled 20 950 P1; } | jq -s . | api "repos/${TRACKER}/issues/20/events"
+labeled 22 901 needs-triage | jq -s . | api "repos/${TRACKER}/issues/22/events"
+
 # thread ID REASON REPO NUMBER [TYPE]
 thread() {
     jq -nc --arg id "$1" --arg reason "$2" --arg repo "$3" --arg n "$4" --arg type "${5:-Issue}" '{id: $id,
@@ -132,7 +162,7 @@ out=$("${BIN}/bot-notify" --dry-run --from-file "${WORK}/threads.json" 2>"${WORK
     fail "bot-notify failed: $(cat "${WORK}/err")"$'\n'"${out}"
 records=$(sed -n 's/^\(answer\|request\) //p' <<<"${out}")
 
-jq -se 'length == 4' <<<"${records}" >/dev/null || fail "expected 4 records, got:"$'\n'"${records}"
+jq -se 'length == 5' <<<"${records}" >/dev/null || fail "expected 5 records, got:"$'\n'"${records}"
 jq -se 'any(.[]; .type == "answer" and .thread_id == "107" and .choice == null)' \
     <<<"${records}" >/dev/null || fail "his comment on a chore isn't an answer:"$'\n'"${records}"
 jq -se 'any(.[]; .type == "answer" and .reason == "mention" and .thread_id == "106" and .choice == null)' \
@@ -151,4 +181,14 @@ test "$(grep -c "would file" <<<"${out}")" -eq 1 || fail "filed more than the as
 grep -q "Skipped mention in cgwalters-forge/bootc" <<<"${out}" || fail "the forge PR thread wasn't skipped:"$'\n'"${out}"
 grep -A1 "^Thread comment in ${TRACKER}: t \[thread 103\]" <<<"${out}" | grep -q "nothing new for the bot" ||
     fail "the bot's own answer on #9 wasn't ignored:"$'\n'"${out}"
+# Only his open, labelled, unacked issue is to triage, keyed by its latest labeling.
+jq -se --arg t "${TRACKER}" '[.[] | select(.reason == "triage")] == [{type: "request", reason: "triage", repo: $t,
+    private: false, number: "20", title: "Look at 20", thread_url: "https://github.com/\($t)/issues/20",
+    thread_id: "https://github.com/\($t)/issues/20", author: "cgwalters",
+    url: "https://github.com/\($t)/issues/20#event-900", excerpt: "Look at 20 note 20", located: true,
+    question: false, choice: null}]' <<<"${records}" >/dev/null || fail "not one triage request for #20:"$'\n'"${records}"
+grep -q "request https://github.com/${TRACKER}/issues/22#event-901 already acked" <<<"${out}" ||
+    fail "#22's acked labeling came back:"$'\n'"${out}"
+grep -q "and 2 issues labelled needs-triage:" <<<"${out}" ||
+    fail "the issues to triage weren't counted right:"$'\n'"${out}"
 echo "ok: tracker answers and requests routed; the bot's own and others' comments ignored"
