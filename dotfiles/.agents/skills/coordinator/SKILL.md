@@ -238,6 +238,11 @@ closed.
   on (or dispatch), then close with `bot-board resolve` and ack. When he
   answers one in the session instead, act on it the same way and put
   his answer in the question issue's closing comment.
+  A question or decision for cgwalters belongs on the PR it concerns (a
+  PR comment or review reply) when there is one, or else as the tracker
+  question above — never only in the coordinator's terminal chat with
+  him. Keep chat replies to brief status, pointing at where it was
+  posted rather than restating the options.
 - **Reply where cgwalters tagged the bot**, per the rule in `workstream`:
   his own @-mentions only, one concise answer in the same thread, once
   the work behind it is reviewed.
