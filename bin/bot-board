@@ -11,15 +11,19 @@ source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     exit 1
 }
 
-readonly OWNER=cgwalters-bot
-# The boards this tool can target, by --project name. The Workstream
-# board is the bot's work queue and holds the state items; the others are
-# milestone views, often over the same issues and PRs. There is
-# deliberately no environment variable for this: the other bot scripts
-# call bot-board and must always reach the Workstream board.
-readonly -A PROJECTS=([workstream]=1 [composefs-stable]=2)
+readonly BOT_LOGIN=cgwalters-bot
+# The boards this tool can target, by --project name, as KIND/OWNER/NUMBER
+# (KIND is users or orgs, as in REST paths). The Workstream board is the
+# bot's work queue and holds the state items; the others are milestone
+# views, often over the same issues and PRs. There is deliberately no
+# environment variable for this: the other bot scripts call bot-board
+# and must always reach the Workstream board.
+readonly -A PROJECTS=([workstream]=users/cgwalters-bot/1 [composefs-stable]=users/cgwalters-bot/2)
 readonly WORKSTREAM=workstream
-# Set by select_project.
+# Set by select_project: the board's KIND/OWNER/NUMBER and its parts.
+PROJECT=
+OWNER_KIND=
+OWNER=
 NUMBER=
 BOARD_URL=
 BOARD_CACHE=
@@ -159,7 +163,7 @@ def merge3($b; $o; $t):
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--refresh] [--project NAME] COMMAND [ARGS...]
+Usage: $(basename "$0") [--refresh] [--project BOARD] COMMAND [ARGS...]
 
 Read and update the Workstream board, or another of the bot's boards
 (${BOARD_URL} here).
@@ -252,10 +256,12 @@ Commands:
 
 Options:
   --refresh                   Ignore cached board data and refetch it
-  --project NAME              The board to use: $(project_names) (default
-                              ${WORKSTREAM}), or a project number of
-                              ${OWNER}. state-get, state-put and question
-                              work on ${WORKSTREAM} only
+  --project BOARD             The board to use: $(project_names) (default
+                              ${WORKSTREAM}), users/LOGIN/NUMBER,
+                              orgs/LOGIN/NUMBER, or a project number of
+                              ${PROJECTS[${WORKSTREAM}]%/*}. state-get,
+                              state-put and question work on
+                              ${WORKSTREAM} only
 
 ITEM is a project item id (PVTI_...), an issue/PR URL, or OWNER/REPO#N.
 BLOCKED and QUESTION are issue/PR URLs or OWNER/REPO#N.
@@ -336,32 +342,37 @@ project_names() {
     printf '%s\n' "${!PROJECTS[@]}" | sort | paste -sd, - | sed 's/,/, /g'
 }
 
-# select_project NAME|NUMBER: sets NUMBER, BOARD_URL and BOARD_CACHE. The
-# Workstream board keeps the cache directory's top level, where the ids
-# of state items created since the last release of this script live too.
+# select_project NAME|KIND/OWNER/NUMBER|NUMBER: sets PROJECT and its
+# parts, BOARD_URL and BOARD_CACHE. A bare NUMBER is a board of the
+# Workstream board's owner. Each board has its own cache directory, so
+# that a board moving elsewhere never reuses another's cached ids.
 select_project() {
     if [[ "$1" =~ ^[1-9][0-9]*$ ]]; then
-        NUMBER=$1
+        PROJECT=${PROJECTS[${WORKSTREAM}]%/*}/$1
+    elif [[ "$1" == */* ]]; then
+        PROJECT=$1
     else
-        NUMBER=${PROJECTS[$1]:-}
-        test -n "${NUMBER}" || fatal "unknown project '$1'; valid: $(project_names), or a project number of ${OWNER}"
+        PROJECT=${PROJECTS[$1]:-}
+        test -n "${PROJECT}" ||
+            fatal "unknown project '$1'; valid: $(project_names), users/LOGIN/NUMBER, orgs/LOGIN/NUMBER, or a project number of ${PROJECTS[${WORKSTREAM}]%/*}"
     fi
-    BOARD_URL=https://github.com/users/${OWNER}/projects/${NUMBER}
-    if test "${NUMBER}" = "${PROJECTS[${WORKSTREAM}]}"; then
-        BOARD_CACHE=${CACHE_DIR}
-    else
-        BOARD_CACHE=${CACHE_DIR}/project-${NUMBER}
-    fi
+    [[ "${PROJECT}" =~ ^(users|orgs)/([A-Za-z0-9-]+)/([1-9][0-9]*)$ ]] ||
+        fatal "invalid project '${PROJECT}'; expected users/LOGIN/NUMBER or orgs/LOGIN/NUMBER"
+    OWNER_KIND=${BASH_REMATCH[1]}
+    OWNER=${BASH_REMATCH[2]}
+    NUMBER=${BASH_REMATCH[3]}
+    BOARD_URL=https://github.com/${OWNER_KIND}/${OWNER}/projects/${NUMBER}
+    BOARD_CACHE=${CACHE_DIR}/${PROJECT}
 }
 
 is_workstream() {
-    test "${NUMBER}" = "${PROJECTS[${WORKSTREAM}]}"
+    test "${PROJECT}" = "${PROJECTS[${WORKSTREAM}]}"
 }
 
 # workstream_only COMMAND: the state items and the Org field exist only
 # on the Workstream board.
 workstream_only() {
-    test "${NUMBER}" = "${PROJECTS[${WORKSTREAM}]}" ||
+    is_workstream ||
         fatal "'$1' works on the ${WORKSTREAM} board only, not on ${BOARD_URL}"
 }
 
@@ -487,14 +498,16 @@ rest_get() {
 }
 
 # rest_items: prints the board's items as 'gh project item-list --format
-# json' does, reading every page with rest_get.
+# json' does, reading every page with rest_get. It leaves out the Type
+# (issue type) field of org boards, which user boards lack, so that
+# items look the same on either.
 rest_items() {
-    local base=users/${OWNER}/projectsV2/${NUMBER} fields path pages=()
+    local base=${OWNER_KIND}/${OWNER}/projectsV2/${NUMBER} fields path pages=()
     test ! -d "${BOARD_CACHE}/rest" ||
         find "${BOARD_CACHE}/rest" -type f -mtime "+${REST_KEEP_DAYS}" -delete ||
         echo "warning: pruning ${BOARD_CACHE}/rest failed" 1>&2
     rest_get "${base}/fields?per_page=${REST_PER_PAGE}" \
-        'map(select(.data_type | IN("title", "parent_issue", "sub_issues_progress") | not) | .id) | join(",")' ||
+        'map(select(.data_type | IN("title", "parent_issue", "sub_issues_progress", "issue_type") | not) | .id) | join(",")' ||
         fail_after $? "reading the board fields failed (gh needs the project scope)"
     fields=$(jq -r .data "${REST_OUT}")
     path="${base}/items?per_page=${REST_PER_PAGE}&fields=${fields}"
@@ -547,14 +560,23 @@ option_id() { # option_id FIELD VALUE; requires load_fields
 # A listing ('gh project item-list') costs about 300 GraphQL points on a
 # board this size, since it reads every field of every item; this reads
 # a few fields of the items in one repository, about 1 point per 100.
+# OWNER_FIELD becomes user or organization (see owner_field).
 readonly ITEM_LOOKUP_QUERY='query($owner: String!, $number: Int!, $q: String!, $after: String) {
-  user(login: $owner) { projectV2(number: $number) { items(first: 100, query: $q, after: $after) {
+  board: OWNER_FIELD(login: $owner) { projectV2(number: $number) { items(first: 100, query: $q, after: $after) {
     pageInfo { hasNextPage endCursor }
     nodes { id
       content { ... on Issue { url title body } ... on PullRequest { url title body } }
       priority: fieldValueByName(name: "Priority") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
       org: fieldValueByName(name: "Org") { ... on ProjectV2ItemFieldSingleSelectValue { name } }
       branch: fieldValueByName(name: "Branch") { ... on ProjectV2ItemFieldTextValue { text } } } } } } }'
+
+# owner_field: the GraphQL query field for the board's owner.
+owner_field() {
+    case "${OWNER_KIND}" in
+        users) echo user ;;
+        orgs) echo organization ;;
+    esac
+}
 
 # lookup_item URL: prints the board item of an issue or PR, shaped like an
 # item of 'list --json' but with only id, content, priority, org and
@@ -566,11 +588,11 @@ lookup_item() {
         fatal "expected an issue or PR URL, got '$1'"
     repo=${BASH_REMATCH[1]}
     while :; do
-        data=$(gqlq "${ITEM_LOOKUP_QUERY}" -f owner="${OWNER}" -F number="${NUMBER}" -f q="repo:${repo}" \
+        data=$(gqlq "${ITEM_LOOKUP_QUERY/OWNER_FIELD/$(owner_field)}" -f owner="${OWNER}" -F number="${NUMBER}" -f q="repo:${repo}" \
             ${after:+-f after="${after}"}) || fail_after $? "looking up ${url} on the board failed"
         # An issue and a PR share numbers, so either path finds the item.
         found=$(jq -c --arg url "${url,,}" 'def key: ascii_downcase | sub("/(issues|pull)/"; "/");
-            first(.user.projectV2.items.nodes[]
+            first(.board.projectV2.items.nodes[]
             | select((.content.url // "" | key) == ($url | key))
             | {id, content, priority: .priority.name, org: .org.name, branch: .branch.text}
             | with_entries(select(.value != null))) // empty' <<<"${data}")
@@ -578,8 +600,8 @@ lookup_item() {
             echo "${found}"
             return 0
         fi
-        jq -e '.user.projectV2.items.pageInfo.hasNextPage' <<<"${data}" >/dev/null || return 0
-        after=$(jq -r '.user.projectV2.items.pageInfo.endCursor' <<<"${data}")
+        jq -e '.board.projectV2.items.pageInfo.hasNextPage' <<<"${data}" >/dev/null || return 0
+        after=$(jq -r '.board.projectV2.items.pageInfo.endCursor' <<<"${data}")
     done
 }
 
@@ -1422,11 +1444,11 @@ STATE_BODY=
 # returns 1 if it doesn't exist yet.
 state_ids() {
     local ids=${STATE_ITEMS[$1]:-}
-    test -n "${ids}" || read -r ids 2>/dev/null <"${CACHE_DIR}/state-$1" || true
+    test -n "${ids}" || read -r ids 2>/dev/null <"${BOARD_CACHE}/state-$1" || true
     test -n "${ids}" || return 1
     read -r STATE_ITEM STATE_DRAFT <<<"${ids}"
     [[ "${STATE_ITEM}" == PVTI_* && "${STATE_DRAFT}" == DI_* ]] ||
-        fatal "the ids of the state item '$1' are not 'PVTI_... DI_...': '${ids}'; fix STATE_ITEMS in $(basename "$0") or ${CACHE_DIR}/state-$1"
+        fatal "the ids of the state item '$1' are not 'PVTI_... DI_...': '${ids}'; fix STATE_ITEMS in $(basename "$0") or ${BOARD_CACHE}/state-$1"
 }
 
 # find_state NAME: sets STATE_ITEM, STATE_DRAFT and STATE_BODY to the
@@ -1437,7 +1459,7 @@ find_state() {
     data=$(gqlq "${STATE_NODE_QUERY}" -f id="${STATE_ITEM}") || fail_after $? "reading the state item ${STATE_ITEM} failed"
     jq -e --arg t "${STATE_PREFIX}$1" --arg draft "${STATE_DRAFT}" \
         '.node.content.title == $t and .node.content.id == $draft' <<<"${data}" >/dev/null ||
-        fatal "${STATE_ITEM} is not the '${STATE_PREFIX}$1' draft item ${STATE_DRAFT} (deleted?); fix STATE_ITEMS in $(basename "$0"), or remove ${CACHE_DIR}/state-$1 to create a new one"
+        fatal "${STATE_ITEM} is not the '${STATE_PREFIX}$1' draft item ${STATE_DRAFT} (deleted?); fix STATE_ITEMS in $(basename "$0"), or remove ${BOARD_CACHE}/state-$1 to create a new one"
     STATE_BODY=$(jq -r .node.content.body <<<"${data}")
     jq -e .node.isArchived <<<"${data}" >/dev/null ||
         echo "warning: the state item ${STATE_ITEM} is not archived; it shows on the board" 1>&2
@@ -1561,8 +1583,8 @@ write_state() {
     draft=$(gqlq "${STATE_NODE_QUERY}" -f id="${id}") ||
         fail_after $? "looking up the draft of the new state item ${id} failed; add it to STATE_ITEMS by hand"
     draft=$(jq -r .node.content.id <<<"${draft}")
-    mkdir -p "${CACHE_DIR}"
-    echo "${id} ${draft}" >"${CACHE_DIR}/state-${name}"
+    mkdir -p "${BOARD_CACHE}"
+    echo "${id} ${draft}" >"${BOARD_CACHE}/state-${name}"
     echo "Created and archived the state item ${id} ('${STATE_PREFIX}${name}'); add [${name}]='${id} ${draft}' to STATE_ITEMS in $(basename "$0")" 1>&2
 }
 
@@ -1657,6 +1679,6 @@ case "${command}" in
     state-put) workstream_only "${command}"; command=state_put ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
-require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${OWNER}"
+require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it as ${BOT_LOGIN}"
 require_cmd jq "install jq"
 "cmd_${command}" "$@"

@@ -6,8 +6,8 @@
 set -euo pipefail
 items=$1 path=$2
 case "${path%%\?*}" in
-    users/*/projectsV2/*/fields) body='[]' ;;
-    users/*/projectsV2/*/items)
+    */*/projectsV2/*/fields) body='[]' ;;
+    */*/projectsV2/*/items)
         body='[]'
         test ! -e "${items}" || body=$(jq -f "$(dirname "$0")/rest-items.jq" "${items}")
         ;;
