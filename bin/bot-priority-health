@@ -82,7 +82,10 @@ they have there, that need a look:
   dco         the DCO check fails: commits lack a Signed-off-by
   ci-pending  checks still pending ${PENDING_HOURS}h after they started
   conflict    the PR conflicts with its base
-  behind      the PR is behind a base that must be up to date
+  behind      the PR is behind a base that must be up to date, and that
+              actually blocks a merge the bot could do: it is approved
+              or has auto-merge enabled (every bot PR here goes behind
+              on each merge to main, which isn't itself worth a look)
   stale       no activity on the PR (by anyone, bots included) for over
               ${PRIORITIES.map((p) => `${STALE_HOURS[p]}h (${p})`).join(" or ")}
 
@@ -99,7 +102,8 @@ four fields identify the problem: they stay the same on every sweep
 until it is fixed or the head moves, so a poll can report each once.
 
 Each PR costs a request for the PR and one for its check runs (a page
-per ${CHECKS_PER_PAGE}) and one for its commit statuses, all conditional (ETags in
+per ${CHECKS_PER_PAGE}) and one for its commit statuses, plus one for its
+reviews when it is behind a base without auto-merge enabled, all conditional (ETags in
 ${ETAG_DIR.replace(os.homedir(), "~")}): an unchanged one costs no quota.
 
 Options:
@@ -317,6 +321,23 @@ function latestByKey(list, keyFn) {
 const runKey = (r) => `${r.name}\u0000${(r.app && r.app.id) ?? (r.app && r.app.slug) ?? ""}`;
 const statusKey = (s) => s.context;
 
+// isApproved(repo, number): whether the PR has an outstanding approving
+// review (the latest submitted review of some user is APPROVED). This
+// approximates GitHub's reviewDecision, which REST doesn't expose
+// directly, without its required-reviewer/CODEOWNERS rules: good enough
+// to tell whether the bot's PR being behind would actually block a
+// merge, not whether branch protection would allow one.
+async function isApproved(repo, number) {
+  const reviews = await restGet(`repos/${repo}/pulls/${number}/reviews?per_page=100`);
+  if (!Array.isArray(reviews)) return false;
+  const latest = new Map();
+  for (const r of reviews) {
+    if (r.state === "PENDING") continue;
+    latest.set(r.user.login, r.state);
+  }
+  return [...latest.values()].includes("APPROVED");
+}
+
 // checkProblems(runs, statuses, now): [[reason, detail]] for a head's
 // check runs and commit statuses, each narrowed to the latest of every
 // name/context first (see latestByKey).
@@ -379,7 +400,9 @@ async function checkPr(t, now) {
   }
   const base = (pr.base && pr.base.ref) || "its base";
   if (pr.mergeable_state === "dirty") problems.push(["conflict", `conflicts with ${base}`]);
-  else if (pr.mergeable_state === "behind") problems.push(["behind", `behind ${base}, which must be up to date`]);
+  else if (pr.mergeable_state === "behind" && (pr.auto_merge || (await isApproved(repo, number)))) {
+    problems.push(["behind", `behind ${base}, which must be up to date`]);
+  }
   if (now - Date.parse(pr.updated_at) > STALE_HOURS[t.priority] * HOUR_MS) {
     problems.push(["stale", `no activity since ${pr.updated_at}`]);
   }

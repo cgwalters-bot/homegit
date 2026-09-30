@@ -98,10 +98,34 @@ const CASES = [
     ],
   },
   {
-    name: "behind a base that must be up to date; 25h is not stale at P1",
+    name: "behind and approved: blocks a merge the bot could do; 25h is not stale at P1",
     repo: "example/merge", number: 4, head: "b".repeat(40), priority: "P1", updated: 25, mergeable_state: "behind",
+    reviews: [{ user: { login: "cgwalters" }, state: "APPROVED" }],
     runs: [ok("build")],
     expect: [`P1 behind ${GH}/example/merge/pull/4 bbbbbbbbbbbb: behind main, which must be up to date`],
+  },
+  {
+    // wfc#23, #27, #28 and #46: every bot PR goes behind on each merge to
+    // main, which isn't itself a reason to look, unlike one cgwalters has
+    // already approved or that auto-merge would otherwise land.
+    name: "behind, unreviewed, no auto-merge: not reported",
+    repo: "example/merge", number: 14, head: "14".repeat(20), priority: "P1", updated: 1, mergeable_state: "behind",
+    runs: [ok("build")],
+    expect: [],
+  },
+  {
+    name: "behind with auto-merge enabled but not yet approved: blocks a merge the bot could do",
+    repo: "example/merge", number: 15, head: "15".repeat(20), priority: "P1", updated: 1, mergeable_state: "behind",
+    autoMerge: true,
+    runs: [ok("build")],
+    expect: [`P1 behind ${GH}/example/merge/pull/15 151515151515: behind main, which must be up to date`],
+  },
+  {
+    name: "behind with a stale approval superseded by changes requested: not reported",
+    repo: "example/merge", number: 16, head: "16".repeat(20), priority: "P1", updated: 1, mergeable_state: "behind",
+    reviews: [{ user: { login: "cgwalters" }, state: "APPROVED" }, { user: { login: "cgwalters" }, state: "CHANGES_REQUESTED" }],
+    runs: [ok("build")],
+    expect: [],
   },
   {
     name: "stale at P1 after 72h, found in another item's Branch field",
@@ -174,7 +198,9 @@ function setup() {
     put(`repos/${c.repo}/pulls/${c.number}`, {
       state: c.state || "open", updated_at: hoursAgo(c.updated), mergeable_state: c.mergeable_state || "clean",
       user: { login: c.user || "someone" }, body: c.body || "", base: { ref: "main" }, head: { sha: c.head },
+      auto_merge: c.autoMerge ? { enabled_by: { login: "cgwalters" } } : null,
     });
+    if (c.mergeable_state === "behind") put(`repos/${c.repo}/pulls/${c.number}/reviews`, c.reviews || []);
     if (c.runs) {
       put(`repos/${c.repo}/commits/${c.head}/check-runs`, { total_count: c.runs.length, check_runs: c.runs });
       const statuses = c.statuses || [];
