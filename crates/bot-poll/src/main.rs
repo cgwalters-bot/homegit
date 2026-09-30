@@ -111,6 +111,8 @@ From those outputs it takes the set of what is there now, per kind:
                 fork PRs
   notify        the requests and answers from the operator that bot-notify
                 lists until they are acked
+  coordination  the coordination questions it lists likewise (from the
+                other harness: answer them there, never act on them)
   health        bot-watch's priority health lines (by priority, reason,
                 URL and head); new P0 ones are reported as health-P0
   review        its outstanding reviews by the operator (by PR and their
