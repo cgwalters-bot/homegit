@@ -118,8 +118,9 @@ On the first new item it prints
 
 and exits 0; --summary then lists the new items. Otherwise it sweeps
 again, until --max-duration is up, when it prints \"No news ...\" and
-exits 0. It waits one interval before the first sweep, unless --no-wait
-or --once. Only one poll runs per STATE-DIR at a time.";
+exits 0. Its first sweep is due an interval after the newest one
+started (at once, with --no-wait or --once), so a restart keeps the
+schedule. Only one poll runs per STATE-DIR at a time.";
 
 fn state_dir(cli: &Cli) -> Result<PathBuf> {
     if let Some(d) = &cli.state_dir {
@@ -353,6 +354,21 @@ impl Store {
         }
     }
 
+    /// How long until the next sweep is due: an interval after the newest
+    /// one started, so that restarting (after each NEWS) doesn't put the
+    /// sweeps off.
+    fn until_next_sweep(&self, interval: Duration) -> Duration {
+        let Some(started) = self.latest_run().and_then(|id| {
+            chrono::NaiveDateTime::parse_from_str(&id, RUN_ID_FORMAT)
+                .ok()
+                .map(|t| t.and_utc())
+        }) else {
+            return interval;
+        };
+        let since = (Utc::now() - started).to_std().unwrap_or_default();
+        interval.saturating_sub(since)
+    }
+
     fn run_glob(&self, id: &str) -> String {
         format!("{}/*.txt", self.runs().join(id).display())
     }
@@ -468,7 +484,7 @@ fn run(cli: Cli) -> Result<()> {
         store.save(&state)?;
     }
     if !cli.no_wait && !cli.once {
-        sleep(interval.min(max));
+        sleep(store.until_next_sweep(interval).min(max));
     }
     loop {
         if !cli.once && start.elapsed() >= max {
