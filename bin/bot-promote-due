@@ -1,0 +1,357 @@
+#!/usr/bin/env node
+// Finds the bot's open fork PRs whose current head the operator approved
+// for a repository whose contribution policy is bot-ok, and with --apply
+// runs 'bot-pr promote' on each. bot-watch runs it on every sweep. See
+// --help. Node's standard library only, plus gh (through
+// bot-priority-health's REST helpers, with their ETag cache),
+// upstream-policy and bot-pr.
+"use strict";
+
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { promisify } = require("node:util");
+
+const execFileP = promisify(execFile);
+
+const PROG = path.basename(process.argv[1] || "bot-promote-due");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const {
+  Exit, restGet, pages, pool, BOT_LOGIN, FORK_OWNERS, FORK_META, EX_RATELIMIT,
+} = require(path.join(BIN_DIR, "bot-priority-health"));
+const retry = require(path.join(__dirname, "..", "lib", "retry-cache.js"));
+const BOT_PR = process.env.BOT_PROMOTE_DUE_BOT_PR || path.join(BIN_DIR, "bot-pr");
+const UPSTREAM_POLICY = process.env.BOT_PROMOTE_DUE_UPSTREAM_POLICY || path.join(BIN_DIR, "upstream-policy");
+// The operator (see lib/operator.js).
+const REVIEWER = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG).operator.login;
+// As in bot-pr: his reviews that decide whether a fork PR is approved (a
+// later comment-only review leaves an approval be), and the lines of his
+// comments and review bodies that approve and ask for a draft.
+const DECIDING_STATES = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
+const PROMOTE_COMMAND = "/promote";
+const HUMAN_TEXT_COMMAND = `${PROMOTE_COMMAND} --human-text`;
+const DRAFT_COMMAND = "/draft";
+const READY_COMMAND = "/ready";
+// The bot's comment recording that promote added his sign-off to the head
+// he approved, which keeps that approval valid for the signed head.
+const SIGNOFF_RECORD_RE = /<!-- bot-pr signoff approved=([0-9a-f]{40}) signed=([0-9a-f]{40}) approval=(\S+) review=(\S+) -->\s*$/;
+const META_RE = /<!-- bot-meta -->[\s\S]*?<!-- \/bot-meta -->/;
+const UPSTREAM_RE = /Upstream: `([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)`, base `[^`]+`/;
+// The bot's open PRs in the forge and in its own forks (the qualifiers
+// are or'ed); those with a bot-meta section are its fork PRs.
+const SEARCH_Q = `is:pr+is:open+author:${BOT_LOGIN}+${FORK_OWNERS.map((o, i) => `${i ? "user" : "org"}:${o}`).join("+")}`;
+const PER_PAGE = 100;
+// The search API returns at most 1000 results.
+const SEARCH_MAX_PAGES = 10;
+const SHORT_SHA = 12;
+const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/([0-9]+)$/;
+// upstream-policy check's exit statuses besides 0 (bot-ok): human-text,
+// then the verdicts and records that hold a promotion back, with why;
+// any other is a failure to check.
+const POLICY_HUMAN_TEXT = 5;
+const POLICY_HELD = {
+  3: (u) => `${u} has no contribution policy record yet; dispatch a policy check`,
+  4: (u) => `${u}'s contribution policy record is stale; dispatch a policy check`,
+  6: (u) => `${u}'s contribution policy is human-only or no-go`,
+  7: (u) => `${u}'s contribution policy record is invalid or uncommitted`,
+};
+// The heads 'bot-pr promote' refused: their result is listed again
+// instead of retrying (see lib/retry-cache.js).
+const ATTEMPTS_FILE = retry.cacheFile("bot-promote-due");
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+function usage() {
+  return `Usage: ${PROG} [--apply | --dry-run] [--json]
+
+Finds the open fork PRs of ${BOT_LOGIN} (in ${FORK_OWNERS.join(", ")}, with a
+bot-meta section) where both hold:
+
+  - ${REVIEWER}'s latest approval or verdict approves the PR's current
+    head: an approving review of it (or of the head promote then signed
+    off, per its record), or a comment with a '${PROMOTE_COMMAND}' line
+    written after the head was pushed (per the fork's activity log);
+  - 'upstream-policy check' passes for the upstream repository its
+    bot-meta section names: the verdict is bot-ok.
+
+That is a fork PR waiting only for 'bot-pr promote URL', which itself
+enforces every rule again (the exact head, the policy gate, DCO
+sign-offs), so this only decides when to run it. With a '${DRAFT_COMMAND}'
+from ${REVIEWER} (his latest '${DRAFT_COMMAND}' or '${READY_COMMAND}' line), it
+passes --draft. Once promoted, the fork PR is closed and drops out, so
+running this again is harmless.
+
+A fork PR he approved for a human-text repository is never promoted: the
+text must be his own (see 'bot-pr --help'), so it is only listed, under
+"Needs your text". One whose repository has no current bot-ok record
+(missing, stale, human-only or no-go) is listed as not promoted.
+
+Prints one line per PR:
+
+  Promotion due: URL at HEAD (UPSTREAM)   (without --apply)
+  Would run: bot-pr promote URL [--draft] (--dry-run)
+  Promoted: URL -> UPSTREAM-PR-URL        (--apply)
+  Promotion refused: URL at HEAD: WHY     (--apply; bot-pr promote said no)
+  Not promoted: URL: WHY                  (no bot-ok policy record)
+  Needs your text: URL (UPSTREAM is human-text): WHAT
+
+and nothing when no PR is approved. A head 'bot-pr promote' refused
+isn't tried again for ${retry.RETRY_HOURS}h: its line is repeated from
+${ATTEMPTS_FILE.replace(os.homedir(), "~")} (as --dry-run does too) until the
+head moves or that time is up. Once its cause is fixed, run 'bot-pr
+promote URL' by hand rather than wait.
+
+Options:
+  --apply     run 'bot-pr promote' on each PR that is due
+  --dry-run   print what --apply would run, and change nothing
+  --json      print a JSON array of {url, head, upstream, draft, result,
+              upstream_url, detail, line} (result: due, would-run,
+              promoted, refused, held, needs-text)
+  -h, --help  show this help
+
+Exits 1 if the search, a PR or a policy check failed (the others are
+still handled), and ${EX_RATELIMIT} if GitHub is rate limiting the bot (having
+printed the promotions made before). A refusal is reported, not an
+error.
+`;
+}
+
+function parseArgs(argv) {
+  const opts = { apply: false, dryRun: false, json: false };
+  for (const a of argv) {
+    switch (a) {
+      case "-h":
+      case "--help":
+        process.stdout.write(usage());
+        process.exit(0);
+      case "--apply": opts.apply = true; break;
+      case "--dry-run": opts.dryRun = true; break;
+      case "--json": opts.json = true; break;
+      default:
+        throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    }
+  }
+  if (opts.apply && opts.dryRun) throw new Exit(EX_USAGE, "--apply and --dry-run exclude each other");
+  return opts;
+}
+
+const warn = (msg) => process.stderr.write(`${PROG}: warning: ${msg}\n`);
+
+// lines(body): its lines, trimmed of spaces and tabs.
+const lines = (body) => (body || "").replace(/\r/g, "").split("\n").map((l) => l.replace(/^[ \t]+|[ \t]+$/g, ""));
+const hasLine = (body, cmd) => lines(body).includes(cmd);
+const isPromoteLine = (body) => hasLine(body, PROMOTE_COMMAND) || hasLine(body, HUMAN_TEXT_COMMAND);
+const byLogin = (login) => (x) => x.user && x.user.login === login;
+
+// approval({reviews, comments}): REVIEWER's latest approval or verdict,
+// as bot-pr's VERDICT_JQ decides it: {at, approved, url, commit_id (a
+// review's), via (PROMOTE_COMMAND for a comment), human_text}, or null.
+function approval({ reviews, comments }) {
+  const decisions = [
+    ...reviews.filter((r) => byLogin(REVIEWER)(r) && DECIDING_STATES.includes(r.state) && r.submitted_at)
+      .map((r) => ({
+        at: r.submitted_at, approved: r.state === "APPROVED", url: r.html_url, commit_id: r.commit_id,
+        via: null, human_text: hasLine(r.body, HUMAN_TEXT_COMMAND),
+      })),
+    ...comments.filter((c) => byLogin(REVIEWER)(c) && isPromoteLine(c.body))
+      .map((c) => ({
+        at: c.created_at, approved: true, url: c.html_url, commit_id: null,
+        via: PROMOTE_COMMAND, human_text: hasLine(c.body, HUMAN_TEXT_COMMAND),
+      })),
+  ].sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  return decisions.length ? decisions[decisions.length - 1] : null;
+}
+
+// approvesHead(a, head, pushed, comments): whether approval a approves
+// head: a review of it, or of the head the bot's sign-off record says
+// head signs off; a '${PROMOTE_COMMAND}' written after head was pushed
+// (pushed: when, or null if unknown, which voids it).
+function approvesHead(a, head, pushed, comments) {
+  if (!a || !a.approved) return false;
+  if (a.via) return pushed !== null && Date.parse(a.at) > Date.parse(pushed);
+  if (a.commit_id === head) return true;
+  return comments.some((c) => {
+    if (!byLogin(BOT_LOGIN)(c)) return false;
+    const m = SIGNOFF_RECORD_RE.exec(c.body || "");
+    return Boolean(m) && m[1] === a.commit_id && m[2] === head && m[3] === a.url;
+  });
+}
+
+// wantsDraft(items): whether REVIEWER's latest '${DRAFT_COMMAND}' or
+// '${READY_COMMAND}' line, in any of his comments or review bodies (items),
+// is '${DRAFT_COMMAND}'.
+function wantsDraft(items) {
+  const cmds = items.filter(byLogin(REVIEWER))
+    .map((x) => ({ at: x.submitted_at || x.updated_at || x.created_at, cmd: lines(x.body).filter((l) => l === DRAFT_COMMAND || l === READY_COMMAND).pop() }))
+    .filter((x) => x.cmd && x.at)
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  return cmds.length > 0 && cmds[cmds.length - 1].cmd === DRAFT_COMMAND;
+}
+
+const isForkPr = (owner, item) => FORK_OWNERS.includes(owner) && byLogin(BOT_LOGIN)(item) && (item.body || "").includes(FORK_META);
+
+// candidates(): the URLs of the bot's open fork PRs.
+async function candidates() {
+  const urls = [];
+  for (let page = 1; page <= SEARCH_MAX_PAGES; page++) {
+    const body = await restGet(`search/issues?q=${SEARCH_Q}&per_page=${PER_PAGE}&page=${page}`);
+    if (!body || !Array.isArray(body.items)) throw new Exit(EX_ERROR, "the search for the bot's fork PRs answered nothing usable");
+    for (const i of body.items) {
+      const m = PR_URL_RE.exec(i.html_url || "");
+      if (m && isForkPr(m[1], i)) urls.push(i.html_url);
+    }
+    if (page * PER_PAGE >= body.total_count || !body.items.length) break;
+  }
+  return [...new Set(urls)];
+}
+
+// check(url): {url, head, upstream, draft, human_text} for a fork PR
+// REVIEWER approved at its head, else null.
+async function check(url) {
+  const [, owner, name, number] = PR_URL_RE.exec(url);
+  const repo = `${owner}/${name}`;
+  // The cheap tests first: most fork PRs have no approval at all.
+  const reviews = await pages(`repos/${repo}/pulls/${number}/reviews`);
+  const comments = await pages(`repos/${repo}/issues/${number}/comments`);
+  const a = approval({ reviews, comments });
+  if (!a || !a.approved) return null;
+  const pr = await restGet(`repos/${repo}/pulls/${number}`);
+  if (!pr || pr.state !== "open" || !isForkPr(owner, pr)) return null;
+  const head = pr.head.sha;
+  let pushed = null;
+  if (a.via) {
+    // The push that made head the branch's head, as bot-pr's push_time
+    // reads it; promote itself also weighs the PR's timeline.
+    const log = await restGet(`repos/${repo}/activity?ref=${encodeURIComponent(`refs/heads/${pr.head.ref}`)}&direction=desc&per_page=1`);
+    const last = Array.isArray(log) ? log[0] : null;
+    if (last && last.after === head) pushed = last.timestamp;
+  }
+  if (!approvesHead(a, head, pushed, comments)) return null;
+  // Only the bot-meta section counts, as for bot-pr: the description
+  // above it is anyone's text.
+  const m = UPSTREAM_RE.exec((META_RE.exec((pr.body || "").replace(/\r\n/g, "\n")) || [""])[0]);
+  if (!m) {
+    warn(`${url} has no valid 'Upstream:' line in its bot-meta section; skipped`);
+    return null;
+  }
+  const reviewComments = await pages(`repos/${repo}/pulls/${number}/comments`);
+  return { url, head, upstream: m[1], draft: wantsDraft([...reviews, ...comments, ...reviewComments]), human_text: a.human_text };
+}
+
+// policy(upstream): upstream-policy check's verdict on upstream:
+// {status: "ok" | "human-text" | "held", detail}. Throws on a failure to
+// check.
+async function policy(upstream) {
+  try {
+    await execFileP(UPSTREAM_POLICY, ["check", upstream]);
+    return { status: "ok", detail: "" };
+  } catch (e) {
+    const last = ((e.stderr || e.message || "").trim().split("\n").filter(Boolean).pop() || "").replace(/^error: /, "");
+    if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (upstream-policy check ${upstream})`);
+    if (e.code === POLICY_HUMAN_TEXT) return { status: "human-text", detail: "" };
+    if (POLICY_HELD[e.code]) return { status: "held", detail: POLICY_HELD[e.code](upstream) };
+    throw new Error(`upstream-policy check ${upstream} failed (${e.code}): ${last}`);
+  }
+}
+
+// promote(d): {result, upstream_url, detail} of running 'bot-pr promote'
+// on the fork PR d.
+async function promote(d) {
+  const args = ["promote", d.url, ...(d.draft ? ["--draft"] : [])];
+  try {
+    const { stdout } = await execFileP(BOT_PR, args, { maxBuffer: 64 << 20 });
+    return { result: "promoted", upstream_url: stdout.trim().split("\n").pop() || "", detail: "" };
+  } catch (e) {
+    if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (bot-pr promote ${d.url})`);
+    const errs = (e.stderr || e.message || "").trim().split("\n").filter(Boolean);
+    return { result: "refused", upstream_url: null, detail: (errs.pop() || `exit status ${e.code}`).replace(/^error: /, "") };
+  }
+}
+
+function line(r) {
+  const at = `${r.url} at ${r.head.slice(0, SHORT_SHA)}`;
+  switch (r.result) {
+    case "due": return `Promotion due: ${at} (${r.upstream})`;
+    case "would-run": return `Would run: bot-pr promote ${r.url}${r.draft ? " --draft" : ""}`;
+    case "promoted": return `Promoted: ${r.url} -> ${r.upstream_url}${r.draft ? " (draft)" : ""}`;
+    case "held": return `Not promoted: ${r.url}: ${r.detail}`;
+    case "needs-text": return `Needs your text: ${r.url} (${r.upstream} is human-text): ${r.detail}`;
+    default: return `Promotion refused: ${at}: ${r.detail}`;
+  }
+}
+
+// needsText(d): what a fork PR approved for a human-text repository
+// waits on.
+function needsText(d) {
+  if (d.human_text) {
+    return `approved with '${HUMAN_TEXT_COMMAND}'; promote it by hand once its text is checked: bot-pr promote ${d.url}`;
+  }
+  return `retitle it, edit its body, reword and push the commits yourself, then comment '${HUMAN_TEXT_COMMAND}'`;
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const urls = await candidates();
+  const failed = [];
+  const approved = (await pool(urls, async (url) => {
+    try {
+      return await check(url);
+    } catch (e) {
+      if (e instanceof Exit && e.status === EX_RATELIMIT) throw e;
+      warn(`reading ${url} failed: ${e.message}`);
+      failed.push(url);
+      return null;
+    }
+  })).filter(Boolean);
+  // One check per upstream, which reads its policy sources upstream.
+  const verdicts = new Map();
+  const tried = retry.load(ATTEMPTS_FILE, warn);
+  const attempts = {};
+  const results = [];
+  let rateLimited = null;
+  // One at a time: each promote clones, pushes and opens a PR.
+  for (const d of approved) {
+    let r;
+    try {
+      if (!verdicts.has(d.upstream)) verdicts.set(d.upstream, await policy(d.upstream));
+      const v = verdicts.get(d.upstream);
+      const key = `${d.url}@${d.head}`;
+      const t = tried[key];
+      if (v.status === "human-text") r = { result: "needs-text", upstream_url: null, detail: needsText(d) };
+      else if (v.status === "held") r = { result: "held", upstream_url: null, detail: v.detail };
+      else if (retry.fresh(t)) r = t;
+      else if (opts.dryRun) r = { result: "would-run", upstream_url: null, detail: "" };
+      else if (opts.apply) r = await promote(d);
+      else r = { result: "due", upstream_url: null, detail: "" };
+      // A repeated attempt keeps its time.
+      if (r.result === "refused") attempts[key] = { at: new Date().toISOString(), ...r };
+    } catch (e) {
+      if (e instanceof Exit && e.status === EX_RATELIMIT) {
+        // What was promoted already must still be reported.
+        rateLimited = e;
+        break;
+      }
+      if (e instanceof Exit) throw e;
+      warn(e.message);
+      failed.push(d.url);
+      continue;
+    }
+    const { at, human_text, ...shown } = { ...d, ...r };
+    results.push({ ...shown, line: line(shown) });
+  }
+  if (opts.apply && !rateLimited) retry.save(ATTEMPTS_FILE, attempts);
+  process.stdout.write(opts.json ? `${JSON.stringify(results)}\n` : results.map((r) => `${r.line}\n`).join(""));
+  if (rateLimited) throw rateLimited;
+  if (failed.length) throw new Exit(EX_ERROR, `${failed.length} fork PR(s) could not be checked; they are not listed`);
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  });
+} else {
+  module.exports = { approval, approvesHead, wantsDraft };
+}

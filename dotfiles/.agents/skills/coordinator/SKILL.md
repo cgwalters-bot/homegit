@@ -200,6 +200,22 @@ or in their open PR, or their PR closed.
   record, say): once its cause is fixed, run `bot-pr signoff URL` by
   hand, since the sweeps only retry a refused head after 6h. A sign-off
   needs nothing more.
+- **Promotions.** Likewise, `bot-watch --apply` runs `bot-pr promote`
+  itself (with `--draft` after the operator's `/draft`) on each fork PR
+  whose current head they approved, by review or `/promote` line, when
+  `upstream-policy check` passes for its upstream (`bot-promote-due`).
+  This is level-triggered: an approval `bot-poll` never woke on (its
+  seen-set was reset, say) still gets promoted on the next sweep. The
+  "Promotions" section lists `Promoted: FORK-PR -> UPSTREAM-PR`, which
+  needs nothing more; `Promotion refused: ...` (a conflict, say), which
+  needs the same look a refused promote by hand does, then `bot-pr
+  promote URL` by hand once fixed, since refused heads are retried only
+  after 6h; or `Not promoted: ...` for a missing or stale policy
+  record, which needs a policy check (see "Policy gate"). Fork PRs
+  approved for a human-text repository are never promoted
+  automatically: they are listed under "Needs your text" until the
+  operator's text and `/promote --human-text` are in, and then promoted
+  by hand.
 - **Outstanding reviews first** (after P0 health). The "Outstanding reviews by LOGIN"
   section (LOGIN being the operator's login) `bot-watch` prints on every sweep is P0: dispatch a worker for
   each listed PR, unless a live worker is already on it (check it's
@@ -229,9 +245,10 @@ or in their open PR, or their PR closed.
   still fails, it's real, and the next "CI failing" news is work for a
   worker.
 - **Promote** a fork PR when inbox shows `[APPROVED]` (an approving
-  review, or a `/promote` line): run the `bot-pr promote` command it
-  prints. A go-ahead in other words only gets its `-> hint:` passed on;
-  never promote on your own reading. For a DCO repository, promote adds
+  review, or a `/promote` line) and the same sweep's "Promotions" didn't
+  already: run the `bot-pr promote` command it prints. A go-ahead in
+  other words only gets its `-> hint:` passed on; never promote on your
+  own reading. For a DCO repository, promote adds
   the operator's sign-off; if it stops over someone else's commits, ask them, and pass
   `--include-others` only if they say so.
 - **Policy gate.** Promote and `bot-pr signoff` first run
