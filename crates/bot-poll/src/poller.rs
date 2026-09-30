@@ -13,7 +13,7 @@ use bot_poll::hot::{
 };
 use bot_poll::operator::Config;
 use bot_poll::{
-    KindNews, NewsItem, Output, Reported, Source, State, evaluate, in_kind_order, signoff_event,
+    KindNews, NewsItem, Output, Reported, Source, State, evaluate, in_kind_order, line_event,
 };
 
 use crate::Sweeper;
@@ -415,7 +415,7 @@ impl Poller<'_> {
             if !SIGNOFF_RESULTS.iter().any(|p| line.starts_with(p)) {
                 continue;
             }
-            if reported.insert(signoff_event(line), now).is_none() {
+            if reported.insert(line_event("signoff", line), now).is_none() {
                 items.push(NewsItem {
                     url: bot_poll::first_url(line),
                     text: line.to_string(),

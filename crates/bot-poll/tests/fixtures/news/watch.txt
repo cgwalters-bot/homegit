@@ -7,6 +7,12 @@ warning: reading https://github.com/example/flaky/pull/1 failed (status 1)
 Sign-offs:
   Signed off: https://github.com/bootc-dev/bootc/pull/2516 (5e20ab31c0d2)
 
+Promotions:
+  Promoted: https://github.com/cgwalters-forge/composefs-rs/pull/6 -> https://github.com/composefs/composefs-rs/pull/310
+
+Needs your text:
+  Needs your text: https://github.com/cgwalters-forge/podman/pull/3 (containers/podman is human-text): retitle it, edit its body, reword and push the commits yourself, then comment '/promote --human-text'
+
 Outstanding reviews by cgwalters:
   bootc-dev/bootc#2500  lint: `/ostree` symlink required
     review CHANGES_REQUESTED at 2026-09-30T12:11:27Z (+1 more): (line comments)

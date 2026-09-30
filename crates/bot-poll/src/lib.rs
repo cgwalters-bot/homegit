@@ -26,8 +26,6 @@ const GITHUB: &str = "https://github.com/";
 const EVENT_ANCHORS: [&str; 3] = ["pullrequestreview-", "issuecomment-", "discussion_r"];
 /// `bot-pr inbox`'s line naming a fork PR's approval.
 const APPROVED_BY: &str = "  -> approved by ";
-/// The prefix of a sign-off line's event id.
-const SIGNOFF_EVENT: &str = "signoff ";
 
 /// A step of the sweep whose output holds news.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -54,7 +52,15 @@ impl Source {
         match self {
             Source::Notify => &["notify"],
             Source::Inbox => &["approval", "forge-review"],
-            Source::Watch => &["health", "review", "signoff", "rebase", "news"],
+            Source::Watch => &[
+                "health",
+                "review",
+                "signoff",
+                "promotion",
+                "text",
+                "rebase",
+                "news",
+            ],
         }
     }
 
@@ -102,13 +108,14 @@ impl Source {
 }
 
 /// bot-watch's warnings that a section is incomplete, and its sets.
-const WATCH_SECTION_FAILURES: [(&str, &[&str]); 3] = [
+const WATCH_SECTION_FAILURES: [(&str, &[&str]); 4] = [
     ("the priority health sweep failed", &["health"]),
     (
         "only the board's PRs were checked for outstanding reviews",
         &["review", "rebase"],
     ),
     ("looking for sign-offs due failed", &["signoff"]),
+    ("looking for promotions due failed", &["promotion", "text"]),
 ];
 
 /// The kinds of news, most urgent first, as the NEWS line and the
@@ -116,11 +123,13 @@ const WATCH_SECTION_FAILURES: [(&str, &[&str]); 3] = [
 /// OPERATOR'S stand for the operator's login (see [`kind_title`]).
 /// health-P0 is the new health lines of P0 PRs (they share the health
 /// seen-set).
-pub const KINDS: [(&str, &str); 9] = [
+pub const KINDS: [(&str, &str); 11] = [
     ("health-P0", "Priority health (P0)"),
     ("review", "Outstanding reviews by OPERATOR"),
     ("approval", "Approved fork PRs (promote)"),
     ("signoff", "Sign-offs"),
+    ("promotion", "Promotions"),
+    ("text", "Needs OPERATOR'S text"),
     ("notify", "Requests and answers from OPERATOR"),
     ("forge-review", "OPERATOR'S activity on fork PRs"),
     ("rebase", "Needs rebase"),
@@ -174,9 +183,19 @@ pub fn event_id(url: &str) -> Option<String> {
         .then(|| frag.to_string())
 }
 
-/// The event id of a sign-off line of bot-signoff-due.
-pub fn signoff_event(line: &str) -> String {
-    format!("{SIGNOFF_EVENT}{line}")
+/// The event id of a line in bot-watch's sign-off, promotion or
+/// "Needs your text" section (SET), which is its own id: one is news
+/// once, however long it stays or comes back.
+pub fn line_event(set: &str, line: &str) -> String {
+    format!("{set} {line}")
+}
+
+/// A line of such a section of SET as an item, keyed by itself.
+fn line_item(set: &str, line: &str) -> Item {
+    let l = line.trim();
+    let mut item = Item::new(l, first_url(l), l);
+    item.event = Some(line_event(set, l));
+    item
 }
 
 /// A report's items, by seen-set.
@@ -320,6 +339,8 @@ pub fn parse_notify(text: &str) -> Parsed {
 enum Section {
     Health,
     Signoff,
+    Promotion,
+    Text,
     Review,
     Rebase,
     News,
@@ -365,6 +386,10 @@ pub fn parse_watch(text: &str) -> Parsed {
                 Some(Section::Health)
             } else if line == "Sign-offs:" {
                 Some(Section::Signoff)
+            } else if line == "Promotions:" {
+                Some(Section::Promotion)
+            } else if line == "Needs your text:" {
+                Some(Section::Text)
             } else if line.starts_with("Outstanding reviews by ") {
                 Some(Section::Review)
             } else if line.starts_with("Needs rebase") {
@@ -399,12 +424,9 @@ pub fn parse_watch(text: &str) -> Parsed {
                     push(&mut out, "health", item);
                 }
             }
-            Some(Section::Signoff) => {
-                let l = line.trim();
-                let mut item = Item::new(l, first_url(l), l);
-                item.event = Some(signoff_event(l));
-                push(&mut out, "signoff", item);
-            }
+            Some(Section::Signoff) => push(&mut out, "signoff", line_item("signoff", line)),
+            Some(Section::Promotion) => push(&mut out, "promotion", line_item("promotion", line)),
+            Some(Section::Text) => push(&mut out, "text", line_item("text", line)),
             Some(Section::Review) => {
                 if let Some((r, title)) = indented(line, 2)
                     .and_then(|l| l.split_once("  "))
@@ -832,10 +854,12 @@ mod tests {
         "rebase",
         "health",
     ];
-    const NEWS_KINDS: [&str; 6] = [
+    const NEWS_KINDS: [&str; 8] = [
         "health-P0",
         "approval",
         "signoff",
+        "promotion",
+        "text",
         "notify",
         "forge-review",
         "news",
@@ -867,6 +891,22 @@ mod tests {
         assert_eq!(
             w["signoff"][0].event().as_deref(),
             Some("signoff Signed off: https://github.com/bootc-dev/bootc/pull/2516 (5e20ab31c0d2)")
+        );
+        assert_eq!(
+            w["promotion"][0].url,
+            "https://github.com/cgwalters-forge/composefs-rs/pull/6"
+        );
+        assert_eq!(
+            w["promotion"][0].event().as_deref(),
+            Some(
+                "promotion Promoted: https://github.com/cgwalters-forge/composefs-rs/pull/6 -> https://github.com/composefs/composefs-rs/pull/310"
+            )
+        );
+        assert_eq!(
+            keys(&w["text"]),
+            [
+                "Needs your text: https://github.com/cgwalters-forge/podman/pull/3 (containers/podman is human-text): retitle it, edit its body, reword and push the commits yourself, then comment '/promote --human-text'"
+            ]
         );
         assert_eq!(
             keys(&w["review"]),
@@ -994,6 +1034,8 @@ mod tests {
             "review",
             "rebase",
             "signoff",
+            "promotion",
+            "text",
             "news",
             "approval",
             "forge-review",
@@ -1126,6 +1168,6 @@ mod tests {
         );
         let (news, _) = eval(&outputs("news"), &Memory::default(), 0);
         let line = news_line(&news, "1415", "/s/runs/x");
-        assert!(line.starts_with("NEWS (health-P0, review, approval, signoff, notify, forge-review, rebase, health, news) at 1415: /s/runs/x/*.txt"));
+        assert!(line.starts_with("NEWS (health-P0, review, approval, signoff, promotion, text, notify, forge-review, rebase, health, news) at 1415: /s/runs/x/*.txt"));
     }
 }
