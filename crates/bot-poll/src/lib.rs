@@ -14,8 +14,19 @@ use operator::Operator;
 /// comes back; a shorter absence (a sweep that missed it, say a failed
 /// read) is not news.
 pub const FORGET_MS: i64 = 3600 * 1000;
+/// An event id (see [`event_id`]) is remembered this long after it was
+/// last listed, so that an item that comes back after [`FORGET_MS`] is
+/// still not news.
+pub const REPORTED_KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
 pub const STATE_VERSION: u32 = 1;
 const GITHUB: &str = "https://github.com/";
+/// The URL fragments that name one review or comment, by its
+/// GitHub-wide unique id.
+const EVENT_ANCHORS: [&str; 3] = ["pullrequestreview-", "issuecomment-", "discussion_r"];
+/// `bot-pr inbox`'s line naming a fork PR's approval.
+const APPROVED_BY: &str = "  -> approved by ";
+/// The prefix of a sign-off line's event id.
+const SIGNOFF_EVENT: &str = "signoff ";
 
 /// A step of the sweep whose output holds news.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -125,6 +136,9 @@ pub struct Item {
     pub text: String,
     /// A P0 health line.
     pub p0: bool,
+    /// What it reports, when that has a stable id of its own (see
+    /// [`Item::event`]).
+    pub event: Option<String>,
 }
 
 impl Item {
@@ -134,8 +148,34 @@ impl Item {
             url: url.into(),
             text: text.into(),
             p0: false,
+            event: None,
         }
     }
+
+    /// The id of the review, comment or sign-off it reports, which the
+    /// same event keeps whichever report lists it: its own, else its
+    /// URL's.
+    pub fn event(&self) -> Option<String> {
+        self.event.clone().or_else(|| event_id(&self.url))
+    }
+}
+
+/// The id of the review or comment a URL points at (its fragment, such as
+/// "pullrequestreview-123"), if it does.
+pub fn event_id(url: &str) -> Option<String> {
+    let (_, frag) = url.split_once('#')?;
+    EVENT_ANCHORS
+        .iter()
+        .any(|a| {
+            frag.strip_prefix(a)
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .then(|| frag.to_string())
+}
+
+/// The event id of a sign-off line of bot-signoff-due.
+pub fn signoff_event(line: &str) -> String {
+    format!("{SIGNOFF_EVENT}{line}")
 }
 
 /// A report's items, by seen-set.
@@ -181,7 +221,8 @@ fn indented(s: &str, n: usize) -> Option<&str> {
 /// ("  -> ..."). Approvals are the [APPROVED...] verdicts, not "APPROVED
 /// earlier; new commits since", which leaves nothing to promote; one is
 /// keyed by his latest approving review listed too, so that approving a
-/// new head is news again.
+/// new head is news again, and its event is the approving review or
+/// /promote comment its "-> approved by URL:" line names.
 pub fn parse_inbox(text: &str) -> Parsed {
     let mut approval = Vec::new();
     let mut activity = Vec::new();
@@ -215,12 +256,18 @@ pub fn parse_inbox(text: &str) -> Parsed {
                 let url = first_url(what);
                 if let (Some(i), true) = (approved, what.starts_with("review APPROVED")) {
                     approval[i].key = format!("{pr} [APPROVED] {url}");
+                    approval[i].event = event_id(&url);
                 }
                 activity.push(Item::new(
                     format!("{pr} {ts} {what}"),
                     if url.is_empty() { pr.to_string() } else { url },
                     format!("{pr}: {what}"),
                 ));
+            }
+            _ if line.starts_with(APPROVED_BY) => {
+                if let Some(i) = approved {
+                    approval[i].event = event_id(&first_url(line)).or(approval[i].event.take());
+                }
             }
             _ if line.starts_with(|c: char| !c.is_whitespace()) => {
                 pr = None;
@@ -353,7 +400,9 @@ pub fn parse_watch(text: &str) -> Parsed {
             }
             Some(Section::Signoff) => {
                 let l = line.trim();
-                push(&mut out, "signoff", Item::new(l, first_url(l), l));
+                let mut item = Item::new(l, first_url(l), l);
+                item.event = Some(signoff_event(l));
+                push(&mut out, "signoff", item);
             }
             Some(Section::Review) => {
                 if let Some((r, title)) = indented(line, 2)
@@ -465,6 +514,9 @@ pub struct KindNews {
 
 /// The seen-sets: per set, each key with when it was last there (ms).
 pub type Seen = BTreeMap<String, BTreeMap<String, i64>>;
+/// The event ids (see [`Item::event`]) listed or reported, with when they
+/// last were (ms): one is news once, whichever report or poll lists it.
+pub type Reported = BTreeMap<String, i64>;
 
 /// One step's output: its text, and its exit status (None: killed, or it
 /// didn't start).
@@ -474,15 +526,19 @@ pub struct Output {
 }
 
 /// What is new in one run's outputs (a missing source is incomplete)
-/// against the seen-sets, in KINDS order, and the seen-sets after it.
-/// A source whose output is incomplete leaves its sets as they are.
+/// against the seen-sets and the reported events, in KINDS order, and the
+/// seen-sets and reported events after it. A source whose output is
+/// incomplete leaves its sets as they are. An item whose event was
+/// reported before is not news, even under a new key or in another set.
 pub fn evaluate(
     outputs: &BTreeMap<Source, Output>,
     seen: &Seen,
+    reported: &Reported,
     now: i64,
-) -> (Vec<KindNews>, Seen) {
+) -> (Vec<KindNews>, Seen, Reported) {
     let mut news: BTreeMap<&str, Vec<NewsItem>> = BTreeMap::new();
     let mut next = Seen::new();
+    let mut next_reported = reported.clone();
     for source in Source::ALL {
         let o = outputs.get(&source);
         let whole = o
@@ -497,7 +553,17 @@ pub fn evaluate(
             }
             let mut cur = BTreeMap::new();
             for item in parsed.remove(set).unwrap_or_default() {
-                if cur.insert(item.key.clone(), now).is_some() || old.contains_key(&item.key) {
+                // Checked against the events before this run, so that two
+                // items reporting one new event are both news.
+                let event = item.event();
+                let known = event.as_ref().is_some_and(|e| reported.contains_key(e));
+                if let Some(e) = event {
+                    next_reported.insert(e, now);
+                }
+                if cur.insert(item.key.clone(), now).is_some()
+                    || old.contains_key(&item.key)
+                    || known
+                {
                     continue;
                 }
                 let kind = if set == "health" && item.p0 {
@@ -527,7 +593,8 @@ pub fn evaluate(
             })
         })
         .collect();
-    (news, next)
+    next_reported.retain(|_, at| now - *at < REPORTED_KEEP_MS);
+    (news, next, next_reported)
 }
 
 /// The last NEWS report, for --summary.
@@ -545,6 +612,8 @@ pub struct State {
     pub version: u32,
     #[serde(default)]
     pub seen: Seen,
+    #[serde(default)]
+    pub reported: Reported,
     /// The newest run checked for news.
     #[serde(default)]
     pub evaluated: Option<String>,
@@ -557,6 +626,7 @@ impl Default for State {
         State {
             version: STATE_VERSION,
             seen: Seen::new(),
+            reported: Reported::new(),
             evaluated: None,
             last_news: None,
         }
@@ -632,6 +702,12 @@ mod tests {
     fn kinds(news: &[KindNews]) -> Vec<&str> {
         news.iter().map(|k| k.kind.as_str()).collect()
     }
+    /// The seen-sets and the reported events.
+    type Memory = (Seen, Reported);
+    fn eval(o: &BTreeMap<Source, Output>, m: &Memory, now: i64) -> (Vec<KindNews>, Memory) {
+        let (news, seen, reported) = evaluate(o, &m.0, &m.1, now);
+        (news, (seen, reported))
+    }
     const BASE_KINDS: [&str; 6] = [
         "health-P0",
         "review",
@@ -671,6 +747,10 @@ mod tests {
         assert_eq!(
             w["signoff"][0].url,
             "https://github.com/bootc-dev/bootc/pull/2516"
+        );
+        assert_eq!(
+            w["signoff"][0].event().as_deref(),
+            Some("signoff Signed off: https://github.com/bootc-dev/bootc/pull/2516 (5e20ab31c0d2)")
         );
         assert_eq!(
             keys(&w["review"]),
@@ -714,6 +794,10 @@ mod tests {
                 "https://github.com/cgwalters-forge/bootc/pull/24 [APPROVED] https://github.com/cgwalters-forge/bootc/pull/24#pullrequestreview-5354700998",
             ]
         );
+        assert_eq!(
+            i["approval"][1].event().as_deref(),
+            Some("pullrequestreview-5354700998")
+        );
         let a = &i["forge-review"];
         assert_eq!(a.len(), 4);
         assert_eq!(
@@ -745,27 +829,30 @@ mod tests {
     #[test]
     fn evaluate_seen_sets() {
         let t0 = 1_000_000_000;
-        let (first, seen) = evaluate(&outputs("base"), &Seen::new(), t0);
+        let (first, seen) = eval(&outputs("base"), &Memory::default(), t0);
         assert_eq!(kinds(&first), BASE_KINDS);
-        let (second, seen) = evaluate(&outputs("news"), &seen, t0 + 1000);
+        let (second, seen) = eval(&outputs("news"), &seen, t0 + 1000);
         assert_eq!(kinds(&second), NEWS_KINDS);
         assert_eq!(
             second[0].items[0].url,
             "https://github.com/bootc-dev/bootc/pull/2437"
         );
         // Back to base: the news items are gone but remembered a while.
-        let (back, back_seen) = evaluate(&outputs("base"), &seen, t0 + 2000);
+        let (back, back_seen) = eval(&outputs("base"), &seen, t0 + 2000);
         assert!(back.is_empty(), "{back:?}");
-        assert!(
-            evaluate(&outputs("news"), &back_seen, t0 + 3000)
-                .0
-                .is_empty()
-        );
-        // Gone for longer: forgotten, and news when they come back.
-        let (none, forgot) = evaluate(&outputs("base"), &back_seen, t0 + 1000 + FORGET_MS);
+        assert!(eval(&outputs("news"), &back_seen, t0 + 3000).0.is_empty());
+        // Gone for longer: forgotten, and news when they come back, but
+        // for the reviews, comments and sign-offs, whose events are
+        // remembered longer.
+        let (none, forgot) = eval(&outputs("base"), &back_seen, t0 + 1000 + FORGET_MS);
         assert!(none.is_empty());
         assert_eq!(
-            kinds(&evaluate(&outputs("news"), &forgot, t0 + 2000 + FORGET_MS).0),
+            kinds(&eval(&outputs("news"), &forgot, t0 + 2000 + FORGET_MS).0),
+            ["health-P0"]
+        );
+        let (_, long_gone) = eval(&outputs("base"), &forgot, t0 + 1000 + REPORTED_KEEP_MS);
+        assert_eq!(
+            kinds(&eval(&outputs("news"), &long_gone, t0 + 2000 + REPORTED_KEEP_MS).0),
             NEWS_KINDS
         );
         // bot-watch cut short, bot-pr inbox failed: their sets are kept.
@@ -784,7 +871,7 @@ mod tests {
                 status: Some(1),
             },
         );
-        let (none, kept) = evaluate(&broken, &seen, t0 + 10 * FORGET_MS);
+        let (none, kept) = eval(&broken, &seen, t0 + 10 * FORGET_MS);
         assert!(none.is_empty());
         for set in [
             "health",
@@ -795,37 +882,67 @@ mod tests {
             "approval",
             "forge-review",
         ] {
-            assert_eq!(kept[set], seen[set], "{set}");
+            assert_eq!(kept.0[set], seen.0[set], "{set}");
         }
         // A step that didn't run at all counts the same.
         broken.remove(&Source::Watch);
         assert_eq!(
-            evaluate(&broken, &seen, t0 + 10 * FORGET_MS).1["health"],
-            seen["health"]
+            eval(&broken, &seen, t0 + 10 * FORGET_MS).1.0["health"],
+            seen.0["health"]
         );
+    }
+
+    fn inbox_approved(review: &str) -> BTreeMap<Source, Output> {
+        BTreeMap::from([(
+            Source::Inbox,
+            Output {
+                text: format!(
+                    "https://github.com/o/r/pull/1  [APPROVED]  Fix\n  2026-09-30T10:00:00Z review APPROVED: https://github.com/o/r/pull/1#pullrequestreview-{review}\n"
+                ),
+                status: Some(0),
+            },
+        )])
     }
 
     #[test]
     fn reapproval_is_news() {
-        let inbox = |review: &str| Output {
-            text: format!(
-                "https://github.com/o/r/pull/1  [APPROVED]  Fix\n  2026-09-30T10:00:00Z review APPROVED: https://github.com/o/r/pull/1#pullrequestreview-{review}\n"
-            ),
-            status: Some(0),
-        };
-        let (news, seen) = evaluate(
-            &BTreeMap::from([(Source::Inbox, inbox("1"))]),
-            &Seen::new(),
-            0,
-        );
+        let (news, seen) = eval(&inbox_approved("1"), &Memory::default(), 0);
         assert_eq!(kinds(&news), ["approval", "forge-review"]);
-        let (news, _) = evaluate(&BTreeMap::from([(Source::Inbox, inbox("2"))]), &seen, 1);
+        let (news, _) = eval(&inbox_approved("2"), &seen, 1);
         assert_eq!(kinds(&news), ["approval", "forge-review"]);
     }
 
     #[test]
+    fn a_reported_event_is_not_news_again() {
+        // Reported by a hot cycle: the sweep's listing of it is no news.
+        let reported = Reported::from([("pullrequestreview-7".to_string(), 0)]);
+        let (news, (_, reported)) = eval(&inbox_approved("7"), &(Seen::new(), reported), 1);
+        assert!(news.is_empty(), "{news:?}");
+        assert_eq!(reported["pullrequestreview-7"], 1, "still listed");
+        for (url, want) in [
+            (
+                "https://github.com/o/r/pull/1#pullrequestreview-7",
+                Some("pullrequestreview-7"),
+            ),
+            (
+                "https://github.com/o/r/issues/1#issuecomment-8",
+                Some("issuecomment-8"),
+            ),
+            (
+                "https://github.com/o/r/pull/1#discussion_r9",
+                Some("discussion_r9"),
+            ),
+            ("https://github.com/o/r/pull/1#issuecomment-", None),
+            ("https://github.com/o/r/pull/1#issue-9", None),
+            ("https://github.com/o/r/pull/1", None),
+        ] {
+            assert_eq!(event_id(url).as_deref(), want, "{url}");
+        }
+    }
+
+    #[test]
     fn failed_watch_sections_keep_their_sets() {
-        let (_, seen) = evaluate(&outputs("news"), &Seen::new(), 0);
+        let (_, seen) = eval(&outputs("news"), &Memory::default(), 0);
         let mut o = outputs("base");
         let watch = o.get_mut(&Source::Watch).unwrap();
         watch.text = watch.text.replace(
@@ -833,12 +950,12 @@ mod tests {
             "warning: the priority health sweep failed (status 1); its section is incomplete\n\
              warning: checking the bot's open PRs off the board failed (status 1); only the board's PRs were checked for outstanding reviews\nSwept ",
         );
-        let (news, next) = evaluate(&o, &seen, FORGET_MS * 10);
+        let (news, next) = eval(&o, &seen, FORGET_MS * 10);
         assert!(news.is_empty(), "{news:?}");
         for set in ["health", "review", "rebase"] {
-            assert_eq!(next[set], seen[set], "{set}");
+            assert_eq!(next.0[set], seen.0[set], "{set}");
         }
-        assert!(next["news"].is_empty(), "the whole sections are updated");
+        assert!(next.0["news"].is_empty(), "the whole sections are updated");
     }
 
     #[test]
@@ -882,7 +999,7 @@ mod tests {
             kind_title("forge-review", &other),
             "jmarrero's activity on fork PRs"
         );
-        let (news, _) = evaluate(&outputs("news"), &Seen::new(), 0);
+        let (news, _) = eval(&outputs("news"), &Memory::default(), 0);
         let line = news_line(&news, "1415", "/s/runs/x");
         assert!(line.starts_with("NEWS (health-P0, review, approval, signoff, notify, forge-review, rebase, health, news) at 1415: /s/runs/x/*.txt"));
     }

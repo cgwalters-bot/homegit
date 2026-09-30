@@ -360,8 +360,14 @@ impl Store {
     /// Checks run `id` for news, updating state; the NEWS line, if any.
     fn check(&self, state: &mut State, id: &str) -> Option<String> {
         let now = Utc::now();
-        let (news, seen) = evaluate(&self.read_run(id), &state.seen, now.timestamp_millis());
+        let (news, seen, reported) = evaluate(
+            &self.read_run(id),
+            &state.seen,
+            &state.reported,
+            now.timestamp_millis(),
+        );
         state.seen = seen;
+        state.reported = reported;
         state.evaluated = Some(id.to_string());
         if news.is_empty() {
             return None;

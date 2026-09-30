@@ -2807,7 +2807,8 @@ cmd_inbox() {
         echo "${url}${verdict:+  [${verdict}]}  $(jq -r .title <<<"${pr}")"
         test -z "${lines}" || echo "${lines}"
         if [[ "${verdict}" == APPROVED ]] || [[ "${verdict}" == "APPROVED, "* ]]; then
-            echo "  -> approved: $(basename "$0") promote ${url}$([[ "${verdict}" == *"${DRAFT_COMMAND}"* ]] && echo " --draft")"
+            # Names the approving review or comment, which bot-poll keys it by.
+            echo "  -> approved by $(verdict approval.url): $(basename "$0") promote ${url}$([[ "${verdict}" == *"${DRAFT_COMMAND}"* ]] && echo " --draft")"
         else
             if [[ "${verdict}" == *"new commits since"* ]]; then
                 echo "  -> needs ${REVIEWER} to approve the current head (or comment '${PROMOTE_COMMAND}' again) before promote"
