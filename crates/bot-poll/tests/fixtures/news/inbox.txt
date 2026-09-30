@@ -6,8 +6,8 @@ https://github.com/cgwalters-forge/bootc/pull/15  composefs: Declare the backend
     > Looks like this needs a rebase
 https://github.com/cgwalters-forge/bootc/pull/23  [APPROVED]  install: Default to the composefs backend for composefs-only images
   2026-09-29T18:43:54Z review APPROVED: https://github.com/cgwalters-forge/bootc/pull/23#pullrequestreview-5356903990
-  -> approved: bot-pr promote https://github.com/cgwalters-forge/bootc/pull/23
+  -> approved by https://github.com/cgwalters-forge/bootc/pull/23#pullrequestreview-5356903990: bot-pr promote https://github.com/cgwalters-forge/bootc/pull/23
 https://github.com/cgwalters-forge/bootc/pull/24  [APPROVED]  install/config: Skip config fragments that vanish while loading
   2026-09-30T14:20:59Z review APPROVED: https://github.com/cgwalters-forge/bootc/pull/24#pullrequestreview-5354700998
-  -> approved: bot-pr promote https://github.com/cgwalters-forge/bootc/pull/24
+  -> approved by https://github.com/cgwalters-forge/bootc/pull/24#pullrequestreview-5354700998: bot-pr promote https://github.com/cgwalters-forge/bootc/pull/24
 12 open fork PR(s); 4 with activity by cgwalters or awaiting promote
