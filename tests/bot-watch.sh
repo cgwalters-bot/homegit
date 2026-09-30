@@ -346,8 +346,11 @@ for failure in "502 Bad Gateway|HTTP 502: Bad Gateway" "403 Forbidden|API rate l
         and ([.outstanding_reviews[].link] == [$link, "\($own)#pullrequestreview-6"])'
     jq -e .swept_at "${WORK}/search.state" >/dev/null ||
         fail "search ${failure%%|*}: the state wasn't written: $(cat "${WORK}/search.state")"
-    grep -q "only the board's PRs were checked" "${WORK}/search.err" ||
-        fail "search ${failure%%|*}: no warning: $(cat "${WORK}/search.err")"
+    # bot-poll matches these warnings: see WATCH_SECTION_FAILURES.
+    if ! grep -q "only the board's PRs were checked for outstanding reviews" "${WORK}/search.err" ||
+        ! grep -q "looking for sign-offs due failed" "${WORK}/search.err"; then
+        fail "search ${failure%%|*}: no warnings: $(cat "${WORK}/search.err")"
+    fi
 done
 rm "${REST}/search/issues.fail"
 
@@ -355,8 +358,9 @@ rm "${REST}/search/issues.fail"
 # two pages (the fake answers every page alike) is read and listed once.
 # The search API stops at 1000 results, with a warning.
 cp "${REST}/search/issues.json" "${WORK}/search.json.orig"
-# sweep runs the tool twice (text and JSON): twice the requests.
-for c in "150|4|" "5000|20|over 1000 open PRs"; do
+# sweep runs the tool twice (text and JSON), and bot-signoff-due's own
+# search pages alike: four times the requests.
+for c in "150|8|" "5000|40|over 1000 open PRs"; do
     IFS='|' read -r total calls warning <<<"${c}"
     jq -c --argjson n "${total}" '.total_count = $n' "${WORK}/search.json.orig" >"${REST}/search/issues.json"
     : >"${FAKE_GH}/calls"
@@ -629,5 +633,32 @@ rc=0
 test "${rc}" -eq 75 || fail "phfail: priority health's rate limiting should exit 75, not ${rc}: $(cat "${WORK}/phfail-rl.err")"
 rm -f "${REST}/repos/example/phbad/pulls/2.fail"
 
+# --- Sign-offs ---
+# bootc#2516: cgwalters approved the head of the bot's upstream PR, but
+# its DCO check kept failing. Listed, with the 'bot-pr signoff' that
+# --apply runs (a --board-file sweep only prints it; bot-signoff-due's
+# own tests cover which PRs are due).
+readonly SO=${GH}/example/so/pull/1 SO_HEAD=dddd000000000000000000000000000000000001
+pr example/so 1 "${SO_HEAD}" 2026-09-25T17:00:00Z
+jq -nc --arg head "${SO_HEAD}" '[{id: 1, user: {login: "cgwalters"}, state: "APPROVED", commit_id: $head,
+    submitted_at: "2026-09-25T17:00:00Z", body: "", html_url: "x"}]' | jq -c '.[]' | reviews repos/example/so/pulls/1
+: | comments repos/example/so/issues/1
+commit example/so "${SO_HEAD}" 2026-09-25T16:00:00Z
+put "repos/example/so/commits/${SO_HEAD}/check-runs" \
+    '{"total_count": 1, "check_runs": [{"name": "DCO", "status": "completed", "conclusion": "action_required", "app": {"slug": "dco"}}]}'
+cp "${REST}/search/issues.json" "${WORK}/search.json.orig"
+put search/issues "$(jq -nc --arg u "${SO}" '{total_count: 1, items: [{html_url: $u, user: {login: "cgwalters-bot"}}]}')"
+echo '[]' >"${WORK}/so-board.json"
+for mode in --json --dry-run; do
+    "${BOT_WATCH}" --apply "${mode}" --now 2026-09-25T18:00:00Z --board-file "${WORK}/so-board.json" \
+        --state-file "${WORK}/so.state" >"${WORK}/so${mode}" 2>"${WORK}/so.err" || { cat "${WORK}/so.err" 1>&2; fail "so ${mode}: sweep failed"; }
+done
+jq -e --arg u "${SO}" '.signoffs == [{url: $u, head: "'"${SO_HEAD}"'", result: "would-run", new_head: null, detail: "",
+    line: "Would run: bot-pr signoff \($u)"}] and (.signoffs_failed | not)' "${WORK}/so--json" >/dev/null ||
+    fail "so: the sign-offs: $(jq -c . "${WORK}/so--json")"
+[[ "$(<"${WORK}/so--dry-run")" == *$'Sign-offs:\n  Would run: bot-pr signoff '"${SO}"$'\n\n'* ]] ||
+    fail "so: the text report lacks the section: $(cat "${WORK}/so--dry-run")"
+cp "${WORK}/search.json.orig" "${REST}/search/issues.json"
+
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
-echo "ok: bot-watch first-sight news, outstanding reviews, PRs that need a rebase and priority health as expected"
+echo "ok: bot-watch first-sight news, outstanding reviews, PRs that need a rebase, priority health and sign-offs as expected"

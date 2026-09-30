@@ -485,5 +485,6 @@ if (require.main === module) {
     process.exit(e.status);
   });
 } else {
-  module.exports = { targets, checkProblems, render };
+  // Shared with bot-signoff-due, which reads PRs the same way.
+  module.exports = { Exit, restGet, checkRuns, checkProblems, pool, targets, render, BOT_LOGIN, FORK_OWNERS, FORK_META, EX_RATELIMIT };
 }

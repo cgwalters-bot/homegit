@@ -1,0 +1,272 @@
+#!/usr/bin/env node
+// Finds the bot's upstream PRs that cgwalters approved at their current
+// head but whose DCO check fails, and with --apply runs 'bot-pr signoff'
+// on each. bot-watch runs it on every sweep. See --help.
+// Node's standard library only, plus gh (through bot-priority-health's
+// REST helpers, with their ETag cache) and bot-pr.
+"use strict";
+
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const { promisify } = require("node:util");
+
+const execFileP = promisify(execFile);
+
+const PROG = path.basename(process.argv[1] || "bot-signoff-due");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const {
+  Exit, restGet, checkRuns, checkProblems, pool, BOT_LOGIN, FORK_OWNERS, FORK_META, EX_RATELIMIT,
+} = require(path.join(BIN_DIR, "bot-priority-health"));
+const BOT_PR = process.env.BOT_SIGNOFF_DUE_BOT_PR || path.join(BIN_DIR, "bot-pr");
+const REVIEWER = "cgwalters";
+// His reviews that decide whether a PR is approved, as in bot-pr's
+// upstream_approval: a later comment-only review leaves an approval be.
+const DECIDING_STATES = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
+// Only PRs he reviewed can be due, which keeps the sweep small.
+const SEARCH_Q = `is:pr+is:open+author:${BOT_LOGIN}+reviewed-by:${REVIEWER}`;
+const PER_PAGE = 100;
+// The search API returns at most 1000 results.
+const SEARCH_MAX_PAGES = 10;
+const SHORT_SHA = 12;
+const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/([0-9]+)$/;
+// The heads 'bot-pr signoff' refused, or signed without changing: their
+// result is listed again instead of retrying, until the head moves or
+// the attempt is RETRY_HOURS old (a refusal's cause, such as a stale
+// policy record, may be fixed by then).
+const RETRY_HOURS = 6;
+const ATTEMPTS_FILE = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "bot-signoff-due", "attempts.json");
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+function usage() {
+  return `Usage: ${PROG} [--apply | --dry-run] [--json]
+
+Finds the open PRs by ${BOT_LOGIN} outside its fork PRs (in ${FORK_OWNERS.join(", ")}
+with a bot-meta section) where both hold:
+
+  - the DCO check fails on the PR's head (commits lack a Signed-off-by);
+  - ${REVIEWER}'s latest review that approves, requests changes or was
+    dismissed is an approval of that head.
+
+That is an upstream PR opened without his sign-off (or pushed to since)
+that he approved as it is: 'bot-pr signoff URL' adds his sign-off,
+itself enforcing every rule (his approval of that exact head, only the
+bot's commits, the contribution policy gate). Once it has, the head
+moves and the PR is no longer due, so running this again is harmless.
+
+Prints one line per PR:
+
+  Sign-off due: URL at HEAD          (without --apply)
+  Would run: bot-pr signoff URL      (--dry-run)
+  Signed off: URL (NEWHEAD)          (--apply)
+  Sign-off refused: URL at HEAD: WHY (--apply; bot-pr signoff said no)
+  Sign-off changed nothing: URL at HEAD: ...
+                                     (--apply; every commit has his
+                                     sign-off already, yet DCO fails)
+
+and nothing when no PR is due. A head 'bot-pr signoff' refused or left
+unchanged isn't tried again for ${RETRY_HOURS}h: its line is repeated from
+${ATTEMPTS_FILE.replace(os.homedir(), "~")} (as --dry-run does too) until the head
+moves or that time is up. Once its cause is fixed, run 'bot-pr signoff
+URL' by hand rather than wait.
+
+Options:
+  --apply     run 'bot-pr signoff' on each PR that is due
+  --dry-run   print what --apply would run, and change nothing
+  --json      print a JSON array of {url, head, result, new_head, detail,
+              line} (result: due, would-run, signed, refused, unchanged)
+  -h, --help  show this help
+
+Exits 1 if the search or a PR could not be read (the others are still
+handled), and ${EX_RATELIMIT} if GitHub is rate limiting the bot (having
+printed the sign-offs made before). A refused sign-off is reported, not
+an error.
+`;
+}
+
+function parseArgs(argv) {
+  const opts = { apply: false, dryRun: false, json: false };
+  for (const a of argv) {
+    switch (a) {
+      case "-h":
+      case "--help":
+        process.stdout.write(usage());
+        process.exit(0);
+      case "--apply": opts.apply = true; break;
+      case "--dry-run": opts.dryRun = true; break;
+      case "--json": opts.json = true; break;
+      default:
+        throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    }
+  }
+  if (opts.apply && opts.dryRun) throw new Exit(EX_USAGE, "--apply and --dry-run exclude each other");
+  return opts;
+}
+
+const warn = (msg) => process.stderr.write(`${PROG}: warning: ${msg}\n`);
+
+// approvedHead(reviews): the commit REVIEWER's deciding review approves,
+// or null when his latest deciding review isn't an approval.
+function approvedHead(reviews) {
+  const his = reviews
+    .filter((r) => r.user && r.user.login === REVIEWER && DECIDING_STATES.includes(r.state) && r.submitted_at)
+    .sort((a, b) => Date.parse(a.submitted_at) - Date.parse(b.submitted_at));
+  const last = his[his.length - 1];
+  return last && last.state === "APPROVED" && last.commit_id ? last.commit_id : null;
+}
+
+// isDue(owner, pr, reviews, runs, statuses): whether a PR (REST pull) in
+// a repository of owner needs REVIEWER's sign-off now, by the rules in
+// usage().
+function isDue(owner, pr, reviews, runs, statuses) {
+  if (pr.state !== "open" || pr.user.login !== BOT_LOGIN) return false;
+  if (isForkPr(owner, pr.body)) return false;
+  if (approvedHead(reviews) !== pr.head.sha) return false;
+  return checkProblems(runs, statuses, new Date()).some(([reason]) => reason === "dco");
+}
+
+async function pages(p) {
+  const out = [];
+  for (let page = 1; ; page++) {
+    const body = await restGet(`${p}${p.includes("?") ? "&" : "?"}per_page=${PER_PAGE}&page=${page}`);
+    if (!Array.isArray(body)) return out;
+    out.push(...body);
+    if (body.length < PER_PAGE) return out;
+  }
+}
+
+// isForkPr(owner, body): whether the bot's PR in a repository of owner
+// with this body is one of its fork PRs, as in bot-watch.
+const isForkPr = (owner, body) => FORK_OWNERS.includes(owner) && (body || "").includes(FORK_META);
+
+// candidates(): the URLs of the bot's open PRs that REVIEWER reviewed,
+// but for its fork PRs.
+async function candidates() {
+  const urls = [];
+  for (let page = 1; page <= SEARCH_MAX_PAGES; page++) {
+    const body = await restGet(`search/issues?q=${SEARCH_Q}&per_page=${PER_PAGE}&page=${page}`);
+    if (!body || !Array.isArray(body.items)) throw new Exit(EX_ERROR, "the search for the bot's reviewed PRs answered nothing usable");
+    for (const i of body.items) {
+      const m = PR_URL_RE.exec(i.html_url || "");
+      if (m && !isForkPr(m[1], i.body)) urls.push(i.html_url);
+    }
+    if (page * PER_PAGE >= body.total_count || !body.items.length) break;
+  }
+  return [...new Set(urls)];
+}
+
+// check(url): {url, head} for a PR that is due, else null.
+async function check(url) {
+  const [, owner, name, number] = PR_URL_RE.exec(url);
+  const repo = `${owner}/${name}`;
+  const pr = await restGet(`repos/${repo}/pulls/${number}`);
+  if (!pr) return null;
+  // The cheap tests first: most PRs he reviewed aren't approved at their head.
+  const reviews = await pages(`repos/${repo}/pulls/${number}/reviews`);
+  if (pr.state !== "open" || approvedHead(reviews) !== pr.head.sha) return null;
+  const runs = await checkRuns(repo, pr.head.sha);
+  const status = await restGet(`repos/${repo}/commits/${pr.head.sha}/status?per_page=${PER_PAGE}`);
+  return isDue(owner, pr, reviews, runs, (status && status.statuses) || []) ? { url, head: pr.head.sha } : null;
+}
+
+// signoff(url, head): {result, new_head, detail} of running 'bot-pr
+// signoff' on the PR at head.
+async function signoff(url, head) {
+  try {
+    const { stdout } = await execFileP(BOT_PR, ["signoff", url], { maxBuffer: 64 << 20 });
+    const newHead = stdout.trim().split("\n").pop() || "";
+    if (newHead === head) return { result: "unchanged", new_head: newHead, detail: "every commit has his sign-off already, yet DCO fails" };
+    return { result: "signed", new_head: newHead, detail: "" };
+  } catch (e) {
+    if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (bot-pr signoff ${url})`);
+    const lines = (e.stderr || e.message || "").trim().split("\n").filter(Boolean);
+    return { result: "refused", new_head: null, detail: (lines.pop() || `exit status ${e.code}`).replace(/^error: /, "") };
+  }
+}
+
+// The attempts file, {"URL@HEAD": {result, new_head, detail, at}}: only
+// the PRs due now are kept, so a head that moved (or a PR no longer due)
+// is forgotten.
+function loadAttempts() {
+  try {
+    return JSON.parse(fs.readFileSync(ATTEMPTS_FILE, "utf8"));
+  } catch (e) {
+    if (e.code !== "ENOENT") warn(`ignoring ${ATTEMPTS_FILE}: ${e.message}`);
+    return {};
+  }
+}
+
+function saveAttempts(attempts) {
+  fs.mkdirSync(path.dirname(ATTEMPTS_FILE), { recursive: true });
+  const tmp = `${ATTEMPTS_FILE}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, `${JSON.stringify(attempts)}\n`);
+  fs.renameSync(tmp, ATTEMPTS_FILE);
+}
+
+function line(r) {
+  const at = `${r.url} at ${r.head.slice(0, SHORT_SHA)}`;
+  switch (r.result) {
+    case "due": return `Sign-off due: ${at}`;
+    case "would-run": return `Would run: bot-pr signoff ${r.url}`;
+    case "signed": return `Signed off: ${r.url} (${r.new_head.slice(0, SHORT_SHA)})`;
+    case "unchanged": return `Sign-off changed nothing: ${at}: ${r.detail}`;
+    default: return `Sign-off refused: ${at}: ${r.detail}`;
+  }
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const urls = await candidates();
+  const failed = [];
+  const due = (await pool(urls, async (url) => {
+    try {
+      return await check(url);
+    } catch (e) {
+      if (e instanceof Exit && e.status === EX_RATELIMIT) throw e;
+      warn(`reading ${url} failed: ${e.message}`);
+      failed.push(url);
+      return null;
+    }
+  })).filter(Boolean);
+  const tried = loadAttempts();
+  const attempts = {};
+  const results = [];
+  let rateLimited = null;
+  // One at a time: each clones and pushes.
+  for (const d of due) {
+    const key = `${d.url}@${d.head}`;
+    let r = { result: "due", new_head: null, detail: "" };
+    const t = tried[key];
+    if (t && Date.now() - Date.parse(t.at) < RETRY_HOURS * 3600 * 1000) r = t;
+    else if (opts.dryRun) r = { ...r, result: "would-run" };
+    else if (opts.apply) {
+      try {
+        r = await signoff(d.url, d.head);
+      } catch (e) {
+        // What was signed already must still be reported.
+        if (!(e instanceof Exit)) throw e;
+        rateLimited = e;
+        break;
+      }
+    }
+    if (r.result === "refused" || r.result === "unchanged") attempts[key] = { at: new Date().toISOString(), ...r };
+    const { at, ...shown } = r;
+    results.push({ ...d, ...shown, line: line({ ...d, ...shown }) });
+  }
+  if (opts.apply && !rateLimited) saveAttempts(attempts);
+  process.stdout.write(opts.json ? `${JSON.stringify(results)}\n` : results.map((r) => `${r.line}\n`).join(""));
+  if (rateLimited) throw rateLimited;
+  if (failed.length) throw new Exit(EX_ERROR, `${failed.length} PR(s) could not be read; they are not listed`);
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  });
+} else {
+  module.exports = { approvedHead, isDue };
+}
