@@ -48,6 +48,7 @@ const DCO_NAME_RE = /(^|[^a-z0-9])dco([^a-z0-9]|$)/i;
 // The problems, in the order they are listed for one PR.
 const REASONS = ["ci-failing", "dco", "ci-pending", "conflict", "behind", "stale"];
 const CHECKS_PER_PAGE = 100;
+const PER_PAGE = 100;
 const SHORT_SHA = 12;
 const MAX_NAMES = 6;
 const API_CONCURRENCY = 6;
@@ -375,6 +376,18 @@ function checkProblems(runs, statuses, now) {
   return problems;
 }
 
+// pages(p): every item of the paginated array at the API path p (empty
+// if GitHub says it doesn't exist).
+async function pages(p) {
+  const out = [];
+  for (let page = 1; ; page++) {
+    const body = await restGet(`${p}${p.includes("?") ? "&" : "?"}per_page=${PER_PAGE}&page=${page}`);
+    if (!Array.isArray(body)) return out;
+    out.push(...body);
+    if (body.length < PER_PAGE) return out;
+  }
+}
+
 async function checkRuns(repo, sha) {
   const runs = [];
   for (let page = 1; ; page++) {
@@ -487,5 +500,5 @@ if (require.main === module) {
   });
 } else {
   // Shared with bot-signoff-due, which reads PRs the same way.
-  module.exports = { Exit, restGet, checkRuns, checkProblems, pool, targets, render, BOT_LOGIN, FORK_OWNERS, FORK_META, EX_RATELIMIT };
+  module.exports = { Exit, restGet, pages, checkRuns, checkProblems, pool, targets, render, BOT_LOGIN, FORK_OWNERS, FORK_META, EX_RATELIMIT };
 }
