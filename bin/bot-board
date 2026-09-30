@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Thin CLI over 'gh project' for the cgwalters-bot Workstream board (and
-# the bot's other boards, with --project).
+# Thin CLI over 'gh project' for the bot's Workstream board (and the
+# bot's other boards, with --project). The operator config (bin/operator.sh)
+# names the bot, the operator, the board and the tracker.
 # GraphQL queries hold literal $variables.
 # shellcheck disable=SC2016
 set -euo pipefail
@@ -10,8 +11,10 @@ source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
     exit 1
 }
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/operator.sh"
 
-readonly BOT_LOGIN=cgwalters-bot
+readonly BOT_LOGIN=${OP_BOT_LOGIN}
 # The boards this tool can target, by --project name, as KIND/OWNER/NUMBER
 # (KIND is users or orgs, as in REST paths). The Workstream board is the
 # bot's work queue and holds the state items; the others are milestone
@@ -19,9 +22,13 @@ readonly BOT_LOGIN=cgwalters-bot
 # environment variable for this: the other bot scripts call bot-board
 # and must always reach the Workstream board. It is an org project
 # because GitHub Apps and fine-grained tokens can write those but not a
-# user's (cgwalters-forge/tracker#144).
-readonly -A PROJECTS=([workstream]=orgs/cgwalters-forge/1 [composefs-stable]=users/cgwalters-bot/2)
+# user's (cgwalters-forge/tracker#144). The operator config names them
+# (board and board.epics).
 readonly WORKSTREAM=workstream
+declare -A PROJECTS=([${WORKSTREAM}]=${OP_BOARD})
+for _p in "${!OP_BOARD_EPICS[@]}"; do PROJECTS[${_p}]=${OP_BOARD_EPICS[${_p}]}; done
+unset _p
+readonly -A PROJECTS
 # Set by select_project: the board's KIND/OWNER/NUMBER and its parts.
 PROJECT=
 OWNER_KIND=
@@ -35,19 +42,20 @@ readonly SET_OPTIONS=(--status --priority --workflow --org --why --branch --gist
 # Free-text fields; the rest of SET_OPTIONS are single-selects.
 readonly TEXT_FIELDS=(Why Branch Gist)
 # The Org field says which organization an item's work targets, so the
-# board can be filtered to the bot's own infrastructure (the
-# cgwalters-forge and cgwalters-bot options) or to work going outbound.
-# A fork owned by one of FORK_OWNERS counts as its upstream's: fork PRs
-# in cgwalters-forge target their upstream, as do branches in cgwalters'
-# and the bot's personal forks. Their other repositories are their own:
-# cgwalters-forge/review is cgwalters-forge.
-readonly FORK_OWNERS=(cgwalters-forge cgwalters-bot cgwalters)
+# board can be filtered to the bot's own infrastructure (the forge org's
+# and the bot's options) or to work going outbound. A fork owned by one
+# of FORK_OWNERS counts as its upstream's: fork PRs in the forge org
+# target their upstream, as do branches in the operator's and the bot's
+# personal forks. Their other repositories are their own: the forge
+# org's review app is the forge org's.
+readonly FORK_OWNERS=("${OP_FORGE_ORG}" "${OP_BOT_LOGIN}" "${OP_OPERATOR_LOGIN}")
 # Owners with an Org other than their name.
-readonly -A OWNER_ORGS=([cgwalters]=cgwalters-bot)
+readonly -A OWNER_ORGS=(["${OP_OPERATOR_LOGIN}"]="${OP_BOT_LOGIN}")
 # Repositories with an Org other than their owner's, lowercase.
 readonly -A REPO_ORGS=(
-    # The bot's runner setup; it lives in bootc-dev for its runners.
-    [bootc-dev/cgwalters-devspace-sandbox]=cgwalters-bot
+    # The bot's runner setup, which may live elsewhere for its runners
+    # (bootc-dev, for cgwalters-bot).
+    [${OP_DEVSPACE_REPO,,}]=${OP_BOT_LOGIN}
 )
 # First path components of github.com URLs that aren't repositories.
 readonly NON_REPO_PATHS=(users orgs settings notifications sponsors marketplace apps)
@@ -64,11 +72,11 @@ readonly -A TITLE_ORGS=(
     [cargo-vendor-filterer]=coreos [zlink]=z-galaxy [podman]=containers
     [image-builder]=osbuild [bootc-image-builder]=osbuild [osbuild]=osbuild
     [rhel-bootc-examples]=redhat-cop
-    [review]=cgwalters-forge
-    [bot-board]=cgwalters-bot [bot-notify]=cgwalters-bot [bot-pr]=cgwalters-bot
-    [bot-watch]=cgwalters-bot [bot-work]=cgwalters-bot [bot-runs]=cgwalters-bot
-    [homegit]=cgwalters-bot [devspace]=cgwalters-bot [coordinator]=cgwalters-bot
-    [board]=cgwalters-bot
+    [review]=${OP_FORGE_ORG}
+    [bot-board]=${OP_BOT_LOGIN} [bot-notify]=${OP_BOT_LOGIN} [bot-pr]=${OP_BOT_LOGIN}
+    [bot-watch]=${OP_BOT_LOGIN} [bot-work]=${OP_BOT_LOGIN} [bot-runs]=${OP_BOT_LOGIN}
+    [homegit]=${OP_BOT_LOGIN} [devspace]=${OP_BOT_LOGIN} [coordinator]=${OP_BOT_LOGIN}
+    [board]=${OP_BOT_LOGIN}
 )
 # Org edits sent per GraphQL request by fill-org.
 readonly ORG_BATCH=20
@@ -76,9 +84,9 @@ readonly ORG_BATCH=20
 # here: work items, parents of larger efforts, and questions for
 # OPERATOR. Its issues say nothing about which organization their work
 # targets, so the Org of an item there comes from its title and body.
-readonly TRACKER_REPO=cgwalters-forge/tracker
+readonly TRACKER_REPO=${OP_TRACKER_REPO}
 # The only login whose answers count; questions are assigned to him.
-readonly OPERATOR=cgwalters
+readonly OPERATOR=${OP_OPERATOR_LOGIN}
 readonly QUESTION_LABEL=question
 # Asks that aren't questions: approving a PR at a given head, and chores
 # such as rerunning failed CI jobs. Each ask is one issue, with one of
@@ -104,7 +112,7 @@ readonly PRIORITY_COLOR_OTHER=bdbdbd
 # Targets are one hue family: outbound work darker than own infra.
 readonly TARGET_COLOR=1d76db
 readonly TARGET_COLOR_OWN=bfd4f2
-readonly OWN_ORGS=(cgwalters-bot cgwalters-forge)
+readonly OWN_ORGS=("${OP_BOT_LOGIN}" "${OP_FORGE_ORG}")
 # Every gh project call spends the bot's GraphQL quota (5000 points/hour),
 # which all agents share, so reads are cached on disk. The item list
 # comes from the REST API instead, revalidated with ETags once ITEMS_TTL
@@ -123,16 +131,20 @@ readonly EX_RATELIMIT=75
 # Scripts keep state shared across machines in archived draft items titled
 # STATE_PREFIX + NAME, holding a fenced JSON block. GitHub's API doesn't
 # list archived items (it ignores archivedStates), so they can't be found
-# by title: their ids are recorded here once state-put has created them,
-# as "ITEM_ID DRAFT_ID" so that state-put can write the draft directly.
+# by title: their ids are recorded once state-put has created them (until
+# then, in the cache), as "ITEM_ID DRAFT_ID" so that state-put can write
+# the draft directly: here for the default config's board, and in the
+# operator config's board.state_items for any other.
 readonly STATE_PREFIX='bot-state: '
-readonly -A STATE_ITEMS=(
+readonly DEFAULT_STATE_BOARD=orgs/cgwalters-forge/1
+readonly -A DEFAULT_STATE_ITEMS=(
     [notifications]='PVTI_lADOE9oHIs4BlJLczg9kJYo DI_lADOE9oHIs4BlJLczgLPK1o'
     [watch]='PVTI_lADOE9oHIs4BlJLczg9kJVU DI_lADOE9oHIs4BlJLczgLPK1Y'
     [pr-inbox]='PVTI_lADOE9oHIs4BlJLczg9kJXQ DI_lADOE9oHIs4BlJLczgLPK1k'
     [lease]='PVTI_lADOE9oHIs4BlJLczg9kJRo DI_lADOE9oHIs4BlJLczgLPK1I'
     [tmt-numbers]='PVTI_lADOE9oHIs4BlJLczg9kJT8 DI_lADOE9oHIs4BlJLczgLPK1U'
 )
+readonly STATE_ITEMS_FIX="board.state_items in the operator config (${OP_CONFIG_PATH})"
 # GitHub's limit on the body of a draft item, in characters.
 readonly STATE_BODY_MAX=65536
 # Per state item, the last state this machine read from or wrote to the
@@ -179,7 +191,7 @@ Commands:
   show ITEM                   Show all fields of one item
   add [--priority P] URL      Add an issue or PR and set its Org from the
                               URL's repository (a fork's upstream, for
-                              forks in cgwalters-forge); prints the new
+                              forks in ${OP_FORGE_ORG}); prints the new
                               item id
   issue [--parent ITEM] [--org O] [--priority P] TITLE BODY
                               Open an issue in ${TRACKER_REPO} and add it
@@ -1417,7 +1429,7 @@ state_name_ok() {
 # is limited in size.
 state_body() {
     printf '%s\n\n```json\n%s\n```\n' \
-        "State of a script in bin/ of cgwalters-bot/homegit, shared by every machine it runs on. Archived on purpose; only the script edits it." \
+        "State of a script in bin/ of ${OP_BOT_HOMEGIT_REPO}, shared by every machine it runs on. Archived on purpose; only the script edits it." \
         "$(jq -c . <<<"$1")"
 }
 
@@ -1442,15 +1454,16 @@ STATE_DRAFT=
 STATE_BODY=
 
 # state_ids NAME: sets STATE_ITEM and STATE_DRAFT to the ids of the state
-# item NAME, from STATE_ITEMS or, for one created since, the cache, or
+# item NAME, from the operator config, DEFAULT_STATE_ITEMS or, for one created since, the cache, or
 # returns 1 if it doesn't exist yet.
 state_ids() {
-    local ids=${STATE_ITEMS[$1]:-}
+    local ids=${OP_BOARD_STATE_ITEMS[$1]:-}
+    test -n "${ids}" || test "${OP_BOARD}" != "${DEFAULT_STATE_BOARD}" || ids=${DEFAULT_STATE_ITEMS[$1]:-}
     test -n "${ids}" || read -r ids 2>/dev/null <"${BOARD_CACHE}/state-$1" || true
     test -n "${ids}" || return 1
     read -r STATE_ITEM STATE_DRAFT <<<"${ids}"
     [[ "${STATE_ITEM}" == PVTI_* && "${STATE_DRAFT}" == DI_* ]] ||
-        fatal "the ids of the state item '$1' are not 'PVTI_... DI_...': '${ids}'; fix STATE_ITEMS in $(basename "$0") or ${BOARD_CACHE}/state-$1"
+        fatal "the ids of the state item '$1' are not 'PVTI_... DI_...': '${ids}'; fix ${STATE_ITEMS_FIX} or ${BOARD_CACHE}/state-$1"
 }
 
 # find_state NAME: sets STATE_ITEM, STATE_DRAFT and STATE_BODY to the
@@ -1461,7 +1474,7 @@ find_state() {
     data=$(gqlq "${STATE_NODE_QUERY}" -f id="${STATE_ITEM}") || fail_after $? "reading the state item ${STATE_ITEM} failed"
     jq -e --arg t "${STATE_PREFIX}$1" --arg draft "${STATE_DRAFT}" \
         '.node.content.title == $t and .node.content.id == $draft' <<<"${data}" >/dev/null ||
-        fatal "${STATE_ITEM} is not the '${STATE_PREFIX}$1' draft item ${STATE_DRAFT} (deleted?); fix STATE_ITEMS in $(basename "$0"), or remove ${BOARD_CACHE}/state-$1 to create a new one"
+        fatal "${STATE_ITEM} is not the '${STATE_PREFIX}$1' draft item ${STATE_DRAFT} (deleted?); fix ${STATE_ITEMS_FIX}, or remove ${BOARD_CACHE}/state-$1 to create a new one"
     STATE_BODY=$(jq -r .node.content.body <<<"${data}")
     jq -e .node.isArchived <<<"${data}" >/dev/null ||
         echo "warning: the state item ${STATE_ITEM} is not archived; it shows on the board" 1>&2
@@ -1564,7 +1577,7 @@ write_state() {
             fail_after $? "writing the state item ${STATE_ITEM} (${STATE_DRAFT}) failed"
         title=$(jq -r .updateProjectV2DraftIssue.draftIssue.title <<<"${data}")
         test "${title}" = "${STATE_PREFIX}${name}" ||
-            fatal "wrote the state '${name}' into the draft ${STATE_DRAFT} titled '${title}'; fix STATE_ITEMS in $(basename "$0") and restore that draft"
+            fatal "wrote the state '${name}' into the draft ${STATE_DRAFT} titled '${title}'; fix ${STATE_ITEMS_FIX} and restore that draft"
         return 0
     fi
     # Workflow manual, so that nothing ever claims it, even unarchived.
@@ -1583,11 +1596,11 @@ write_state() {
         fail_after $? "archiving the state item ${id} failed; archive it by hand"
     local draft
     draft=$(gqlq "${STATE_NODE_QUERY}" -f id="${id}") ||
-        fail_after $? "looking up the draft of the new state item ${id} failed; add it to STATE_ITEMS by hand"
+        fail_after $? "looking up the draft of the new state item ${id} failed; add it to ${STATE_ITEMS_FIX} by hand"
     draft=$(jq -r .node.content.id <<<"${draft}")
     mkdir -p "${BOARD_CACHE}"
     echo "${id} ${draft}" >"${BOARD_CACHE}/state-${name}"
-    echo "Created and archived the state item ${id} ('${STATE_PREFIX}${name}'); add [${name}]='${id} ${draft}' to STATE_ITEMS in $(basename "$0")" 1>&2
+    echo "Created and archived the state item ${id} ('${STATE_PREFIX}${name}'); add \"${name}\": {\"item\": \"${id}\", \"draft\": \"${draft}\"} to ${STATE_ITEMS_FIX}" 1>&2
 }
 
 # checked_put NAME JSON STRICT: state-put --checked (see usage).
