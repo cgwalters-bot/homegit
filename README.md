@@ -7,7 +7,7 @@ used as the dotfiles and prompt repository for the
 bot that helps with upstream contributions. Commits made from this
 environment are authored as `Colin Walters <walters+llm@verbum.org>` (see
 `bin/bot-git`), and the agents' work is
-coordinated through the [Workstream](https://github.com/users/cgwalters-bot/projects/1)
+coordinated through the [Workstream](https://github.com/orgs/cgwalters-forge/projects/1)
 project board: a human moves items into Todo, the bot claims them, pushes
 tested branches to forks in the [cgwalters-forge](https://github.com/cgwalters-forge)
 organization and proposes them there as draft PRs (Draft),
