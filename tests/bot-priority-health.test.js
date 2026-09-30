@@ -262,6 +262,27 @@ test("an unreadable PR costs only its lines, and exits 1; rate limiting exits 75
   fs.rmSync(fail);
 });
 
+test("a bug or a surprising response on one PR skips only it, cleanly, not the whole section", () => {
+  // Unlike a clean gh failure (above), this is what an uncaught bug in
+  // the tool itself would raise (here, unparseable JSON from gh):
+  // before the fix, the pool's worker rethrew it past sweep(), an
+  // unhandled rejection that lost every PR's lines, not just this one's.
+  const pr = "repos/cgwalters-bot/homegit/pulls/49";
+  const saved = fs.readFileSync(path.join(REST, `${pr}.json`), "utf8");
+  fs.writeFileSync(path.join(REST, `${pr}.json`), "not valid json");
+  try {
+    const r = tool(["--json"]);
+    assert.equal(r.status, 1, r.stderr);
+    const urls = JSON.parse(r.stdout).map((p) => p.url);
+    assert.ok(!urls.includes(`${GH}/cgwalters-bot/homegit/pull/49`), "the broken PR's own lines are gone");
+    assert.ok(urls.includes(`${GH}/bootc-dev/bootc/pull/2516`), urls.join("\n"));
+    assert.match(r.stderr, /reading https:\/\/github\.com\/cgwalters-bot\/homegit\/pull\/49 failed/);
+    assert.ok(!/at Object|UnhandledPromiseRejection/.test(r.stderr), `crashed instead of warning: ${r.stderr}`);
+  } finally {
+    fs.writeFileSync(path.join(REST, `${pr}.json`), saved);
+  }
+});
+
 test("nothing to flag", () => {
   const r = spawnSync(TOOL, ["--board-file", writeJson("empty.json", []), "--epic-board-file", writeJson("empty2.json", []), "--now", NOW],
     { env: ENV, encoding: "utf8" });
