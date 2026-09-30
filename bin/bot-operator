@@ -1,0 +1,94 @@
+#!/usr/bin/env node
+// Print the operator config (lib/operator.js); see --help.
+"use strict";
+
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1]);
+const operator = require(path.join(__dirname, "..", "lib", "operator.js"));
+
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+function usage() {
+  const { path: file } = operator.configPath();
+  return `Usage: ${PROG} [--json | --shell | get KEY | path]
+
+Prints the operator config: who runs this bot harness and where its
+work lives. It is read from $${operator.ENV_PATH}, or else
+${file}
+(JSON; a missing file means the defaults). See
+docs/bootstrap.md for its keys.
+
+  --json    the full config, defaults filled in (the default)
+  --shell   bash assignments of OP_* variables, for bin/operator.sh
+  get KEY   one value by dotted KEY, e.g. 'get operator.login'
+  path      the config file this environment reads
+`;
+}
+
+// shq(S): S quoted for bash.
+function shq(s) {
+  return `'${String(s).replaceAll("'", `'\\''`)}'`;
+}
+
+function shell(c) {
+  const vars = {
+    OP_OPERATOR_LOGIN: c.operator.login,
+    OP_OPERATOR_NAME: c.operator.name,
+    OP_OPERATOR_EMAIL: c.operator.email,
+    OP_OPERATOR_POSSESSIVE: operator.possessive(c.operator.login),
+    OP_BOT_LOGIN: c.bot.login,
+    OP_BOT_GIT_NAME: c.bot.git_name,
+    OP_BOT_GIT_EMAIL: c.bot.git_email,
+    OP_BOT_ISSUE_REPO: c.bot.issue_repo,
+    OP_BOT_HOMEGIT_REPO: c.bot.homegit_repo,
+    OP_FORGE_ORG: c.forge_org,
+    OP_TRACKER_REPO: c.tracker_repo,
+    OP_BOARD: operator.boardPath(c),
+    OP_BOARD_URL: operator.boardUrl(c),
+    OP_GENERATED_BY_URL: c.generated_by_url,
+    OP_DEVSPACE_REPO: c.devspace.repo,
+    OP_DEVSPACE_HOST_PREFIX: c.devspace.host_prefix,
+    OP_CONFIG_PATH: operator.configPath().path,
+  };
+  const lines = Object.entries(vars).map(([k, v]) => `${k}=${shq(v)}`);
+  const items = Object.entries(c.board.state_items).map(([k, v]) => `[${shq(k)}]=${shq(`${v.item} ${v.draft}`)}`);
+  lines.push(`declare -gA OP_BOARD_STATE_ITEMS=(${items.join(" ")})`);
+  const epics = Object.entries(c.board.epics).map(([k, v]) => `[${shq(k)}]=${shq(v)}`);
+  lines.push(`declare -gA OP_BOARD_EPICS=(${epics.join(" ")})`);
+  return `${lines.join("\n")}\n`;
+}
+
+function get(c, key) {
+  let v = c;
+  for (const k of key.split(".")) {
+    if (v === null || typeof v !== "object" || !Object.hasOwn(v, k)) {
+      throw Object.assign(new Error(`no key '${key}' in the operator config; see ${PROG} --json`), { status: EX_USAGE });
+    }
+    v = v[k];
+  }
+  return typeof v === "object" ? JSON.stringify(v) : String(v);
+}
+
+function main(argv) {
+  if (argv.includes("-h") || argv.includes("--help")) return process.stdout.write(usage());
+  const [cmd = "--json", ...rest] = argv;
+  const want = { "--json": 0, "--shell": 0, get: 1, path: 0 }[cmd];
+  if (want === undefined || rest.length !== want) {
+    process.stderr.write(usage());
+    process.exit(EX_USAGE);
+  }
+  if (cmd === "path") return process.stdout.write(`${operator.configPath().path}\n`);
+  const c = operator.load();
+  if (cmd === "--shell") return process.stdout.write(shell(c));
+  if (cmd === "get") return process.stdout.write(`${get(c, rest[0])}\n`);
+  process.stdout.write(`${JSON.stringify(c, null, 2)}\n`);
+}
+
+try {
+  main(process.argv.slice(2));
+} catch (e) {
+  process.stderr.write(`${PROG}: error: ${e.message}\n`);
+  process.exit(e.status || EX_ERROR);
+}
