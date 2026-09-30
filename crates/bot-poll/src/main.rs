@@ -1,6 +1,10 @@
 //! bot-poll: the coordinator's news-gated poll. It sweeps with
-//! bot-notify, `bot-pr inbox` and bot-watch every few minutes, and exits,
-//! waking the coordinator, only when something new turns up.
+//! bot-notify, `bot-pr inbox` and bot-watch every few minutes, polls the
+//! hot set cheaply in between, and exits, waking the coordinator, only
+//! when something new turns up.
+
+mod gh;
+mod poller;
 
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -11,13 +15,17 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bot_poll::hot::CycleStat;
 use bot_poll::{
-    LastNews, Output, STATE_VERSION, Source, State, evaluate, news_line, operator, render_summary,
+    KindNews, LastNews, Output, STATE_VERSION, Source, State, evaluate, news_line, operator,
+    render_status, render_summary, status,
 };
 use chrono::{Local, Utc};
 use clap::Parser;
+use poller::Poller;
 
 const DEFAULT_INTERVAL: u64 = 900;
+const DEFAULT_HOT_INTERVAL: u64 = 90;
 const DEFAULT_MAX_DURATION: u64 = 12 * 3600;
 /// A step that runs longer than this is killed, so that one hung call
 /// can't stall the poll.
@@ -29,6 +37,8 @@ const RUN_ID_FORMAT: &str = "%Y%m%d-%H%M%S-%3f";
 /// The tool whose location on PATH says where the others (and the
 /// homegit checkout) are.
 const LOCATOR: &str = "bot-watch";
+/// The prefix of a hot cycle's run directory, which isn't a sweep's.
+const HOT_RUN_PREFIX: &str = "hot-";
 
 /// One sweep, in order: output (stdout and stderr) to NAME.txt in the
 /// run's directory. None as the tool is git.
@@ -49,6 +59,9 @@ struct Cli {
     /// Seconds between sweeps.
     #[arg(long, default_value_t = DEFAULT_INTERVAL)]
     interval: u64,
+    /// Seconds between hot cycles (0: none).
+    #[arg(long, default_value_t = DEFAULT_HOT_INTERVAL)]
+    hot_interval: u64,
     /// Seconds after which to give up without news.
     #[arg(long, default_value_t = DEFAULT_MAX_DURATION)]
     max_duration: u64,
@@ -58,8 +71,12 @@ struct Cli {
     /// Sweep once, at once, print the news or "No news", and exit.
     #[arg(long)]
     once: bool,
+    /// Run one hot cycle, at once, print the news or "No news", and exit.
+    #[arg(long, conflicts_with_all = ["once", "summary", "dry_run"])]
+    hot_once: bool,
     /// Print the items of the last NEWS report, grouped by kind, with
-    /// their URLs, and exit.
+    /// their URLs, then how quiet it has been since and what the polling
+    /// costs, and exit.
     #[arg(long, conflicts_with = "dry_run")]
     summary: bool,
     /// Run nothing: print the commands a sweep runs, and what the newest
@@ -102,9 +119,10 @@ From those outputs it takes the set of what is there now, per kind:
   rebase        its PRs that need a rebase (by PR)
   news          its item news, but for bots' own activity
 
-Anything not in the seen-set of its kind is new. The seen-sets live in
-STATE-DIR/state.json, so a restart neither reports again what was
-reported nor loses what a sweep found: on start, the newest run is
+Anything not in the seen-set of its kind is new, unless it is a review,
+comment or sign-off (by its id) listed or reported before. The seen-sets
+live in STATE-DIR/state.json, so a restart neither reports again what
+was reported nor loses what a sweep found: on start, the newest run is
 checked first if nothing checked it yet. A key is kept for an hour after
 it was last there, so a sweep that missed it (a failed read) doesn't make
 it news again; after that it is forgotten. An incomplete output (bot-notify
@@ -112,13 +130,39 @@ or bot-pr inbox failing, bot-watch without its closing \"Swept\" line, or
 a section its warnings say is incomplete) leaves those seen-sets as they
 are.
 
+Each sweep also rebuilds the hot set, where the operator is likely to
+act soon: the bot's open PRs in the forge org (fork PRs awaiting his
+review) and elsewhere (awaiting his review, or his approval for a
+sign-off), the tracker's open asks assigned to him (question, decision,
+review, chore), and anything of the bot's he reviewed or commented on in
+the last 3 hours. Between sweeps, every --hot-interval, a hot cycle
+polls, with conditional requests (a 304 costs no rate limit):
+
+  GET notifications         (If-Modified-Since; at most as often as its
+                            X-Poll-Interval says)
+  GET users/OPERATOR/events (If-None-Match; likewise)
+
+and then, for each hot item a changed notification thread or one of his
+events points at, and each he was active on in the last 3 hours (at most
+10), its reviews and comments (If-None-Match). His reviews and comments
+since the sweep before the last are new events, by their ids: an
+approval of a fork PR's head (or /promote) is an approval, other
+activity there forge-review; on a tracker issue notify; on another PR
+review (an approval of an upstream PR's head also runs
+bot-signoff-due --apply, whose results are signoff), else news. A
+thread updated for a mention, review request or assignment runs
+bot-notify, whose output counts as a sweep's. What a hot cycle reports,
+a sweep doesn't report again, and the other way round. Its files are in
+a RUN named hot-*.
+
 On the first new item it prints
 
   NEWS (KIND, ...) at HHMM: RUN/*.txt
 
-and exits 0; --summary then lists the new items. Otherwise it sweeps
-again, until --max-duration is up, when it prints \"No news ...\" and
-exits 0. Its first sweep is due an interval after the newest one
+and exits 0; --summary then lists the new items, and how quiet it has
+been since and what its own requests cost (STATE-DIR/status.json holds
+the same). Otherwise it goes on, until --max-duration is up, when it
+prints \"No news ...\" and exits 0. Its first sweep is due an interval after the newest one
 started (at once, with --no-wait or --once), so a restart keeps the
 schedule. Only one poll runs per STATE-DIR at a time.";
 
@@ -221,42 +265,68 @@ impl Sweeper {
     }
 
     fn step(&self, out_path: &Path, tool: Option<&str>, args: &[&str]) -> Result<Option<i32>> {
-        let mut out =
-            File::create(out_path).with_context(|| format!("creating {}", out_path.display()))?;
         let (cmd, args) = self.command(tool, args);
-        let child = Command::new(&cmd)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(out.try_clone()?)
-            .stderr(out.try_clone()?)
-            .spawn();
-        let mut child = match child {
-            Ok(c) => c,
-            Err(e) => {
-                writeln!(out, "bot-poll: cannot run {}: {e}", cmd.display())?;
-                return Ok(None);
-            }
-        };
-        let start = Instant::now();
-        loop {
-            if let Some(st) = child.try_wait()? {
-                return Ok(st.code());
-            }
-            if start.elapsed() > STEP_TIMEOUT {
-                // Killing an exited child fails harmlessly.
-                let _ = child.kill();
-                child.wait()?;
-                writeln!(
-                    out,
-                    "bot-poll: killed {} after {}s",
-                    cmd.display(),
-                    STEP_TIMEOUT.as_secs()
-                )?;
-                return Ok(None);
-            }
-            sleep(STEP_POLL);
-        }
+        run_captured(out_path, None, &cmd, &args, STEP_TIMEOUT)
     }
+}
+
+/// Runs CMD with ARGS, its stdout to OUT_PATH and its stderr there too
+/// or to ERR_PATH, killing it after TIMEOUT: its exit status (None:
+/// killed, or it didn't start).
+fn run_captured(
+    out_path: &Path,
+    err_path: Option<&Path>,
+    cmd: &Path,
+    args: &[String],
+    timeout: Duration,
+) -> Result<Option<i32>> {
+    let mut out =
+        File::create(out_path).with_context(|| format!("creating {}", out_path.display()))?;
+    let err = match err_path {
+        Some(p) => File::create(p).with_context(|| format!("creating {}", p.display()))?,
+        None => out.try_clone()?,
+    };
+    let child = Command::new(cmd)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(out.try_clone()?)
+        .stderr(err)
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            writeln!(out, "bot-poll: cannot run {}: {e}", cmd.display())?;
+            return Ok(None);
+        }
+    };
+    let start = Instant::now();
+    loop {
+        if let Some(st) = child.try_wait()? {
+            return Ok(st.code());
+        }
+        if start.elapsed() > timeout {
+            // Killing an exited child fails harmlessly.
+            let _ = child.kill();
+            child.wait()?;
+            writeln!(
+                out,
+                "bot-poll: killed {} after {}s",
+                cmd.display(),
+                timeout.as_secs()
+            )?;
+            return Ok(None);
+        }
+        sleep(STEP_POLL);
+    }
+}
+
+/// The gh CLI: $BOT_POLL_GH, else gh on PATH.
+fn gh_path() -> PathBuf {
+    std::env::var_os("BOT_POLL_GH").map_or_else(|| PathBuf::from("gh"), PathBuf::from)
+}
+
+fn now_ms() -> i64 {
+    Utc::now().timestamp_millis()
 }
 
 fn write_atomic(path: &Path, text: &str) -> Result<()> {
@@ -302,10 +372,18 @@ impl Store {
         Ok(state)
     }
 
+    /// Saves the state, and the status that goes with it.
     fn save(&self, state: &State) -> Result<()> {
         write_atomic(
             &self.state_path(),
             &format!("{}\n", serde_json::to_string(state)?),
+        )?;
+        write_atomic(
+            &self.dir.join("status.json"),
+            &format!(
+                "{}\n",
+                serde_json::to_string_pretty(&status(state, now_ms()))?
+            ),
         )
     }
 
@@ -375,19 +453,20 @@ impl Store {
 
     /// Checks run `id` for news, updating state; the NEWS line, if any.
     fn check(&self, state: &mut State, id: &str) -> Option<String> {
-        let now = Utc::now();
-        let (news, seen, reported) = evaluate(
-            &self.read_run(id),
-            &state.seen,
-            &state.reported,
-            now.timestamp_millis(),
-        );
+        let (news, seen, reported) =
+            evaluate(&self.read_run(id), &state.seen, &state.reported, now_ms());
         state.seen = seen;
         state.reported = reported;
         state.evaluated = Some(id.to_string());
+        self.record_news(state, news, id)
+    }
+
+    /// Records the news of run `id` as the last reported; its NEWS line.
+    fn record_news(&self, state: &mut State, news: Vec<KindNews>, id: &str) -> Option<String> {
         if news.is_empty() {
             return None;
         }
+        let now = Utc::now();
         let hhmm = now.with_timezone(&Local).format("%H%M").to_string();
         let line = news_line(&news, &hhmm, &self.runs().join(id).display().to_string());
         state.last_news = Some(LastNews {
@@ -421,16 +500,68 @@ impl Store {
     }
 }
 
+/// A full sweep: its run id, and its NEWS line if any. Rebuilds the hot
+/// set after it.
+fn full_sweep(
+    store: &Store,
+    sweeper: &Sweeper,
+    poller: &Poller,
+    state: &mut State,
+) -> Result<(String, Option<String>)> {
+    store.prune_runs();
+    state.hot.start_sweep(now_ms());
+    let id = Utc::now().format(RUN_ID_FORMAT).to_string();
+    sweeper.sweep(&store.runs().join(&id))?;
+    let line = store.check(state, &id);
+    poller.rebuild(state, now_ms());
+    Ok((id, line))
+}
+
+/// A hot cycle: its NEWS line if any, and its requests.
+fn hot_cycle(
+    store: &Store,
+    poller: &Poller,
+    state: &mut State,
+) -> Result<(Option<String>, CycleStat)> {
+    let now = Utc::now();
+    let id = format!("{HOT_RUN_PREFIX}{}", now.format(RUN_ID_FORMAT));
+    // On a copy: a cycle that fails midway leaves the state as it was, so
+    // that what it found is found again.
+    let mut next = state.clone();
+    let cycle = poller.cycle(&mut next, &store.runs().join(&id), now.timestamp_millis())?;
+    *state = next;
+    Ok((store.record_news(state, cycle.news, &id), cycle.stat))
+}
+
 fn run(cli: Cli) -> Result<()> {
     let store = Store {
         dir: state_dir(&cli)?,
     };
+    if store.dir.starts_with(std::env::temp_dir()) {
+        // Often a tmpfs: a reboot would lose what was reported.
+        eprintln!(
+            "bot-poll: warning: the state dir {} is under {}, which may not survive a reboot",
+            store.dir.display(),
+            std::env::temp_dir().display()
+        );
+    }
+    let cfg = operator::load()?;
     if cli.summary {
-        let op = operator::load()?.operator;
-        print!("{}", render_summary(store.load()?.last_news.as_ref(), &op));
+        let state = store.load()?;
+        print!(
+            "{}\n{}",
+            render_summary(state.last_news.as_ref(), &cfg.operator),
+            render_status(&status(&state, now_ms()))
+        );
         return Ok(());
     }
     let sweeper = Sweeper::new()?;
+    let poller = Poller {
+        cfg: &cfg,
+        gh: gh_path(),
+        sweeper: &sweeper,
+        dir: &store.dir,
+    };
     if cli.dry_run {
         println!("A sweep runs:");
         for (_, tool, args) in STEPS {
@@ -444,15 +575,23 @@ fn run(cli: Cli) -> Result<()> {
                     .join(" ")
             );
         }
+        let mut state = store.load()?;
+        println!(
+            "Every {}s in between, a hot cycle polls the notifications, {}'s events and \
+             the hot items they flag, and up to {} he was active on (hot set: {} items).",
+            cli.hot_interval,
+            cfg.operator.login,
+            bot_poll::hot::MAX_DIRECT,
+            state.hot.items.len()
+        );
         let Some(id) = store.latest_run() else {
             println!("No run yet.");
             return Ok(());
         };
-        let mut state = store.load()?;
         match store.check(&mut state, &id) {
             Some(_) => print!(
                 "The newest run would report:\n{}",
-                render_summary(state.last_news.as_ref(), &operator::load()?.operator)
+                render_summary(state.last_news.as_ref(), &cfg.operator)
             ),
             None => println!("The newest run, {id}, has no news."),
         }
@@ -483,32 +622,69 @@ fn run(cli: Cli) -> Result<()> {
         }
         store.save(&state)?;
     }
-    if !cli.no_wait && !cli.once {
-        sleep(store.until_next_sweep(interval).min(max));
-    }
-    loop {
-        if !cli.once && start.elapsed() >= max {
-            break;
-        }
-        store.prune_runs();
-        let id = Utc::now().format(RUN_ID_FORMAT).to_string();
-        sweeper.sweep(&store.runs().join(&id))?;
-        if let Some(line) = store.check(&mut state, &id) {
+    let hhmm = || Local::now().format("%H%M");
+    if cli.hot_once {
+        let (line, stat) = hot_cycle(&store, &poller, &mut state)?;
+        if let Some(line) = line {
             return report(&state, &line);
         }
         store.save(&state)?;
-        if cli.once {
-            println!(
-                "No news at {}: {}",
-                Local::now().format("%H%M"),
-                store.run_glob(&id)
-            );
-            return Ok(());
+        println!(
+            "No news at {} (hot cycle: {} requests, {} not modified)",
+            hhmm(),
+            stat.requests,
+            stat.not_modified
+        );
+        return Ok(());
+    }
+    if cli.once {
+        let (id, line) = full_sweep(&store, &sweeper, &poller, &mut state)?;
+        if let Some(line) = line {
+            return report(&state, &line);
         }
-        if start.elapsed() + interval >= max {
+        store.save(&state)?;
+        println!("No news at {}: {}", hhmm(), store.run_glob(&id));
+        return Ok(());
+    }
+
+    let hot_every = (cli.hot_interval > 0).then(|| Duration::from_secs(cli.hot_interval));
+    let mut next_sweep = if cli.no_wait {
+        start
+    } else {
+        start + store.until_next_sweep(interval)
+    };
+    // A hot cycle at once, unless a sweep is due.
+    let mut next_hot = start;
+    let end = start + max;
+    loop {
+        let now = Instant::now();
+        if now >= end {
             break;
         }
-        sleep(interval);
+        if now >= next_sweep {
+            let (_, line) = full_sweep(&store, &sweeper, &poller, &mut state)?;
+            if let Some(line) = line {
+                return report(&state, &line);
+            }
+            store.save(&state)?;
+            next_sweep = now + interval;
+            next_hot = Instant::now() + hot_every.unwrap_or_default();
+        } else if let Some(every) = hot_every
+            && now >= next_hot
+        {
+            match hot_cycle(&store, &poller, &mut state) {
+                Ok((Some(line), _)) => return report(&state, &line),
+                Ok((None, _)) => store.save(&state)?,
+                Err(e) => eprintln!("bot-poll: warning: the hot cycle failed: {e:#}"),
+            }
+            next_hot = now + every;
+        }
+        let wake = match hot_every {
+            Some(_) => next_sweep.min(next_hot),
+            None => next_sweep,
+        }
+        .min(end);
+        sleep(wake.saturating_duration_since(Instant::now()));
     }
     let last = state
         .evaluated

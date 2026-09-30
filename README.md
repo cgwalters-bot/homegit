@@ -91,7 +91,11 @@ The coordinator doesn't run these by hand: `bot-poll` (Rust, in
 inbox` and `bot-watch` every 15 minutes, keeps their output, and exits
 only when something is new since it last reported (an approval, a
 review, a new P0 health problem, ...), which wakes the coordinator;
-`bot-poll --summary` lists what's new.
+`bot-poll --summary` lists what's new. Between sweeps it polls a hot
+set (the bot's open PRs, my open asks, what I touched lately) every 90
+seconds with conditional requests, so my approvals and answers wake the
+coordinator within a couple of minutes, while a quiet cycle costs two
+304s (and a few more per item I'm active on).
 
 ### Overnight working model
 

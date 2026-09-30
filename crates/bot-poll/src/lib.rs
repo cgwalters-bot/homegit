@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+pub mod hot;
 pub mod operator;
 use operator::Operator;
 
@@ -182,7 +183,7 @@ pub fn signoff_event(line: &str) -> String {
 pub type Parsed = BTreeMap<&'static str, Vec<Item>>;
 
 /// The first github.com URL in s, without trailing punctuation.
-fn first_url(s: &str) -> String {
+pub fn first_url(s: &str) -> String {
     s.find(GITHUB)
         .map(|i| {
             let url = s[i..].split_whitespace().next().unwrap_or_default();
@@ -584,17 +585,24 @@ pub fn evaluate(
             next.insert(set.to_string(), cur);
         }
     }
-    let news = KINDS
+    let news = news.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    next_reported.retain(|_, at| now - *at < REPORTED_KEEP_MS);
+    (in_kind_order(news), next, next_reported)
+}
+
+/// News by kind, in KINDS order.
+pub fn in_kind_order(mut news: BTreeMap<String, Vec<NewsItem>>) -> Vec<KindNews> {
+    KINDS
         .iter()
         .filter_map(|(kind, _)| {
-            news.remove(kind).map(|items| KindNews {
-                kind: kind.to_string(),
-                items,
-            })
+            news.remove(*kind)
+                .filter(|items| !items.is_empty())
+                .map(|items| KindNews {
+                    kind: kind.to_string(),
+                    items,
+                })
         })
-        .collect();
-    next_reported.retain(|_, at| now - *at < REPORTED_KEEP_MS);
-    (news, next, next_reported)
+        .collect()
 }
 
 /// The last NEWS report, for --summary.
@@ -619,6 +627,8 @@ pub struct State {
     pub evaluated: Option<String>,
     #[serde(default)]
     pub last_news: Option<LastNews>,
+    #[serde(default)]
+    pub hot: hot::HotState,
 }
 
 impl Default for State {
@@ -629,8 +639,114 @@ impl Default for State {
             reported: Reported::new(),
             evaluated: None,
             last_news: None,
+            hot: hot::HotState::default(),
         }
     }
+}
+
+/// How quiet the poll has been and what it costs: what STATE-DIR/status.json
+/// holds, and --summary shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Status {
+    pub updated_at: String,
+    /// When the poll last printed a NEWS line, waking the coordinator.
+    pub last_wake: Option<String>,
+    pub quiet_secs: Option<i64>,
+    /// The hot set's items per class.
+    pub hot: BTreeMap<String, usize>,
+    /// Of those, the ones polled on every hot cycle.
+    pub direct: usize,
+    /// When the last full sweep started.
+    pub last_sweep: Option<String>,
+    /// The last hot cycle's requests.
+    pub last_cycle: Option<hot::CycleStat>,
+    pub last_hour: HourStats,
+}
+
+/// bot-poll's own requests in the last hour (not its sweeps' tools').
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct HourStats {
+    pub hot_cycles: u32,
+    pub rebuilds: u32,
+    pub requests: u32,
+    pub not_modified: u32,
+}
+
+/// The status of a state at `now` (ms).
+pub fn status(state: &State, now: i64) -> Status {
+    let wake = state.last_news.as_ref().map(|n| n.at.clone());
+    let quiet_secs = wake
+        .as_deref()
+        .and_then(hot::parse_time)
+        .map(|at| (now - at) / 1000);
+    let mut last_hour = HourStats::default();
+    for s in state
+        .hot
+        .stats
+        .iter()
+        .filter(|s| now - s.at < hot::STATS_KEEP_MS)
+    {
+        if s.sweep {
+            last_hour.rebuilds += 1;
+        } else {
+            last_hour.hot_cycles += 1;
+        }
+        last_hour.requests += s.requests;
+        last_hour.not_modified += s.not_modified;
+    }
+    Status {
+        updated_at: hot::rfc3339(now),
+        last_wake: wake,
+        quiet_secs,
+        hot: state
+            .hot
+            .sizes()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect(),
+        direct: state.hot.direct(now).len(),
+        last_sweep: state.hot.sweep_start.map(hot::rfc3339),
+        last_cycle: state.hot.stats.iter().rev().find(|s| !s.sweep).copied(),
+        last_hour,
+    }
+}
+
+/// A duration in seconds, roughly: 45s, 12m, 3h05m.
+fn human_secs(secs: i64) -> String {
+    match secs.max(0) {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s => format!("{}h{:02}m", s / 3600, s % 3600 / 60),
+    }
+}
+
+/// The status, for --summary.
+pub fn render_status(st: &Status) -> String {
+    let quiet = match (&st.last_wake, st.quiet_secs) {
+        (Some(at), Some(s)) => format!("{} since the last wake ({at})", human_secs(s)),
+        _ => "no wake yet".to_string(),
+    };
+    let total: usize = st.hot.values().sum();
+    let classes: Vec<String> = st.hot.iter().map(|(k, v)| format!("{v} {k}")).collect();
+    let cycle = st.last_cycle.map_or("no hot cycle yet".to_string(), |c| {
+        format!(
+            "last hot cycle {} requests, {} not modified",
+            c.requests, c.not_modified
+        )
+    });
+    let h = &st.last_hour;
+    format!(
+        "Quiet: {quiet}.\n\
+         Hot set: {total} items ({}), {} polled directly.\n\
+         Requests (bot-poll's own, not its sweeps' tools): {cycle}; \
+         last hour {} in {} hot cycles and {} hot set rebuilds, {} not modified.\n",
+        classes.join(", "),
+        st.direct,
+        h.requests,
+        h.hot_cycles,
+        h.rebuilds,
+        h.not_modified,
+    )
 }
 
 /// The NEWS line.
@@ -890,6 +1006,15 @@ mod tests {
             eval(&broken, &seen, t0 + 10 * FORGET_MS).1.0["health"],
             seen.0["health"]
         );
+    }
+
+    #[test]
+    fn a_restart_after_a_long_outage_is_no_news() {
+        // The machine was down for days: what the first sweep after lists
+        // was there before, so its keys were never dropped.
+        let (_, seen) = eval(&outputs("news"), &Memory::default(), 0);
+        let (news, _) = eval(&outputs("news"), &seen, 3 * REPORTED_KEEP_MS);
+        assert!(news.is_empty(), "{news:?}");
     }
 
     fn inbox_approved(review: &str) -> BTreeMap<Source, Output> {
