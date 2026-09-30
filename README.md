@@ -29,7 +29,8 @@ opencode, Codex, Gemini CLI and Cursor look; Claude Code reads only
 `bot-feedback` (surfacing reactions on the bot's work), `bot-notify`
 (routing mentions of and requests to the bot),
 `upstream-pr` (how to contribute as the bot, with `bot-pr`), `devspace-work` (building
-and testing on a remote runner), `coordinator` (running a top-level
+and testing on a remote runner), `devspace-time` (finishing before that runner's
+time limit), `coordinator` (running a top-level
 session that polls, dispatches worker and reviewer subagents, and writes
 the morning brief; the preambles it briefs them with live next to it),
 `topic-lead` (a session of its own for one topic, which owns the board items
