@@ -1,0 +1,512 @@
+[
+  {
+    "name": "defaults",
+    "config": {},
+    "expect": {
+      "operator": {
+        "login": "cgwalters",
+        "name": "Colin Walters",
+        "email": "walters@verbum.org"
+      },
+      "bot": {
+        "login": "cgwalters-bot",
+        "git_name": "Colin Walters",
+        "git_email": "walters+llm@verbum.org",
+        "issue_repo": "cgwalters-bot/cgwalters-bot",
+        "homegit_repo": "cgwalters-bot/homegit"
+      },
+      "forge_org": "cgwalters-forge",
+      "tracker_repo": "cgwalters-forge/tracker",
+      "heartbeat_issue": 176,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "cgwalters-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {
+          "composefs-stable": "users/cgwalters-bot/2"
+        }
+      },
+      "generated_by_url": "https://github.com/cgwalters/#llms",
+      "devspace": {
+        "repo": "bootc-dev/cgwalters-devspace-sandbox",
+        "host_prefix": "cgwalters-devspace-"
+      }
+    }
+  },
+  {
+    "name": "another operator, minimal",
+    "config": {
+      "operator": {
+        "login": "jmarrero",
+        "name": "Joseph Marrero",
+        "email": "jmarrero@example.com"
+      },
+      "bot": {
+        "login": "jmarrero-bot"
+      },
+      "forge_org": "jmarrero-forge",
+      "devspace": {
+        "repo": "jmarrero-bot/jmarrero-devspace-sandbox"
+      }
+    },
+    "expect": {
+      "operator": {
+        "login": "jmarrero",
+        "name": "Joseph Marrero",
+        "email": "jmarrero@example.com"
+      },
+      "bot": {
+        "login": "jmarrero-bot",
+        "git_name": "Joseph Marrero",
+        "git_email": "jmarrero+llm@example.com",
+        "issue_repo": "jmarrero-bot/jmarrero-bot",
+        "homegit_repo": "jmarrero-bot/homegit"
+      },
+      "forge_org": "jmarrero-forge",
+      "tracker_repo": "jmarrero-forge/tracker",
+      "heartbeat_issue": null,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "jmarrero-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {}
+      },
+      "generated_by_url": "https://github.com/jmarrero/#llms",
+      "devspace": {
+        "repo": "jmarrero-bot/jmarrero-devspace-sandbox",
+        "host_prefix": "jmarrero-devspace-"
+      }
+    }
+  },
+  {
+    "name": "every key",
+    "config": {
+      "operator": {
+        "login": "jmarrero",
+        "name": "Joseph Marrero",
+        "email": "jmarrero@example.com"
+      },
+      "bot": {
+        "login": "jm-bot",
+        "git_name": "JM Bot",
+        "git_email": "jm-bot@example.org",
+        "issue_repo": "jm-bot/issues",
+        "homegit_repo": "jm-bot/dotfiles"
+      },
+      "forge_org": "jm-forge",
+      "tracker_repo": "jm-forge/work",
+      "heartbeat_issue": 3,
+      "board": {
+        "owner_type": "users",
+        "owner": "jm-bot",
+        "number": 4,
+        "state_items": {
+          "lease": {
+            "item": "PVTI_a1",
+            "draft": "DI_b2"
+          }
+        },
+        "epics": {
+          "release": "orgs/jm-forge/5"
+        }
+      },
+      "generated_by_url": "https://example.org/llm-policy",
+      "devspace": {
+        "repo": "jm-bot/sandbox",
+        "host_prefix": "jm-devspace-"
+      }
+    },
+    "expect": {
+      "operator": {
+        "login": "jmarrero",
+        "name": "Joseph Marrero",
+        "email": "jmarrero@example.com"
+      },
+      "bot": {
+        "login": "jm-bot",
+        "git_name": "JM Bot",
+        "git_email": "jm-bot@example.org",
+        "issue_repo": "jm-bot/issues",
+        "homegit_repo": "jm-bot/dotfiles"
+      },
+      "forge_org": "jm-forge",
+      "tracker_repo": "jm-forge/work",
+      "heartbeat_issue": 3,
+      "board": {
+        "owner_type": "users",
+        "owner": "jm-bot",
+        "number": 4,
+        "state_items": {
+          "lease": {
+            "item": "PVTI_a1",
+            "draft": "DI_b2"
+          }
+        },
+        "epics": {
+          "release": "orgs/jm-forge/5"
+        }
+      },
+      "generated_by_url": "https://example.org/llm-policy",
+      "devspace": {
+        "repo": "jm-bot/sandbox",
+        "host_prefix": "jm-devspace-"
+      }
+    }
+  },
+  {
+    "name": "default board, a state item added",
+    "config": {
+      "board": {
+        "state_items": {
+          "extra": {
+            "item": "PVTI_x",
+            "draft": "DI_y"
+          }
+        }
+      }
+    },
+    "expect": {
+      "operator": {
+        "login": "cgwalters",
+        "name": "Colin Walters",
+        "email": "walters@verbum.org"
+      },
+      "bot": {
+        "login": "cgwalters-bot",
+        "git_name": "Colin Walters",
+        "git_email": "walters+llm@verbum.org",
+        "issue_repo": "cgwalters-bot/cgwalters-bot",
+        "homegit_repo": "cgwalters-bot/homegit"
+      },
+      "forge_org": "cgwalters-forge",
+      "tracker_repo": "cgwalters-forge/tracker",
+      "heartbeat_issue": 176,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "cgwalters-forge",
+        "number": 1,
+        "state_items": {
+          "extra": {
+            "item": "PVTI_x",
+            "draft": "DI_y"
+          }
+        },
+        "epics": {
+          "composefs-stable": "users/cgwalters-bot/2"
+        }
+      },
+      "generated_by_url": "https://github.com/cgwalters/#llms",
+      "devspace": {
+        "repo": "bootc-dev/cgwalters-devspace-sandbox",
+        "host_prefix": "cgwalters-devspace-"
+      }
+    }
+  },
+  {
+    "name": "default board, no epics",
+    "config": {
+      "board": {
+        "epics": {}
+      }
+    },
+    "expect": {
+      "operator": {
+        "login": "cgwalters",
+        "name": "Colin Walters",
+        "email": "walters@verbum.org"
+      },
+      "bot": {
+        "login": "cgwalters-bot",
+        "git_name": "Colin Walters",
+        "git_email": "walters+llm@verbum.org",
+        "issue_repo": "cgwalters-bot/cgwalters-bot",
+        "homegit_repo": "cgwalters-bot/homegit"
+      },
+      "forge_org": "cgwalters-forge",
+      "tracker_repo": "cgwalters-forge/tracker",
+      "heartbeat_issue": 176,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "cgwalters-forge",
+        "number": 1,
+        "epics": {},
+        "state_items": {}
+      },
+      "generated_by_url": "https://github.com/cgwalters/#llms",
+      "devspace": {
+        "repo": "bootc-dev/cgwalters-devspace-sandbox",
+        "host_prefix": "cgwalters-devspace-"
+      }
+    }
+  },
+  {
+    "name": "the default tracker named explicitly",
+    "config": {
+      "forge_org": "other-forge",
+      "tracker_repo": "cgwalters-forge/tracker"
+    },
+    "expect": {
+      "operator": {
+        "login": "cgwalters",
+        "name": "Colin Walters",
+        "email": "walters@verbum.org"
+      },
+      "bot": {
+        "login": "cgwalters-bot",
+        "git_name": "Colin Walters",
+        "git_email": "walters+llm@verbum.org",
+        "issue_repo": "cgwalters-bot/cgwalters-bot",
+        "homegit_repo": "cgwalters-bot/homegit"
+      },
+      "forge_org": "other-forge",
+      "tracker_repo": "cgwalters-forge/tracker",
+      "heartbeat_issue": 176,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "other-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {}
+      },
+      "generated_by_url": "https://github.com/cgwalters/#llms",
+      "devspace": {
+        "repo": "bootc-dev/cgwalters-devspace-sandbox",
+        "host_prefix": "cgwalters-devspace-"
+      }
+    }
+  },
+  {
+    "name": "a login ending in s",
+    "config": {
+      "operator": {
+        "login": "someones"
+      }
+    },
+    "expect": {
+      "operator": {
+        "login": "someones",
+        "name": "Colin Walters",
+        "email": "walters@verbum.org"
+      },
+      "bot": {
+        "login": "cgwalters-bot",
+        "git_name": "Colin Walters",
+        "git_email": "walters+llm@verbum.org",
+        "issue_repo": "cgwalters-bot/cgwalters-bot",
+        "homegit_repo": "cgwalters-bot/homegit"
+      },
+      "forge_org": "cgwalters-forge",
+      "tracker_repo": "cgwalters-forge/tracker",
+      "heartbeat_issue": 176,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "cgwalters-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {
+          "composefs-stable": "users/cgwalters-bot/2"
+        }
+      },
+      "generated_by_url": "https://github.com/someones/#llms",
+      "devspace": {
+        "repo": "bootc-dev/cgwalters-devspace-sandbox",
+        "host_prefix": "cgwalters-devspace-"
+      }
+    }
+  },
+  {
+    "name": "unknown key",
+    "config": {
+      "operatr": {}
+    }
+  },
+  {
+    "name": "unknown nested key",
+    "config": {
+      "operator": {
+        "handle": "x"
+      }
+    }
+  },
+  {
+    "name": "not an object",
+    "config": []
+  },
+  {
+    "name": "operator not an object",
+    "config": {
+      "operator": "x"
+    }
+  },
+  {
+    "name": "login with a leading dash",
+    "config": {
+      "operator": {
+        "login": "-x"
+      }
+    }
+  },
+  {
+    "name": "login too long",
+    "config": {
+      "bot": {
+        "login": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  },
+  {
+    "name": "email without @",
+    "config": {
+      "operator": {
+        "email": "nobody"
+      }
+    }
+  },
+  {
+    "name": "name with angle brackets",
+    "config": {
+      "operator": {
+        "name": "A <b>"
+      }
+    }
+  },
+  {
+    "name": "repo without owner",
+    "config": {
+      "tracker_repo": "tracker"
+    }
+  },
+  {
+    "name": "board owner_type singular",
+    "config": {
+      "board": {
+        "owner_type": "org"
+      }
+    }
+  },
+  {
+    "name": "board number 0",
+    "config": {
+      "board": {
+        "number": 0
+      }
+    }
+  },
+  {
+    "name": "board number a string",
+    "config": {
+      "board": {
+        "number": "1"
+      }
+    }
+  },
+  {
+    "name": "state item with a bad id",
+    "config": {
+      "board": {
+        "state_items": {
+          "lease": {
+            "item": "PVT_1",
+            "draft": "DI_1"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "state item with an extra key",
+    "config": {
+      "board": {
+        "state_items": {
+          "lease": {
+            "item": "PVTI_1",
+            "draft": "DI_1",
+            "x": "y"
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "epic named workstream",
+    "config": {
+      "board": {
+        "epics": {
+          "workstream": "orgs/o/1"
+        }
+      }
+    }
+  },
+  {
+    "name": "epic with a bad path",
+    "config": {
+      "board": {
+        "epics": {
+          "e": "org/o/1"
+        }
+      }
+    }
+  },
+  {
+    "name": "http URL",
+    "config": {
+      "generated_by_url": "http://example.org/"
+    }
+  },
+  {
+    "name": "underivable host prefix",
+    "config": {
+      "devspace": {
+        "repo": "o/Bad_Name"
+      }
+    }
+  },
+  {
+    "name": "host prefix uppercase",
+    "config": {
+      "devspace": {
+        "host_prefix": "Dev-"
+      }
+    }
+  },
+  {
+    "name": "bot login same as the operator's",
+    "config": {
+      "bot": {
+        "login": "CGWALTERS"
+      }
+    }
+  },
+  {
+    "name": "bot email same as the operator's",
+    "config": {
+      "bot": {
+        "git_email": "walters@verbum.org"
+      }
+    }
+  },
+  {
+    "name": "name with a leading space",
+    "config": {
+      "operator": {
+        "name": " Colin"
+      }
+    }
+  },
+  {
+    "name": "a null value",
+    "config": {
+      "forge_org": null
+    }
+  },
+  {
+    "name": "a null nested value",
+    "config": {
+      "board": {
+        "epics": null
+      }
+    }
+  }
+]
