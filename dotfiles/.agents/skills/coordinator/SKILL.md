@@ -115,13 +115,42 @@ and compares what they list against what it has already reported:
 approvals, the operator's activity on fork PRs, outstanding reviews,
 rebase needs, priority health lines (a new P0 one is its own kind),
 sign-offs, requests and answers from `bot-notify`, and item news other
-than bots'. On the first new item it exits printing
-`NEWS (KINDS) at HHMM: RUN/*.txt`; then run `bot-poll --summary` for
-the new items themselves, grouped, with their URLs, and read the run's
-files for the rest. After 12h without news it exits too. Handle the
-news, then start `bot-poll` again: what it reported stays reported,
+than bots'. A review, comment or sign-off is news once, by its id,
+whichever report lists it.
+
+Each sweep also rebuilds a *hot set*: the bot's open PRs (fork PRs in
+the forge and the rest), the tracker's open asks assigned to the
+operator, and anything of the bot's they reviewed or commented on in
+the last 3 hours. Between sweeps, every 90 seconds, a hot cycle polls
+the notifications and the operator's public events with conditional
+requests (a 304 costs no rate limit, and their X-Poll-Interval is
+honored), then reads the reviews and comments of the hot items those
+point at, and of up to 10 they were active on lately. The operator's
+new reviews and comments there wake the session within a cycle: an
+approval of a fork PR's head (or `/promote`) as `approval`, other fork
+PR activity as `forge-review`, on a tracker issue `notify`, on another
+PR `review` (an approval of an upstream PR's head also runs
+`bot-signoff-due --apply`, reported as `signoff`), else `news`. A
+thread updated for a mention, review request or assignment runs
+`bot-notify` at once. A quiet cycle costs two 304s, plus about three
+more (also 304s) per item the operator is active on; GitHub rate limits
+pause the cycles until their reset. Nothing wakes the session unless
+something is new. What the hot cycles can't see (the operator's
+activity in private repositories, items the bot doesn't follow) waits
+for the next sweep, as before.
+
+On the first new item it exits printing
+`NEWS (KINDS) at HHMM: RUN/*.txt` (RUN is `hot-*` for a hot cycle's);
+then run `bot-poll --summary` for the new items themselves, grouped,
+with their URLs, and read the run's files for the rest. The summary
+ends with how long it has been quiet, the hot set's size and the
+requests per cycle and per hour (also in
+`~/.local/state/bot-poll/status.json`). After 12h without news it exits
+too. Handle the news, then start `bot-poll` again: what it reported
+stays reported,
 and news a sweep found before a restart is reported on the next
-start, since it keeps what it has seen in its state dir. `bot-poll
+start, since it keeps what it has seen in its state dir, and keeps
+the sweeps' 15-minute schedule across restarts. `bot-poll
 --once` sweeps right away (at session start, say); `--help` has the
 rest. It is homegit's Rust crate `crates/bot-poll`: `make
 install-crates` in the shared checkout installs it into `~/.cargo/bin`,
