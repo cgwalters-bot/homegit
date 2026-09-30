@@ -37,10 +37,20 @@ const writeJson = (name, data) => {
   fs.writeFileSync(f, JSON.stringify(data));
   return f;
 };
-// hoursAgo(h): the time h hours before NOW.
+// hoursAgo(h) / minutesAgo(m): the time h hours or m minutes before NOW.
 const hoursAgo = (h) => new Date(Date.parse(NOW) - h * 3600 * 1000).toISOString().replace(/\.000Z$/, "Z");
+const minutesAgo = (m) => new Date(Date.parse(NOW) - m * 60 * 1000).toISOString().replace(/\.000Z$/, "Z");
 const run = (name, status, conclusion, extra = {}) => ({ name, status, conclusion, started_at: hoursAgo(5), app: { slug: "github-actions" }, ...extra });
 const ok = (name) => run(name, "completed", "success");
+// superseded(name, firstConclusion): two runs of the same check name, as
+// wfc#23's head d77e3ccdabff had (a rerun after a cancelled or failed
+// first attempt): the newer, successful one listed FIRST, as the API
+// does (newest first), so a fix that just took runs[0] per name would
+// also pass; only comparing their times catches that.
+const superseded = (name, firstConclusion) => [
+  run(name, "completed", "success", { started_at: minutesAgo(10), completed_at: minutesAgo(5) }),
+  run(name, "completed", firstConclusion, { started_at: minutesAgo(15), completed_at: minutesAgo(14) }),
+];
 
 // Each case is a PR (fixtures from its fields) on a board item, and the
 // lines expected for it. PR fields: number, head, priority (on the
@@ -131,6 +141,23 @@ const CASES = [
   {
     name: "healthy P0: nothing", repo: "example/fine", number: 10, head: "4".repeat(40), priority: "P0", updated: 2,
     mergeable_state: "clean", runs: [ok("build"), ok("DCO")], expect: [],
+  },
+  {
+    // wfc#23 at d77e3ccdabff: a first push whose ci/lint/compile/etc.
+    // failed or was cancelled, superseded by a green rerun of each. The
+    // GitHub UI (and this tool) must go by the latest run of each name,
+    // never a superseded failure or cancellation.
+    name: "wfc#23: cancelled and failed runs superseded by a later success",
+    repo: "cgwalters-forge/workflow-compiler", number: 23, head: `d77e3ccdabff${"0".repeat(28)}`, priority: "P0", updated: 1,
+    runs: [...superseded("ci", "failure"), ...superseded("lint", "cancelled"), ...superseded("compile", "cancelled"), ok("DCO")],
+    expect: [],
+  },
+  {
+    name: "a name's latest run still fails after an earlier success (not superseded the other way)",
+    repo: "example/flaky", number: 12, head: `deadbeef${"0".repeat(32)}`, priority: "P1", updated: 1,
+    runs: [run("flaky", "completed", "success", { started_at: minutesAgo(30), completed_at: minutesAgo(29) }),
+      run("flaky", "completed", "failure", { started_at: minutesAgo(5), completed_at: minutesAgo(4) })],
+    expect: [`P1 ci-failing ${GH}/example/flaky/pull/12 deadbeef0000: flaky`],
   },
 ];
 
