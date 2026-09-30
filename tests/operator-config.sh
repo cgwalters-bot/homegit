@@ -68,6 +68,7 @@ done
 case "${method} ${path}" in
     "GET user") jq -rn '{login: "jmarrero-bot"} | '"${filter}" ;;
     "GET rate_limit") echo 5000 ;;
+    "GET repos/"*/bot-ops) jq -rn '{private: true} | '"${filter}" ;;
     "GET repos/"*/issues/*/comments*) echo '[]' | jq -r "${filter}" ;;
     "POST repos/"*/issues/*/comments) jq -rn '{html_url: "https://github.com/x/y/issues/1#issuecomment-1"} | '"${filter}" ;;
     "GET repos/"*/actions/runs/*) jq -rn '{path: ".github/workflows/devspace.yml", status: "in_progress", conclusion: null} | '"${filter}" ;;
@@ -152,6 +153,8 @@ grep -q '^api --paginate repos/jmarrero-forge/tracker/issues/9/comments' "${FAKE
 grep -q '^api -X POST repos/jmarrero-forge/tracker/issues/9/comments' "${FAKE}/calls" ||
     fail "heartbeat: didn't write to jmarrero-forge/tracker#9: $(cat "${FAKE}/calls")"
 grep -q 'in jmarrero-bot/homegit' "${FAKE}/input" || fail "heartbeat: comment doesn't name jmarrero-bot/homegit: $(cat "${FAKE}/input")"
+grep -q '^api -X POST repos/jmarrero-forge/bot-ops/issues/1/comments' "${FAKE}/calls" ||
+    fail "heartbeat: didn't write the usage snapshot to jmarrero-forge/bot-ops#1: $(cat "${FAKE}/calls")"
 
 # --- bot-board: the configured board, no default state items or epics ---
 run board-list "${BIN}/bot-board" list --json

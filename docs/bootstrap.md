@@ -71,6 +71,10 @@ can create repositories, and a tracker repository in it (`tracker_repo`).
 The bot needs write access to the tracker. For the heartbeat, open an
 issue titled "Bot heartbeat" in the tracker, pin and lock it, and set
 `heartbeat_issue` to its number.
+`bot-heartbeat publish` also writes a usage snapshot, which must not be
+public: create a private repository `bot-ops` in the forge org, with the
+bot able to write to it, and a locked issue #1 titled "Bot usage" (or
+publish with `--no-usage`).
 
 The Workstream board is an org-owned Projects (v2) board (GitHub Apps and
 fine-grained tokens can't write a user's), with the bot able to edit it.

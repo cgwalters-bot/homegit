@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 // Publish the coordinator's heartbeat, which the review app's ops view
-// shows as "Local agents"; see --help. Node's standard library only, and
-// gh (REST only: the GraphQL quota is shared with the board tooling).
+// shows as "Local agents" and "Usage"; see --help. Node's standard
+// library only, and gh (REST only: the GraphQL quota is shared with the
+// board tooling).
 "use strict";
 
 const { execFileSync } = require("node:child_process");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
 
-const PROG = path.basename(process.argv[1]);
+const PROG = path.basename(process.argv[1] || "bot-heartbeat");
 const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG);
 // The pinned, locked "Bot heartbeat" issue, whose one comment by the bot
 // holds the heartbeat (from the operator config). The review app reads
@@ -19,6 +21,15 @@ const BOT_LOGIN = CONFIG.bot.login;
 // The comment's first line; the JSON follows in a ```json fence.
 const MARKER = "<!-- bot-heartbeat v1 -->";
 const SCHEMA = "bot-heartbeat/v1";
+// The usage snapshot is not public: it goes to the one comment by the
+// bot on the locked "Bot usage" issue of this private repository in the
+// forge org, which the review app reads with the viewer's own token.
+const USAGE_REPO = `${CONFIG.forge_org}/bot-ops`;
+const USAGE_ISSUE = 1;
+const USAGE_MARKER = "<!-- bot-usage v1 -->";
+const USAGE_SCHEMA = "bot-usage/v1";
+// Between the two comments --dry-run prints.
+const DRY_RUN_SEPARATOR = `<!-- ${USAGE_REPO}#${USAGE_ISSUE} -->`;
 
 // Limits: the input, the workers listed and the comment written.
 const MAX_INPUT_BYTES = 16 * 1024;
@@ -41,6 +52,36 @@ const DEVSPACE_RE = /^[a-z0-9][a-z0-9_.-]{0,62}$/;
 const ITEM_URL_RE = /^https:\/\/github\.com\/([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\/([A-Za-z0-9._-]{1,100})\/(issues|pull)\/([1-9][0-9]{0,9})$/;
 const TIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z$/;
 
+// Usage: the plan's windows, as Claude Code's status line reports them
+// (rate_limits.five_hour and .seven_day), and the tokens this machine's
+// transcripts spent in each.
+const HOUR_MS = 3600 * 1000;
+const WINDOWS = [
+  { kind: "five_hour", ms: 5 * HOUR_MS },
+  { kind: "seven_day", ms: 7 * 24 * HOUR_MS },
+];
+const LONGEST_WINDOW_MS = Math.max(...WINDOWS.map((w) => w.ms));
+const CACHE_DIR = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "bot-heartbeat");
+// What `statusline` last saw of the plan's windows.
+const RATE_LIMITS_FILE = path.join(CACHE_DIR, "rate-limits.json");
+// A reading older than this is not published: the status line runs after
+// every assistant message, so an older one means it stopped running.
+const RATE_LIMITS_MAX_AGE_MS = HOUR_MS;
+// Per-transcript token sums, so a publish re-reads only the transcripts
+// that changed.
+const TRANSCRIPT_CACHE_FILE = path.join(CACHE_DIR, "transcripts.json");
+const TRANSCRIPT_CACHE_VERSION = 1;
+// Token sums are kept per bucket of this many ms, so a window's start is
+// rounded down to it.
+const BUCKET_MS = 5 * 60 * 1000;
+const PROJECTS_ROOT = process.env.BOT_HEARTBEAT_PROJECTS || path.join(os.homedir(), ".claude", "projects");
+// The status line's JSON; it carries the conversation's metadata, not its text.
+const MAX_STATUSLINE_BYTES = 1024 * 1024;
+// A worker's subagents (itself, its reviewer), by the agentId the Agent tool returned.
+const MAX_AGENT_IDS = 8;
+const AGENT_ID_RE = /^[A-Za-z0-9]{1,64}$/;
+const TOKEN_KEYS = ["input", "output", "cache_read", "cache_write"];
+
 const EX_ERROR = 1;
 const EX_USAGE = 2;
 const EX_INVALID = 3;
@@ -53,8 +94,10 @@ class Exit extends Error {
 }
 
 function usage() {
-  return `Usage: ${PROG} publish [--dry-run] < HEARTBEAT.json
-       ${PROG} show
+  return `Usage: ${PROG} publish [--dry-run] [--no-usage] < HEARTBEAT.json
+       ${PROG} show [--usage]
+       ${PROG} usage
+       ${PROG} statusline < STATUSLINE.json
 
 publish writes the coordinator's heartbeat to the one comment the bot
 keeps on ${TRACKER_REPO}#${HEARTBEAT_ISSUE} ("Bot heartbeat", pinned and
@@ -72,7 +115,8 @@ The input, on stdin, is at most ${MAX_INPUT_BYTES} bytes of JSON:
    "workers": [{"name": "ops-v2",
                 "item_url": "https://github.com/OWNER/REPO/issues/N",
                 "started_at": "2026-09-28T19:40:00Z",
-                "devspace": "ops-v2", "status": "testing"}]}
+                "devspace": "ops-v2", "status": "testing",
+                "agent_ids": ["a1b2c3d4e5f60718"]}]}
 
 updated_at defaults to now, and neither it nor started_at may be in the
 future. next_wake_at is optional: when the loop wakes next, at most
@@ -84,14 +128,45 @@ request, devspace is optional, and no other keys are allowed: the
 comment is public, so it carries names and links only. At most
 ${MAX_WORKERS} workers, with distinct names. A worker whose item is in a
 private (or unreadable) repository is dropped, and said so on stderr.
+agent_ids (optional, at most ${MAX_AGENT_IDS}) are the agentIds the Agent tool
+returned for the worker and its reviewer; they are only read here, to
+find their transcripts, and never published.
 
-The comment names items only inside code, so that editing it never
+Unless --no-usage, publish also writes a usage snapshot, never to the
+public heartbeat: to the one comment the bot keeps on
+${USAGE_REPO}#${USAGE_ISSUE} ("Bot usage", locked), edited in place the same
+way, and only once GitHub says that repository is private. The review
+app reads it with the viewer's own token. It holds aggregate numbers
+only: for the plan's 5-hour and 7-day windows, the percent used and
+reset time that Claude Code's status line last reported (see
+statusline), and the requests and tokens (input, output, cache read,
+cache write) that every transcript under ${PROJECTS_ROOT}
+spent in the window; plus the tokens of each worker's subagents (all
+of them), and of the coordinator's session in the 5-hour window. A
+failure to collect it is logged, and the heartbeat is published anyway.
+Without a status line reading from the last hour, a window is the last
+5 hours or 7 days. Sums are kept per ${BUCKET_MS / 60000} minutes in ${TRANSCRIPT_CACHE_FILE}.
+
+The heartbeat comment names items only inside code, so that editing it never
 adds a "mentioned this" event to them.
 
-  --dry-run   validate and filter, then print the comment instead of
-              writing it (still reads the repositories' visibility)
+  --dry-run   validate and filter, then print the comments instead of
+              writing them: the heartbeat, then a ${DRY_RUN_SEPARATOR}
+              line and the usage comment (still reads the item
+              repositories' visibility)
+  --no-usage  write no usage snapshot
 
-show prints the published heartbeat's JSON.
+show prints the published heartbeat's JSON, or with --usage the usage
+snapshot's.
+
+usage prints the usage publish would write (without a coordinator
+session, so no per-agent tokens).
+
+statusline is a Claude Code status line command: set
+  "statusLine": {"type": "command", "command": "${PROG} statusline"}
+in ~/.claude/settings.json. It saves rate_limits' used_percentage and
+resets_at (and nothing else of its input) to ${RATE_LIMITS_FILE},
+and prints the model and both percentages.
 
 Exit status: 0 done, ${EX_INVALID} invalid input, ${EX_USAGE} usage, ${EX_ERROR} anything else.
 `;
@@ -163,7 +238,9 @@ function checkTime(v, where, nowMs, maxMs = MAX_SKEW_MS) {
   return new Date(Math.floor(t / 1000) * 1000).toISOString().replace(".000Z", "Z");
 }
 
-// validate(input, nowMs): the heartbeat, normalized, with the schema tag.
+// validate(input, nowMs): {hb, agentIds}: the heartbeat, normalized,
+// with the schema tag, and each worker's agent ids (local only: they are
+// not part of the heartbeat), by name.
 function validate(input, nowMs) {
   checkKeys(input, "heartbeat", ["coordinator", "workers"], ["updated_at"]);
   const updatedAt = input.updated_at === undefined ? checkTime(new Date(nowMs).toISOString(), "updated_at", nowMs) : checkTime(input.updated_at, "updated_at", nowMs);
@@ -181,9 +258,10 @@ function validate(input, nowMs) {
   if (!Array.isArray(input.workers)) throw invalid("workers", "must be an array");
   if (input.workers.length > MAX_WORKERS) throw invalid("workers", `${input.workers.length} workers; at most ${MAX_WORKERS}`);
   const names = new Set();
+  const agentIds = new Map();
   const workers = input.workers.map((w, i) => {
     const where = `workers[${i}]`;
-    checkKeys(w, where, ["name", "item_url", "started_at", "status"], ["devspace"]);
+    checkKeys(w, where, ["name", "item_url", "started_at", "status"], ["devspace", "agent_ids"]);
     const worker = {
       name: checkString(w.name, `${where}.name`, WORKER_NAME_RE, "1-64 of [A-Za-z0-9_.-]"),
       item_url: checkString(w.item_url, `${where}.item_url`, ITEM_URL_RE, "a github.com issue or pull request URL"),
@@ -195,9 +273,13 @@ function validate(input, nowMs) {
     }
     if (names.has(worker.name)) throw invalid(`${where}.name`, `'${worker.name}' is listed twice`);
     names.add(worker.name);
+    if (w.agent_ids !== undefined && w.agent_ids !== null) {
+      if (!Array.isArray(w.agent_ids) || w.agent_ids.length > MAX_AGENT_IDS) throw invalid(`${where}.agent_ids`, `must be an array of at most ${MAX_AGENT_IDS} agent ids`);
+      agentIds.set(worker.name, w.agent_ids.map((id, j) => checkString(id, `${where}.agent_ids[${j}]`, AGENT_ID_RE, "an agentId, 1-64 of [A-Za-z0-9]")));
+    }
     return worker;
   });
-  return { schema: SCHEMA, updated_at: updatedAt, coordinator, workers };
+  return { hb: { schema: SCHEMA, updated_at: updatedAt, coordinator, workers }, agentIds };
 }
 
 // --- Privacy ------------------------------------------------------------
@@ -234,6 +316,202 @@ function dropPrivate(hb) {
   return { ...hb, workers };
 }
 
+// --- Usage --------------------------------------------------------------
+
+const iso = (ms) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace(".000Z", "Z");
+const zeroTokens = () => Object.fromEntries(TOKEN_KEYS.map((k) => [k, 0]));
+function addTokens(into, t) {
+  for (const k of TOKEN_KEYS) into[k] += t[k];
+  return into;
+}
+const totalTokens = (t) => TOKEN_KEYS.reduce((n, k) => n + t[k], 0);
+
+// A status line rate-limit window: {used_percent, resets_at}, or null
+// if it is missing or malformed. used_percentage is 0-100 (a little
+// more when usage runs past the cap); resets_at is in epoch seconds.
+function statuslineWindow(raw) {
+  if (!isObject(raw)) return null;
+  const pct = raw.used_percentage;
+  const reset = raw.resets_at;
+  if (typeof pct !== "number" || !Number.isFinite(pct) || pct < 0 || pct > 1000) return null;
+  if (typeof reset !== "number" || !Number.isFinite(reset) || reset <= 0) return null;
+  return { used_percent: Math.round(pct * 10) / 10, resets_at: iso(reset * 1000) };
+}
+
+// rateLimitsOf(statusline, nowMs): what RATE_LIMITS_FILE keeps of a
+// status line's input, or null when it has no rate limits (an API-key
+// session, or before the session's first response).
+function rateLimitsOf(input, nowMs) {
+  const rl = isObject(input) ? input.rate_limits : undefined;
+  if (!isObject(rl)) return null;
+  const out = { observed_at: iso(nowMs) };
+  for (const { kind } of WINDOWS) {
+    const w = statuslineWindow(rl[kind]);
+    if (w) out[kind] = w;
+  }
+  return Object.keys(out).length > 1 ? out : null;
+}
+
+// readRateLimits(nowMs): the saved windows that haven't reset yet (after
+// its reset, a window's percent says nothing of the new one), or null,
+// also when the reading is older than RATE_LIMITS_MAX_AGE_MS.
+function readRateLimits(nowMs) {
+  let saved;
+  try {
+    saved = JSON.parse(fs.readFileSync(RATE_LIMITS_FILE, "utf8"));
+  } catch (e) {
+    if (e.code !== "ENOENT") log(`ignoring ${RATE_LIMITS_FILE}: ${e.message}`);
+    return null;
+  }
+  if (!isObject(saved) || typeof saved.observed_at !== "string" || !TIME_RE.test(saved.observed_at)) return null;
+  if (nowMs - Date.parse(saved.observed_at) > RATE_LIMITS_MAX_AGE_MS) return null;
+  const out = { observed_at: saved.observed_at };
+  for (const { kind } of WINDOWS) {
+    const w = saved[kind];
+    if (!isObject(w) || typeof w.used_percent !== "number" || typeof w.resets_at !== "string" || !TIME_RE.test(w.resets_at)) continue;
+    if (Date.parse(w.resets_at) > nowMs) out[kind] = { used_percent: w.used_percent, resets_at: w.resets_at };
+  }
+  return Object.keys(out).length > 1 ? out : null;
+}
+
+function writeFileAtomic(file, data) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
+}
+
+// The transcript helpers are bot-cost's, which prices the same transcripts.
+function costLib() {
+  return require(path.join(__dirname, "bot-cost"));
+}
+
+// summarize(t, readTranscript): a transcript's tokens: in total, and per
+// BUCKET_MS bucket (by its start, in ms) over the last LONGEST_WINDOW_MS.
+function summarize(t, readTranscript, nowMs) {
+  const { usage } = readTranscript(t, { since: 0, until: Infinity });
+  const total = zeroTokens();
+  const buckets = {};
+  const oldest = nowMs - LONGEST_WINDOW_MS - BUCKET_MS;
+  for (const u of usage) {
+    const tokens = { input: u.input, output: u.output, cache_read: u.cache_read, cache_write: u.cache_write_5m + u.cache_write_1h };
+    addTokens(total, tokens);
+    if (u.ts < oldest) continue;
+    const b = (buckets[Math.floor(u.ts / BUCKET_MS) * BUCKET_MS] ||= { requests: 0, ...zeroTokens() });
+    b.requests++;
+    addTokens(b, tokens);
+  }
+  return { total, buckets };
+}
+
+// transcriptSummaries(since, nowMs): the summary of each transcript
+// touched since SINCE, as [transcript, summary], re-reading only those
+// that changed since the cache was written.
+function transcriptSummaries(since, nowMs) {
+  let dirs;
+  try {
+    dirs = fs.readdirSync(PROJECTS_ROOT, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => path.join(PROJECTS_ROOT, e.name));
+  } catch (e) {
+    log(`no transcript usage: cannot read ${PROJECTS_ROOT}: ${e.message}`);
+    return [];
+  }
+  const { transcriptFiles, readTranscript } = costLib();
+  let cache = {};
+  try {
+    const c = JSON.parse(fs.readFileSync(TRANSCRIPT_CACHE_FILE, "utf8"));
+    if (c.version === TRANSCRIPT_CACHE_VERSION && isObject(c.files)) cache = c.files;
+  } catch {
+    // none yet, or unreadable: rebuild it
+  }
+  const files = {};
+  const out = [];
+  for (const t of transcriptFiles(dirs, since)) {
+    let st;
+    try {
+      st = fs.statSync(t.file);
+    } catch {
+      continue; // vanished
+    }
+    let entry = cache[t.file];
+    if (!entry || entry.size !== st.size || entry.mtime_ms !== st.mtimeMs) {
+      try {
+        entry = { size: st.size, mtime_ms: st.mtimeMs, ...summarize(t, readTranscript, nowMs) };
+      } catch (e) {
+        log(`skipping ${t.file}: ${e.message}`);
+        continue;
+      }
+    }
+    files[t.file] = entry;
+    out.push([t, entry]);
+  }
+  try {
+    writeFileAtomic(TRANSCRIPT_CACHE_FILE, JSON.stringify({ version: TRANSCRIPT_CACHE_VERSION, files }));
+  } catch (e) {
+    log(`cannot write ${TRANSCRIPT_CACHE_FILE}: ${e.message}`);
+  }
+  return out;
+}
+
+// windowSums(summaries, sinceMs): requests and tokens of every transcript
+// in the buckets from SINCEMS (rounded down to a bucket) on.
+function windowSums(summaries, sinceMs) {
+  const from = Math.floor(sinceMs / BUCKET_MS) * BUCKET_MS;
+  const sum = { requests: 0, tokens: zeroTokens() };
+  for (const [, s] of summaries) {
+    for (const [start, b] of Object.entries(s.buckets)) {
+      if (Number(start) < from) continue;
+      sum.requests += b.requests;
+      addTokens(sum.tokens, b);
+    }
+  }
+  return sum;
+}
+
+// collectUsage(nowMs, session, agentIds): {usage, workerTokens}: the
+// snapshot publish adds (aggregates only), and the tokens of each
+// worker's subagents in coordinator session SESSION, by worker name.
+function collectUsage(nowMs, session = null, agentIds = new Map()) {
+  const plan = readRateLimits(nowMs);
+  const windows = WINDOWS.map(({ kind, ms }) => {
+    const p = plan?.[kind];
+    // A window's start: its reset less its length, once the status line
+    // has said when that is.
+    const since = p ? Math.min(nowMs, Date.parse(p.resets_at) - ms) : nowMs - ms;
+    return { kind, since: iso(since), ...(p || {}) };
+  });
+  const summaries = transcriptSummaries(Math.min(...windows.map((w) => Date.parse(w.since))), nowMs);
+  for (const w of windows) Object.assign(w, windowSums(summaries, Date.parse(w.since)));
+  const usage = {};
+  if (plan) usage.observed_at = plan.observed_at;
+  usage.windows = windows;
+  const workerTokens = new Map();
+  if (session) {
+    const mine = summaries.filter(([t]) => t.session === session);
+    const coordinator = mine.filter(([t]) => t.kind === "session");
+    if (coordinator.length) usage.coordinator_tokens = windowSums(coordinator, Date.parse(windows[0].since)).tokens;
+    const byAgent = new Map(mine.filter(([t]) => t.kind === "subagent").map(([t, s]) => [path.basename(t.file, ".jsonl").replace(/^agent-/, ""), s]));
+    for (const [name, ids] of agentIds) {
+      const found = ids.filter((id) => byAgent.has(id));
+      if (found.length) workerTokens.set(name, found.reduce((acc, id) => addTokens(acc, byAgent.get(id).total), zeroTokens()));
+    }
+  }
+  return { usage, workerTokens };
+}
+
+// usageSnapshot(hb, agentIds, nowMs): what goes to USAGE_REPO: the
+// usage, and the tokens of each worker (all of them: the repository is
+// private) whose subagents' transcripts were found.
+function usageSnapshot(hb, agentIds, nowMs) {
+  const { usage, workerTokens } = collectUsage(nowMs, hb.coordinator.session, agentIds);
+  return {
+    schema: USAGE_SCHEMA,
+    updated_at: hb.updated_at,
+    session: hb.coordinator.session,
+    ...usage,
+    workers: [...workerTokens].map(([name, tokens]) => ({ name, tokens })),
+  };
+}
+
 // --- The comment --------------------------------------------------------
 
 // OWNER/REPO#N of an item URL.
@@ -244,8 +522,20 @@ function itemRef(url) {
 
 const code = (s) => `\`${s}\``;
 
-// render(hb): the comment's body. Items appear only in code, where
-// GitHub neither links them nor records a cross-reference on them.
+const WINDOW_LABEL = { five_hour: "5-hour", seven_day: "7-day" };
+
+// The usage line: each window's percent (when known) and tokens.
+function usageLine(usage) {
+  const { fmtTokens } = costLib();
+  const parts = usage.windows.map((w) => {
+    const pct = w.used_percent === undefined ? "" : `${w.used_percent}% used, resets ${w.resets_at}, `;
+    return `${WINDOW_LABEL[w.kind] ?? w.kind} window: ${pct}${fmtTokens(totalTokens(w.tokens))} tokens (${fmtTokens(w.tokens.output)} output) in ${w.requests} requests since ${w.since}`;
+  });
+  return `Usage, ${parts.join("; ")}.`;
+}
+
+// render(hb): the heartbeat comment's body. Items appear only in code,
+// where GitHub neither links them nor records a cross-reference on them.
 function render(hb) {
   const lines = [
     MARKER,
@@ -259,35 +549,83 @@ function render(hb) {
     }
     lines.push("");
   }
-  lines.push("```json", JSON.stringify(hb, null, 2), "```", "");
+  return finish(lines, hb);
+}
+
+// renderUsage(snap): the usage comment's body.
+function renderUsage(snap) {
+  const { fmtTokens } = costLib();
+  const lines = [USAGE_MARKER, `${usageLine(snap)} Written by ${code(`${PROG} publish`)} in ${CONFIG.bot.homegit_repo}; the review app's ops view reads the JSON below.`, ""];
+  if (snap.workers.length) {
+    lines.push("| Worker | Tokens |", "|---|---|");
+    for (const w of snap.workers) lines.push(`| ${code(w.name)} | ${fmtTokens(totalTokens(w.tokens))} |`);
+    lines.push("");
+  }
+  return finish(lines, snap);
+}
+
+function finish(lines, json) {
+  lines.push("```json", JSON.stringify(json, null, 2), "```", "");
   const body = lines.join("\n");
   if (body.length > MAX_BODY_CHARS) throw new Exit(EX_INVALID, `the comment would be ${body.length} characters; at most ${MAX_BODY_CHARS}`);
   return body;
 }
 
-// heartbeatComment(): the bot's heartbeat comment on the issue, if any.
-// The issue is locked, so its comments are few.
-function heartbeatComment() {
+// Where the two comments go: the heartbeat, public, and the usage,
+// private.
+const HEARTBEAT = { repo: TRACKER_REPO, issue: HEARTBEAT_ISSUE, marker: MARKER, what: "heartbeat" };
+const USAGE = { repo: USAGE_REPO, issue: USAGE_ISSUE, marker: USAGE_MARKER, what: "usage" };
+const where = (t) => `${t.repo}#${t.issue}`;
+
+// botComment(t): the bot's comment on T's issue, if any. The issues are
+// locked, so their comments are few.
+function botComment(t) {
   const out = gh(
-    ["api", "--paginate", `repos/${TRACKER_REPO}/issues/${HEARTBEAT_ISSUE}/comments?per_page=100`, "--jq", ".[] | {id, html_url, login: .user.login, body} | @json"],
-    `list the comments of ${TRACKER_REPO}#${HEARTBEAT_ISSUE}`,
+    ["api", "--paginate", `repos/${t.repo}/issues/${t.issue}/comments?per_page=100`, "--jq", ".[] | {id, html_url, login: .user.login, body} | @json"],
+    `list the comments of ${where(t)}`,
   );
   for (const line of out.split("\n")) {
     if (!line) continue;
     const c = JSON.parse(line);
-    if (c.login === BOT_LOGIN && typeof c.body === "string" && c.body.startsWith(MARKER)) return c;
+    if (c.login === BOT_LOGIN && typeof c.body === "string" && c.body.startsWith(t.marker)) return c;
   }
   return null;
 }
 
-// parseComment(body): the heartbeat JSON in a comment's body.
+// writeComment(t, body): edit the bot's comment on T's issue in place
+// (create it the first time), unless it already says BODY. Returns what
+// happened, for the log.
+function writeComment(t, body) {
+  const existing = botComment(t);
+  if (existing && existing.body === body) return `unchanged: ${existing.html_url}`;
+  // The lookup only finds BOT_LOGIN's comment: under another login,
+  // every publish would create one more.
+  if (!existing) {
+    const login = gh(["api", "user", "--jq", ".login"], "read gh's login").trim();
+    if (login !== BOT_LOGIN) throw new Exit(EX_ERROR, `gh is authenticated as '${login}', not ${BOT_LOGIN}; not creating a ${t.what} comment it would never find again`);
+  }
+  const payload = JSON.stringify({ body });
+  const out = existing
+    ? gh(["api", "-X", "PATCH", `repos/${t.repo}/issues/comments/${existing.id}`, "--input", "-", "--jq", ".html_url"], `edit the ${t.what} comment`, payload)
+    : gh(["api", "-X", "POST", `repos/${t.repo}/issues/${t.issue}/comments`, "--input", "-", "--jq", ".html_url"], `create the ${t.what} comment`, payload);
+  return `${existing ? "updated" : "created"} ${out.trim()}`;
+}
+
+// assertPrivate(repo): refuse to write usage to a repository GitHub
+// doesn't say is private.
+function assertPrivate(repo) {
+  const priv = gh(["api", `repos/${repo}`, "--jq", ".private"], `read ${repo}'s visibility`).trim();
+  if (priv !== "true") throw new Exit(EX_ERROR, `${repo} is not private; not writing the usage snapshot there`);
+}
+
+// parseComment(body): the JSON in a comment's body.
 function parseComment(body) {
   const m = /^```json\n([\s\S]*?)\n```$/m.exec(body);
-  if (!m) throw new Exit(EX_ERROR, "the heartbeat comment has no JSON block");
+  if (!m) throw new Exit(EX_ERROR, "the comment has no JSON block");
   try {
     return JSON.parse(m[1]);
   } catch (e) {
-    throw new Exit(EX_ERROR, `the heartbeat comment's JSON block is malformed: ${e.message}`);
+    throw new Exit(EX_ERROR, `the comment's JSON block is malformed: ${e.message}`);
   }
 }
 
@@ -310,39 +648,73 @@ function readInput() {
 
 function cmdPublish(args) {
   let dryRun = false;
+  let withUsage = true;
   for (const a of args) {
     if (a === "--dry-run") dryRun = true;
+    else if (a === "--no-usage") withUsage = false;
     else throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
   }
-  const hb = dropPrivate(validate(readInput(), now()));
+  const nowMs = now();
+  const { hb: valid, agentIds } = validate(readInput(), nowMs);
+  const hb = dropPrivate(valid);
   const body = render(hb);
+  let usageBody = null;
+  if (withUsage) {
+    // Best effort: a heartbeat without usage beats none.
+    try {
+      usageBody = renderUsage(usageSnapshot(valid, agentIds, nowMs));
+    } catch (e) {
+      log(`no usage snapshot: ${e.message}`);
+    }
+  }
   if (dryRun) {
     process.stdout.write(body);
+    if (usageBody !== null) process.stdout.write(`${DRY_RUN_SEPARATOR}\n${usageBody}`);
     return;
   }
-  const existing = heartbeatComment();
-  if (existing && existing.body === body) {
-    log(`unchanged: ${existing.html_url}`);
-    return;
-  }
-  // The lookup only finds BOT_LOGIN's comment: under another login,
-  // every publish would create one more.
-  if (!existing) {
-    const login = gh(["api", "user", "--jq", ".login"], "read gh's login").trim();
-    if (login !== BOT_LOGIN) throw new Exit(EX_ERROR, `gh is authenticated as '${login}', not ${BOT_LOGIN}; not creating a heartbeat comment it would never find again`);
-  }
-  const payload = JSON.stringify({ body });
-  const out = existing
-    ? gh(["api", "-X", "PATCH", `repos/${TRACKER_REPO}/issues/comments/${existing.id}`, "--input", "-", "--jq", ".html_url"], "edit the heartbeat comment", payload)
-    : gh(["api", "-X", "POST", `repos/${TRACKER_REPO}/issues/${HEARTBEAT_ISSUE}/comments`, "--input", "-", "--jq", ".html_url"], "create the heartbeat comment", payload);
-  log(`${existing ? "updated" : "created"} ${out.trim()} (${hb.workers.length} worker(s))`);
+  log(`${writeComment(HEARTBEAT, body)} (${hb.workers.length} worker(s))`);
+  if (usageBody === null) return;
+  assertPrivate(USAGE_REPO);
+  log(`usage: ${writeComment(USAGE, usageBody)}`);
 }
 
 function cmdShow(args) {
-  if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
-  const c = heartbeatComment();
-  if (!c) throw new Exit(EX_ERROR, `no heartbeat comment on ${TRACKER_REPO}#${HEARTBEAT_ISSUE} yet`);
+  let t = HEARTBEAT;
+  for (const a of args) {
+    if (a === "--usage") t = USAGE;
+    else throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+  }
+  const c = botComment(t);
+  if (!c) throw new Exit(EX_ERROR, `no ${t.what} comment on ${where(t)} yet`);
   process.stdout.write(`${JSON.stringify(parseComment(c.body), null, 2)}\n`);
+}
+function cmdUsage(args) {
+  if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
+  process.stdout.write(`${JSON.stringify(collectUsage(now()).usage, null, 2)}\n`);
+}
+
+// A status line command: save the rate limits, print a short line. It
+// runs after every assistant message, so it never fails loudly.
+function cmdStatusline(args) {
+  if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
+  let input = null;
+  try {
+    const raw = fs.readFileSync(0);
+    if (raw.length <= MAX_STATUSLINE_BYTES) input = JSON.parse(raw.toString("utf8"));
+  } catch {
+    // no input: print what we can
+  }
+  const limits = rateLimitsOf(input, now());
+  if (limits) {
+    try {
+      writeFileAtomic(RATE_LIMITS_FILE, `${JSON.stringify(limits)}\n`);
+    } catch (e) {
+      log(`cannot save the rate limits: ${e.message}`);
+    }
+  }
+  const model = isObject(input) && isObject(input.model) && typeof input.model.display_name === "string" ? input.model.display_name.slice(0, 40) : "";
+  const pcts = WINDOWS.flatMap(({ kind }) => (limits?.[kind] ? [`${kind === "five_hour" ? "5h" : "7d"} ${Math.round(limits[kind].used_percent)}%`] : []));
+  process.stdout.write(`${[model, ...pcts].filter(Boolean).join(" · ")}\n`);
 }
 
 // needIssue(): there must be a heartbeat issue to write or read.
@@ -366,6 +738,10 @@ function main() {
     case "show":
       needIssue();
       return cmdShow(args);
+    case "usage":
+      return cmdUsage(args);
+    case "statusline":
+      return cmdStatusline(args);
     default:
       throw new Exit(EX_USAGE, `${cmd === undefined ? "missing command" : `unknown command '${cmd}'`}\n\n${usage()}`);
   }
@@ -380,5 +756,5 @@ if (require.main === module) {
     process.exit(e.status);
   }
 } else {
-  module.exports = { validate, render, parseComment, SCHEMA, MARKER };
+  module.exports = { validate, render, renderUsage, usageSnapshot, parseComment, rateLimitsOf, collectUsage, SCHEMA, MARKER, USAGE_MARKER };
 }
