@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Run one non-interactive cgwalters-bot session against the Workstream board.
+# Run one non-interactive bot session against the Workstream board (both
+# named by the operator config).
 set -euo pipefail
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/operator.sh"
 
 readonly DEFAULT_AGENT=opencode
-readonly BOT_LOGIN=cgwalters-bot
-readonly BOARD_URL=https://github.com/orgs/cgwalters-forge/projects/1
+readonly BOT_LOGIN=${OP_BOT_LOGIN}
+readonly BOARD_URL=${OP_BOARD_URL}
 readonly LOCK_FILE=${XDG_RUNTIME_DIR:-/tmp}/bot-work.lock
 # Only one run on any machine at a time: besides the local lock, a run
 # holds a lease in the archived 'bot-state: lease' board item (see
@@ -30,7 +33,7 @@ usage() {
 Usage: $(basename "$0") [--agent opencode|claude] [--plan [--since YYYY-MM-DD]] [EXTRA INSTRUCTIONS...]
 
 Run an agent non-interactively to pick up or advance the next item on the
-cgwalters-bot Workstream board (${BOARD_URL}).
+${BOT_LOGIN} Workstream board (${BOARD_URL}).
 
 Options:
   --agent AGENT  Agent CLI to use: opencode (default) or claude

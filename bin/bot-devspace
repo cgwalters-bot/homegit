@@ -3,13 +3,16 @@
 # the tailnet) for building and testing the bot's work.
 set -euo pipefail
 
-readonly REPO=bootc-dev/cgwalters-devspace-sandbox
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/operator.sh"
+# The runner repository, from the operator config.
+readonly REPO=${OP_DEVSPACE_REPO}
 readonly WORKFLOW=devspace.yml
 readonly WORKFLOW_PATH=.github/workflows/${WORKFLOW}
 # Only REST endpoints are used: the GraphQL quota is shared with the board
 # tooling and easily exhausted by parallel agents.
 readonly RUNS_API="repos/${REPO}/actions/workflows/${WORKFLOW}/runs?event=workflow_dispatch&per_page=100"
-readonly HOST_PREFIX=cgwalters-devspace-
+readonly HOST_PREFIX=${OP_DEVSPACE_HOST_PREFIX}
 # SSH sessions run as the unprivileged 'runner-sandbox', without sudo: the 'runner'
 # user holds the job's credentials. Devspaces from a workflow revision that
 # predates it admit only 'runner'; start probes both, in this order, and
