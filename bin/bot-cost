@@ -863,5 +863,9 @@ if (require.main === module) {
     process.exit(e.status);
   });
 } else {
-  module.exports = { parseTime, splitByDay, runnerOf, usdPerMinute, modelPrice, usdOf, devspaceName, devspacesStarted, render, scan };
+  module.exports = {
+    parseTime, splitByDay, runnerOf, usdPerMinute, modelPrice, usdOf, devspaceName, devspacesStarted, render, scan,
+    // For bot-heartbeat's usage snapshot.
+    transcriptFiles, readTranscript, fmtTokens,
+  };
 }
