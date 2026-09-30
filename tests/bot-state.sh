@@ -403,7 +403,7 @@ JSON
     ! "${BIN}/bot-board" --project nope list 2>/dev/null || fail "an unknown board was accepted"
     reset_calls
     "${BIN}/bot-board" --refresh list >/dev/null
-    grep -q '^api -i users/cgwalters-bot/projectsV2/1/items?' "${FAKE_GH}/calls" || fail "the default isn't the Workstream board"
+    grep -q '^api -i orgs/cgwalters-forge/projectsV2/1/items?' "${FAKE_GH}/calls" || fail "the default isn't the Workstream board"
 }
 
 # --- bot-pr -----------------------------------------------------------------

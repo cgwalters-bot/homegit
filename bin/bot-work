@@ -4,7 +4,7 @@ set -euo pipefail
 
 readonly DEFAULT_AGENT=opencode
 readonly BOT_LOGIN=cgwalters-bot
-readonly BOARD_URL=https://github.com/users/${BOT_LOGIN}/projects/1
+readonly BOARD_URL=https://github.com/orgs/cgwalters-forge/projects/1
 readonly LOCK_FILE=${XDG_RUNTIME_DIR:-/tmp}/bot-work.lock
 # Only one run on any machine at a time: besides the local lock, a run
 # holds a lease in the archived 'bot-state: lease' board item (see

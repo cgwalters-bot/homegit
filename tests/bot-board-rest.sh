@@ -54,14 +54,14 @@ query=${path#*\?}
 fields=$(sed -n 's/.*[?&]fields=\([^&]*\).*/\1/p' <<<"${query}")
 link=""
 case "${path%%\?*}" in
-    users/cgwalters-bot/projectsV2/1/fields) file=fields ;;
-    users/cgwalters-bot/projectsV2/1/items|user/17814078/projectsV2/1/items)
+    orgs/cgwalters-forge/projectsV2/1/fields) file=fields ;;
+    orgs/cgwalters-forge/projectsV2/1/items|organizations/333055778/projectsV2/1/items)
         if [[ "${query}" == *after=c2* ]]; then
             file=items-2
         else
             file=items-1
             if test -e "${store}/items-2.json"; then
-                link="Link: <https://api.github.com/user/17814078/projectsV2/1/items?per_page=100&fields=${fields}&after=c2>; rel=\"next\""$'\r\n'
+                link="Link: <https://api.github.com/organizations/333055778/projectsV2/1/items?per_page=100&fields=${fields}&after=c2>; rel=\"next\""$'\r\n'
             fi
         fi
         ;;
@@ -87,7 +87,7 @@ chmod +x "${WORK}/bin/gh"
 list() {
     local name=$1
     shift
-    rm -f "${XDG_CACHE_HOME}/bot-board/users/cgwalters-bot/1/items.json"
+    rm -f "${XDG_CACHE_HOME}/bot-board/orgs/cgwalters-forge/1/items.json"
     : >"${FAKE_GH}/calls"
     out=$("${BOT_BOARD}" "$@" list --json 2>"${WORK}/err") || { fail "${name}: $(cat "${WORK}/err")"; out='[]'; }
 }

@@ -287,7 +287,7 @@ minutes, which means the session is gone or stuck.
 Each morning, open an issue on
 [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues)
 that mentions @cgwalters, with a link to the "Needs cgwalters" view
-(<https://github.com/users/cgwalters-bot/projects/1/views/2>) and a
+(<https://github.com/orgs/cgwalters-forge/projects/1/views/2>) and a
 summary of it:
 
 - **quick wins**: fork PRs that are small and ready, with links;

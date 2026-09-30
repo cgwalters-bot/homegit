@@ -17,8 +17,10 @@ readonly BOT_LOGIN=cgwalters-bot
 # bot's work queue and holds the state items; the others are milestone
 # views, often over the same issues and PRs. There is deliberately no
 # environment variable for this: the other bot scripts call bot-board
-# and must always reach the Workstream board.
-readonly -A PROJECTS=([workstream]=users/cgwalters-bot/1 [composefs-stable]=users/cgwalters-bot/2)
+# and must always reach the Workstream board. It is an org project
+# because GitHub Apps and fine-grained tokens can write those but not a
+# user's (cgwalters-forge/tracker#144).
+readonly -A PROJECTS=([workstream]=orgs/cgwalters-forge/1 [composefs-stable]=users/cgwalters-bot/2)
 readonly WORKSTREAM=workstream
 # Set by select_project: the board's KIND/OWNER/NUMBER and its parts.
 PROJECT=
@@ -125,11 +127,11 @@ readonly EX_RATELIMIT=75
 # as "ITEM_ID DRAFT_ID" so that state-put can write the draft directly.
 readonly STATE_PREFIX='bot-state: '
 readonly -A STATE_ITEMS=(
-    [notifications]='PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk DI_lAHOAQ_SPs4Bj2GizgLL1Nk'
-    [watch]='PVTI_lAHOAQ_SPs4Bj2Gizg8bu2Q DI_lAHOAQ_SPs4Bj2GizgLL6AY'
-    [pr-inbox]='PVTI_lAHOAQ_SPs4Bj2Gizg8evC8 DI_lAHOAQ_SPs4Bj2GizgLMD8k'
-    [lease]='PVTI_lAHOAQ_SPs4Bj2Gizg8evDc DI_lAHOAQ_SPs4Bj2GizgLMD8s'
-    [tmt-numbers]='PVTI_lAHOAQ_SPs4Bj2Gizg84Ipc DI_lAHOAQ_SPs4Bj2GizgLNEX0'
+    [notifications]='PVTI_lADOE9oHIs4BlJLczg9kJYo DI_lADOE9oHIs4BlJLczgLPK1o'
+    [watch]='PVTI_lADOE9oHIs4BlJLczg9kJVU DI_lADOE9oHIs4BlJLczgLPK1Y'
+    [pr-inbox]='PVTI_lADOE9oHIs4BlJLczg9kJXQ DI_lADOE9oHIs4BlJLczgLPK1k'
+    [lease]='PVTI_lADOE9oHIs4BlJLczg9kJRo DI_lADOE9oHIs4BlJLczgLPK1I'
+    [tmt-numbers]='PVTI_lADOE9oHIs4BlJLczg9kJT8 DI_lADOE9oHIs4BlJLczgLPK1U'
 )
 # GitHub's limit on the body of a draft item, in characters.
 readonly STATE_BODY_MAX=65536

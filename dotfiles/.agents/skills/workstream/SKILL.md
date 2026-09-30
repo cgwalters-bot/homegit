@@ -1,14 +1,17 @@
 ---
 name: workstream
-description: Pick up, claim, and update work items on the cgwalters-bot "Workstream" GitHub Project board (users/cgwalters-bot/projects/1) using the gh CLI, and run the fork-PR review loop with bot-pr. Load this at the start of any bot work session and whenever an item's status changes (started, proposed as a draft, promoted upstream, blocked on a human, finished).
+description: Pick up, claim, and update work items on the cgwalters-bot "Workstream" GitHub Project board (orgs/cgwalters-forge/projects/1) using the gh CLI, and run the fork-PR review loop with bot-pr. Load this at the start of any bot work session and whenever an item's status changes (started, proposed as a draft, promoted upstream, blocked on a human, finished).
 ---
 
 # workstream — Working the cgwalters-bot project board
 
 All of the bot's work is coordinated through the GitHub Projects (v2) board
-<https://github.com/users/cgwalters-bot/projects/1> ("Workstream", owner user
-`cgwalters-bot`, number `1`). The board is how the human sees what you are doing,
-so keep it accurate: it matters more than any local notes.
+<https://github.com/orgs/cgwalters-forge/projects/1> ("Workstream", owner org
+`cgwalters-forge`, number `1`). The board is how the human sees what you are doing,
+so keep it accurate: it matters more than any local notes. It moved there
+from the `cgwalters-bot` user's project 1, which is kept read-only for
+now, because GitHub Apps and fine-grained tokens can write only org
+projects: item ids (`PVTI_...`) from before the move are the old board's.
 
 The [Composefs Stable](https://github.com/users/cgwalters-bot/projects/2) board (`bot-board --project composefs-stable`) is only a milestone view for declaring bootc's composefs backend stable. It also tracks other people's work. Every bot-owned item on it is also on Workstream, so `bot-watch` sweeps only Workstream. When one of those items changes status, lands or gets a new next action, also update its Status, Owner and Next there, using `set --field`.
 
@@ -44,7 +47,7 @@ needs to run there).
 
 The board is the only queue of things waiting on cgwalters: the
 "Needs cgwalters" view
-(<https://github.com/users/cgwalters-bot/projects/1/views/2>, filter
+(<https://github.com/orgs/cgwalters-forge/projects/1/views/2>, filter
 `status:"Needs human",Draft`, sorted by Priority). Needs human items
 are his decisions and actions; Draft items are ready for his review on
 the forge (or as a gist). Because the items are the issues and PRs

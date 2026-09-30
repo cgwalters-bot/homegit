@@ -64,8 +64,8 @@ api() { # api PATH: stdin becomes the answer to 'gh api PATH'
 
 echo '{"login": "cgwalters-bot"}' | api user
 # bot-board state-get reads the state item with one GraphQL query.
-jq -n '{data: {node: {id: "PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk", isArchived: true,
-    content: {id: "DI_lAHOAQ_SPs4Bj2GizgLL1Nk", title: "bot-state: notifications",
+jq -n '{data: {node: {id: "PVTI_lADOE9oHIs4BlJLczg9kJYo", isArchived: true,
+    content: {id: "DI_lADOE9oHIs4BlJLczgLPK1o", title: "bot-state: notifications",
               body: "state\n\n```json\n{\"since\": \"2026-09-26T00:00:00Z\"}\n```\n"}}}}' | api graphql
 echo '[]' | api notifications
 echo '[]' | api gists
