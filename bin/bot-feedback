@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Surface emoji reactions on content authored by cgwalters-bot, so that
+# Surface emoji reactions on content authored by the bot, so that
 # feedback on the bot (especially 👎 and 😕) is never missed.
 set -euo pipefail
 shopt -s inherit_errexit
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/operator.sh"
 
-readonly BOT_LOGIN=cgwalters-bot
+readonly BOT_LOGIN=${OP_BOT_LOGIN}
 readonly DEFAULT_LOOKBACK_DAYS=14
 readonly API=https://api.github.com
 readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-feedback
@@ -12,10 +14,10 @@ readonly STATE_FILE=${STATE_DIR}/seen.json
 readonly STATE_VERSION=1
 # Reactions that ask for a human to look; the others are just reported.
 readonly NEGATIVE_JQ='["-1", "confused"]'
-# Reactors that are never reported: the bot itself, and cgwalters, who
-# already knows what he reacted to. Overridable, e.g. to test with a
+# Reactors that are never reported: the bot itself, and the operator,
+# who already knows what they reacted to. Overridable, e.g. to test with a
 # reaction added by the bot.
-readonly IGNORE_LOGINS=${BOT_FEEDBACK_IGNORE-${BOT_LOGIN} cgwalters}
+readonly IGNORE_LOGINS=${BOT_FEEDBACK_IGNORE-${BOT_LOGIN} ${OP_OPERATOR_LOGIN}}
 # One search per query below, each paginated 100 at a time; the search
 # API allows only 30 requests a minute.
 readonly SEARCH_QUALIFIERS=(commenter author reviewed-by)
@@ -24,8 +26,8 @@ readonly EXCERPT_LEN=160
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
 # Where --file-issues files feedback, and who it notifies there.
-readonly DEFAULT_ISSUE_REPO=cgwalters-bot/cgwalters-bot
-readonly MENTION_LOGIN=cgwalters
+readonly DEFAULT_ISSUE_REPO=${OP_BOT_ISSUE_REPO}
+readonly MENTION_LOGIN=${OP_OPERATOR_LOGIN}
 # Hidden marker in each filed issue's body, so a reaction is never filed
 # twice even if the state file is lost.
 readonly MARKER_PREFIX='bot-feedback-reaction:'

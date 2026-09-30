@@ -7,17 +7,19 @@
 # shellcheck disable=SC2016
 set -euo pipefail
 shopt -s inherit_errexit
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/operator.sh"
 
-readonly BOT_LOGIN=cgwalters-bot
+readonly BOT_LOGIN=${OP_BOT_LOGIN}
 # Comments by this login are flagged: they may be requests.
-readonly REQUESTER=cgwalters
+readonly REQUESTER=${OP_OPERATOR_LOGIN}
 # The bot's PRs in repositories of these owners with a bot-meta section
 # (which 'bot-pr fork-pr' writes) are its fork PRs, the ones 'bot-pr
-# inbox' searches: cgwalters' comments and reviews on them, and his
-# closing them, are for inbox; here they only get their head and CI
+# inbox' searches: the operator's comments and reviews on them, and
+# their closing them, are for inbox; here they only get their head and CI
 # watched. Anything else there (the bot's own repositories' PRs, issues,
 # PRs by others) is swept in full.
-readonly FORK_OWNERS='["cgwalters-forge", "cgwalters-bot"]'
+readonly FORK_OWNERS="[\"${OP_FORGE_ORG}\", \"${OP_BOT_LOGIN}\"]"
 readonly FORK_META='<!-- bot-meta -->'
 # fork_pr(OWNER): whether a PR (REST pull or search item) in a repository
 # of OWNER is one of the bot's fork PRs; takes $bot, $forks and $meta.
@@ -93,12 +95,12 @@ sweep saw and report:
   - CI turning red (or green again), flagged on the bot's own branches.
     Runs of workflows disabled since don't count, failed or still
     queued: 'bot-pr fork-setup' disables every workflow on the forks in
-    cgwalters-forge, where devspace testing is the CI, so the runs
+    ${OP_FORGE_ORG}, where devspace testing is the CI, so the runs
     cancelled then (whose summary jobs fail) aren't news.
 
 On the bot's fork PRs (its PRs in ${FORK_OWNERS} with a
 bot-meta section; not its own repositories' PRs) only pushes and CI
-are reported; 'bot-pr inbox' covers cgwalters' review there. Most have
+are reported; 'bot-pr inbox' covers ${OP_OPERATOR_POSSESSIVE} review there. Most have
 no CI at all, which is expected and not reported. A URL seen for the
 first time is only recorded, unless CI on the bot's branch fails, with
 two exceptions (none on the very first sweep, with no state yet). On an
@@ -893,7 +895,7 @@ fi
 
 # (bot-poll recognizes an incomplete section by its warning below, as
 # for the health and outstanding-review sections: keep the wording.)
-# Sign-offs cgwalters' approval of an upstream PR's head allows: only
+# Sign-offs the operator's approval of an upstream PR's head allows: only
 # --apply runs them. Like the health section, its failing costs only
 # the section, with a warning and a nonzero exit; so does a rate limit,
 # which is the search's (as for the PRs off the board above).

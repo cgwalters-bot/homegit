@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
-# Route cgwalters-bot's GitHub notifications (mentions, review requests,
-# assignments): requests from cgwalters become request records for the
+# Route the bot's GitHub notifications (mentions, review requests,
+# assignments): requests from the operator become request records for the
 # agent to put on the board; anything from anyone else is filed as an issue
-# for cgwalters and never acted on.
+# for the operator and never acted on. The operator config (bin/operator.sh)
+# names both, the forge org and the tracker.
 # GraphQL queries and jq programs hold literal $variables.
 # shellcheck disable=SC2016
 set -euo pipefail
 shopt -s inherit_errexit
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/operator.sh"
 
-readonly BOT_LOGIN=cgwalters-bot
+readonly BOT_LOGIN=${OP_BOT_LOGIN}
 # The only login whose asks are acted on.
-readonly REQUESTER=cgwalters
+readonly REQUESTER=${OP_OPERATOR_LOGIN}
 # Fork PRs in the forge are handled by 'bot-pr inbox'.
-readonly FORGE_ORG=cgwalters-forge
+readonly FORGE_ORG=${OP_FORGE_ORG}
 # Notification reasons that ask something of the bot. The rest (comment,
 # author, state_change, ci_activity, subscribed) are about threads the bot
 # already follows, which are on the board, where bot-watch reports them,
@@ -23,7 +26,7 @@ readonly SELECT_REASONS='["mention", "team_mention", "review_requested", "assign
 # reason COMMENT_REASON: on an ask it is his answer, printed as an
 # 'answer' record; on any other issue there, a 'request'. Everyone else's
 # comments there, the bot's own included, are left to bot-watch.
-readonly TRACKER_REPO=cgwalters-forge/tracker
+readonly TRACKER_REPO=${OP_TRACKER_REPO}
 # Asks for REQUESTER: a question, a PR to review, or a chore.
 readonly ASK_LABELS='["question", "review", "chore"]'
 readonly COMMENT_REASON=comment
@@ -70,7 +73,7 @@ readonly ACKED_KEEP_DAYS=30
 readonly ASSIGN_STATUS=Todo
 readonly ASSIGN_PRIORITY=P1
 # Where issues about asks by others are filed, and who they notify.
-readonly DEFAULT_ISSUE_REPO=cgwalters-bot/cgwalters-bot
+readonly DEFAULT_ISSUE_REPO=${OP_BOT_ISSUE_REPO}
 # Hidden marker in each filed issue's body, keyed by the trigger's URL, so
 # a retried run never files the same trigger twice.
 readonly MARKER_PREFIX='bot-notify-trigger:'

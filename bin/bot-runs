@@ -12,9 +12,11 @@ source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
     exit 1
 }
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/operator.sh"
 
 readonly SUMMARY_SCHEMA=agent-run-summary/v1
-readonly RUNS_REPO=${BOT_RUNS_REPO:-bootc-dev/cgwalters-devspace-sandbox}
+readonly RUNS_REPO=${BOT_RUNS_REPO:-${OP_DEVSPACE_REPO}}
 readonly RUNS_WORKFLOW=${BOT_RUNS_WORKFLOW:-agent.yml}
 readonly RUNS_REF=${BOT_RUNS_REF:-main}
 readonly SUMMARY_ARTIFACT=agent-run
@@ -26,8 +28,8 @@ readonly TRANSCRIPT_NAME=transcript.tar.zst
 # The job log group holding the condensed transcript.
 readonly LOG_GROUP='agent (condensed)'
 # Run footers are in the bot's PRs in this organization.
-readonly FOOTER_OWNER=cgwalters-forge
-readonly BOT_LOGIN=cgwalters-bot
+readonly FOOTER_OWNER=${OP_FORGE_ORG}
+readonly BOT_LOGIN=${OP_BOT_LOGIN}
 # A run whose summary could not be found at all is looked up again after
 # this many minutes (its footer may be written after the run).
 readonly NONE_RETRY_MINUTES=1440
