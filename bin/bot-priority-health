@@ -409,7 +409,10 @@ async function sweep(boards, now) {
     try {
       return await checkPr(t, now);
     } catch (e) {
-      if (!(e instanceof Exit) || e.status === EX_RATELIMIT) throw e;
+      // An exhausted quota stops everything (see main()); any other
+      // failure, expected (Exit) or not (a bug, a surprising response),
+      // costs only this PR's lines, not the whole section.
+      if (e instanceof Exit && e.status === EX_RATELIMIT) throw e;
       warn(`reading ${t.url} failed: ${e.message}`);
       failed.push(t.url);
       return null;
