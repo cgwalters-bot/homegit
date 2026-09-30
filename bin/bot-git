@@ -1,19 +1,26 @@
 #!/usr/bin/env bash
-# git as cgwalters-bot: the one place that defines the git identity of the
-# bot's commits, a git wrapper that commits and rebases with it, and a
-# pre-push check of a branch's commits; see --help. bot-pr and dco-signoff
-# source this file for the identity constants.
+# git as the bot: the one place that defines the git identity of the
+# bot's commits (from the operator config, bin/operator.sh), a git
+# wrapper that commits and rebases with it, and a pre-push check of a
+# branch's commits; see --help. bot-pr and dco-signoff source this file
+# for the identity constants.
+
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/operator.sh"
 
 # The git identity of the bot's commits. The email is what marks a commit
-# as the bot's rather than cgwalters' own; the bot's commits from before
-# it was named after him have BOT_GIT_LEGACY_NAME.
-readonly BOT_GIT_NAME="Colin Walters"
-readonly BOT_GIT_EMAIL=walters+llm@verbum.org
-readonly BOT_GIT_LEGACY_NAME=cgwalters-bot
-# cgwalters' own identity: 'bot-pr promote' and 'bot-pr signoff' add his
-# sign-off, as him, on his approval.
-readonly HUMAN_GIT_NAME="Colin Walters"
-readonly HUMAN_GIT_EMAIL=walters@verbum.org
+# as the bot's rather than the operator's own; the bot's commits from
+# before it was named after the operator have BOT_GIT_LEGACY_NAME (its
+# login).
+readonly BOT_GIT_NAME=${OP_BOT_GIT_NAME}
+readonly BOT_GIT_EMAIL=${OP_BOT_GIT_EMAIL}
+readonly BOT_GIT_LEGACY_NAME=${OP_BOT_LOGIN}
+# The operator's own identity: 'bot-pr promote' and 'bot-pr signoff' add
+# their sign-off, as them, on their approval.
+readonly HUMAN_LOGIN=${OP_OPERATOR_LOGIN}
+readonly HUMAN_POSSESSIVE=${OP_OPERATOR_POSSESSIVE}
+readonly HUMAN_GIT_NAME=${OP_OPERATOR_NAME}
+readonly HUMAN_GIT_EMAIL=${OP_OPERATOR_EMAIL}
 
 # Sourced: only the constants.
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
@@ -40,13 +47,13 @@ declare -rA SIGNOFF_SHORT_VALUE_OPTS=(
     [format-patch]="ov -"
     [revert]="m S"
 )
-readonly SIGNOFF_REFUSAL="the bot never adds a Signed-off-by; only 'bot-pr promote' and 'bot-pr signoff' add cgwalters' own on his approval"
-# cgwalters' sign-off, as promote and signoff add it.
+readonly SIGNOFF_REFUSAL="the bot never adds a Signed-off-by; only 'bot-pr promote' and 'bot-pr signoff' add ${HUMAN_POSSESSIVE} own on their approval"
+# The operator's sign-off, as promote and signoff add it.
 readonly HUMAN_SIGNOFF="Signed-off-by: ${HUMAN_GIT_NAME} <${HUMAN_GIT_EMAIL}>"
 # The clones other agents use too, where the bot never commits: its
 # homegit clone, and those listed in SHARED_CLONES_CONFIG, one path or
 # glob per line ('~/' for the home directory, '#' for comments).
-readonly DEFAULT_SHARED_CLONE=${HOME}/src/github/cgwalters-bot/homegit
+readonly DEFAULT_SHARED_CLONE=${HOME}/src/github/${OP_BOT_LOGIN}/homegit
 readonly SHARED_CLONES_CONFIG=${BOT_GIT_SHARED_CLONES:-${XDG_CONFIG_HOME:-${HOME}/.config}/bot-git/shared-clones}
 # Set to 1 to commit in a shared clone anyway.
 readonly ALLOW_SHARED_ENV=BOT_GIT_ALLOW_SHARED_CLONE
@@ -61,7 +68,7 @@ Usage: ${PROG} GIT-ARGS...
        ${PROG} check [--no-ai-trailer] [--promoted] [--was OLD-HEAD]
                      [--pair OLD=NEW]... [--patch-id] [RANGE]
 
-The git identity of cgwalters-bot's commits is
+The git identity of ${OP_BOT_LOGIN}'s commits is
 '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'. The email is what marks a commit as the
 bot's; the bot's older commits are named '${BOT_GIT_LEGACY_NAME}'.
 
@@ -70,7 +77,7 @@ for every git command that creates or rewrites commits: commit, rebase,
 cherry-pick, am, merge. Rebases and amends keep each commit's original
 author. It refuses to add a Signed-off-by (-s/--signoff, or a
 Signed-off-by --trailer): the bot never signs off; only 'bot-pr promote'
-and 'bot-pr signoff' add cgwalters' own on his approval.
+and 'bot-pr signoff' add ${HUMAN_POSSESSIVE} own on their approval.
 
 It also refuses those, revert, pull, stash and 'rework' in a shared clone that
 other agents use: ${DEFAULT_SHARED_CLONE},
@@ -81,7 +88,7 @@ comments; \$BOT_GIT_SHARED_CLONES names another file). Work in your own
 worktree instead ('git worktree add'). For a rare one-line fix that has
 to be made there, set ${ALLOW_SHARED_ENV}=1.
 
-${PROG} rework keeps cgwalters' sign-off on the commits reworked to act on
+${PROG} rework keeps ${HUMAN_POSSESSIVE} sign-off on the commits reworked to act on
 his review, after they were rewritten (e.g. with '${PROG} rebase'): it pairs
 each commit of UPSTREAM..HEAD with the one of UPSTREAM..OLD-HEAD, the
 published branch (default: @{upstream}; UPSTREAM defaults to their
@@ -114,12 +121,12 @@ pushing, and lists what's wrong with them:
     (by either name), and others' commits committed by the bot's email
     under another name;
   - bot commits with a Signed-off-by (with --promoted, for a head that
-    'bot-pr promote' signed off, those committed by cgwalters with his;
+    'bot-pr promote' signed off, those committed by ${HUMAN_LOGIN} with his;
     and those that '${PROG} rework' kept his on, committed by him, whose
     pair on the published branch had the same: @{upstream} for the
     default range, else --was OLD-HEAD, paired as 'rework' does, with
     --pair and --patch-id, with RANGE's start as UPSTREAM);
-  - commits made as cgwalters with a Generated-by trailer, which is the
+  - commits made as ${HUMAN_LOGIN} with a Generated-by trailer, which is the
     bot's work done with plain git; it warns about those he authored with
     an AI trailer, and others' commits he committed (except, with a
     published head to pair with as above, others' commits that only a
@@ -287,7 +294,7 @@ is_bot_name() {
     test "$1" = "${BOT_GIT_NAME}" || test "$1" = "${BOT_GIT_LEGACY_NAME}"
 }
 
-# has_human_signoff COMMIT: succeeds if COMMIT has cgwalters' sign-off
+# has_human_signoff COMMIT: succeeds if COMMIT has the operator's sign-off
 # trailer.
 has_human_signoff() {
     local sobs
@@ -296,14 +303,14 @@ has_human_signoff() {
 }
 
 # only_human_signoff COMMIT: succeeds if COMMIT's Signed-off-by trailers
-# are all cgwalters' own, if any.
+# are all the operator's own, if any.
 only_human_signoff() {
     local sobs
     sobs=$(git show -s --format='%(trailers:key=Signed-off-by,valueonly)' "$1")
     ! grep -vxF -e "${HUMAN_GIT_NAME} <${HUMAN_GIT_EMAIL}>" -e "" <<<"${sobs}" >/dev/null
 }
 
-# human_committed COMMIT: succeeds if cgwalters committed COMMIT, under
+# human_committed COMMIT: succeeds if the operator committed COMMIT, under
 # his name.
 human_committed() {
     local c
@@ -318,7 +325,7 @@ bot_authored() {
     test "${ae,,}" = "${BOT_GIT_EMAIL,,}"
 }
 
-# signed_bot_commit COMMIT: succeeds for a bot commit with cgwalters'
+# signed_bot_commit COMMIT: succeeds for a bot commit with the operator's
 # sign-off and him as committer, as 'bot-pr promote' makes them.
 signed_bot_commit() {
     bot_authored "$1" && human_committed "$1" && has_human_signoff "$1" && only_human_signoff "$1"
@@ -406,7 +413,7 @@ pair_commits() {
             return 1
         fi
         if ! signed_bot_commit "${olds[i]}"; then
-            PAIR_ERROR="OLD of --pair ${spec} is not a bot commit that cgwalters signed off and committed; only those take an explicit pair"
+            PAIR_ERROR="OLD of --pair ${spec} is not a bot commit that ${HUMAN_LOGIN} signed off and committed; only those take an explicit pair"
             return 1
         fi
         if ! bot_authored "${PAIR_NEW[j]}"; then
@@ -478,14 +485,14 @@ pair_commits() {
     done
     for i in "${!olds[@]}"; do
         test -z "${old_used[${i}]:-}" || continue
-        PAIR_ERROR="'${old_subjects[i]}' of ${upstream}..${old} is gone from ${upstream}..${new} (if cgwalters asked to retitle it, pair it with --pair $(git rev-parse --short "${olds[i]}")=NEW)"
+        PAIR_ERROR="'${old_subjects[i]}' of ${upstream}..${old} is gone from ${upstream}..${new} (if ${HUMAN_LOGIN} asked to retitle it, pair it with --pair $(git rev-parse --short "${olds[i]}")=NEW)"
         return 1
     done
 }
 
 # kept_note NEW OLD: the line naming a sign-off kept from OLD on NEW.
 kept_note() {
-    echo "kept cgwalters' sign-off on $(git rev-parse --short "$1") (was on $(git rev-parse --short "$2")); name it in your reply"
+    echo "kept ${HUMAN_POSSESSIVE} sign-off on $(git rev-parse --short "$1") (was on $(git rev-parse --short "$2")); name it in your reply"
 }
 
 # unchanged_note NEW OLD: the line naming someone else's commit rebased
@@ -528,7 +535,7 @@ problems() {
             echo "error: committed as '${cn} <${f[3]}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>': rebase with ${PROG}"
         fi
         # A commit as the published branch has it, only rebased (e.g. one
-        # cgwalters rewrote and pushed himself): what it is was decided
+        # the operator rewrote and pushed themselves): what it is was decided
         # when it was published, not by this rebase.
         local was=${PAIRED[${c}]:-}
         if test -n "${was}" && rebased_unchanged "${c}" "${was}"; then
@@ -536,19 +543,19 @@ problems() {
             return 0
         fi
         # The bot's work, done with plain git on this machine, whose own
-        # identity is cgwalters'.
+        # identity is the operator's.
         if { test "${ae}" = "${human}" || test "${ce}" = "${human}"; } &&
             git show -s --format="%(trailers:key=${AI_TRAILER_KEYS[0]})" "${c}" | grep -q .; then
-            echo "error: has a ${AI_TRAILER_KEYS[0]} trailer but was made as cgwalters (${an} <${f[1]}> / ${cn} <${f[3]}>): commit with ${PROG}"
+            echo "error: has a ${AI_TRAILER_KEYS[0]} trailer but was made as ${HUMAN_LOGIN} (${an} <${f[1]}> / ${cn} <${f[3]}>): commit with ${PROG}"
         elif test "${ae}" = "${human}" && test -n "${ai}"; then
-            echo "warning: authored by cgwalters with an AI trailer: if the bot wrote it with plain git, recommit it with ${PROG}"
+            echo "warning: authored by ${HUMAN_LOGIN} with an AI trailer: if the bot wrote it with plain git, recommit it with ${PROG}"
         elif test "${ae}" != "${human}" && test "${ce}" = "${human}"; then
-            echo "warning: someone else's commit, committed by cgwalters: if the bot rebased it with plain git, redo that with ${PROG}"
+            echo "warning: someone else's commit, committed by ${HUMAN_LOGIN}: if the bot rebased it with plain git, redo that with ${PROG}"
         fi
         return 0
     fi
     is_bot_name "${an}" || echo "error: authored as '${an} <${f[1]}>', not '${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'"
-    # What 'bot-pr promote' makes of a bot commit on cgwalters' approval:
+    # What 'bot-pr promote' makes of a bot commit on the operator's approval:
     # committed by him, with his sign-off. Only with --promoted, since a
     # plain 'git commit --amend -s' here makes the same.
     local as_promoted=false was=${PAIRED[${c}]:-}
@@ -623,7 +630,7 @@ cmd_check() {
         echo "${PROG}: ${bad} of ${n} commits in ${range} need fixing before pushing" 1>&2
         exit 1
     fi
-    echo "ok: ${n} commits in ${range}$(test "${warned}" -eq 0 || echo ", ${warned} with warnings")$(test "${kept}" -eq 0 || echo ", ${kept} with cgwalters' sign-off kept")$(test "${unchanged}" -eq 0 || echo ", ${unchanged} not the bot's, rebased unchanged")"
+    echo "ok: ${n} commits in ${range}$(test "${warned}" -eq 0 || echo ", ${warned} with warnings")$(test "${kept}" -eq 0 || echo ", ${kept} with ${HUMAN_POSSESSIVE} sign-off kept")$(test "${unchanged}" -eq 0 || echo ", ${unchanged} not the bot's, rebased unchanged")"
 }
 
 # pair_published RANGE WAS: for check, pairs RANGE's commits with those of
@@ -692,7 +699,7 @@ cmd_rework() {
         base=$(git merge-base "${old}" "${head}") || die "${was} and HEAD have no merge-base; pass UPSTREAM"
     fi
     pair_commits "${old}" "${head}" "${base}" ||
-        die "cannot pair the reworked commits with ${was}: ${PAIR_ERROR}; a change that restructures the commits needs cgwalters to sign off again$(test -n "${upstream}" || echo " (if HEAD was rebased onto a newer base, pass it as UPSTREAM)")"
+        die "cannot pair the reworked commits with ${was}: ${PAIR_ERROR}; a change that restructures the commits needs ${HUMAN_LOGIN} to sign off again$(test -n "${upstream}" || echo " (if HEAD was rebased onto a newer base, pass it as UPSTREAM)")"
     # With the merge-base as UPSTREAM, a rebase onto a newer base brings in
     # its commits, which are not ours to rewrite.
     if test -z "${upstream}"; then
@@ -715,15 +722,15 @@ cmd_rework() {
         local keep=false
         if test -z "${o}"; then
             ! { bot_authored "${n}" && has_human_signoff "${n}"; } ||
-                die "$(git rev-parse --short "${n}") has cgwalters' sign-off, but is new since ${was}: ${SIGNOFF_REFUSAL}"
+                die "$(git rev-parse --short "${n}") has ${HUMAN_POSSESSIVE} sign-off, but is new since ${was}: ${SIGNOFF_REFUSAL}"
         elif signed_bot_commit "${o}"; then
             bot_authored "${n}" ||
                 die "$(git rev-parse --short "${n}") is not the bot's commit, but its pair $(git rev-parse --short "${o}") on ${was} is; not keeping the sign-off"
             only_human_signoff "${n}" ||
-                die "$(git rev-parse --short "${n}") has a Signed-off-by other than cgwalters': ${SIGNOFF_REFUSAL}"
+                die "$(git rev-parse --short "${n}") has a Signed-off-by other than ${HUMAN_POSSESSIVE}: ${SIGNOFF_REFUSAL}"
             keep=true
         elif bot_authored "${n}" && has_human_signoff "${n}" && ! has_human_signoff "${o}"; then
-            die "$(git rev-parse --short "${n}") has cgwalters' sign-off, but its pair $(git rev-parse --short "${o}") on ${was} had none: ${SIGNOFF_REFUSAL}"
+            die "$(git rev-parse --short "${n}") has ${HUMAN_POSSESSIVE} sign-off, but its pair $(git rev-parse --short "${o}") on ${was} had none: ${SIGNOFF_REFUSAL}"
         fi
         if ! ${rewriting} && { ! ${keep} || { human_committed "${n}" && has_human_signoff "${n}"; }; }; then
             parent=${n}
@@ -762,7 +769,7 @@ cmd_rework() {
     fi
     test "$(git rev-parse "${parent}^{tree}")" = "$(git rev-parse "${head}^{tree}")" ||
         die "the rewritten ${parent} has a different tree from HEAD; not updating HEAD"
-    git update-ref -m "${PROG} rework: keep cgwalters' sign-off from ${was}" HEAD "${parent}" "${head}" ||
+    git update-ref -m "${PROG} rework: keep ${HUMAN_POSSESSIVE} sign-off from ${was}" HEAD "${parent}" "${head}" ||
         die "cannot update HEAD to ${parent}"
     printf '%s\n' "${notes[@]}"
     if test "${#PAIR_EXPLICIT[@]}" -gt 0 || ${PAIR_BY_PATCH_ID}; then

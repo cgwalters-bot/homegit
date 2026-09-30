@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Add cgwalters' DCO Signed-off-by to the commits of cgwalters-bot's open
-# PRs in repositories that require DCO. Only a human can make the DCO
-# statement, so this runs as him (his git identity and gh login), never as
-# the bot; see --help.
+# Add the operator's DCO Signed-off-by to the commits of the bot's open
+# PRs in repositories that require DCO (both named by the operator
+# config, which bot-git sources). Only a human can make the DCO
+# statement, so this runs as the operator (their git identity and gh
+# login), never as the bot; see --help.
 set -euo pipefail
 shopt -s inherit_errexit
 
-readonly BOT_LOGIN=cgwalters-bot
 # The bot's git identity; its commits are recognized by BOT_GIT_EMAIL.
 BOT_GIT=$(dirname "$(readlink -f "$0")")/bot-git
 for f in "${BOT_GIT}" "$(dirname "${BOT_GIT}")/dco-detect.sh"; do
@@ -20,9 +20,10 @@ source "${BOT_GIT}"
 # dco_checks, shared with bot-pr.
 # shellcheck source=bin/dco-detect.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "${BOT_GIT}")/dco-detect.sh"
+readonly BOT_LOGIN=${OP_BOT_LOGIN}
 # The organization holding the forks that 'bot-pr promote' opens upstream
 # PRs from, as FORGE_ORG:bot/SLUG.
-readonly FORGE_ORG=${DCO_SIGNOFF_FORGE:-cgwalters-forge}
+readonly FORGE_ORG=${DCO_SIGNOFF_FORGE:-${OP_FORGE_ORG}}
 readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/dco-signoff
 readonly PER_PAGE=100
 readonly TITLE_LEN=50
@@ -344,9 +345,12 @@ LEGACY_IDENT="${BOT_GIT_LEGACY_NAME,,} <${BOT_GIT_EMAIL,,}>"
 readonly LEGACY_IDENT
 # Run by the rebase after each commit it rewrites: give the bot's commits
 # from before its rename its current name, as 'bot-pr promote' does, so
-# the PR shows one name for them. The author email and date stay.
-RENAME_EXEC="test \"\$(git log -1 --format='%an <%ae>' | tr '[:upper:]' '[:lower:]')\" != '${LEGACY_IDENT}' || \
-git commit -q --amend --no-edit --no-verify --allow-empty --cleanup=verbatim --author='${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>'"
+# the PR shows one name for them. The author email and date stay. The
+# identities come from the operator config, so they are quoted for the
+# shell the rebase runs this in.
+# shellcheck disable=SC2016 # expanded by that shell
+printf -v RENAME_EXEC 'test "$(git log -1 --format=%s | tr %s %s)" != %q || git commit -q --amend --no-edit --no-verify --allow-empty --cleanup=verbatim --author=%q' \
+    "'%an <%ae>'" "'[:upper:]'" "'[:lower:]'" "${LEGACY_IDENT}" "${BOT_GIT_NAME} <${BOT_GIT_EMAIL}>"
 readonly RENAME_EXEC
 
 # author_of REPO COMMIT: its '%an <%ae> %ad' (raw date), with the bot's
