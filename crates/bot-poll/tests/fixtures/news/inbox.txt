@@ -1,0 +1,13 @@
+https://github.com/cgwalters-forge/bcvk/pull/10  [APPROVED earlier; new commits since]  ephemeral: Add test-basic subcommand
+  2026-09-28T20:22:46Z review APPROVED: https://github.com/cgwalters-forge/bcvk/pull/10#pullrequestreview-5344173988
+  -> needs cgwalters to approve the current head (or comment '/promote' again) before promote
+https://github.com/cgwalters-forge/bootc/pull/15  composefs: Declare the backend stable
+  2026-09-25T19:27:10Z comment: https://github.com/cgwalters-forge/bootc/pull/15#issuecomment-5838321507
+    > Looks like this needs a rebase
+https://github.com/cgwalters-forge/bootc/pull/23  [APPROVED]  install: Default to the composefs backend for composefs-only images
+  2026-09-29T18:43:54Z review APPROVED: https://github.com/cgwalters-forge/bootc/pull/23#pullrequestreview-5356903990
+  -> approved: bot-pr promote https://github.com/cgwalters-forge/bootc/pull/23
+https://github.com/cgwalters-forge/bootc/pull/24  [APPROVED]  install/config: Skip config fragments that vanish while loading
+  2026-09-30T14:20:59Z review APPROVED: https://github.com/cgwalters-forge/bootc/pull/24#pullrequestreview-5354700998
+  -> approved: bot-pr promote https://github.com/cgwalters-forge/bootc/pull/24
+12 open fork PR(s); 4 with activity by cgwalters or awaiting promote

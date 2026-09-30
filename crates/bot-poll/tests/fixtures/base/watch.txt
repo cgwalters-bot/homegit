@@ -1,0 +1,20 @@
+Priority health:
+  P0 dco https://github.com/bootc-dev/bootc/pull/2516 4e10ca5cee5e: DCO: commits lack a Signed-off-by
+  P1 ci-failing https://github.com/coreos/rpm-ostree/pull/5637 498e91eb18ea: Container build, continuous-integration/jenkins/pr-merge
+
+Outstanding reviews by cgwalters:
+  bootc-dev/bootc#2500  lint: `/ostree` symlink required
+    review CHANGES_REQUESTED at 2026-09-30T12:11:27Z (+1 more): (line comments)
+      https://github.com/bootc-dev/bootc/pull/2500#pullrequestreview-5365982119
+
+Needs rebase (bot-pr rebase URL):
+  conflict-free:
+    bootc-dev/bootc#2515  bootc: install mount picks the deployment from the default boot entry
+      CI failing (required-checks), 2 behind main at a3c55bf1ce
+
+Bump deps  [In Review]  PVTI_renovate
+  bootc-dev/bootc#2530
+    force-pushed by @renovate[bot]: 1111111111 -> 2222222222
+
+Swept 328 URLs of 255 board items: 2 priority health problems, 0 sign-offs, 1 items with news, 1 outstanding reviews, 1 needing a rebase, 0 URLs newly tracked, 0 failed.
+State advanced; 0 item(s) updated on the board.

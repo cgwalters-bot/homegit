@@ -1,0 +1,21 @@
+[package]
+name = "bot-poll"
+version = "0.1.0"
+description = "The coordinator's news-gated poll of bot-notify, bot-pr inbox and bot-watch"
+edition.workspace = true
+# File::try_lock
+rust-version = "1.89"
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
