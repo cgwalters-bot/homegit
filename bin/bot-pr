@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # Propose the bot's changes as draft PRs on forks in the forge organization,
-# where cgwalters reviews them, and open the upstream PR only once he approves.
+# where the operator reviews them, and open the upstream PR only once they
+# approve. The operator config (bin/operator.sh, which bot-git sources)
+# names the bot, the operator and the forge org.
 set -euo pipefail
 shopt -s inherit_errexit
 
-readonly BOT_LOGIN=cgwalters-bot
-# The bot's git identity (BOT_GIT_*) and cgwalters' (HUMAN_GIT_*).
+# The bot's git identity (BOT_GIT_*) and the operator's (HUMAN_*).
 BOT_GIT=$(dirname "$(readlink -f "$0")")/bot-git
 for f in "${BOT_GIT}" "$(dirname "${BOT_GIT}")/dco-detect.sh"; do
     test -r "${f}" || {
@@ -26,13 +27,14 @@ source "${REVIEW_STATE}"
 # dco_checks, shared with dco-signoff.
 # shellcheck source=bin/dco-detect.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "${BOT_GIT}")/dco-detect.sh"
+readonly BOT_LOGIN=${OP_BOT_LOGIN}
 # The only login whose reviews and comments on a fork PR are acted on.
-readonly REVIEWER=cgwalters
+readonly REVIEWER=${HUMAN_LOGIN}
 # The organization holding the forks where fork PRs are opened. Its forks
 # start with a clean default branch, and both the bot and REVIEWER can push
 # to them and edit PRs. They run no CI by default (see fork_setup): the
 # bot tests every change on a devspace, and upstream CI runs once promoted.
-readonly FORGE_ORG=${BOT_PR_FORGE:-cgwalters-forge}
+readonly FORGE_ORG=${BOT_PR_FORGE:-${OP_FORGE_ORG}}
 readonly BRANCH_PREFIX=bot/
 # A board item id, as recorded in a fork PR's bot-meta section.
 readonly ITEM_ID_RE='PVTI_[A-Za-z0-9_-]+'
@@ -42,7 +44,7 @@ readonly META_END='<!-- /bot-meta -->'
 # run's agent-run-summary/v1), after its summary line; footers accumulate
 # at the end of the bot-meta section.
 readonly FOOTER_MARKER_RE='^<!-- (bot-run|agent-run-summary)/v1 [{].*[}] -->$'
-readonly LLMS_TRAILER='Generated-by: https://github.com/cgwalters/#llms'
+readonly LLMS_TRAILER="Generated-by: ${OP_GENERATED_BY_URL}"
 # A line consisting of this, in a comment or review by REVIEWER, asks for
 # the upstream PR to be opened as a draft.
 readonly DRAFT_COMMAND=/draft
@@ -647,8 +649,8 @@ declare -rA WORKFLOW_OVERRIDES=(
 
 # The Actions variable of a fork that lists the workflows opted in to run
 # there (see fork_setup), separated by spaces. On the fork itself, so that
-# every fork-pr run and every machine sees the same list, and cgwalters
-# can change it in the fork's settings.
+# every fork-pr run and every machine sees the same list, and the
+# operator can change it in the fork's settings.
 readonly CI_VARIABLE=BOT_PR_CI
 # What --ci takes: a file name in .github/workflows.
 readonly WORKFLOW_FILE_RE='^[A-Za-z0-9_.-]+\.ya?ml$'

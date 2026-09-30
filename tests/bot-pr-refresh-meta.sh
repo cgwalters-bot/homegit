@@ -34,7 +34,9 @@ fail() {
 }
 
 mkdir -p "${WORK}/bin" "${WORK}/fakes"
-cp "${TESTS}/../bin/bot-pr" "${TESTS}/../bin/bot-git" "${TESTS}/../bin/dco-detect.sh" "${TESTS}/../bin/review-state.sh" "${WORK}/bin/"
+cp "${TESTS}/../bin/bot-pr" "${TESTS}/../bin/bot-git" "${TESTS}/../bin/dco-detect.sh" "${TESTS}/../bin/review-state.sh" \
+    "${TESTS}/../bin/operator.sh" "${TESTS}/../bin/bot-operator" "${WORK}/bin/"
+mkdir -p "${WORK}/lib" && cp "${TESTS}/../lib/operator.js" "${WORK}/lib/"
 # The fake bot-board: the inbox state in $FAKE_GH/state.json.
 cat >"${WORK}/bin/bot-board" <<'EOF'
 #!/usr/bin/env bash
