@@ -1,0 +1,393 @@
+#!/usr/bin/env bash
+# One-off: copy the Workstream board from the cgwalters-bot user project
+# to the cgwalters-forge org project (cgwalters-forge/tracker#144), so
+# that GitHub Apps and fine-grained tokens can write it. Every step is
+# idempotent, so the cutover can re-run it after the first copy to pick
+# up what changed on the old board meanwhile. Delete this script once
+# the old board is retired.
+# GraphQL queries and jq programs hold literal $variables.
+# shellcheck disable=SC2016
+set -euo pipefail
+shopt -s inherit_errexit
+
+# shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
+source "$(dirname "$(readlink -f "$0")")/gh-http.sh"
+
+readonly OLD_REST=users/cgwalters-bot/projectsV2/1
+readonly NEW_REST=orgs/cgwalters-forge/projectsV2/1
+readonly OLD_URL=https://github.com/users/cgwalters-bot/projects/1
+readonly NEW_URL=https://github.com/orgs/cgwalters-forge/projects/1
+readonly FORGE_ORG=cgwalters-forge
+# The archived state items ("ITEM_ID DRAFT_ID"; see bot-board), which
+# no API lists: the old board's, and their copies on the new one.
+readonly -A OLD_STATE=(
+    [notifications]='PVTI_lAHOAQ_SPs4Bj2Gizg8Znwk DI_lAHOAQ_SPs4Bj2GizgLL1Nk'
+    [watch]='PVTI_lAHOAQ_SPs4Bj2Gizg8bu2Q DI_lAHOAQ_SPs4Bj2GizgLL6AY'
+    [pr-inbox]='PVTI_lAHOAQ_SPs4Bj2Gizg8evC8 DI_lAHOAQ_SPs4Bj2GizgLMD8k'
+    [lease]='PVTI_lAHOAQ_SPs4Bj2Gizg8evDc DI_lAHOAQ_SPs4Bj2GizgLMD8s'
+    [tmt-numbers]='PVTI_lAHOAQ_SPs4Bj2Gizg84Ipc DI_lAHOAQ_SPs4Bj2GizgLNEX0'
+)
+readonly -A NEW_STATE=(
+    [notifications]='PVTI_lADOE9oHIs4BlJLczg9kJYo DI_lADOE9oHIs4BlJLczgLPK1o'
+    [watch]='PVTI_lADOE9oHIs4BlJLczg9kJVU DI_lADOE9oHIs4BlJLczgLPK1Y'
+    [pr-inbox]='PVTI_lADOE9oHIs4BlJLczg9kJXQ DI_lADOE9oHIs4BlJLczgLPK1k'
+    [lease]='PVTI_lADOE9oHIs4BlJLczg9kJRo DI_lADOE9oHIs4BlJLczgLPK1I'
+    [tmt-numbers]='PVTI_lADOE9oHIs4BlJLczg9kJT8 DI_lADOE9oHIs4BlJLczgLPK1U'
+)
+readonly STATE_PREFIX='bot-state: '
+# Aliased mutations per GraphQL request. The bot's token is shared with
+# every agent and the coordinator's poll loop, so the copy goes slowly:
+# after each request it pauses PAUSE seconds per mutation, staying well
+# under GitHub's secondary limit on content-creating requests.
+readonly BATCH=20
+# Moves are slow for GitHub; bigger batches time out.
+readonly MOVE_BATCH=5
+readonly PAUSE=1
+readonly RETRIES=5
+# First wait after a rate limit without a Retry-After, doubled per retry.
+readonly BACKOFF=60
+readonly PER_PAGE=100
+# Board fields whose values are the board's own, not their content's.
+readonly OWN_TYPES='["single_select", "text", "number", "date", "iteration"]'
+BIN=$(dirname "$(readlink -f "$0")")
+readonly BIN
+
+fatal() {
+    echo "error: $*" 1>&2
+    exit 1
+}
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") [--dry-run] COMMAND
+
+Copies ${OLD_URL} to ${NEW_URL}.
+
+  items      add every item missing from the new board, and set every
+             board field (Status, Priority, Why, ...) to the old value,
+             clearing the ones the old item lacks
+  state      create the archived '${STATE_PREFIX}NAME' items on the new
+             board if needed, and copy each body from the old board
+  fork-prs   point the bot-meta 'Board item' line of every open fork PR
+             in ${FORGE_ORG} from its old item to the new one (bot-pr
+             set-item)
+  verify     compare the two boards: fields and options, every item and
+             field value, board order and the state bodies; exits 1 on
+             any difference
+  cutover    items, state, fork-prs, then verify
+
+--dry-run prints the changes without making them.
+EOF
+}
+
+# gql FILE: runs the GraphQL request (query and variables) in FILE and
+# prints .data; fails on any error, even a partial one. Every request
+# here is idempotent, so a failed one is retried: after a rate limit
+# (403 or 429) once Retry-After or x-ratelimit-reset allows, else with
+# an exponential backoff; after anything else (GitHub answers big
+# batches of moves with 502s at times) after a short wait.
+gql() {
+    local tmp try status wait backoff=${BACKOFF} out
+    tmp=$(mktemp -d)
+    for try in $(seq "${RETRIES}"); do
+        gh api -i graphql --input "$1" >"${tmp}/raw" 2>"${tmp}/err" || true
+        split_http_response "${tmp}/raw" "${tmp}/headers" "${tmp}/body"
+        status=$(awk 'NR == 1 { print $2 }' "${tmp}/headers")
+        test "${status}" != 200 || break
+        test "${try}" -lt "${RETRIES}" ||
+            fatal "GraphQL request failed (HTTP ${status:-none}): $(head -c 300 "${tmp}/err") $(head -c 300 "${tmp}/body")"
+        if [[ "${status}" == 403 || "${status}" == 429 ]]; then
+            wait=$(awk -v now="$(date +%s)" 'tolower($1) == "retry-after:" { print $2 + 0; exit }
+                tolower($1) == "x-ratelimit-remaining:" && $2 + 0 == 0 { zero = 1 }
+                tolower($1) == "x-ratelimit-reset:" { reset = $2 + 0 }
+                END { if (zero && reset > now) print reset - now + 1 }' "${tmp}/headers")
+            wait=${wait:-${backoff}}
+            backoff=$((backoff * 2))
+            echo "rate limited (HTTP ${status}); waiting ${wait}s" 1>&2
+        else
+            wait=$((try * 10))
+            echo "HTTP ${status:-none}; retrying in ${wait}s" 1>&2
+        fi
+        sleep "${wait}"
+    done
+    out=$(cat "${tmp}/body")
+    rm -rf "${tmp}"
+    jq -e '(.errors // []) | length == 0' <<<"${out}" >/dev/null ||
+        fatal "GraphQL errors: $(jq -c .errors <<<"${out}")"
+    jq -c .data <<<"${out}"
+}
+
+# rest_all PATH: every page of a REST list, as one array.
+rest_all() {
+    gh api --paginate "$1" | jq -cs 'add // []'
+}
+
+project_id() { # project_id REST_BASE
+    gh api "$1" --jq .node_id
+}
+
+# fields REST_BASE: [{id, node_id, name, type, options: {NAME: ID}}]
+fields() {
+    rest_all "$1/fields?per_page=${PER_PAGE}" |
+        jq -c 'map({id, node_id, name, type: .data_type,
+                    options: ((.options // []) | map({(.name.raw): .id}) | add // {})})'
+}
+
+# items REST_BASE: the board's items in board order, as [{id, url,
+# type, values: {FIELD: VALUE}}], values holding only the board's own
+# fields.
+items() {
+    local ids
+    ids=$(fields "$1" | jq -r --argjson own "${OWN_TYPES}" 'map(select(.type | IN($own[])) | .id) | join(",")')
+    rest_all "$1/items?per_page=${PER_PAGE}&fields=${ids}" | jq -c '
+        map({id: .node_id, url: .content.html_url, type: .content_type,
+             content: .content.node_id,
+             values: ([.fields[] | select(.value != null)
+                       | {(.name): (.value | if type == "object" then (.name.raw // .raw // .) else . end)}] | add // {})})'
+}
+
+# run_batches FILE [SIZE]: runs the mutations in FILE (one JSON object per line:
+# {m: "FIELD(input: ...) { ... }", v: {NAME: VALUE}, types: {NAME:
+# TYPE}}) in aliased batches, and prints each result object per line.
+run_batches() {
+    local file=$1 size=${2:-${BATCH}} total n=0 req
+    total=$(wc -l <"${file}")
+    test "${total}" -gt 0 || return 0
+    req=$(mktemp)
+    while test "${n}" -lt "${total}"; do
+        sed -n "$((n + 1)),$((n + size))p" "${file}" | jq -cs '
+            to_entries
+            | (map(.key as $i | .value.types | to_entries | map("$\(.key)\($i): \(.value)")) | add) as $decls
+            | {query: ("mutation" + (if ($decls | length) > 0 then "(" + ($decls | join(", ")) + ")" else "" end)
+                       + " { " + (map("m\(.key): " + (.key as $i | .value.m | gsub("\\$(?<v>[a-z]+)\\b"; "$\(.v)\($i)"))) | join(" ")) + " }"),
+               variables: (map(.key as $i | .value.v | with_entries(.key += "\($i)")) | add)}' >"${req}"
+        gql "${req}" | jq -c '.[]'
+        n=$((n + size))
+        test "${n}" -le "${total}" || n=${total}
+        echo "  ${n}/${total}" 1>&2
+        sleep $((PAUSE * size))
+    done
+    rm -f "${req}"
+}
+
+cmd_items() {
+    local work pid n
+    work=$(mktemp -d)
+    pid=$(project_id "${NEW_REST}")
+    items "${OLD_REST}" >"${work}/old"
+    items "${NEW_REST}" >"${work}/new"
+    fields "${NEW_REST}" >"${work}/fields"
+    echo "old board: $(jq length "${work}/old") items; new board: $(jq length "${work}/new")" 1>&2
+    jq -e 'all(.[]; .type != "DraftIssue")' "${work}/old" >/dev/null ||
+        fatal "the old board has unarchived draft items; convert or archive them first"
+    jq -r --slurpfile new "${work}/new" '($new[0] | map(.url)) as $have
+        | .[] | select(.url as $u | $have | index($u) | not) | .content' "${work}/old" >"${work}/add"
+    n=$(grep -c . "${work}/add" || true)
+    echo "items to add: ${n}" 1>&2
+    echo '[]' >"${work}/added"
+    if test "${n}" -gt 0; then
+        if ${dry_run}; then
+            sed 's/^/  add /' "${work}/add" 1>&2
+        else
+            jq -Rc --arg p "${pid}" '{m: "addProjectV2ItemById(input: {projectId: $p, contentId: $c}) { item { id content { ... on Issue { url } ... on PullRequest { url } } } }",
+                v: {p: $p, c: .}, types: {p: "ID!", c: "ID!"}}' "${work}/add" >"${work}/add.m"
+            run_batches "${work}/add.m" | jq -cs 'map(.item | {id, url: .content.url, values: {}})' >"${work}/added"
+        fi
+    fi
+    # Fresh items have no values yet; GitHub's listing may not show them.
+    jq -cs 'add' "${work}/new" "${work}/added" >"${work}/all"
+    jq -c --slurpfile new "${work}/all" --slurpfile fields "${work}/fields" --arg p "${pid}" --argjson own "${OWN_TYPES}" '
+        ($new[0] | map({(.url): .}) | add // {}) as $by
+        | .[] | . as $o | $by[$o.url] as $n | select($n != null)
+        | $fields[0][] | select(.type | IN($own[])) | . as $f
+        | ($o.values[$f.name]) as $want | ($n.values[$f.name]) as $have
+        | select($want != $have)
+        | if $want == null then
+            {m: "clearProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f}) { projectV2Item { id } }",
+             v: {p: $p, i: $n.id, f: $f.node_id}, types: {p: "ID!", i: "ID!", f: "ID!"}, show: "\($o.url) clear \($f.name)"}
+          elif $f.type == "single_select" then
+            ($f.options[$want] // error("the new board has no \($f.name) option \($want)")) as $opt
+            | {m: "updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}}) { projectV2Item { id } }",
+               v: {p: $p, i: $n.id, f: $f.node_id, o: $opt}, types: {p: "ID!", i: "ID!", f: "ID!", o: "String!"}, show: "\($o.url) \($f.name)=\($want)"}
+          elif $f.type == "text" then
+            {m: "updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f, value: {text: $t}}) { projectV2Item { id } }",
+             v: {p: $p, i: $n.id, f: $f.node_id, t: $want}, types: {p: "ID!", i: "ID!", f: "ID!", t: "String!"}, show: "\($o.url) \($f.name)=\($want | .[:60])"}
+          else error("cannot copy \($f.type) field \($f.name)") end' "${work}/old" >"${work}/edit" ||
+        fatal "cannot work out the field edits"
+    n=$(grep -c . "${work}/edit" || true)
+    echo "field values to change: ${n}" 1>&2
+    if ${dry_run}; then
+        jq -r '"  " + .show' "${work}/edit" 1>&2
+    elif test "${n}" -gt 0; then
+        jq -c 'del(.show)' "${work}/edit" >"${work}/edit.m"
+        run_batches "${work}/edit.m" >/dev/null
+    fi
+    # Board order: from the first item out of place on, each goes after
+    # the one before it, as on the old board. This needs every item in
+    # the listing, which lags behind additions.
+    if test "$(jq length "${work}/added")" -gt 0; then
+        echo "board order: not checked until GitHub lists the new items; run this again later" 1>&2
+    else
+        jq -c --slurpfile new "${work}/new" --arg p "${pid}" '
+            ($new[0] | map({(.url): .id}) | add // {}) as $id
+            | map($id[.url]) as $want | ($new[0] | map(.id)) as $have
+            | (first(range($want | length) | select($want[.] != $have[.])) // null) as $from
+            | if $from == null then empty else
+                range($from; $want | length) as $k
+                | {m: "updateProjectV2ItemPosition(input: {projectId: $p, itemId: $i\(if $k > 0 then ", afterId: $a" else "" end)}) { clientMutationId }",
+                   v: ({p: $p, i: $want[$k]} + (if $k > 0 then {a: $want[$k - 1]} else {} end)),
+                   types: ({p: "ID!", i: "ID!"} + (if $k > 0 then {a: "ID!"} else {} end))} end' "${work}/old" >"${work}/move" ||
+            fatal "cannot work out the board order"
+        n=$(grep -c . "${work}/move" || true)
+        echo "items to move: ${n}" 1>&2
+        ${dry_run} || test "${n}" -eq 0 || run_batches "${work}/move" "${MOVE_BATCH}" >/dev/null
+    fi
+    rm -rf "${work}"
+}
+
+readonly STATE_NODE_QUERY='query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
+    id isArchived content { ... on DraftIssue { id title body } } } } }'
+
+state_node() { # state_node ITEM_ID
+    local req
+    req=$(mktemp)
+    jq -n --arg q "${STATE_NODE_QUERY}" --arg id "$1" '{query: $q, variables: {id: $id}}' >"${req}"
+    gql "${req}" | jq -c .node
+    rm -f "${req}"
+}
+
+cmd_state() {
+    local name old_item new_item new_draft old new req pid created=()
+    pid=$(project_id "${NEW_REST}")
+    req=$(mktemp)
+    for name in "${!OLD_STATE[@]}"; do
+        read -r old_item _ <<<"${OLD_STATE[${name}]}"
+        old=$(state_node "${old_item}")
+        jq -e --arg t "${STATE_PREFIX}${name}" '.content.title == $t' <<<"${old}" >/dev/null ||
+            fatal "${old_item} is not the old '${STATE_PREFIX}${name}' item"
+        if test -z "${NEW_STATE[${name}]:-}"; then
+            if ${dry_run}; then
+                echo "would create '${STATE_PREFIX}${name}' on the new board" 1>&2
+                continue
+            fi
+            # Created the way bot-board state-put does: Workflow manual, archived.
+            jq -n --arg q 'mutation($p: ID!, $t: String!, $b: String!) { addProjectV2DraftIssue(input: {projectId: $p, title: $t, body: $b}) { projectItem { id content { ... on DraftIssue { id } } } } }' \
+                --arg p "${pid}" --arg t "${STATE_PREFIX}${name}" --arg b "$(jq -r .content.body <<<"${old}")" \
+                '{query: $q, variables: {p: $p, t: $t, b: $b}}' >"${req}"
+            read -r new_item new_draft < <(gql "${req}" | jq -r '.addProjectV2DraftIssue.projectItem | "\(.id) \(.content.id)"')
+            local wf opt
+            wf=$(fields "${NEW_REST}" | jq -r '.[] | select(.name == "Workflow") | .node_id')
+            opt=$(fields "${NEW_REST}" | jq -r '.[] | select(.name == "Workflow") | .options.manual')
+            jq -n --arg q 'mutation($p: ID!, $i: ID!, $f: ID!, $o: String!) {
+                u: updateProjectV2ItemFieldValue(input: {projectId: $p, itemId: $i, fieldId: $f, value: {singleSelectOptionId: $o}}) { projectV2Item { id } }
+                a: archiveProjectV2Item(input: {projectId: $p, itemId: $i}) { item { id } } }' \
+                --arg p "${pid}" --arg i "${new_item}" --arg f "${wf}" --arg o "${opt}" \
+                '{query: $q, variables: {p: $p, i: $i, f: $f, o: $o}}' >"${req}"
+            gql "${req}" >/dev/null
+            created+=("[${name}]='${new_item} ${new_draft}'")
+            continue
+        fi
+        read -r new_item new_draft <<<"${NEW_STATE[${name}]}"
+        new=$(state_node "${new_item}")
+        jq -e --arg t "${STATE_PREFIX}${name}" --arg d "${new_draft}" '.content.title == $t and .content.id == $d and .isArchived' <<<"${new}" >/dev/null ||
+            fatal "${new_item} is not the new archived '${STATE_PREFIX}${name}' item ${new_draft}"
+        if test "$(jq -r .content.body <<<"${old}")" = "$(jq -r .content.body <<<"${new}")"; then
+            echo "state ${name}: up to date" 1>&2
+        elif ${dry_run}; then
+            echo "state ${name}: would copy the body" 1>&2
+        else
+            jq -n --arg q 'mutation($d: ID!, $b: String!) { updateProjectV2DraftIssue(input: {draftIssueId: $d, body: $b}) { draftIssue { id } } }' \
+                --arg d "${new_draft}" --arg b "$(jq -r .content.body <<<"${old}")" \
+                '{query: $q, variables: {d: $d, b: $b}}' >"${req}"
+            gql "${req}" >/dev/null
+            echo "state ${name}: copied" 1>&2
+        fi
+    done
+    rm -f "${req}"
+    if test "${#created[@]}" -gt 0; then
+        echo "Created state items; record them in NEW_STATE here and STATE_ITEMS in bot-board:" 1>&2
+        printf '    %s\n' "${created[@]}" 1>&2
+    fi
+}
+
+cmd_fork_prs() {
+    local work map url item target name
+    work=$(mktemp -d)
+    items "${OLD_REST}" >"${work}/old"
+    items "${NEW_REST}" >"${work}/new"
+    map=$(jq -c --slurpfile new "${work}/new" '($new[0] | map({(.url): .id}) | add // {}) as $n
+        | map({(.id): $n[.url]}) | add // {}' "${work}/old")
+    rm -rf "${work}"
+    for name in "${!OLD_STATE[@]}"; do
+        test -z "${NEW_STATE[${name}]:-}" ||
+            map=$(jq -c --arg o "${OLD_STATE[${name}]%% *}" --arg n "${NEW_STATE[${name}]%% *}" '.[$o] = $n' <<<"${map}")
+    done
+    gh api -X GET --paginate search/issues -f q="org:${FORGE_ORG} is:pr is:open \"Board item\"" -f per_page=100 \
+        --jq '.items[] | [.html_url, ((.body // "") | capture("- Board item: `(?<i>PVTI_[A-Za-z0-9_-]+)`").i // "")] | @tsv' |
+        while IFS=$'\t' read -r url item; do
+            test -n "${item}" || continue
+            target=$(jq -r --arg i "${item}" '.[$i] // empty' <<<"${map}")
+            if test -z "${target}"; then
+                # Already moved, or an item the old board no longer has.
+                jq -e --arg i "${item}" 'any(.[]; . == $i)' <<<"${map}" >/dev/null ||
+                    echo "warning: ${url} records ${item}, on neither board's listing" 1>&2
+                continue
+            fi
+            if ${dry_run}; then
+                echo "${url}: ${item} -> ${target}" 1>&2
+            else
+                "${BIN}/bot-pr" set-item "${url}" "${target}" --force
+                sleep "${PAUSE}"
+            fi
+        done
+}
+
+# Org projects have a Type field (issue types) that user projects lack;
+# it is the content's, like Labels.
+readonly FIELDS_JQ='map(select(.type != "issue_type") | {name, type, options: (.options | keys)})'
+
+cmd_verify() {
+    local rc=0 old new name o n
+    diff <(fields "${OLD_REST}" | jq -S "${FIELDS_JQ}") \
+        <(fields "${NEW_REST}" | jq -S "${FIELDS_JQ}") ||
+        { echo "the fields differ" 1>&2; rc=1; }
+    old=$(items "${OLD_REST}")
+    new=$(items "${NEW_REST}")
+    echo "items: old $(jq length <<<"${old}"), new $(jq length <<<"${new}")"
+    diff <(jq -r '.[] | [.url, (.values | tojson)] | @tsv' <<<"${old}" | sort) \
+        <(jq -r '.[] | [.url, (.values | tojson)] | @tsv' <<<"${new}" | sort) ||
+        { echo "the items or their field values differ" 1>&2; rc=1; }
+    diff <(jq -r '.[].url' <<<"${old}") <(jq -r '.[].url' <<<"${new}") >/dev/null ||
+        { echo "the board order differs" 1>&2; rc=1; }
+    for name in "${!OLD_STATE[@]}"; do
+        o=$(state_node "${OLD_STATE[${name}]%% *}" | jq -r .content.body)
+        if test -z "${NEW_STATE[${name}]:-}"; then
+            echo "state ${name}: missing on the new board" 1>&2
+            rc=1
+            continue
+        fi
+        n=$(state_node "${NEW_STATE[${name}]%% *}" | jq -r .content.body)
+        test "${o}" = "${n}" || { echo "state ${name}: bodies differ" 1>&2; rc=1; }
+    done
+    test "${rc}" -ne 0 || echo "The boards match."
+    return "${rc}"
+}
+
+dry_run=false
+while test $# -gt 0; do
+    case "$1" in
+        --dry-run) dry_run=true; shift ;;
+        -h | --help) usage; exit 0 ;;
+        -*) fatal "unknown option $1 (see --help)" ;;
+        *) break ;;
+    esac
+done
+test $# -eq 1 || { usage 1>&2; exit 2; }
+case "$1" in
+    items) cmd_items ;;
+    state) cmd_state ;;
+    fork-prs) cmd_fork_prs ;;
+    verify) cmd_verify ;;
+    cutover) cmd_items; cmd_state; cmd_fork_prs; cmd_verify ;;
+    *) fatal "unknown command '$1' (see --help)" ;;
+esac
