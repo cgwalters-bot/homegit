@@ -116,6 +116,10 @@ From those outputs it takes the set of what is there now, per kind:
   review        its outstanding reviews by the operator (by PR and their
                 latest review or comment)
   signoff       its sign-off lines (bot-signoff-due)
+  promotion     its promotion lines (bot-promote-due): fork PRs promoted,
+                refused or held back by their contribution policy
+  text          its \"Needs your text\" lines: approved fork PRs for a
+                human-text repository, which are never promoted
   rebase        its PRs that need a rebase (by PR)
   news          its item news, but for bots' own activity
 

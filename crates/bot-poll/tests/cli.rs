@@ -1,7 +1,8 @@
 //! bot-poll itself, over fake tools that print the fixture outputs of
 //! tests/fixtures: "base", then "news", which adds an approval, a P0
-//! health line, a sign-off, an answer and item news. A fake gh answers
-//! its requests from files each test writes (see [`World::gh`]).
+//! health line, a sign-off, a promotion, a fork PR needing the
+//! operator's text, an answer and item news. A fake gh answers its
+//! requests from files each test writes (see [`World::gh`]).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,9 +19,9 @@ const FAKES: [(&str, &str); 6] = [
     ("git", "git"),
 ];
 const BASE_KINDS: &str = "health-P0, review, approval, forge-review, rebase, health";
-const NEWS_KINDS: &str = "health-P0, approval, signoff, notify, forge-review, news";
-const ALL_KINDS: &str =
-    "health-P0, review, approval, signoff, notify, forge-review, rebase, health, news";
+const NEWS_KINDS: &str =
+    "health-P0, approval, signoff, promotion, text, notify, forge-review, news";
+const ALL_KINDS: &str = "health-P0, review, approval, signoff, promotion, text, notify, forge-review, rebase, health, news";
 
 // The requests of a hot set's rebuild and of a hot cycle, for the default
 // operator config.
@@ -269,6 +270,8 @@ fn reports_once_and_keeps_the_seen_sets_across_runs() {
         "\nPriority health (P0) (health-P0):\n  P0 ci-failing https://github.com/bootc-dev/bootc/pull/2437 781bbcac8255: required-checks",
         "\nApproved fork PRs (promote) (approval):\n  install/config: Skip config fragments that vanish while loading [APPROVED]\n    https://github.com/cgwalters-forge/bootc/pull/24\n",
         "\nSign-offs (signoff):\n  Signed off: https://github.com/bootc-dev/bootc/pull/2516 (5e20ab31c0d2)\n",
+        "\nPromotions (promotion):\n  Promoted: https://github.com/cgwalters-forge/composefs-rs/pull/6 -> ",
+        "\nNeeds cgwalters' text (text):\n  Needs your text: https://github.com/cgwalters-forge/podman/pull/3 ",
         "  answer from @cgwalters: bootc#2499 (.vmlinuz.hmac): sign off again [thread 25909312948]\n    https://github.com/cgwalters-forge/tracker/issues/151#issuecomment-1\n",
         "\nItem news (news):\n  UKI Addons Support: bootc-dev/bootc#2448 review COMMENTED by @Johan-Liebert1: fixed\n    https://github.com/bootc-dev/bootc/pull/2448#pullrequestreview-5362732351\n",
     ] {
@@ -794,9 +797,13 @@ fn an_upstream_approval_runs_bot_signoff_due() {
     let run = assert_news(&r, "review, signoff");
     assert_eq!(r.calls, ["bot-signoff-due --apply"]);
     assert!(run.join("signoff.txt").exists());
-    // The sweep's bot-watch lists the same sign-off: no news again.
+    // The sweep's bot-watch lists the same sign-off: no news again
+    // (its promotion and text lines are).
     let r = w.run(&fixtures("news"), &["--once"]);
-    assert_news(&r, "health-P0, approval, notify, forge-review, news");
+    assert_news(
+        &r,
+        "health-P0, approval, promotion, text, notify, forge-review, news",
+    );
 }
 
 #[test]
