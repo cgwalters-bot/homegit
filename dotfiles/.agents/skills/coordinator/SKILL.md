@@ -427,7 +427,8 @@ jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
   updated_at: $now,
   coordinator: {session: "SESSION", loop_state: "sleeping", next_wake_at: "2026-09-28T20:30:00Z"},
   workers: [{name: "ops-v2", item_url: "https://github.com/OWNER/REPO/issues/N",
-             started_at: "2026-09-28T19:40:00Z", devspace: "ops-v2", status: "testing"}]
+             started_at: "2026-09-28T19:40:00Z", devspace: "ops-v2", status: "testing",
+             agent_ids: ["a1b2c3d4e5f60718"]}]
 }' | bot-heartbeat publish
 ```
 
@@ -437,8 +438,15 @@ stop), `next_wake_at` when the running `bot-poll` gives up (its start plus
 12h; it wakes the session sooner on news), and each running worker is listed by the name, board item and
 devspace in its brief, with the `status` it last reported (`starting`,
 `working`, `testing`, `reviewing`, `landing`, `waiting`); a finished one
-is left out. The heartbeat is public: names and links only, never task
-text. The tool drops workers on private repositories' items, and edits
+is left out. `agent_ids` are the agentIds the Agent tool returned for the
+worker and its reviewer: publish reads their transcripts for the
+worker's token total, and doesn't publish them. The heartbeat is
+public: names and links only, never task text. The plan's usage (the
+5-hour and 7-day percent from the status line, which must be
+`bot-heartbeat statusline`, and the tokens local transcripts spent in
+each window and per worker) is not: publish writes it to a comment in
+the private cgwalters-forge/bot-ops instead, and never copy it to a
+public place. The tool drops workers on private repositories' items, and edits
 one pinned comment on cgwalters-forge/tracker#176 in place, which
 notifies no one. The view warns when `updated_at` is more than 15
 minutes old and `next_wake_at` (if given) has passed by more than a few

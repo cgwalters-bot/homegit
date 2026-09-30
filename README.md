@@ -144,7 +144,15 @@ workers (names, board item links, devspaces) in one pinned comment on
 the "Bot heartbeat" issue in cgwalters-forge/tracker, edited in place,
 where the review app's ops view reads them as "Local agents"; it
 validates the input against a strict schema and leaves out items in
-private repositories. `tests/bot-heartbeat.sh` tests it offline.
+private repositories. It also writes a usage snapshot, the ops view's
+"Usage", but never to that public comment: to one comment on the
+"Bot usage" issue in the private cgwalters-forge/bot-ops, which the
+review app reads with the viewer's own token. The snapshot is the
+plan's 5-hour and 7-day percent used and reset times, which
+`bot-heartbeat statusline` saves as the Claude Code status line, and
+the tokens local transcripts spent in each window and per worker
+(aggregate numbers only). `tests/bot-heartbeat.sh` and
+`tests/bot-heartbeat-usage.sh` test it offline.
 
 `bot-board` is a small CLI over `gh project` for the Workstream board
 (`list`, `show`, `add`, `draft`, `set`, and `state-get`/`state-put` for
