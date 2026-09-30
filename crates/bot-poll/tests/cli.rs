@@ -17,6 +17,8 @@ const FAKES: [(&str, &str); 5] = [
 ];
 const BASE_KINDS: &str = "health-P0, review, approval, forge-review, rebase, health";
 const NEWS_KINDS: &str = "health-P0, approval, signoff, notify, forge-review, news";
+const ALL_KINDS: &str =
+    "health-P0, review, approval, signoff, notify, forge-review, rebase, health, news";
 
 struct World {
     dir: tempfile::TempDir,
@@ -226,10 +228,7 @@ fn a_restart_reports_what_the_last_sweep_found_once() {
 #[test]
 fn loops_until_the_max_duration() {
     let w = World::new();
-    assert_news(
-        &w.run(&fixtures("news"), &["--once"]),
-        "health-P0, review, approval, signoff, notify, forge-review, rebase, health, news",
-    );
+    assert_news(&w.run(&fixtures("news"), &["--once"]), ALL_KINDS);
     let r = w.run(
         &fixtures("news"),
         &["--no-wait", "--interval", "1", "--max-duration", "2"],
@@ -240,6 +239,44 @@ fn loops_until_the_max_duration() {
         "{}",
         r.stdout
     );
+    assert!(
+        r.calls.iter().any(|c| c == "bot-watch --apply"),
+        "{:?}",
+        r.calls
+    );
+}
+
+#[test]
+fn a_restart_keeps_the_sweep_schedule() {
+    let w = World::new();
+    assert_news(&w.run(&fixtures("news"), &["--once"]), ALL_KINDS);
+    // Just swept: the next sweep is an interval away.
+    let r = w.run(
+        &fixtures("news"),
+        &["--interval", "60", "--max-duration", "1"],
+    );
+    assert_eq!(r.status, 0, "{}", r.stderr);
+    assert!(r.calls.is_empty(), "{:?}", r.calls);
+    // The newest sweep an hour ago: the next one is overdue.
+    let runs = w.state().join("runs");
+    let id = fs::read_dir(&runs)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .file_name();
+    let id = id.to_str().unwrap();
+    let old = (chrono::Utc::now() - chrono::Duration::hours(1))
+        .format("%Y%m%d-%H%M%S-%3f")
+        .to_string();
+    fs::rename(runs.join(id), runs.join(&old)).unwrap();
+    let state = fs::read_to_string(w.state().join("state.json")).unwrap();
+    fs::write(w.state().join("state.json"), state.replace(id, &old)).unwrap();
+    let r = w.run(
+        &fixtures("news"),
+        &["--interval", "60", "--max-duration", "1"],
+    );
+    assert_eq!(r.status, 0, "{}", r.stderr);
     assert!(
         r.calls.iter().any(|c| c == "bot-watch --apply"),
         "{:?}",
