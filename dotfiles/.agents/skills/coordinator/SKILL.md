@@ -131,6 +131,14 @@ closed.
   sure there is an ask for it (see `workstream`). P1 lines come after
   the outstanding reviews below. A line that stays while someone is
   on it needs nothing more.
+- **Sign-offs.** `bot-watch --apply` runs `bot-pr signoff` itself on
+  each of the bot's upstream PRs whose DCO check fails although
+  cgwalters approved its current head (`bot-signoff-due`), and lists
+  the result under "Sign-offs": `Signed off: URL (NEW-HEAD)`, or why
+  `bot-pr signoff` refused. A refusal needs a look (a stale policy
+  record, say): once its cause is fixed, run `bot-pr signoff URL` by
+  hand, since the sweeps only retry a refused head after 6h. A sign-off
+  needs nothing more.
 - **Outstanding reviews first** (after P0 health). The "Outstanding reviews by cgwalters"
   section `bot-watch` prints on every sweep is P0: dispatch a worker for
   each listed PR, unless a live worker is already on it (check it's

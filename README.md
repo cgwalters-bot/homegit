@@ -76,7 +76,10 @@ rebase URL` does that for a conflict-free one, keeping my sign-off, and
 the coordinator runs it on its own. And it starts with the "Priority
 health" of the P0 and P1 PRs (`bot-priority-health`): failing or stuck
 CI, conflicts, missing sign-offs, and PRs nobody has touched in a day
-(P0) or three (P1), so that a red P0 PR can't sit unnoticed.
+(P0) or three (P1), so that a red P0 PR can't sit unnoticed. With
+`--apply`, it also runs `bot-pr signoff` on the bot's upstream PRs whose
+DCO check fails although I approved their head (`bot-signoff-due`), so
+my approval is all a sign-off takes.
 
 ### Overnight working model
 
