@@ -13,6 +13,7 @@ shopt -s inherit_errexit
 # shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/gh-http.sh"
 
+readonly OLD_LOGIN=cgwalters-bot OLD_NUMBER=1
 readonly OLD_REST=users/cgwalters-bot/projectsV2/1
 readonly NEW_REST=orgs/cgwalters-forge/projectsV2/1
 readonly OLD_URL=https://github.com/users/cgwalters-bot/projects/1
@@ -51,6 +52,13 @@ readonly PER_PAGE=100
 readonly OWN_TYPES='["single_select", "text", "number", "date", "iteration"]'
 BIN=$(dirname "$(readlink -f "$0")")
 readonly BIN
+# What archive-old leaves on the old board: one draft item, and the
+# project's short description and README, all pointing at the new one.
+readonly REDIRECT_TITLE="Moved: this board is now ${NEW_URL}"
+readonly REDIRECT_BODY="This board moved to ${NEW_URL} on 2026-09-30 (cgwalters-forge/tracker#144), so that GitHub Apps can write it. This one is kept as a read-only redirect: its items are archived, and the bot's tools no longer read or write it."
+# The old board's items as archive-old last saw them before archiving
+# them, for verify to compare the new board against afterwards.
+readonly SNAPSHOT=${XDG_STATE_HOME:-$HOME/.local/state}/bot-board-migrate/old-items.json
 
 fatal() {
     echo "error: $*" 1>&2
@@ -72,9 +80,21 @@ Copies ${OLD_URL} to ${NEW_URL}.
              in ${FORGE_ORG} from its old item to the new one (bot-pr
              set-item)
   verify     compare the two boards: fields and options, every item and
-             field value, board order and the state bodies; exits 1 on
-             any difference
-  cutover    items, state, fork-prs, then verify
+             field value, board order, the state bodies, and that no
+             open fork PR records an old item; exits 1 on any
+             difference. Once fork-prs ran, pr-inbox is the new board's
+             own (set-item records there) and isn't compared; once
+             archive-old ran, the old board's items are compared as it
+             saved them (${SNAPSHOT}),
+             no state is compared, and the redirect is checked
+  cutover    items, state, items again (for the order of items it just
+             added), verify, fork-prs, then verify
+  archive-old
+             only when verify passes: save the old board's items for
+             verify, create or update the redirect draft item
+             '${REDIRECT_TITLE}',
+             archive every other item, and set the old project's short
+             description and README to the redirect
 
 --dry-run prints the changes without making them.
 EOF
@@ -135,12 +155,13 @@ fields() {
 
 # items REST_BASE: the board's items in board order, as [{id, url,
 # type, values: {FIELD: VALUE}}], values holding only the board's own
-# fields.
+# fields, leaving out the redirect item.
 items() {
     local ids
     ids=$(fields "$1" | jq -r --argjson own "${OWN_TYPES}" 'map(select(.type | IN($own[])) | .id) | join(",")')
-    rest_all "$1/items?per_page=${PER_PAGE}&fields=${ids}" | jq -c '
-        map({id: .node_id, url: .content.html_url, type: .content_type,
+    rest_all "$1/items?per_page=${PER_PAGE}&fields=${ids}" | jq -c --arg redirect "${REDIRECT_TITLE}" '
+        map(select(.content_type != "DraftIssue" or .content.title != $redirect))
+        | map({id: .node_id, url: .content.html_url, type: .content_type,
              content: .content.node_id,
              values: ([.fields[] | select(.value != null)
                        | {(.name): (.value | if type == "object" then (.name.raw // .raw // .) else . end)}] | add // {})})'
@@ -346,31 +367,154 @@ cmd_fork_prs() {
 # it is the content's, like Labels.
 readonly FIELDS_JQ='map(select(.type != "issue_type") | {name, type, options: (.options | keys)})'
 
+# old_project: the old project's {id, shortDescription, readme}.
+old_project() {
+    local req
+    req=$(mktemp)
+    jq -n --arg l "${OLD_LOGIN}" --argjson n "${OLD_NUMBER}" \
+        '{query: "query($l: String!, $n: Int!) { user(login: $l) { projectV2(number: $n) { id shortDescription readme } } }",
+          variables: {l: $l, n: $n}}' >"${req}"
+    gql "${req}" | jq -c .user.projectV2
+    rm -f "${req}"
+}
+
+# fork_pr_items: "URL ITEM" for each open fork PR in FORGE_ORG that
+# records a board item.
+fork_pr_items() {
+    gh api -X GET --paginate search/issues -f q="org:${FORGE_ORG} is:pr is:open \"Board item\"" -f per_page=100 \
+        --jq '.items[] | [.html_url, ((.body // "") | capture("- Board item: `(?<i>PVTI_[A-Za-z0-9_-]+)`").i // "")]
+              | select(.[1] != "") | join(" ")'
+}
+
 cmd_verify() {
-    local rc=0 old new name o n
+    local rc=0 old new name o n archived=false stale moved
     diff <(fields "${OLD_REST}" | jq -S "${FIELDS_JQ}") \
         <(fields "${NEW_REST}" | jq -S "${FIELDS_JQ}") ||
         { echo "the fields differ" 1>&2; rc=1; }
     old=$(items "${OLD_REST}")
     new=$(items "${NEW_REST}")
+    if test "$(jq length <<<"${old}")" -eq 0 && test -s "${SNAPSHOT}"; then
+        archived=true
+        echo "the old board is archived; comparing with its items as of $(date -r "${SNAPSHOT}" -u +%FT%TZ)"
+        old=$(cat "${SNAPSHOT}")
+        rest_all "${OLD_REST}/items?per_page=${PER_PAGE}" |
+            jq -e --arg t "${REDIRECT_TITLE}" --arg b "${REDIRECT_BODY}" \
+                'length == 1 and .[0].content_type == "DraftIssue" and .[0].content.title == $t and .[0].content.body == $b' >/dev/null ||
+            { echo "the old board doesn't list exactly the redirect item" 1>&2; rc=1; }
+        old_project | jq -e --arg t "${REDIRECT_TITLE}" --arg b "${REDIRECT_BODY}" \
+            '.shortDescription == $t and .readme == $b' >/dev/null ||
+            { echo "the old project's description or README isn't the redirect" 1>&2; rc=1; }
+    fi
     echo "items: old $(jq length <<<"${old}"), new $(jq length <<<"${new}")"
     diff <(jq -r '.[] | [.url, (.values | tojson)] | @tsv' <<<"${old}" | sort) \
         <(jq -r '.[] | [.url, (.values | tojson)] | @tsv' <<<"${new}" | sort) ||
         { echo "the items or their field values differ" 1>&2; rc=1; }
     diff <(jq -r '.[].url' <<<"${old}") <(jq -r '.[].url' <<<"${new}") >/dev/null ||
         { echo "the board order differs" 1>&2; rc=1; }
-    for name in "${!OLD_STATE[@]}"; do
-        o=$(state_node "${OLD_STATE[${name}]%% *}" | jq -r .content.body)
-        if test -z "${NEW_STATE[${name}]:-}"; then
-            echo "state ${name}: missing on the new board" 1>&2
-            rc=1
-            continue
-        fi
-        n=$(state_node "${NEW_STATE[${name}]%% *}" | jq -r .content.body)
-        test "${o}" = "${n}" || { echo "state ${name}: bodies differ" 1>&2; rc=1; }
-    done
+    # Open fork PRs: none may record an old item; one recording a new
+    # item means fork-prs ran.
+    local recorded
+    recorded=$(fork_pr_items)
+    stale=$(jq -Rr --argjson old "$(jq -c 'map(.id)' <<<"${old}")" \
+        'split(" ") | select(.[1] as $i | $old | index($i)) | .[0]' <<<"${recorded}")
+    moved=$(jq -Rr --argjson new "$(jq -c 'map(.id)' <<<"${new}")" \
+        'split(" ") | select(.[1] as $i | $new | index($i)) | .[0]' <<<"${recorded}" | grep -c . || true)
+    echo "open fork PRs recording new items: ${moved}, old items: $(grep -c . <<<"${stale}" || true)"
+    if test -n "${stale}" && { ${archived} || test "${moved}" -gt 0; }; then
+        echo "fork-prs left these recording old items: ${stale//$'\n'/ }" 1>&2
+        rc=1
+    fi
+    if ${archived}; then
+        echo "state: not compared; the new board's state items are the live ones"
+    else
+        for name in "${!OLD_STATE[@]}"; do
+            if test -z "${NEW_STATE[${name}]:-}"; then
+                echo "state ${name}: missing on the new board" 1>&2
+                rc=1
+                continue
+            fi
+            if test "${name}" = pr-inbox && test "${moved}" -gt 0; then
+                echo "state pr-inbox: not compared; fork-prs recorded the new ids there"
+                continue
+            fi
+            o=$(state_node "${OLD_STATE[${name}]%% *}" | jq -r .content.body)
+            n=$(state_node "${NEW_STATE[${name}]%% *}" | jq -r .content.body)
+            test "${o}" = "${n}" || { echo "state ${name}: bodies differ" 1>&2; rc=1; }
+        done
+    fi
     test "${rc}" -ne 0 || echo "The boards match."
     return "${rc}"
+}
+
+cmd_archive_old() {
+    local work pid project redirect="" n req
+    work=$(mktemp -d)
+    rest_all "${OLD_REST}/items?per_page=${PER_PAGE}" >"${work}/listed"
+    # Before the first archiving, the boards must match, and the old
+    # board's items are saved for verify.
+    if jq -e --arg t "${REDIRECT_TITLE}" 'any(.[]; .content_type != "DraftIssue" or .content.title != $t)' \
+        "${work}/listed" >/dev/null; then
+        cmd_verify >"${work}/verify" 2>&1 || { cat "${work}/verify" 1>&2; fatal "the boards differ; not archiving the old board"; }
+        echo "verify passed" 1>&2
+        if ${dry_run}; then
+            echo "would save the old board's items to ${SNAPSHOT}"
+        else
+            mkdir -p "$(dirname "${SNAPSHOT}")"
+            items "${OLD_REST}" >"${SNAPSHOT}.tmp"
+            mv -f "${SNAPSHOT}.tmp" "${SNAPSHOT}"
+            echo "saved $(jq length "${SNAPSHOT}") old items to ${SNAPSHOT}"
+        fi
+    fi
+    project=$(old_project)
+    pid=$(jq -r .id <<<"${project}")
+    req=$(mktemp)
+    # The redirect item: the first unarchived draft with its title.
+    redirect=$(jq -c --arg t "${REDIRECT_TITLE}" \
+        'first(.[] | select(.content_type == "DraftIssue" and .content.title == $t)) // empty' "${work}/listed")
+    if test -z "${redirect}"; then
+        echo "create the draft item '${REDIRECT_TITLE}'"
+        if ! ${dry_run}; then
+            jq -n --arg p "${pid}" --arg t "${REDIRECT_TITLE}" --arg b "${REDIRECT_BODY}" \
+                '{query: "mutation($p: ID!, $t: String!, $b: String!) { addProjectV2DraftIssue(input: {projectId: $p, title: $t, body: $b}) { projectItem { id } } }",
+                  variables: {p: $p, t: $t, b: $b}}' >"${req}"
+            redirect=$(gql "${req}" | jq -c '{node_id: .addProjectV2DraftIssue.projectItem.id}')
+        fi
+    elif test "$(jq -r '.content.body // ""' <<<"${redirect}")" != "${REDIRECT_BODY}"; then
+        echo "update the body of the redirect item $(jq -r .node_id <<<"${redirect}")"
+        if ! ${dry_run}; then
+            jq -n --arg d "$(jq -r .content.node_id <<<"${redirect}")" --arg b "${REDIRECT_BODY}" \
+                '{query: "mutation($d: ID!, $b: String!) { updateProjectV2DraftIssue(input: {draftIssueId: $d, body: $b}) { draftIssue { id } } }",
+                  variables: {d: $d, b: $b}}' >"${req}"
+            gql "${req}" >/dev/null
+        fi
+    else
+        echo "the redirect item $(jq -r .node_id <<<"${redirect}") is up to date"
+    fi
+    # Everything else is archived.
+    jq -r --arg t "${REDIRECT_TITLE}" '.[] | select(.content_type != "DraftIssue" or .content.title != $t)
+        | "\(.node_id) \(.content.html_url // .content.title)"' "${work}/listed" >"${work}/archive"
+    n=$(grep -c . "${work}/archive" || true)
+    echo "archive ${n} items"
+    if ${dry_run}; then
+        sed 's/^/  archive /' "${work}/archive"
+    elif test "${n}" -gt 0; then
+        cut -d' ' -f1 "${work}/archive" | jq -Rc --arg p "${pid}" '{m: "archiveProjectV2Item(input: {projectId: $p, itemId: $i}) { item { id } }",
+            v: {p: $p, i: .}, types: {p: "ID!", i: "ID!"}}' >"${work}/archive.m"
+        run_batches "${work}/archive.m" >/dev/null
+    fi
+    if jq -e --arg t "${REDIRECT_TITLE}" --arg b "${REDIRECT_BODY}" '.shortDescription == $t and .readme == $b' \
+        <<<"${project}" >/dev/null; then
+        echo "the old project's description and README are up to date"
+    else
+        echo "set the old project's short description to '${REDIRECT_TITLE}' and its README to the redirect text"
+        if ! ${dry_run}; then
+            jq -n --arg p "${pid}" --arg t "${REDIRECT_TITLE}" --arg b "${REDIRECT_BODY}" \
+                '{query: "mutation($p: ID!, $t: String!, $b: String!) { updateProjectV2(input: {projectId: $p, shortDescription: $t, readme: $b}) { projectV2 { id } } }",
+                  variables: {p: $p, t: $t, b: $b}}' >"${req}"
+            gql "${req}" >/dev/null
+        fi
+    fi
+    rm -rf "${work}" "${req}"
 }
 
 dry_run=false
@@ -388,6 +532,7 @@ case "$1" in
     state) cmd_state ;;
     fork-prs) cmd_fork_prs ;;
     verify) cmd_verify ;;
-    cutover) cmd_items; cmd_state; cmd_fork_prs; cmd_verify ;;
+    cutover) cmd_items; cmd_state; cmd_items; cmd_verify; cmd_fork_prs; cmd_verify ;;
+    archive-old) cmd_archive_old ;;
     *) fatal "unknown command '$1' (see --help)" ;;
 esac
