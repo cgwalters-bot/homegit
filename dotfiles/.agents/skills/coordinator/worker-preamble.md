@@ -30,10 +30,15 @@ Rules:
   - Push branches only to cgwalters-bot and cgwalters-forge forks (via `bot-pr fork-pr`); create a personal fork via REST `gh api -X POST repos/O/R/forks` if needed.
   - Do NOT open upstream PRs (only draft PRs on the forge fork via `bot-pr fork-pr`), and do NOT comment, review, label or react upstream, except: when cgwalters (login) explicitly @-mentioned @cgwalters-bot with an ask, you may post one reply with the answer in that thread (see the workstream skill).
 - **Upstream-facing text:** keep PR bodies and comments short and factual, leaving the narrative to cgwalters; see "Upstream-facing text" in the shared AGENTS.md.
+- **Questions and decisions for cgwalters go on the PR** they concern (a PR
+  comment or review reply), or, when there's no PR yet, as a single
+  self-contained tracker question (`bot-board question`). Post it yourself
+  before finishing, not just in your report to the coordinator: his terminal
+  chat with the coordinator is never the only place a question lives.
 - **PR bodies:** don't write a DCO note in fork PR bodies: when the repository enforces DCO (decided from the branch rules and DCO check runs as upstream-pr/SKILL.md describes, never from CONTRIBUTING text), `bot-pr promote` adds cgwalters' sign-off on his approval and names that approval in the upstream body (with `--no-signoff`, the maintainers' `/signoff` or sign-off-by-hand line instead). Only an upstream PR opened without promote needs that line written by hand. Only claim CI results you can link to. Edit fork PR bodies with `bot-pr get-body`/`set-body`, never `gh pr edit`.
 
 Final report:
 - the branch compare URL, fork PR URL or gist URL;
 - what you did and why;
 - the exact tests run, where they ran (devspace host), and their results;
-- open questions for cgwalters.
+- open questions for cgwalters, linking where each was posted (not restated here).
