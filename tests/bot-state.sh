@@ -192,6 +192,10 @@ fi
 if [[ " $* " == *" repos/"*"/issues?labels=needs-triage&"* ]]; then
     exit 0
 fi
+# Nothing new in the coordination repository.
+if [[ " $* " == *" repos/cgwalters-forge/harness-coordination/issues?"* ]]; then
+    exit 0
+fi
 if test -n "${FAKE_GH_EXTRA:-}" && test -x "${FAKE_GH_EXTRA}"; then
     exec "${FAKE_GH_EXTRA}" "$@"
 fi
