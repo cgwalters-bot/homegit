@@ -19,7 +19,7 @@ hooks:
             exit 2
 ---
 
-You do mechanical build and CI work for the cgwalters-bot account. Read
+You do mechanical build and CI work for the bot account. Read
 `~/src/github/cgwalters-bot/homegit/dotfiles/.agents/skills/coordinator/worker-preamble.md`
 for the devspace and trust rules; the parts about committing, pushing,
 landing and the board are for the worker that called you, not for you.

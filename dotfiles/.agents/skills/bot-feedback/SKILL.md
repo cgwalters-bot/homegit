@@ -1,16 +1,21 @@
 ---
 name: bot-feedback
-description: Review new emoji reactions on cgwalters-bot's GitHub content (its comments, inline review comments, and the issues and PRs it opened), assess each new 👎/😕 in context, and file one issue per reaction on cgwalters-bot/cgwalters-bot for cgwalters. Run it at the start of every backlog-planning pass, and whenever asked whether anyone reacted to or disliked the bot's work.
+description: Review new emoji reactions on cgwalters-bot's GitHub content (its comments, inline review comments, and the issues and PRs it opened), assess each new 👎/😕 in context, and file one issue per reaction on the bot's issue repo (cgwalters-bot/cgwalters-bot) for the operator. Run it at the start of every backlog-planning pass, and whenever asked whether anyone reacted to or disliked the bot's work.
 ---
 
 # bot-feedback — Never miss reactions on the bot's work
 
+Names: *the operator* is the human who runs this bot (`operator.login` in
+the operator config, see `bot-operator` and docs/bootstrap.md; cgwalters by
+default). The bot (cgwalters-bot) and its issue repo (cgwalters-bot/cgwalters-bot)
+below are the default config's `bot.login` and `bot.issue_repo`.
+
 People often answer the bot with an emoji instead of a comment. A 👎 or 😕
-on one of its comments or PRs is feedback that cgwalters needs to see: the
+on one of its comments or PRs is feedback that the operator needs to see: the
 bot said something wrong, noisy or unwelcome. This skill turns each such
 reaction into an issue on the bot's own repository,
 [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues),
-with your assessment of what went wrong, and mentions @cgwalters there.
+with your assessment of what went wrong, and mentions the operator there.
 
 Run it at the start of every planning pass (the `backlog-planning` skill
 does), or whenever someone asks about feedback on the bot.
@@ -45,7 +50,7 @@ It keeps what it has seen and filed in
 `~/.local/state/bot-feedback/seen.json`, and holds a lock so two runs don't
 overlap; running it again never repeats itself. It uses REST only (the
 GraphQL quota is shared) and three search requests. Reactions by
-cgwalters-bot and cgwalters are ignored. If nothing is listed, you're done.
+the bot and the operator are ignored. If nothing is listed, you're done.
 
 ## 2. Assess each negative reaction
 
@@ -72,7 +77,7 @@ mentions anyway) and don't quote long passages.
 
 **Private sources:** if the source repository isn't public
 (`gh api repos/O/R --jq .visibility`), write just "Private source; see
-the thread." as its assessment and give cgwalters your real assessment in
+the thread." as its assessment and give the operator your real assessment in
 your report instead. The target repository is public, so the script files
 links only for such reactions, without the excerpt or assessment.
 
@@ -85,20 +90,21 @@ bot-feedback --file-issues --assessment-dir "$ASSESS_DIR"
 This opens one issue per reaction that has an assessment file, titled
 `Feedback: 👎 from @user on OWNER/REPO#N`, with the links, a quoted
 excerpt of the bot's text, your assessment and a line mentioning
-@cgwalters, and records each one as filed right after creating it.
+the operator, and records each one as filed right after creating it.
 Reactions without an assessment file are left for a later run. Report the
 issue URLs it prints.
 
-The filed issues are for cgwalters to read and decide on; don't act on the
-suggested action yourself until he says so.
+The filed issues are for the operator to read and decide on; don't act on the
+suggested action yourself until they say so.
 
 ## Testing
 
-Use `--no-mention` so nothing notifies cgwalters, `--repo OWNER/REPO` to
+Use `--no-mention` so nothing notifies the operator, `--repo OWNER/REPO` to
 file elsewhere, and a separate `XDG_STATE_HOME` to keep the real state
 untouched. To produce a reaction, add one as the bot to its own content in
 a fork (`gh api -X POST repos/O/R/issues/N/reactions -f content=-1`) and
-run with `BOT_FEEDBACK_IGNORE=cgwalters`, so the bot's own reactions
+run with `BOT_FEEDBACK_IGNORE` set to just the operator's login
+(`BOT_FEEDBACK_IGNORE=cgwalters` by default), so the bot's own reactions
 count. Remove the reaction and delete the test issue afterwards
 (`deleteIssue` in GraphQL; the bot owns the repository).
 

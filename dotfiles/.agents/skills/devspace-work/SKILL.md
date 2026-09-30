@@ -5,6 +5,11 @@ description: Build and test the bot's changes on an ephemeral devspace runner (R
 
 # devspace-work — Edit locally, test on a devspace
 
+Names: the devspace repo, bot account and forge org below
+(bootc-dev/cgwalters-devspace-sandbox, cgwalters-bot, cgwalters-forge) are
+the default operator config's; under another config, read them as its
+`devspace.repo`, `bot.login` and `forge_org` (`bot-operator --json`).
+
 Devspaces are ephemeral GitHub Actions runners from
 `bootc-dev/cgwalters-devspace-sandbox`, reachable over the tailnet. They
 have `/dev/kvm`, ~150G of disk, and podman, buildah, skopeo, gcc, make,
