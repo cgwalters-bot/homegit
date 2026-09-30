@@ -81,6 +81,8 @@ rg 'fn join_path\|fn build_path\|fn make_path' src/
 
 **No magic strings or numbers.** Literals used more than once or whose meaning isn't obvious at the call site should be constants.
 
+**No environment-specific constants in harness tools.** The bot's tools (homegit's `bin/`, crates and skills) should work for any operator and runner setup: don't hard-code facts about one environment, such as a workflow's `timeout-minutes`, a run-name format, a repository, host name or runner label. Take them from the environment the tool runs against (an env var or file the workflow provides, the operator config via `bot-operator`) or from an argument. If the environment doesn't expose what the tool needs, change the environment to provide it.
+
 **Error handling.** Every `?` propagation should carry enough context for a user to locate the problem. Prefer `.with_context(|| format!("...: {path}"))` over bare `?`.
 
 **Workarounds for other projects' bugs link upstream.** A workaround for a bug in another project (a retry, a sleep, a version check, a disabled feature) must link the upstream bug report or fix. If none exists, triage the upstream code and queue a report (filed by a human, or drafted by an agent for the operator to file) before landing the workaround, and say in the comment when it can be removed (e.g. the upstream version with the fix).
