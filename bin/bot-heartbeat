@@ -9,11 +9,13 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const PROG = path.basename(process.argv[1]);
+const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG);
 // The pinned, locked "Bot heartbeat" issue, whose one comment by the bot
-// holds the heartbeat. The review app reads it from the same place.
-const TRACKER_REPO = "cgwalters-forge/tracker";
-const HEARTBEAT_ISSUE = 176;
-const BOT_LOGIN = "cgwalters-bot";
+// holds the heartbeat (from the operator config). The review app reads
+// it from the same place.
+const TRACKER_REPO = CONFIG.tracker_repo;
+const HEARTBEAT_ISSUE = CONFIG.heartbeat_issue;
+const BOT_LOGIN = CONFIG.bot.login;
 // The comment's first line; the JSON follows in a ```json fence.
 const MARKER = "<!-- bot-heartbeat v1 -->";
 const SCHEMA = "bot-heartbeat/v1";
@@ -247,7 +249,7 @@ const code = (s) => `\`${s}\``;
 function render(hb) {
   const lines = [
     MARKER,
-    `Coordinator ${code(hb.coordinator.session)} is ${hb.coordinator.loop_state}, as of ${hb.updated_at}; ${hb.workers.length} local worker(s). Written by ${code(`${PROG} publish`)} in cgwalters-bot/homegit; the review app's ops view reads the JSON below.`,
+    `Coordinator ${code(hb.coordinator.session)} is ${hb.coordinator.loop_state}, as of ${hb.updated_at}; ${hb.workers.length} local worker(s). Written by ${code(`${PROG} publish`)} in ${CONFIG.bot.homegit_repo}; the review app's ops view reads the JSON below.`,
     "",
   ];
   if (hb.workers.length) {
@@ -343,6 +345,13 @@ function cmdShow(args) {
   process.stdout.write(`${JSON.stringify(parseComment(c.body), null, 2)}\n`);
 }
 
+// needIssue(): there must be a heartbeat issue to write or read.
+function needIssue() {
+  if (HEARTBEAT_ISSUE === null) {
+    throw new Exit(EX_ERROR, `no heartbeat issue for ${TRACKER_REPO}: open a "Bot heartbeat" issue there (pin and lock it), then set heartbeat_issue in the operator config`);
+  }
+}
+
 function main() {
   const [cmd, ...args] = process.argv.slice(2);
   switch (cmd) {
@@ -352,8 +361,10 @@ function main() {
       process.stdout.write(usage());
       return;
     case "publish":
+      needIssue();
       return cmdPublish(args);
     case "show":
+      needIssue();
       return cmdShow(args);
     default:
       throw new Exit(EX_USAGE, `${cmd === undefined ? "missing command" : `unknown command '${cmd}'`}\n\n${usage()}`);

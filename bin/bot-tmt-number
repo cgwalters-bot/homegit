@@ -23,8 +23,9 @@ const CACHE_VERSION = "v1";
 const DEFAULT_REPO = "bootc-dev/bootc";
 // Where the bot's own branches live: the forge forks hold draft PRs, and
 // both push branches that become upstream PRs.
-const FORGE_ORG = "cgwalters-forge";
-const BOT_OWNERS = [FORGE_ORG, "cgwalters-bot"];
+const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG);
+const FORGE_ORG = CONFIG.forge_org;
+const BOT_OWNERS = [FORGE_ORG, CONFIG.bot.login];
 // The bot-board state item holding the reservations.
 const STATE_NAME = "tmt-numbers";
 // bot-board's exit status for a checked write that lost a race.

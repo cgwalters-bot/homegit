@@ -11,6 +11,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const PROG = path.basename(process.argv[1]);
+const OPERATOR = require(path.join(__dirname, "..", "lib", "operator.js"));
+const CONFIG = OPERATOR.loadOrExit(PROG);
 // The records live in homegit's upstream-policy/OWNER/REPO.md, next to
 // this script's bin/ (through the ~/.local/bin symlink). The override is
 // only for tests: the gate is the records in homegit.
@@ -21,10 +23,10 @@ const POLICY_DIR =
 // has, and GitHub vouches for whoever loosened a verdict there.
 const REMOTE = "origin";
 const REMOTE_BRANCH = "main";
-const HOMEGIT_REPO = "cgwalters-bot/homegit";
-// The only login that may loosen a verdict: in a commit GitHub verified,
-// or by approving the pull request that merged it.
-const OWNER_LOGIN = "cgwalters";
+const HOMEGIT_REPO = CONFIG.bot.homegit_repo;
+// The only login that may loosen a verdict (the operator's): in a commit
+// GitHub verified, or by approving the pull request that merged it.
+const OWNER_LOGIN = CONFIG.operator.login;
 // Where check remembers the last REMOTE_BRANCH it accepted, per remote.
 const STATE_DIR = path.join(
   process.env.XDG_STATE_HOME || path.join(require("node:os").homedir(), ".local", "state"),
@@ -33,13 +35,13 @@ const STATE_DIR = path.join(
 // Verdicts from the loosest to the strictest.
 const VERDICTS = {
   "bot-ok": "the bot may write the code and the text, with the AI trailer",
-  "human-text": "code by the bot is fine, but the PR title and body, commit messages and comments must be cgwalters' own",
+  "human-text": `code by the bot is fine, but the PR title and body, commit messages and comments must be ${OPERATOR.possessive(OWNER_LOGIN)} own`,
   "human-only": "no AI-generated contributions at all",
   "no-go": "the bot does not contribute here",
 };
 const REQUIRED_KEYS = ["verdict", "ai-trailer", "dco", "sources", "checked"];
 // The optional 'rebase:' of a record: a maintainer asking the bot not to
-// rebase PRs that don't conflict, or (for repositories cgwalters
+// rebase PRs that don't conflict, or (for repositories the operator
 // maintains) wanting them rebased despite a merge queue.
 const REBASE_CONFLICTS_ONLY = "conflicts-only";
 const REBASE_ANY = "any";
@@ -114,7 +116,7 @@ Commands:
         The promote gate: print the verdict and succeed only if the record
         exists, is committed to git and valid, is current, and its verdict
         is bot-ok (or human-text, with --allow-human-text, for when
-        cgwalters wrote the text himself). Current means that every
+        ${OWNER_LOGIN} wrote the text themselves). Current means that every
         source still has its recorded id on the default branch of its
         repository, and that the scan below finds no source missing from
         the record (e.g. a newly added AI policy). Exit status: ${EX_MISSING}
@@ -141,7 +143,7 @@ Commands:
         in ${WORKFLOWS_DIR} there (what shows when the rules don't, to
         outsiders). Detection is cached for ${CACHE_TTL_MS / 3600000}
         hours in ${CACHE_FILE}. A record's 'rebase: ${REBASE_ANY}' (where
-        cgwalters maintains and wants them) overrides detection, but
+        ${OWNER_LOGIN} maintains and wants them) overrides detection, but
         only once committed and what the checkout's ${REMOTE}/${REMOTE_BRANCH}
         has (not fetched); otherwise it warns, and a HEAD or
         ${REMOTE}/${REMOTE_BRANCH} record saying '${REBASE_CONFLICTS_ONLY}' still
@@ -472,7 +474,7 @@ function approvedPull(top, commit) {
 }
 
 // checkLoosening(top, rel): REL's verdict may be no looser than the
-// strictest one it held since cgwalters last loosened it (or since it was
+// strictest one it held since OWNER_LOGIN last loosened it (or since it was
 // created), across deletions and moves (see history). He loosens by
 // changing the verdict in a commit he vouches for (see vouched; merely
 // touching an already loosened record doesn't vouch for it). Anyone else's loosening doesn't count, but
@@ -522,7 +524,7 @@ function checkHistoryKept(top) {
   if (accepted && gitMaybe(top, ["merge-base", "--is-ancestor", accepted, tip]) === null) {
     throw new Exit(
       EX_INVALID,
-      `${upstream} (${tip.slice(0, 12)}) does not descend from ${accepted.slice(0, 12)}, which the last check accepted: its history was rewritten, which could hide how a verdict was loosened. If cgwalters did that on purpose, he removes ${file}`,
+      `${upstream} (${tip.slice(0, 12)}) does not descend from ${accepted.slice(0, 12)}, which the last check accepted: its history was rewritten, which could hide how a verdict was loosened. If ${OWNER_LOGIN} did that on purpose, they remove ${file}`,
     );
   }
   return () => {
