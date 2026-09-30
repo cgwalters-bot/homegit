@@ -81,6 +81,13 @@ CI, conflicts, missing sign-offs, and PRs nobody has touched in a day
 DCO check fails although I approved their head (`bot-signoff-due`), so
 my approval is all a sign-off takes.
 
+The coordinator doesn't run these by hand: `bot-poll` (Rust, in
+`crates/`, installed by `make install`) sweeps with `bot-notify`, `bot-pr
+inbox` and `bot-watch` every 15 minutes, keeps their output, and exits
+only when something is new since it last reported (an approval, a
+review, a new P0 health problem, ...), which wakes the coordinator;
+`bot-poll --summary` lists what's new.
+
 ### Overnight working model
 
 The agents run on a trusted machine that holds the clones and the bot's

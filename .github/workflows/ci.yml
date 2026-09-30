@@ -32,6 +32,14 @@ jobs:
         run: |
           { grep -lE '^#!.*[/ ](ba)?sh$' bin/* tests/*.sh; ls bin/*.sh; } | sort -u |
             grep -vxF -f <(tr ' ' '\n' <<<"${LEGACY}") | xargs shellcheck -x
+      - name: Rust
+        run: |
+          cargo fmt --all --check
+          cargo clippy --locked --all-targets -- -D warnings
+          cargo test --locked
+          cargo build --locked --release
+          # For the tests below, which run the crates' tools from PATH.
+          echo "${PWD}/target/release" >>"${GITHUB_PATH}"
       - name: node --check
         run: grep -lE '^#!.*[/ ]node$' bin/* | xargs -n1 node --check
       - name: tests

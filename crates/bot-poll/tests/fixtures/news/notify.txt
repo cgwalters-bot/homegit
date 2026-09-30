@@ -1,0 +1,8 @@
+1 notification threads updated since 2026-09-30T14:10:28Z; poll again in 60s at the earliest.
+Thread comment in cgwalters-forge/tracker: bootc#2499 (.vmlinuz.hmac): sign off again [thread 25909312948]
+  answer from @cgwalters, pending until acked
+  left unread until 'bot-notify ack 25909312948'
+Routed 1 threads: 1 new requests and 0 assignments from cgwalters, 0 triggers by others filed, 0 skipped.
+1 requests and answers from cgwalters to act on; then 'bot-notify ack THREAD_ID...':
+answer {"type":"answer","reason":"comment","repo":"cgwalters-forge/tracker","number":"151","title":"bootc#2499 (.vmlinuz.hmac): sign off again","thread_url":"https://github.com/cgwalters-forge/tracker/issues/151","thread_id":"25909312948","author":"cgwalters","url":"https://github.com/cgwalters-forge/tracker/issues/151#issuecomment-1","choice":"A"}
+State advanced to since=2026-09-30T14:25:00Z.

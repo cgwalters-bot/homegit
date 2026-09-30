@@ -85,25 +85,50 @@ failure it reports as "unexplained" stay on the default model.
 
 ## Polling
 
-At session start, and on every loop iteration, in this order (`$SCRATCH`
-being the session's scratch dir):
+Poll with `bot-poll`, run in the background, which wakes the session
+(by exiting) only when something new turns up:
+
+```bash
+bot-poll
+```
+
+Every 15 minutes it sweeps the checkout with `git pull --ff-only`, then
+runs:
 
 ```bash
 bot-notify
 bot-pr inbox --dry-run
-bot-watch --apply > "$SCRATCH/watch-$(date +%H%M).txt"
+bot-watch --apply
 bot-tmt-number --gc
 ```
+
+saving each one's whole output under `~/.local/state/bot-poll/runs/`,
+and compares what they list against what it has already reported:
+approvals, cgwalters' activity on fork PRs, outstanding reviews,
+rebase needs, priority health lines (a new P0 one is its own kind),
+sign-offs, requests and answers from `bot-notify`, and item news other
+than bots'. On the first new item it exits printing
+`NEWS (KINDS) at HHMM: RUN/*.txt`; then run `bot-poll --summary` for
+the new items themselves, grouped, with their URLs, and read the run's
+files for the rest. After 12h without news it exits too. Handle the
+news, then start `bot-poll` again: what it reported stays reported,
+and news a sweep found before a restart is reported on the next
+start, since it keeps what it has seen in its state dir. `bot-poll
+--once` sweeps right away (at session start, say); `--help` has the
+rest. It is homegit's Rust crate `crates/bot-poll`: `make
+install-crates` in the shared checkout installs it into `~/.cargo/bin`,
+and it runs that checkout's `bin/` tools. Its sweeps pull the checkout
+but don't rebuild it, so after a pull that changes `crates/bot-poll`,
+run `make install-crates` again before restarting it.
 
 `bot-notify` routes new pings (see its skill; ack requests once they're on
 the board). `bot-pr inbox --dry-run` shows cgwalters' review activity on
 fork PRs without consuming it, so the worker who picks up a fork PR still
 sees it. `bot-watch --apply` consumes its news (the next sweep won't
-report it again), so capture its whole output to a file and read that,
-instead of piping it through `tail` and losing lines for good.
-`bot-tmt-number --gc` releases the bootc tmt test numbers workers
-reserved once their number is on main or in their open PR, or their PR
-closed.
+report it again), which is why `bot-poll` keeps its whole output: read
+the file rather than rerunning it. `bot-tmt-number --gc` releases the
+bootc tmt test numbers workers reserved once their number is on main
+or in their open PR, or their PR closed.
 
 ## Acting on it
 
@@ -122,9 +147,8 @@ closed.
   ```
 
   The first four fields (priority, reason, URL, head) identify a
-  problem and stay the same until it is fixed or the head moves, so a
-  news-gated poll wakes on each new one once: keep the set of those
-  keys from the last wake and wake on any key not in it. Handle a new
+  problem and stay the same until it is fixed or the head moves, so
+  `bot-poll` wakes on each new one once. Handle a new
   P0 line first, before other news: find out why (the failing job's
   log, the conflict, who it waits on) and dispatch a worker or fix it,
   or, when it waits on a human (a review, a rerun, a sign-off), make
@@ -257,11 +281,10 @@ closed.
 
 ## Loop cadence
 
-Loop with a background sleep as the heartbeat (`sleep 1200` or `sleep 1800`
-run in the background, which wakes the session when it exits): 20 minutes while
-workers are running or news is coming in, 30 minutes when idle. Worker
-completions wake the session too; handle them as they arrive, and poll
-again when the sleep ends.
+`bot-poll` in the background is the loop's heartbeat: it wakes the
+session on news, or after 12h. Worker completions wake the session too;
+handle them as they arrive, and keep one `bot-poll` running (a second
+one refuses to start while the first holds its state dir).
 
 ## Heartbeat
 
@@ -280,7 +303,8 @@ jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
 
 `session` is this session's id, `loop_state` what the loop does next
 (`polling`, `working`, `sleeping`, or `stopped` when cgwalters says to
-stop), `next_wake_at` when the background sleep ends, and each running worker is listed by the name, board item and
+stop), `next_wake_at` when the running `bot-poll` gives up (its start plus
+12h; it wakes the session sooner on news), and each running worker is listed by the name, board item and
 devspace in its brief, with the `status` it last reported (`starting`,
 `working`, `testing`, `reviewing`, `landing`, `waiting`); a finished one
 is left out. The heartbeat is public: names and links only, never task
