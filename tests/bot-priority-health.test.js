@@ -159,6 +159,12 @@ const CASES = [
       run("flaky", "completed", "failure", { started_at: minutesAgo(5), completed_at: minutesAgo(4) })],
     expect: [`P1 ci-failing ${GH}/example/flaky/pull/12 deadbeef0000: flaky`],
   },
+  {
+    name: "a queued run with no started_at counts as pending from created_at",
+    repo: "example/queued", number: 13, head: `c0ffee${"0".repeat(34)}`, priority: "P1", updated: 1,
+    runs: [{ name: "slow-app", status: "queued", conclusion: null, created_at: hoursAgo(6), app: { slug: "some-app" } }],
+    expect: [`P1 ci-pending ${GH}/example/queued/pull/13 c0ffee000000: pending since ${hoursAgo(6)}: slow-app`],
+  },
 ];
 
 const prUrl = (c) => `${GH}/${c.repo}/pull/${c.number}`;

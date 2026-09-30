@@ -330,8 +330,10 @@ function checkProblems(runs, statuses, now) {
     if (r.status === "completed") {
       if (isDco(r) && DCO_FAILED_CONCLUSIONS.includes(r.conclusion)) dco.push(r.name);
       else if (FAILED_CONCLUSIONS.includes(r.conclusion)) failing.push(r.name);
-    } else if (r.started_at) {
-      pending.push([r.name, r.started_at]);
+    } else if (r.started_at || r.created_at) {
+      // Queued runs some apps never give a started_at until they begin;
+      // pending since their creation, not never.
+      pending.push([r.name, r.started_at || r.created_at]);
     }
   }
   for (const s of statuses) {
