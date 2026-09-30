@@ -53,7 +53,7 @@ case "$1 $2" in
     "api graphql")
         filter=$(arg --jq "$@")
         if grep -q 'items(first: 100, query' <<<"$*"; then
-            jq '{data: {user: {projectV2: {items: {pageInfo: {hasNextPage: false}, nodes: [.items[]
+            jq '{data: {board: {projectV2: {items: {pageInfo: {hasNextPage: false}, nodes: [.items[]
                 | {id, content, priority: (if .priority then {name: .priority} else null end),
                    org: (if .org then {name: .org} else null end)}]}}}}}' "${store}/items.json"
         else

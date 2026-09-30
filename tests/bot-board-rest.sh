@@ -87,7 +87,7 @@ chmod +x "${WORK}/bin/gh"
 list() {
     local name=$1
     shift
-    rm -f "${XDG_CACHE_HOME}/bot-board/items.json"
+    rm -f "${XDG_CACHE_HOME}/bot-board/users/cgwalters-bot/1/items.json"
     : >"${FAKE_GH}/calls"
     out=$("${BOT_BOARD}" "$@" list --json 2>"${WORK}/err") || { fail "${name}: $(cat "${WORK}/err")"; out='[]'; }
 }

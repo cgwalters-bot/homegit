@@ -98,7 +98,7 @@ case "$1 $2" in
                 echo "lookup ${n}" >>"${store}/calls"
                 items=${store}/items-${n}.json
                 test -e "${items}" || items=${store}/items.json
-                jq -c '{user: {projectV2: {items: {pageInfo: {hasNextPage: false}, nodes: [.items[]
+                jq -c '{board: {projectV2: {items: {pageInfo: {hasNextPage: false}, nodes: [.items[]
                     | {id, content, priority: null, org: null}]}}}}' "${items}"
                 ;;
             # A PR body's edits: $FAKE_GH/body-edits.json (as
@@ -151,8 +151,8 @@ case "$1 $2" in
     "project item-edit") exit 0 ;;
 esac
 # Board N's items, from $FAKE_GH/items-N.json, over REST.
-if test "$1 $2" = "api -i" && [[ "$3" =~ ^users/[^/]+/projectsV2/([0-9]+)/ ]]; then
-    exec "${FAKE_BOARD_REST:?}" "${store}/items-${BASH_REMATCH[1]}.json" "$3"
+if test "$1 $2" = "api -i" && [[ "$3" =~ ^(users|orgs)/[^/]+/projectsV2/([0-9]+)/ ]]; then
+    exec "${FAKE_BOARD_REST:?}" "${store}/items-${BASH_REMATCH[2]}.json" "$3"
 fi
 # Notifications: nothing new. $FAKE_GH/on-poll runs first, if it exists,
 # to simulate another machine writing meanwhile.
@@ -386,8 +386,10 @@ JSON
     grep -q -- '--field-id F_owner --text=bot' "${FAKE_GH}/calls" || fail "Owner not set"
     ! "${BIN}/bot-board" --project composefs-stable set PVTI_a --field Area nope 2>/dev/null ||
         fail "an invalid option was accepted"
-    "${BIN}/bot-board" --project=2 show PVTI_a | grep -qx $'area:\tdocs' || fail "show lacks the Area field"
-    test -d "${XDG_CACHE_HOME}/bot-board/project-2/rest" || fail "board 2 isn't cached apart"
+    "${BIN}/bot-board" --project=users/cgwalters-bot/2 show PVTI_a | grep -qx $'area:\tdocs' || fail "show lacks the Area field"
+    test -d "${XDG_CACHE_HOME}/bot-board/users/cgwalters-bot/2/rest" || fail "board 2 isn't cached apart"
+    grep -q '^api -i users/cgwalters-bot/projectsV2/2/items?' "${FAKE_GH}/calls" || fail "board 2 isn't the user's"
+    ! "${BIN}/bot-board" --project=users/x 2>/dev/null || fail "a malformed board was accepted"
     # Board-bound commands and the default board.
     local cmd
     for cmd in "state-get x" "state-put x {}"; do

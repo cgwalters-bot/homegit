@@ -10,5 +10,6 @@
   {"id": 9, "node_id": "PVTF_parent", "name": "Parent issue", "data_type": "parent_issue"},
   {"id": 10, "node_id": "PVTF_progress", "name": "Sub-issues progress", "data_type": "sub_issues_progress"},
   {"id": 11, "node_id": "PVTF_why", "name": "Why", "data_type": "text"},
-  {"id": 12, "node_id": "PVTSSF_priority", "name": "Priority", "data_type": "single_select"}
+  {"id": 12, "node_id": "PVTSSF_priority", "name": "Priority", "data_type": "single_select"},
+  {"id": 13, "node_id": "PVTF_type", "name": "Type", "data_type": "issue_type"}
 ]
