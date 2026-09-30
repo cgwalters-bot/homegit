@@ -19,15 +19,18 @@ const PROG = path.basename(process.argv[1] || "bot-priority-health");
 const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
 const GH = process.env.BOT_PRIORITY_HEALTH_GH || "gh";
 const BOT_BOARD = process.env.BOT_PRIORITY_HEALTH_BOT_BOARD || path.join(BIN_DIR, "bot-board");
-const BOT_LOGIN = "cgwalters-bot";
+const OPERATOR = require(path.join(__dirname, "..", "lib", "operator.js"));
+const CONFIG = OPERATOR.loadOrExit(PROG);
+const BOT_LOGIN = CONFIG.bot.login;
 // The bot's PRs in these owners' repositories with a bot-meta section
-// are its fork PRs (as in bot-watch): cgwalters' review queue, with their
-// CI off, and the sign-off added by 'bot-pr promote'.
-const FORK_OWNERS = ["cgwalters-forge", "cgwalters-bot"];
+// are its fork PRs (as in bot-watch): the operator's review queue, with
+// their CI off, and the sign-off added by 'bot-pr promote'.
+const FORK_OWNERS = [CONFIG.forge_org, BOT_LOGIN];
 const FORK_META = "<!-- bot-meta -->";
 // The P0 epic's board (bot-board --project), whose PRs are swept at the
-// priority they have there.
-const EPIC_PROJECT = "composefs-stable";
+// priority they have there: the operator config's first epic board, if
+// it has any.
+const EPIC_PROJECT = Object.keys(CONFIG.board.epics)[0] || null;
 // Swept priorities, most urgent first, and how long each may go without
 // any activity on its PR.
 const STALE_HOURS = { P0: 24, P1: 72 };
@@ -72,8 +75,8 @@ function usage() {
 
 Lists the open PRs of the Workstream board's items with Priority ${PRIORITIES.join(" or ")}
 (the item's own PR, and the PRs in its Branch field; not ${SKIP_STATUSES.join(", ")}),
-and those of the ${EPIC_PROJECT} board (the P0 epic's) at the priority
-they have there, that need a look:
+${EPIC_PROJECT ? `and those of the ${EPIC_PROJECT} board (the P0 epic's) at the priority
+they have there, ` : ""}that need a look:
 
   ci-failing  a check run or commit status failed on the current head
               (the failing ones are named; only the latest run of each
@@ -90,7 +93,7 @@ they have there, that need a look:
               ${PRIORITIES.map((p) => `${STALE_HOURS[p]}h (${p})`).join(" or ")}
 
 The bot's fork PRs (in ${FORK_OWNERS.join(", ")}, with a bot-meta section) are
-cgwalters' review queue, with no CI of their own: only P0 ones are
+${OPERATOR.possessive(CONFIG.operator.login)} review queue, with no CI of their own: only P0 ones are
 checked, and only for conflicts and staleness.
 
 One line per problem, P0 first:
@@ -109,7 +112,7 @@ ${ETAG_DIR.replace(os.homedir(), "~")}): an unchanged one costs no quota.
 Options:
   --board-file FILE       the Workstream board as 'bot-board list --json'
                           prints it (default: run that)
-  --epic-board-file FILE  the same for the ${EPIC_PROJECT} board
+  --epic-board-file FILE  the same for the ${EPIC_PROJECT || "epic"} board
   --now TIME              take TIME as now
   --json                  print a JSON array of {priority, reason, url,
                           head, detail, items, line}
@@ -469,10 +472,8 @@ function render(problems) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   pruneCache(opts.now);
-  const boards = [
-    ["workstream", await loadBoard(opts.boardFile, null)],
-    [EPIC_PROJECT, await loadBoard(opts.epicBoardFile, EPIC_PROJECT)],
-  ];
+  const boards = [["workstream", await loadBoard(opts.boardFile, null)]];
+  if (EPIC_PROJECT) boards.push([EPIC_PROJECT, await loadBoard(opts.epicBoardFile, EPIC_PROJECT)]);
   const { problems, failed } = await sweep(boards, opts.now);
   process.stdout.write(opts.json ? `${JSON.stringify(problems)}\n` : render(problems));
   if (failed.length) throw new Exit(EX_ERROR, `${failed.length} PR(s) could not be read; they are not listed`);

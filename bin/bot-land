@@ -12,7 +12,7 @@ const PROG = path.basename(process.argv[1]);
 const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1]));
 const BOT_GIT = path.join(BIN_DIR, "bot-git");
 const BOT_BOARD = path.join(BIN_DIR, "bot-board");
-// The Status on the board of a pull request that waits for cgwalters'
+// The Status on the board of a pull request that waits for the operator's
 // approval (--no-auto).
 const WAITING_STATUS = "Draft";
 const REMOTE = "origin";
@@ -41,7 +41,7 @@ function usage() {
                 [--no-auto] [--no-wait] [--timeout MINUTES]
 
 Lands the current branch of this worktree on one of the bot's own
-repositories (homegit, cgwalters-bot/*, cgwalters-forge's own), whose
+repositories (homegit, and the bot's and the forge org's own), whose
 main takes changes only as pull requests with a green '${CHECK_NAME}' check,
 up to date with main, rebase-merged:
 
@@ -52,7 +52,7 @@ up to date with main, rebase-merged:
      commit (it is required for more); BODY to a list of the commits'
      subjects, plus '${AI_TRAILER}';
   4. enables auto-merge by rebase, unless --no-auto (for a pull request
-     that waits for cgwalters' approval, such as one loosening an
+     that waits for the operator's approval, such as one loosening an
      upstream-policy verdict: that one goes on the Workstream board
      with Status ${WAITING_STATUS}, so that bot-watch reports his review);
   5. unless --no-wait (or --no-auto), waits until it merges: when main

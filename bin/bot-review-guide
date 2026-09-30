@@ -14,10 +14,12 @@ const GH = process.env.BOT_REVIEW_GUIDE_GH || "gh";
 const SCHEMA = "review-guide/v1";
 const MARKER_START = `<!-- ${SCHEMA} `;
 const MARKER_END = " -->";
-const BOT_LOGIN = "cgwalters-bot";
+const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG);
+const BOT_LOGIN = CONFIG.bot.login;
 // Owners whose PRs the bot may post guides on.
-const POST_OWNERS = ["cgwalters-forge", "cgwalters-bot"];
-const APP_URL = "https://cgwalters-forge.github.io/review/";
+const POST_OWNERS = [CONFIG.forge_org, BOT_LOGIN];
+// The review app, which the forge org publishes.
+const APP_URL = `https://${CONFIG.forge_org.toLowerCase()}.github.io/review/`;
 
 const SEVERITIES = ["risky", "look-closely", "note"];
 const CATEGORIES = ["logic", "security", "error-handling", "test-gap", "api", "perf"];

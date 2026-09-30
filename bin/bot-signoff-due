@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Finds the bot's upstream PRs that cgwalters approved at their current
+// Finds the bot's upstream PRs that the operator approved at their current
 // head but whose DCO check fails, and with --apply runs 'bot-pr signoff'
 // on each. bot-watch runs it on every sweep. See --help.
 // Node's standard library only, plus gh (through bot-priority-health's
@@ -20,7 +20,8 @@ const {
   Exit, restGet, checkRuns, checkProblems, pool, BOT_LOGIN, FORK_OWNERS, FORK_META, EX_RATELIMIT,
 } = require(path.join(BIN_DIR, "bot-priority-health"));
 const BOT_PR = process.env.BOT_SIGNOFF_DUE_BOT_PR || path.join(BIN_DIR, "bot-pr");
-const REVIEWER = "cgwalters";
+// The operator (see lib/operator.js).
+const REVIEWER = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG).operator.login;
 // His reviews that decide whether a PR is approved, as in bot-pr's
 // upstream_approval: a later comment-only review leaves an approval be.
 const DECIDING_STATES = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
