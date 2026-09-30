@@ -98,6 +98,7 @@ rg 'fn join_path\|fn build_path\|fn make_path' src/
 - Prefer `rustix` over `libc` for syscall wrappers — safer types, no raw pointers.
 - TOCTOU: never do `if path.exists() { open(path) }`. Open directly and handle the error.
 - Before adding a new dependency, check whether an existing crate already in `Cargo.toml` covers it, or whether a well-known alternative (`bstr`, `camino`, `rustix`, etc.) is a better fit.
+- Prefer `split_once`/`rsplit_once` or other structured parsing (`strip_prefix`/`strip_suffix`, a proper parser) over manual index/`find`+slice juggling to pull a substring out of a string.
 
 ### Architecture
 
