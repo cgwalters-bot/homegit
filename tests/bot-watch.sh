@@ -594,5 +594,40 @@ test "$(head -3 "${WORK}/ph--dry-run")" = "Priority health:
   P0 ci-failing ${PH}/2 ${PH_HEAD:0:12}: ${PH_JOB}" ||
     fail "ph: the text report doesn't start with the section: $(cat "${WORK}/ph--dry-run")"
 
+# --- Priority health failures ---
+# A PR bot-priority-health can't read (on the P0 epic's board only, so
+# bot-watch's own per-item sweep never touches it) must cost only its own
+# lines, with a warning, not the whole section: the other P0 (stale, on
+# the Workstream board) is still reported. Rate limiting is different: it
+# is the whole sweep's problem, passed through as bot-watch's own exit,
+# not folded into the generic "a section failed" exit 1.
+readonly PHF_OK=${GH}/example/phok/pull/1 PHF_BAD=${GH}/example/phbad/pull/2
+readonly PHF_HEAD=cccc000000000000000000000000000000000001
+pr example/phok 1 "${PHF_HEAD}" 2026-09-24T00:00:00Z
+: | reviews repos/example/phok/pulls/1
+: | comments repos/example/phok/issues/1
+commit example/phok "${PHF_HEAD}" 2026-09-23T00:00:00Z
+jq -n --arg pr "${PHF_OK}" '[{id: "PVTI_phok", title: "OK but stale", status: "In Review", priority: "P0",
+    content: {type: "PullRequest", url: $pr}}]' >"${WORK}/phfail-board.json"
+jq -n --arg pr "${PHF_BAD}" '[{id: "PVTI_phbad", title: "Unreadable", status: "In Review", priority: "P0",
+    content: {type: "PullRequest", url: $pr}}]' >"${WORK}/phfail-epic.json"
+
+mkdir -p "${REST}/repos/example/phbad/pulls"
+printf '502 Bad Gateway\nboom\n' >"${REST}/repos/example/phbad/pulls/2.fail"
+rc=0
+"${BOT_WATCH}" --json --now 2026-09-25T18:00:00Z --board-file "${WORK}/phfail-board.json" --epic-board-file "${WORK}/phfail-epic.json" \
+    --state-file "${WORK}/phfail.state" >"${WORK}/phfail.json" 2>"${WORK}/phfail.err" || rc=$?
+test "${rc}" -eq 1 || fail "phfail: an unreadable PR should exit 1, not $((rc)): $(cat "${WORK}/phfail.err")"
+jq -e --arg ok "${PHF_OK}" '.priority_health_failed == true and ([.priority_health[].url] == [$ok])' "${WORK}/phfail.json" >/dev/null ||
+    fail "phfail: the other P0's stale line should survive: $(cat "${WORK}/phfail.json")"
+grep -q "priority health sweep failed" "${WORK}/phfail.err" || fail "phfail: no warning about the failed section: $(cat "${WORK}/phfail.err")"
+
+printf '403 Forbidden\nAPI rate limit exceeded for user (HTTP 403)\n' >"${REST}/repos/example/phbad/pulls/2.fail"
+rc=0
+"${BOT_WATCH}" --json --now 2026-09-25T18:00:00Z --board-file "${WORK}/phfail-board.json" --epic-board-file "${WORK}/phfail-epic.json" \
+    --state-file "${WORK}/phfail-rl.state" >"${WORK}/phfail-rl.json" 2>"${WORK}/phfail-rl.err" || rc=$?
+test "${rc}" -eq 75 || fail "phfail: priority health's rate limiting should exit 75, not ${rc}: $(cat "${WORK}/phfail-rl.err")"
+rm -f "${REST}/repos/example/phbad/pulls/2.fail"
+
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
 echo "ok: bot-watch first-sight news, outstanding reviews, PRs that need a rebase and priority health as expected"
