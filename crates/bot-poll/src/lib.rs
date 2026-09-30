@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// The operator, whose reviews and requests the tools report.
-pub const REQUESTER: &str = "cgwalters";
+pub mod operator;
+use operator::Operator;
+
 /// A key not there for this long is forgotten, and news again when it
 /// comes back; a shorter absence (a sweep that missed it, say a failed
 /// read) is not news.
@@ -99,15 +100,17 @@ const WATCH_SECTION_FAILURES: [(&str, &[&str]); 3] = [
 ];
 
 /// The kinds of news, most urgent first, as the NEWS line and the
-/// summary order them, with their titles. health-P0 is the new health
-/// lines of P0 PRs (they share the health seen-set).
+/// summary order them, with their titles, where OPERATOR and
+/// OPERATOR'S stand for the operator's login (see [`kind_title`]).
+/// health-P0 is the new health lines of P0 PRs (they share the health
+/// seen-set).
 pub const KINDS: [(&str, &str); 9] = [
     ("health-P0", "Priority health (P0)"),
-    ("review", "Outstanding reviews by cgwalters"),
+    ("review", "Outstanding reviews by OPERATOR"),
     ("approval", "Approved fork PRs (promote)"),
     ("signoff", "Sign-offs"),
-    ("notify", "Requests and answers from cgwalters"),
-    ("forge-review", "cgwalters' activity on fork PRs"),
+    ("notify", "Requests and answers from OPERATOR"),
+    ("forge-review", "OPERATOR'S activity on fork PRs"),
     ("rebase", "Needs rebase"),
     ("health", "Priority health (P1)"),
     ("news", "Item news"),
@@ -566,18 +569,26 @@ pub fn news_line(news: &[KindNews], hhmm: &str, run_dir: &str) -> String {
     format!("NEWS ({}) at {hhmm}: {run_dir}/*.txt", kinds.join(", "))
 }
 
+/// The title of KIND in the summary, for OPERATOR.
+pub fn kind_title(kind: &str, operator: &Operator) -> String {
+    KINDS
+        .iter()
+        .find(|(k, _)| *k == kind)
+        .map_or(kind.to_string(), |(_, t)| {
+            t.replace("OPERATOR'S", &operator.possessive())
+                .replace("OPERATOR", &operator.login)
+        })
+}
+
 /// The --summary: the NEWS line, then the new items grouped by kind,
 /// each with its URL unless its text has it.
-pub fn render_summary(last: Option<&LastNews>) -> String {
+pub fn render_summary(last: Option<&LastNews>, operator: &Operator) -> String {
     let Some(last) = last else {
         return "No news reported yet.\n".to_string();
     };
     let mut out = format!("{}\n", last.line);
     for k in &last.items {
-        let title = KINDS
-            .iter()
-            .find(|(kind, _)| *kind == k.kind)
-            .map_or(k.kind.as_str(), |(_, t)| t);
+        let title = kind_title(&k.kind, operator);
         out.push_str(&format!("\n{title} ({}):\n", k.kind));
         for it in &k.items {
             out.push_str(&format!("  {}\n", it.text));
@@ -847,7 +858,30 @@ mod tests {
 
     #[test]
     fn summary() {
-        assert_eq!(render_summary(None), "No news reported yet.\n");
+        let op = operator::parse("{}").unwrap().operator;
+        assert_eq!(render_summary(None, &op), "No news reported yet.\n");
+        assert_eq!(
+            kind_title("review", &op),
+            "Outstanding reviews by cgwalters"
+        );
+        assert_eq!(
+            kind_title("forge-review", &op),
+            "cgwalters' activity on fork PRs"
+        );
+        let other = operator::parse(r#"{"operator": {"login": "jmarrero"}}"#)
+            .unwrap()
+            .operator;
+        for (kind, _) in KINDS {
+            assert!(!kind_title(kind, &other).contains("cgwalters"), "{kind}");
+        }
+        assert_eq!(
+            kind_title("notify", &other),
+            "Requests and answers from jmarrero"
+        );
+        assert_eq!(
+            kind_title("forge-review", &other),
+            "jmarrero's activity on fork PRs"
+        );
         let (news, _) = evaluate(&outputs("news"), &Seen::new(), 0);
         let line = news_line(&news, "1415", "/s/runs/x");
         assert!(line.starts_with("NEWS (health-P0, review, approval, signoff, notify, forge-review, rebase, health, news) at 1415: /s/runs/x/*.txt"));

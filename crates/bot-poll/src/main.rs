@@ -12,7 +12,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result, anyhow, bail};
 use bot_poll::{
-    LastNews, Output, STATE_VERSION, Source, State, evaluate, news_line, render_summary,
+    LastNews, Output, STATE_VERSION, Source, State, evaluate, news_line, operator, render_summary,
 };
 use chrono::{Local, Utc};
 use clap::Parser;
@@ -89,13 +89,14 @@ $BOT_POLL_BIN_DIR).
 From those outputs it takes the set of what is there now, per kind:
 
   approval      fork PRs 'bot-pr inbox' shows [APPROVED] (not \"APPROVED
-                earlier; new commits since\"), by his latest approval
-  forge-review  cgwalters' reviews, comments and edits it lists on fork PRs
-  notify        the requests and answers from cgwalters that bot-notify
+                earlier; new commits since\"), by their latest approval
+  forge-review  the operator's reviews, comments and edits it lists on
+                fork PRs
+  notify        the requests and answers from the operator that bot-notify
                 lists until they are acked
   health        bot-watch's priority health lines (by priority, reason,
                 URL and head); new P0 ones are reported as health-P0
-  review        its outstanding reviews by cgwalters (by PR and his
+  review        its outstanding reviews by the operator (by PR and their
                 latest review or comment)
   signoff       its sign-off lines (bot-signoff-due)
   rebase        its PRs that need a rebase (by PR)
@@ -403,7 +404,8 @@ fn run(cli: Cli) -> Result<()> {
         dir: state_dir(&cli)?,
     };
     if cli.summary {
-        print!("{}", render_summary(store.load()?.last_news.as_ref()));
+        let op = operator::load()?.operator;
+        print!("{}", render_summary(store.load()?.last_news.as_ref(), &op));
         return Ok(());
     }
     let sweeper = Sweeper::new()?;
@@ -428,7 +430,7 @@ fn run(cli: Cli) -> Result<()> {
         match store.check(&mut state, &id) {
             Some(_) => print!(
                 "The newest run would report:\n{}",
-                render_summary(state.last_news.as_ref())
+                render_summary(state.last_news.as_ref(), &operator::load()?.operator)
             ),
             None => println!("The newest run, {id}, has no news."),
         }
