@@ -76,7 +76,9 @@ and those of the ${EPIC_PROJECT} board (the P0 epic's) at the priority
 they have there, that need a look:
 
   ci-failing  a check run or commit status failed on the current head
-              (the failing ones are named)
+              (the failing ones are named; only the latest run of each
+              name/app, or status of each context, counts, so one a
+              later rerun superseded never does)
   dco         the DCO check fails: commits lack a Signed-off-by
   ci-pending  checks still pending ${PENDING_HOURS}h after they started
   conflict    the PR conflicts with its base
@@ -276,10 +278,51 @@ function names(list) {
   return sorted.slice(0, MAX_NAMES).join(", ") + (more > 0 ? ` (+${more} more)` : "");
 }
 
+// effectiveTime(x): the time to rank a check run or commit status by, for
+// telling the latest of a name (or context) apart from one it superseded:
+// a completed run's end, else its start, else (a status, or a run with
+// neither, which the API shouldn't send) its creation.
+const effectiveTime = (x) => x.completed_at || x.started_at || x.created_at || null;
+
+// newer(a, b): whether a is the more recent of two check runs (or two
+// statuses) sharing a name/context, by effectiveTime, the higher id
+// breaking a tie (including one where neither has a time).
+function newer(a, b) {
+  const ta = effectiveTime(a);
+  const tb = effectiveTime(b);
+  if (ta && tb && ta !== tb) return Date.parse(ta) > Date.parse(tb);
+  if (Boolean(ta) !== Boolean(tb)) return Boolean(ta);
+  return (a.id || 0) > (b.id || 0);
+}
+
+// latestByKey(list, keyFn): list with only the newest (by newer()) item of
+// each keyFn(item). The check-runs API lists every run of a head,
+// including ones a later run of the same name (rerequested, or a fresh
+// push of a force-pushed PR reusing the SHA) superseded, cancelled ones
+// included; the GitHub UI treats only the latest of each name (and app,
+// so two apps can share a name) as authoritative, and so must this: a
+// superseded run's failure or cancellation must never count. Applied to
+// commit statuses too (by context), though GitHub's combined-status
+// endpoint already returns just the latest of each.
+function latestByKey(list, keyFn) {
+  const best = new Map();
+  for (const item of list) {
+    const key = keyFn(item);
+    const prev = best.get(key);
+    if (!prev || newer(item, prev)) best.set(key, item);
+  }
+  return [...best.values()];
+}
+
+const runKey = (r) => `${r.name}\u0000${(r.app && r.app.id) ?? (r.app && r.app.slug) ?? ""}`;
+const statusKey = (s) => s.context;
+
 // checkProblems(runs, statuses, now): [[reason, detail]] for a head's
-// check runs (the latest of each name, as the API lists them) and commit
-// statuses (the latest of each context).
+// check runs and commit statuses, each narrowed to the latest of every
+// name/context first (see latestByKey).
 function checkProblems(runs, statuses, now) {
+  runs = latestByKey(runs, runKey);
+  statuses = latestByKey(statuses, statusKey);
   const failing = [];
   const dco = [];
   const pending = [];
