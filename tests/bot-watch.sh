@@ -296,7 +296,10 @@ if ! grep -q "reading ${UNREADABLE_PR} (off the board) for outstanding reviews f
     grep -q -e "checking the bot's open PRs off the board failed" -e pull/20 "${WORK}/watch.err"; then
     fail "watch: expected only a warning about ${UNREADABLE_PR}: $(cat "${WORK}/watch.err")"
 fi
-if grep -v -e '^304 ' -e '^200 search/issues$' -e '^404 repos/bootc-dev/bootc/pulls/2700$' "${FAKE_GH}/calls" | grep -q . ||
+# (bot-promote-due looks for approvals of the fork PR #20 search lists,
+# which has no fixtures: 404s aren't cached.)
+if grep -v -E -e '^304 ' -e '^200 search/issues$' -e '^404 repos/bootc-dev/bootc/pulls/2700$' \
+    -e '^404 repos/cgwalters-forge/bootc/(pulls/20/reviews|issues/20/comments)$' "${FAKE_GH}/calls" | grep -q . ||
     ! grep -q "^304 ${PR_API}/reviews$" "${FAKE_GH}/calls"; then
     fail "watch: the second sweep read unchanged resources without 304s: $(sort "${FAKE_GH}/calls" | uniq -c)"
 fi
@@ -348,7 +351,8 @@ for failure in "502 Bad Gateway|HTTP 502: Bad Gateway" "403 Forbidden|API rate l
         fail "search ${failure%%|*}: the state wasn't written: $(cat "${WORK}/search.state")"
     # bot-poll matches these warnings: see WATCH_SECTION_FAILURES.
     if ! grep -q "only the board's PRs were checked for outstanding reviews" "${WORK}/search.err" ||
-        ! grep -q "looking for sign-offs due failed" "${WORK}/search.err"; then
+        ! grep -q "looking for sign-offs due failed" "${WORK}/search.err" ||
+        ! grep -q "looking for promotions due failed" "${WORK}/search.err"; then
         fail "search ${failure%%|*}: no warnings: $(cat "${WORK}/search.err")"
     fi
 done
@@ -358,9 +362,9 @@ rm "${REST}/search/issues.fail"
 # two pages (the fake answers every page alike) is read and listed once.
 # The search API stops at 1000 results, with a warning.
 cp "${REST}/search/issues.json" "${WORK}/search.json.orig"
-# sweep runs the tool twice (text and JSON), and bot-signoff-due's own
-# search pages alike: four times the requests.
-for c in "150|8|" "5000|40|over 1000 open PRs"; do
+# sweep runs the tool twice (text and JSON), and bot-signoff-due's and
+# bot-promote-due's own searches page alike: six times the requests.
+for c in "150|12|" "5000|60|over 1000 open PRs"; do
     IFS='|' read -r total calls warning <<<"${c}"
     jq -c --argjson n "${total}" '.total_count = $n' "${WORK}/search.json.orig" >"${REST}/search/issues.json"
     : >"${FAKE_GH}/calls"
@@ -660,5 +664,44 @@ jq -e --arg u "${SO}" '.signoffs == [{url: $u, head: "'"${SO_HEAD}"'", result: "
     fail "so: the text report lacks the section: $(cat "${WORK}/so--dry-run")"
 cp "${WORK}/search.json.orig" "${REST}/search/issues.json"
 
+# --- Promotions ---
+# bootc#24 on the forge: cgwalters approved the fork PR's head, and
+# nothing promoted it for a day. Listed, with the 'bot-pr promote' that
+# --apply runs; the same approval for a human-text repository is only
+# listed under "Needs your text" (bot-promote-due's own tests cover
+# which fork PRs are due).
+readonly PD=${GH}/cgwalters-forge/pd/pull/1 PD_TEXT=${GH}/cgwalters-forge/pdtext/pull/1
+readonly PD_HEAD=eeee000000000000000000000000000000000001
+# The policy gate: human-text for example/pdtext, bot-ok for the rest.
+printf '%s\n' '#!/usr/bin/env bash' 'test "$2" != example/pdtext || { echo human-text; exit 5; }' 'echo bot-ok' \
+    >"${WORK}/upstream-policy"
+chmod +x "${WORK}/upstream-policy"
+search_items=()
+for name in pd pdtext; do
+    pr "cgwalters-forge/${name}" 1 "${PD_HEAD}" 2026-09-25T17:00:00Z \
+        $'Why.\n\n<!-- bot-meta -->\n- Upstream: `example/'"${name}"$'`, base `main`\n<!-- /bot-meta -->'
+    jq -nc --arg head "${PD_HEAD}" '{id: 1, user: {login: "cgwalters"}, state: "APPROVED", commit_id: $head,
+        submitted_at: "2026-09-25T17:00:00Z", body: "", html_url: "x"}' | reviews "repos/cgwalters-forge/${name}/pulls/1"
+    : | comments "repos/cgwalters-forge/${name}/issues/1"
+    : | comments "repos/cgwalters-forge/${name}/pulls/1"
+    commit "cgwalters-forge/${name}" "${PD_HEAD}" 2026-09-25T16:00:00Z
+    search_items+=("$(jq -c --arg u "${GH}/cgwalters-forge/${name}/pull/1" '{html_url: $u, user, body}' \
+        "${REST}/repos/cgwalters-forge/${name}/pulls/1.json")")
+done
+put search/issues "$(printf '%s\n' "${search_items[@]}" | jq -sc '{total_count: length, items: .}')"
+for mode in --json --dry-run; do
+    BOT_PROMOTE_DUE_UPSTREAM_POLICY=${WORK}/upstream-policy "${BOT_WATCH}" --apply "${mode}" --now 2026-09-25T18:00:00Z \
+        --board-file "${WORK}/so-board.json" --state-file "${WORK}/pd.state" >"${WORK}/pd${mode}" 2>"${WORK}/pd.err" ||
+        { cat "${WORK}/pd.err" 1>&2; fail "pd ${mode}: sweep failed"; }
+done
+jq -e --arg u "${PD}" --arg t "${PD_TEXT}" '(.promotions | map([.url, .result, .line]))
+        == [[$u, "would-run", "Would run: bot-pr promote \($u)"]]
+    and (.needs_text | map([.url, .result])) == [[$t, "needs-text"]]
+    and (.promotions_failed | not)' "${WORK}/pd--json" >/dev/null ||
+    fail "pd: the promotions: $(jq -c . "${WORK}/pd--json")"
+[[ "$(<"${WORK}/pd--dry-run")" == *$'Promotions:\n  Would run: bot-pr promote '"${PD}"$'\n\nNeeds your text:\n  Needs your text: '"${PD_TEXT}"' (example/pdtext is human-text): '* ]] ||
+    fail "pd: the text report lacks the sections: $(cat "${WORK}/pd--dry-run")"
+cp "${WORK}/search.json.orig" "${REST}/search/issues.json"
+
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
-echo "ok: bot-watch first-sight news, outstanding reviews, PRs that need a rebase, priority health and sign-offs as expected"
+echo "ok: bot-watch first-sight news, outstanding reviews, PRs that need a rebase, priority health, sign-offs and promotions as expected"

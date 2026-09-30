@@ -65,6 +65,8 @@ PRIORITY_HEALTH=$(dirname "$(readlink -f "$0")")/bot-priority-health
 readonly PRIORITY_HEALTH
 SIGNOFF_DUE=$(dirname "$(readlink -f "$0")")/bot-signoff-due
 readonly SIGNOFF_DUE
+PROMOTE_DUE=$(dirname "$(readlink -f "$0")")/bot-promote-due
+readonly PROMOTE_DUE
 # shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
@@ -121,6 +123,15 @@ their head. With --apply, each gets 'bot-pr signoff' and a line
 "Signed off: URL (NEW-HEAD)", or why it was refused; with --dry-run
 (or --board-file), the command it would run; otherwise they are only
 listed.
+
+Then the "Promotions" of 'bot-promote-due' (see its --help): the bot's
+fork PRs whose current head ${REQUESTER} approved (a review or a
+'/promote' line), for a repository whose contribution policy is bot-ok.
+With --apply, each gets 'bot-pr promote' (with --draft after his
+'/draft') and a line "Promoted: URL -> UPSTREAM-PR-URL", or why it was
+refused; with --dry-run (or --board-file), the command it would run;
+otherwise they are only listed. Approved fork PRs for a human-text
+repository are never promoted: they are listed under "Needs your text".
 
 Apart from those changes, every sweep lists the "Outstanding reviews by
 ${REQUESTER}" on the bot's open PRs other than fork PRs (upstream ones
@@ -893,29 +904,40 @@ if test "${rc}" -ne 0; then
     health_failed=true
 fi
 
-# (bot-poll recognizes an incomplete section by its warning below, as
-# for the health and outstanding-review sections: keep the wording.)
-# Sign-offs the operator's approval of an upstream PR's head allows: only
-# --apply runs them. Like the health section, its failing costs only
-# the section, with a warning and a nonzero exit; so does a rate limit,
-# which is the search's (as for the PRs off the board above).
-signoff_failed=false
-signoff_args=(--json)
+# The sign-offs and promotions the operator's approvals allow: only
+# --apply runs them. Like the health section, a step's failing costs
+# only its sections, with a warning and a nonzero exit; so does a rate
+# limit, which is the search's (as for the PRs off the board above).
+due_args=(--json)
 if ${dry_run} || test -n "${board_file}"; then
-    signoff_args+=(--dry-run)
+    due_args+=(--dry-run)
 elif ${apply}; then
-    signoff_args+=(--apply)
+    due_args+=(--apply)
 fi
-rc=0
-"${SIGNOFF_DUE}" "${signoff_args[@]}" >"${scratch}/signoffs.json" || rc=$?
-if ! signoffs=$(jq -ce 'arrays' "${scratch}/signoffs.json" 2>/dev/null); then
-    signoffs='[]'
-    signoff_failed=true
-fi
-if test "${rc}" -ne 0; then
-    warn "looking for sign-offs due failed (status ${rc}); its section is incomplete"
-    signoff_failed=true
-fi
+# due_step TOOL WHAT: prints the JSON array of TOOL (bot-signoff-due or
+# bot-promote-due), run in the sweep's mode; an empty one, with a
+# warning naming WHAT, and fails, if TOOL failed. (bot-poll recognizes
+# an incomplete section by that warning, as for the health and
+# outstanding-review sections: keep the wording.)
+due_step() {
+    local out rc=0
+    out=$("$1" "${due_args[@]}") || rc=$?
+    if ! jq -ce 'arrays' <<<"${out}" 2>/dev/null; then
+        echo '[]'
+        test "${rc}" -ne 0 || rc="invalid output"
+    fi
+    test "${rc}" = 0 && return 0
+    warn "looking for $2 failed (status ${rc}); its section is incomplete"
+    return 1
+}
+signoff_failed=false
+signoffs=$(due_step "${SIGNOFF_DUE}" "sign-offs due") || signoff_failed=true
+# Fork PRs approved for a human-text repository only get listed, under
+# "Needs your text".
+promotion_failed=false
+promotions=$(due_step "${PROMOTE_DUE}" "promotions due") || promotion_failed=true
+needs_text=$(jq -c '[.[] | select(.result == "needs-text")]' <<<"${promotions}")
+promotions=$(jq -c '[.[] | select(.result != "needs-text")]' <<<"${promotions}")
 
 # keep_last_seen ITEM: puts the URLs of ITEM back to their last-seen
 # state, so that the next sweep sees their transitions again (and
@@ -1001,17 +1023,21 @@ if ${json}; then
         --slurpfile outstanding <(printf '%s\n' "${outstanding}") --slurpfile needs_rebase <(printf '%s\n' "${needs_rebase}") \
         --argjson search_failed "${search_failed}" --slurpfile health <(printf '%s\n' "${health}") \
         --argjson health_failed "${health_failed}" --slurpfile signoffs <(printf '%s\n' "${signoffs}") \
-        --argjson signoff_failed "${signoff_failed}" \
+        --argjson signoff_failed "${signoff_failed}" --slurpfile promotions <(printf '%s\n' "${promotions}") \
+        --slurpfile needs_text <(printf '%s\n' "${needs_text}") --argjson promotion_failed "${promotion_failed}" \
         '$new[0] as $new | $failed[0] as $failed | $gone[0] as $gone
          | $outstanding[0] as $outstanding | $needs_rebase[0] as $needs_rebase
-         | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], signoffs: $signoffs[0], items: ., outstanding_reviews: $outstanding,
+         | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], signoffs: $signoffs[0], promotions: $promotions[0],
+          needs_text: $needs_text[0], items: ., outstanding_reviews: $outstanding,
           needs_rebase: $needs_rebase, new_urls: $new, failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed,
-          priority_health_failed: $health_failed, signoffs_failed: $signoff_failed, state_advanced: $advance}' <<<"${report}"
+          priority_health_failed: $health_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news. The P0 and P1
     # health lines come first of all.
     jq -r 'if length == 0 then empty else "Priority health:", (.[] | "  \(.line)"), "" end' <<<"${health}"
     jq -r 'if length == 0 then empty else "Sign-offs:", (.[] | "  \(.line)"), "" end' <<<"${signoffs}"
+    jq -r 'if length == 0 then empty else "Promotions:", (.[] | "  \(.line)"), "" end' <<<"${promotions}"
+    jq -r 'if length == 0 then empty else "Needs your text:", (.[] | "  \(.line)"), "" end' <<<"${needs_text}"
     jq -r --arg req "${REQUESTER}" "${REPO_REF_JQ}"'
         if length == 0 then empty else
             "Outstanding reviews by \($req):",
@@ -1053,7 +1079,7 @@ else
               elif .allowed then " (with --apply)"
               else " (not applied from \($status // "no status"); a human decides)" end),
         ""' <<<"${report}"
-    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
 # Failed URLs kept their last-seen state in new_seen, so their changes
@@ -1081,3 +1107,4 @@ test "${napply_failed}" -eq 0 || exit 1
 ! ${search_failed} || exit 1
 ! ${health_failed} || exit 1
 ! ${signoff_failed} || exit 1
+! ${promotion_failed} || exit 1
