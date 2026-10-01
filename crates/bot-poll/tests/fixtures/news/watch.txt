@@ -8,6 +8,9 @@ P0 drive:
   behind https://github.com/bootc-dev/bootc/pull/2510 9a1b2c3d4e5f: behind main, which must be up to date; rebase held until 13:00Z (one per PR per 1h)
   mergeable https://github.com/bootc-dev/bootc/pull/2516 5e20ab31c0d2: ready to merge; none
 
+Operator activity:
+  review-feedback act https://github.com/cgwalters-forge/bootc/pull/12#pullrequestreview-201: address the requested changes
+
 Sign-offs:
   Signed off: https://github.com/bootc-dev/bootc/pull/2516 (5e20ab31c0d2)
 

@@ -126,6 +126,8 @@ From those outputs it takes the set of what is there now, per kind:
                 URL and head); new P0 ones are reported as health-P0
   drive         its \"P0 drive\" lines (bot-drive), by blocker, PR and
                 head: each P0 PR's merge blocker, once per new state
+  operator      its \"Operator activity\" lines (bot-operator-activity), by
+                event: what the operator did that the bot should act on
   review        its outstanding reviews by the operator (by PR and their
                 latest review or comment)
   signoff       its sign-off lines (bot-signoff-due)
