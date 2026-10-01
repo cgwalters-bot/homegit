@@ -11,6 +11,8 @@ const os = require("node:os");
 const path = require("node:path");
 const { promisify } = require("node:util");
 
+const { itemMarker } = require(path.join(__dirname, "..", "lib", "capacity.js"));
+
 const execFileP = promisify(execFile);
 
 const PROG = path.basename(process.argv[1] || "bot-cost");
@@ -99,9 +101,11 @@ published list prices. It is an estimate, not a bill.
              --models-json reads a saved copy). Runs of the mock inference
              shim are counted apart and not priced.
 
-Tasks are the board item, scratch dir or devspace named in a subagent's
-prompt; a devspace run belongs to the agent that started it by name.
-With --json, each task also lists its first and last message times, its
+Tasks are the board item (an "Item: URL-or-PVTI_ID" line, else a PVTI_
+id), scratch dir or devspace named in a subagent's prompt; a devspace run belongs to the agent that started it by name.
+Each task's fresh_tokens (input, output and cache writes, not cache
+reads) is what the board's Est. cost buckets and bot-actuals count. With
+--json, each task also lists its first and last message times, its
 sessions, subagents and Actions runs, and its tokens and cost per model
 (what bot-footer shows).
 
@@ -431,7 +435,6 @@ function usdOf(entry, u) {
 
 // --- inference: transcripts ----------------------------------------------------
 
-const ITEM_RE = /\bPVTI_[A-Za-z0-9_-]+/;
 const SCRATCH_RE = /scratchpad\/([A-Za-z0-9._-]+)\//;
 const DEVSPACE_PROMPT_RE = /\bDevspace:\s*`?([a-z0-9][a-z0-9_.-]*[a-z0-9])/;
 // bot-devspace's own rule for NAME.
@@ -546,7 +549,7 @@ function readTranscript(t, win) {
     });
   }
   if (prompt) {
-    agent.item = (ITEM_RE.exec(prompt) || [])[0] || null;
+    agent.item = itemMarker(prompt);
     agent.scratch = (SCRATCH_RE.exec(prompt) || [])[1] || null;
     const d = (DEVSPACE_PROMPT_RE.exec(prompt) || [])[1];
     if (d && !agent.devspaces.includes(d)) agent.devspaces.unshift(d);
@@ -624,7 +627,7 @@ async function scan(opts) {
     if (!tasks.has(key)) {
       tasks.set(key, {
         key, label, item: null, scratch: null, devspaces: [], agents: 0,
-        core_hours: 0, compute_usd: 0, tokens: 0, inference_usd: 0,
+        core_hours: 0, compute_usd: 0, tokens: 0, fresh_tokens: 0, inference_usd: 0,
         first_message_at: null, last_message_at: null, sessions: [], subagents: [], run_urls: [], models: {},
       });
     }
@@ -646,6 +649,7 @@ async function scan(opts) {
     const tm = t && (t.models[u.model] ||= { tokens: zeroTokens(), usd: 0 });
     if (t) {
       t.tokens += n;
+      t.fresh_tokens += n - u.cache_read;
       addTokens(tm.tokens, u);
       const iso = new Date(u.ts).toISOString();
       if (!t.first_message_at || iso < t.first_message_at) t.first_message_at = iso;
@@ -758,6 +762,7 @@ async function scan(opts) {
     core_hours: dayList.reduce((n, d) => n + d.compute.core_hours, 0),
     compute_usd: dayList.reduce((n, d) => n + d.compute.list_usd, 0),
     tokens: dayList.reduce((n, d) => n + sumTokens(d.inference.tokens), 0),
+    fresh_tokens: dayList.reduce((n, d) => n + sumTokens(d.inference.tokens) - d.inference.tokens.cache_read, 0),
     inference_usd: dayList.reduce((n, d) => n + d.inference.usd, 0),
   };
   totals.total_usd = totals.compute_usd + totals.inference_usd;
