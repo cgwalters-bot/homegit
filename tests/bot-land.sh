@@ -58,9 +58,10 @@ fail() {
 # The fake gh. $FAKE_GH holds: open.json (the open pull requests for the
 # branch), polls/ (the successive answers for pull request 5, the last
 # one repeating; a poll whose answer is merged runs on-merge first),
-# checks.json (the ci check runs), reviews.json (the reviews of pull
-# request 5), body (the body of the pull request opened) and calls (every
-# call); requesting a review fails when request-fails exists.
+# rules.json (the rules of main), checks-NAME.json (the runs of check
+# NAME, none if missing), reviews.json (the reviews of pull request 5),
+# body (the body of the pull request opened) and calls (every call);
+# requesting a review fails when request-fails exists.
 mkdir -p "${WORK}/bin"
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -80,7 +81,10 @@ case "$*" in
         test "${#polls[@]}" -eq 1 || rm "${f}"
         if jq -e .merged "${FAKE_GH}/answer" >/dev/null; then "${FAKE_GH}/on-merge"; fi
         cat "${FAKE_GH}/answer" ;;
-    "api repos/acme/proj/commits/"*"/check-runs?check_name=ci") cat "${FAKE_GH}/checks.json" ;;
+    "api repos/acme/proj/rules/branches/main") cat "${FAKE_GH}/rules.json" ;;
+    "api repos/acme/proj/commits/"*"/check-runs?check_name="*)
+        f=${FAKE_GH}/checks-${2##*check_name=}.json
+        if test -e "${f}"; then cat "${f}"; else echo '{"check_runs": []}'; fi ;;
     "api --paginate repos/acme/proj/pulls/5/reviews?per_page=100 --jq "*) jq -r "${!#}" "${FAKE_GH}/reviews.json" ;;
     "api --silent -X POST repos/acme/proj/pulls/5/requested_reviewers -f reviewers[]=cgwalters")
         test ! -e "${FAKE_GH}/request-fails" || { echo "Reviews may only be requested from collaborators." 1>&2; exit 1; } ;;
@@ -110,8 +114,10 @@ setup() {
     rm -rf "${WORK}/origin.git" "${WORK}/shared" "${WORK}/worktree" "${FAKE_GH}"
     mkdir -p "${FAKE_GH}/polls"
     echo '[]' >"${FAKE_GH}/open.json"
-    echo '{"check_runs": []}' >"${FAKE_GH}/checks.json"
     echo '[]' >"${FAKE_GH}/reviews.json"
+    # Like homegit's: the required-checks gate, besides other rules.
+    jq -n '[{type: "pull_request"}, {type: "required_status_checks",
+        parameters: {required_status_checks: [{context: "required-checks", integration_id: 15368}]}}]' >"${FAKE_GH}/rules.json"
     printf '#!/bin/sh\ngit -C "%s" push -q origin HEAD:main\n' "${WORK}/worktree" >"${FAKE_GH}/on-merge"
     chmod +x "${FAKE_GH}/on-merge"
     git init -q --bare "${WORK}/origin.git"
@@ -166,19 +172,23 @@ poll 2 merged
 run "behind" 0 "main moved on; rebasing onto it"
 git --git-dir="${WORK}/origin.git" merge-base --is-ancestor "${ELSEWHERE}" "${BRANCH}" || fail "behind: the pushed branch lacks main"
 
-# Stops, and waits no longer, on a failed ci, a closed pull request, or
-# the timeout; ci runs of another head don't count.
-while read -r name status pattern polls checks; do
+# Stops, and waits no longer, on a failed required check (ci when the
+# rules require none), a closed pull request, or the timeout; checks the
+# rules don't require don't count, nor runs of another head.
+while read -r name status pattern polls check conclusion rules; do
     setup
     i=0
     for p in ${polls}; do i=$((i + 1)); poll "${i}" "${p}"; done
-    test "${checks}" = - || echo "{\"check_runs\": [{\"status\": \"completed\", \"conclusion\": \"${checks}\", \"html_url\": \"https://ci/1\"}]}" >"${FAKE_GH}/checks.json"
+    test "${conclusion}" = - || echo "{\"check_runs\": [{\"status\": \"completed\", \"conclusion\": \"${conclusion}\", \"html_url\": \"https://ci/1\"}]}" >"${FAKE_GH}/checks-${check}.json"
+    test "${rules}" = - || echo "${rules}" >"${FAKE_GH}/rules.json"
     run "${name}" "${status}" "${pattern}" --timeout 0.001
 done <<EOF
-failed ${EX_FAILED} ci.failed.on.${URL}:.https://ci/1 open failure
-cancelled ${EX_FAILED} ci.failed.on open cancelled
-closed ${EX_FAILED} ${URL}.was.closed.without.merging closed -
-timeout ${EX_TIMEOUT} still.open.after open success
+failed ${EX_FAILED} required.check.failed.on.${URL}:.required-checks.https://ci/1 open required-checks failure -
+cancelled ${EX_FAILED} required.check.failed.on open required-checks cancelled -
+not-required ${EX_TIMEOUT} still.open.after open lint failure -
+no-rules ${EX_FAILED} required.check.failed.on.${URL}:.ci.https://ci/1 open ci failure []
+closed ${EX_FAILED} ${URL}.was.closed.without.merging closed - - -
+timeout ${EX_TIMEOUT} still.open.after open required-checks success -
 EOF
 
 # --no-auto opens without auto-merge and requests cgwalters' review...

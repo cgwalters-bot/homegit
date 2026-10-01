@@ -311,7 +311,8 @@ work is.
   gate counts their approval of the merged head.
 - **Own repositories take pull requests only.** homegit and the bot's
   other own repositories (listed in `worker-preamble.md`) require a pull
-  request with a green `ci` check on main, rebase-merged; workers land
+  request with green required checks on main (homegit's
+  `required-checks` gate, elsewhere `ci`), rebase-merged; workers land
   there with `bin/bot-land`, never with a push to main. Commit in a
   worktree of your own (`git worktree add`), not in the shared clone:
   `bot-git` refuses to commit or rebase in

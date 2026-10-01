@@ -71,7 +71,7 @@ In your worktree:
 ```bash
 git add upstream-policy/OWNER/REPO.md
 bin/bot-git commit -m "upstream-policy: Record OWNER/REPO as VERDICT" -m "<why: what decided it>" -m "Generated-by: AI"
-bin/bot-land  # pull request, auto-merged on green ci; it waits, and rebases if main moved on
+bin/bot-land  # pull request, auto-merged once the required checks pass; it waits, and rebases if main moved on
 bin/upstream-policy check OWNER/REPO --allow-human-text  # must not say stale or invalid
 ```
 
