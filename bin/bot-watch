@@ -67,6 +67,8 @@ SIGNOFF_DUE=$(dirname "$(readlink -f "$0")")/bot-signoff-due
 readonly SIGNOFF_DUE
 PROMOTE_DUE=$(dirname "$(readlink -f "$0")")/bot-promote-due
 readonly PROMOTE_DUE
+DRIVE=$(dirname "$(readlink -f "$0")")/bot-drive
+readonly DRIVE
 # shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
@@ -117,7 +119,15 @@ work whose CI fails or is stuck, that conflict or are behind, lack a
 sign-off, or have seen no activity for too long, P0 first. Its lines
 stay the same until the problem is fixed or the PR's head moves.
 
-Next come the "Sign-offs" of 'bot-signoff-due' (see its --help): the
+Next comes the "P0 drive" of 'bot-drive' (see its --help): one line
+per open P0 PR of the bot's, its merge blocker derived anew on every
+sweep (conflict, needs-regen, behind, dco, ci-failing, ci-pending,
+review or mergeable) and the step taken. With --apply, a conflicting
+PR, or one only behind a base that must be up to date, gets 'bot-pr
+rebase' (at most once per PR per hour); with --dry-run (or
+--board-file), the command it would run.
+
+Then the "Sign-offs" of 'bot-signoff-due' (see its --help): the
 bot's upstream PRs whose DCO check fails although ${REQUESTER} approved
 their head. With --apply, each gets 'bot-pr signoff' and a line
 "Signed off: URL (NEW-HEAD)", or why it was refused; with --dry-run
@@ -889,6 +899,9 @@ if test -n "${epic_board_file}"; then
 elif test -n "${board_file}"; then
     echo '[]' >"${scratch}/epic-board.json"
     health_args+=(--epic-board-file "${scratch}/epic-board.json")
+else
+    # Read once, for bot-drive too.
+    health_args+=(--write-epic-board "${scratch}/epic-board.json")
 fi
 rc=0
 "${PRIORITY_HEALTH}" "${health_args[@]}" >"${scratch}/health.json" || rc=$?
@@ -914,14 +927,15 @@ if ${dry_run} || test -n "${board_file}"; then
 elif ${apply}; then
     due_args+=(--apply)
 fi
-# due_step TOOL WHAT: prints the JSON array of TOOL (bot-signoff-due or
-# bot-promote-due), run in the sweep's mode; an empty one, with a
-# warning naming WHAT, and fails, if TOOL failed. (bot-poll recognizes
-# an incomplete section by that warning, as for the health and
-# outstanding-review sections: keep the wording.)
+# due_step TOOL WHAT [ARGS...]: prints the JSON array of TOOL
+# (bot-drive, bot-signoff-due or bot-promote-due), run in the sweep's
+# mode with ARGS; an empty one, with a warning naming WHAT, and fails, if
+# TOOL failed. (bot-poll recognizes an incomplete section by that
+# warning, as for the health and outstanding-review sections: keep the
+# wording.)
 due_step() {
     local out rc=0
-    out=$("$1" "${due_args[@]}") || rc=$?
+    out=$("$1" "${due_args[@]}" "${@:3}") || rc=$?
     if ! jq -ce 'arrays' <<<"${out}" 2>/dev/null; then
         echo '[]'
         test "${rc}" -ne 0 || rc="invalid output"
@@ -930,6 +944,16 @@ due_step() {
     warn "looking for $2 failed (status ${rc}); its section is incomplete"
     return 1
 }
+# The P0 PRs' blockers, level-triggered: the board the health step read.
+drive_args=(--board-file "${scratch}/board.json")
+test -z "${now}" || drive_args+=(--now "${now}")
+if test -n "${epic_board_file}"; then
+    drive_args+=(--epic-board-file "${epic_board_file}")
+elif test -s "${scratch}/epic-board.json"; then
+    drive_args+=(--epic-board-file "${scratch}/epic-board.json")
+fi
+drive_failed=false
+drive=$(due_step "${DRIVE}" "P0 drive steps" "${drive_args[@]}") || drive_failed=true
 signoff_failed=false
 signoffs=$(due_step "${SIGNOFF_DUE}" "sign-offs due") || signoff_failed=true
 # Fork PRs approved for a human-text repository only get listed, under
@@ -1022,19 +1046,21 @@ if ${json}; then
         --argjson advance "${advance}" \
         --slurpfile outstanding <(printf '%s\n' "${outstanding}") --slurpfile needs_rebase <(printf '%s\n' "${needs_rebase}") \
         --argjson search_failed "${search_failed}" --slurpfile health <(printf '%s\n' "${health}") \
-        --argjson health_failed "${health_failed}" --slurpfile signoffs <(printf '%s\n' "${signoffs}") \
+        --argjson health_failed "${health_failed}" --slurpfile drive <(printf '%s\n' "${drive}") \
+        --argjson drive_failed "${drive_failed}" --slurpfile signoffs <(printf '%s\n' "${signoffs}") \
         --argjson signoff_failed "${signoff_failed}" --slurpfile promotions <(printf '%s\n' "${promotions}") \
         --slurpfile needs_text <(printf '%s\n' "${needs_text}") --argjson promotion_failed "${promotion_failed}" \
         '$new[0] as $new | $failed[0] as $failed | $gone[0] as $gone
          | $outstanding[0] as $outstanding | $needs_rebase[0] as $needs_rebase
-         | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], signoffs: $signoffs[0], promotions: $promotions[0],
+         | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], p0_drive: $drive[0], signoffs: $signoffs[0], promotions: $promotions[0],
           needs_text: $needs_text[0], items: ., outstanding_reviews: $outstanding,
           needs_rebase: $needs_rebase, new_urls: $new, failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed,
-          priority_health_failed: $health_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, state_advanced: $advance}' <<<"${report}"
+          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news. The P0 and P1
     # health lines come first of all.
     jq -r 'if length == 0 then empty else "Priority health:", (.[] | "  \(.line)"), "" end' <<<"${health}"
+    jq -r 'if length == 0 then empty else "P0 drive:", (.[] | "  \(.line)"), "" end' <<<"${drive}"
     jq -r 'if length == 0 then empty else "Sign-offs:", (.[] | "  \(.line)"), "" end' <<<"${signoffs}"
     jq -r 'if length == 0 then empty else "Promotions:", (.[] | "  \(.line)"), "" end' <<<"${promotions}"
     jq -r 'if length == 0 then empty else "Needs your text:", (.[] | "  \(.line)"), "" end' <<<"${needs_text}"
@@ -1079,7 +1105,7 @@ else
               elif .allowed then " (with --apply)"
               else " (not applied from \($status // "no status"); a human decides)" end),
         ""' <<<"${report}"
-    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${drive}") P0 PRs driven, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
 # Failed URLs kept their last-seen state in new_seen, so their changes
@@ -1106,5 +1132,6 @@ fi
 test "${napply_failed}" -eq 0 || exit 1
 ! ${search_failed} || exit 1
 ! ${health_failed} || exit 1
+! ${drive_failed} || exit 1
 ! ${signoff_failed} || exit 1
 ! ${promotion_failed} || exit 1
