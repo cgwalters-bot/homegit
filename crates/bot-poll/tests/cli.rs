@@ -20,8 +20,8 @@ const FAKES: [(&str, &str); 6] = [
 ];
 const BASE_KINDS: &str = "health-P0, drive, review, approval, forge-review, rebase, health";
 const NEWS_KINDS: &str =
-    "health-P0, drive, approval, signoff, promotion, text, notify, forge-review, news";
-const ALL_KINDS: &str = "health-P0, drive, review, approval, signoff, promotion, text, notify, forge-review, rebase, health, news";
+    "health-P0, drive, operator, approval, signoff, promotion, text, notify, forge-review, news";
+const ALL_KINDS: &str = "health-P0, drive, operator, review, approval, signoff, promotion, text, notify, forge-review, rebase, health, news";
 
 // The requests of a hot set's rebuild and of a hot cycle, for the default
 // operator config.
@@ -834,7 +834,7 @@ fn an_upstream_approval_runs_bot_signoff_due() {
     let r = w.run(&fixtures("news"), &["--once"]);
     assert_news(
         &r,
-        "health-P0, drive, approval, promotion, text, notify, forge-review, news",
+        "health-P0, drive, operator, approval, promotion, text, notify, forge-review, news",
     );
 }
 

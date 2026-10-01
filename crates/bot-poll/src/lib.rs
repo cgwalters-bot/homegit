@@ -55,6 +55,7 @@ impl Source {
             Source::Watch => &[
                 "health",
                 "drive",
+                "operator",
                 "review",
                 "signoff",
                 "promotion",
@@ -109,9 +110,10 @@ impl Source {
 }
 
 /// bot-watch's warnings that a section is incomplete, and its sets.
-const WATCH_SECTION_FAILURES: [(&str, &[&str]); 5] = [
+const WATCH_SECTION_FAILURES: [(&str, &[&str]); 6] = [
     ("the priority health sweep failed", &["health"]),
     ("looking for P0 drive steps failed", &["drive"]),
+    ("looking for operator activity failed", &["operator"]),
     (
         "only the board's PRs were checked for outstanding reviews",
         &["review", "rebase"],
@@ -124,10 +126,13 @@ const WATCH_SECTION_FAILURES: [(&str, &[&str]); 5] = [
 /// summary order them, with their titles, where OPERATOR and
 /// OPERATOR'S stand for the operator's login (see [`kind_title`]).
 /// health-P0 is the new health lines of P0 PRs (they share the health
-/// seen-set); drive is the P0 PRs' new merge blockers (bot-drive).
-pub const KINDS: [(&str, &str); 13] = [
+/// seen-set); drive is the P0 PRs' new merge blockers (bot-drive);
+/// operator is what the operator did that the bot should act on
+/// (bot-operator-activity).
+pub const KINDS: [(&str, &str); 14] = [
     ("health-P0", "Priority health (P0)"),
     ("drive", "P0 drive"),
+    ("operator", "OPERATOR'S activity to act on"),
     ("review", "Outstanding reviews by OPERATOR"),
     ("approval", "Approved fork PRs (promote)"),
     ("signoff", "Sign-offs"),
@@ -353,6 +358,7 @@ pub fn parse_notify(text: &str) -> Parsed {
 enum Section {
     Health,
     Drive,
+    Operator,
     Signoff,
     Promotion,
     Text,
@@ -401,6 +407,8 @@ pub fn parse_watch(text: &str) -> Parsed {
                 Some(Section::Health)
             } else if line == "P0 drive:" {
                 Some(Section::Drive)
+            } else if line == "Operator activity:" {
+                Some(Section::Operator)
             } else if line == "Sign-offs:" {
                 Some(Section::Signoff)
             } else if line == "Promotions:" {
@@ -454,6 +462,15 @@ pub fn parse_watch(text: &str) -> Parsed {
                         "drive",
                         Item::new(format!("{} {} {head}", f[0], f[1]), f[1], l),
                     );
+                }
+            }
+            // "KIND ACTION URL: SUMMARY", keyed by the event's URL (a
+            // review's or comment's, whose id makes it news once).
+            Some(Section::Operator) => {
+                let Some(l) = indented(line, 2) else { continue };
+                let url = l.split(' ').nth(2).and_then(|u| u.strip_suffix(':'));
+                if let Some(url) = url.filter(|u| u.starts_with(GITHUB)) {
+                    push(&mut out, "operator", Item::new(url.to_string(), url, l));
                 }
             }
             Some(Section::Signoff) => push(&mut out, "signoff", line_item("signoff", line)),
@@ -887,9 +904,10 @@ mod tests {
         "rebase",
         "health",
     ];
-    const NEWS_KINDS: [&str; 9] = [
+    const NEWS_KINDS: [&str; 10] = [
         "health-P0",
         "drive",
+        "operator",
         "approval",
         "signoff",
         "promotion",
@@ -924,6 +942,10 @@ mod tests {
         assert_eq!(
             w["drive"][0].url,
             "https://github.com/bootc-dev/bootc/pull/2510"
+        );
+        assert_eq!(
+            keys(&w["operator"]),
+            ["https://github.com/cgwalters-forge/bootc/pull/12#pullrequestreview-201"]
         );
         assert_eq!(
             keys(&w["signoff"]),
@@ -1105,6 +1127,7 @@ mod tests {
         for set in [
             "health",
             "drive",
+            "operator",
             "review",
             "rebase",
             "signoff",
@@ -1242,6 +1265,6 @@ mod tests {
         );
         let (news, _) = eval(&outputs("news"), &Memory::default(), 0);
         let line = news_line(&news, "1415", "/s/runs/x");
-        assert!(line.starts_with("NEWS (health-P0, drive, review, approval, signoff, promotion, text, notify, forge-review, rebase, health, news) at 1415: /s/runs/x/*.txt"));
+        assert!(line.starts_with("NEWS (health-P0, drive, operator, review, approval, signoff, promotion, text, notify, forge-review, rebase, health, news) at 1415: /s/runs/x/*.txt"));
     }
 }
