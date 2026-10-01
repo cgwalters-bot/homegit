@@ -108,7 +108,12 @@ fields hold result links: the fork PR URL while Draft, the upstream PR URL
 once In Review (or compare URLs, for follow-up branches on the operator's PRs),
 and secret gist write-up URLs. **Priority** ranks the work
 (below), and **Workflow** says what kind of output the item wants.
-**Org** is the organization the item's work targets, so the operator can
+**Lead** is a text field naming the topic session that owns the item
+(`wfc`, for example; see the `topic-lead` skill). Empty, or `coordinator`,
+means the coordinator's: a topic session sets it on the items it owns
+(`bot-board set ITEM --field Lead TOPIC`) and filters on it
+(`bot-board list --field Lead=TOPIC`, or `bot-watch --lead TOPIC`), and the
+coordinator doesn't dispatch on those items. **Org** is the organization the item's work targets, so the operator can
 filter the board to the bot's own infrastructure or to outbound work.
 Outbound orgs are `bootc-dev`, `composefs`, `ostreedev`, `coreos`,
 `containers`, `podman-container-tools`, `osbuild`, `redhat-cop`,

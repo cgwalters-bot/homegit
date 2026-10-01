@@ -101,10 +101,11 @@ Poll with `bot-poll`, run in the background, which wakes the session
 (by exiting) only when something new turns up:
 
 ```bash
-bot-poll
+bot-poll --exclude-lead '*'
 ```
 
-Every 15 minutes it sweeps the checkout with `git pull --ff-only`, then
+(`--exclude-lead '*'` leaves the items led by a topic session to it; see
+"Topic sessions" below.) Every 15 minutes it sweeps the checkout with `git pull --ff-only`, then
 runs:
 
 ```bash
@@ -171,6 +172,34 @@ report it again), which is why `bot-poll` keeps its whole output: read
 the file rather than rerunning it. `bot-tmt-number --gc` releases the
 bootc tmt test numbers workers reserved once their number is on main
 or in their open PR, or their PR closed.
+
+## Topic sessions
+
+The operator may run a separate Claude session per topic (the `topic-lead`
+skill), each owning the board items whose **Lead** field names its topic.
+They coordinate with you only through the board and issues: handoffs and
+requests are comments on the epic or the item, new work comes as new items
+with Lead set, and a finished item is Done. There is no session messaging.
+
+- **Before dispatching on an item, check its Lead.** If it is set and isn't
+  `coordinator`, don't dispatch on it, and don't act on its news (a
+  comment, a review, a CI failure): the topic session owns it. The sweep
+  with `--exclude-lead '*'` already leaves those items out of the news. Items
+  with no Lead are yours. `bot-notify` and `bot-pr inbox` still list
+  everything: apply the same rule to what they show.
+- **The deterministic tools stay shared.** The P0 drive, auto sign-off and
+  promotion (and the priority health lines) run for every item, led or not:
+  they derive their step from state and need no judgment. Don't redo
+  what they report on a led item; if one needs a decision, comment on the
+  item or the epic.
+- **Watch for idle topic sessions.** An item with a Lead whose PR or issue
+  has seen no activity for over 24h at P0 or P1 (by its last update) gets a comment on its topic's epic saying so, once,
+  and asking the topic session to continue, or to say it is paused. Never
+  take such an item over yourself; if the operator wants it back, he clears
+  Lead.
+- A request or handoff from a topic session (a comment on its epic or item)
+  is read on your sweep like any other mention: do what it asks within the
+  usual rules, or answer on the same thread.
 
 ## Capacity
 
