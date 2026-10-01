@@ -83,6 +83,8 @@ rg 'fn join_path\|fn build_path\|fn make_path' src/
 
 **Error handling.** Every `?` propagation should carry enough context for a user to locate the problem. Prefer `.with_context(|| format!("...: {path}"))` over bare `?`.
 
+**Workarounds for other projects' bugs link upstream.** A workaround for a bug in another project (a retry, a sleep, a version check, a disabled feature) must link the upstream bug report or fix. If none exists, triage the upstream code and queue a report (filed by a human, or drafted by an agent for the operator to file) before landing the workaround, and say in the comment when it can be removed (e.g. the upstream version with the fix).
+
 **No parsing structured data with text tools.** If the input is JSON, TOML, YAML, XML — use a proper parser. `grep`/`sed`/`awk` on structured formats is fragile and wrong.
 
 ### Testing
