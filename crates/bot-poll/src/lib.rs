@@ -54,6 +54,7 @@ impl Source {
             Source::Inbox => &["approval", "forge-review"],
             Source::Watch => &[
                 "health",
+                "drive",
                 "review",
                 "signoff",
                 "promotion",
@@ -108,8 +109,9 @@ impl Source {
 }
 
 /// bot-watch's warnings that a section is incomplete, and its sets.
-const WATCH_SECTION_FAILURES: [(&str, &[&str]); 4] = [
+const WATCH_SECTION_FAILURES: [(&str, &[&str]); 5] = [
     ("the priority health sweep failed", &["health"]),
+    ("looking for P0 drive steps failed", &["drive"]),
     (
         "only the board's PRs were checked for outstanding reviews",
         &["review", "rebase"],
@@ -122,9 +124,10 @@ const WATCH_SECTION_FAILURES: [(&str, &[&str]); 4] = [
 /// summary order them, with their titles, where OPERATOR and
 /// OPERATOR'S stand for the operator's login (see [`kind_title`]).
 /// health-P0 is the new health lines of P0 PRs (they share the health
-/// seen-set).
-pub const KINDS: [(&str, &str); 12] = [
+/// seen-set); drive is the P0 PRs' new merge blockers (bot-drive).
+pub const KINDS: [(&str, &str); 13] = [
     ("health-P0", "Priority health (P0)"),
+    ("drive", "P0 drive"),
     ("review", "Outstanding reviews by OPERATOR"),
     ("approval", "Approved fork PRs (promote)"),
     ("signoff", "Sign-offs"),
@@ -349,6 +352,7 @@ pub fn parse_notify(text: &str) -> Parsed {
 #[derive(Clone, Copy, PartialEq)]
 enum Section {
     Health,
+    Drive,
     Signoff,
     Promotion,
     Text,
@@ -395,6 +399,8 @@ pub fn parse_watch(text: &str) -> Parsed {
             entry = None;
             section = if line == "Priority health:" {
                 Some(Section::Health)
+            } else if line == "P0 drive:" {
+                Some(Section::Drive)
             } else if line == "Sign-offs:" {
                 Some(Section::Signoff)
             } else if line == "Promotions:" {
@@ -433,6 +439,21 @@ pub fn parse_watch(text: &str) -> Parsed {
                     let mut item = Item::new(format!("{} {} {} {head}", f[0], f[1], f[2]), f[2], l);
                     item.p0 = f[0] == "P0";
                     push(&mut out, "health", item);
+                }
+            }
+            // "BLOCKER URL HEAD: DETAIL; ACTION", keyed by its first
+            // three fields: news once per new blocker or head, however
+            // often the sweeps list it.
+            Some(Section::Drive) => {
+                let Some(l) = indented(line, 2) else { continue };
+                let f: Vec<&str> = l.splitn(4, ' ').collect();
+                let head = f.get(2).and_then(|h| h.strip_suffix(':'));
+                if let (true, Some(head)) = (f.len() == 4 && f[1].starts_with(GITHUB), head) {
+                    push(
+                        &mut out,
+                        "drive",
+                        Item::new(format!("{} {} {head}", f[0], f[1]), f[1], l),
+                    );
                 }
             }
             Some(Section::Signoff) => push(&mut out, "signoff", line_item("signoff", line)),
@@ -857,16 +878,18 @@ mod tests {
         let (news, seen, reported) = evaluate(o, &m.0, &m.1, now);
         (news, (seen, reported))
     }
-    const BASE_KINDS: [&str; 6] = [
+    const BASE_KINDS: [&str; 7] = [
         "health-P0",
+        "drive",
         "review",
         "approval",
         "forge-review",
         "rebase",
         "health",
     ];
-    const NEWS_KINDS: [&str; 8] = [
+    const NEWS_KINDS: [&str; 9] = [
         "health-P0",
+        "drive",
         "approval",
         "signoff",
         "promotion",
@@ -890,6 +913,17 @@ mod tests {
         assert_eq!(
             w["health"].iter().map(|i| i.p0).collect::<Vec<_>>(),
             [true, true, false]
+        );
+        assert_eq!(
+            keys(&w["drive"]),
+            [
+                "behind https://github.com/bootc-dev/bootc/pull/2510 9a1b2c3d4e5f",
+                "mergeable https://github.com/bootc-dev/bootc/pull/2516 5e20ab31c0d2",
+            ]
+        );
+        assert_eq!(
+            w["drive"][0].url,
+            "https://github.com/bootc-dev/bootc/pull/2510"
         );
         assert_eq!(
             keys(&w["signoff"]),
@@ -1043,7 +1077,7 @@ mod tests {
         assert!(none.is_empty());
         assert_eq!(
             kinds(&eval(&outputs("news"), &forgot, t0 + 2000 + FORGET_MS).0),
-            ["health-P0"]
+            ["health-P0", "drive"]
         );
         let (_, long_gone) = eval(&outputs("base"), &forgot, t0 + 1000 + REPORTED_KEEP_MS);
         assert_eq!(
@@ -1070,6 +1104,7 @@ mod tests {
         assert!(none.is_empty());
         for set in [
             "health",
+            "drive",
             "review",
             "rebase",
             "signoff",
@@ -1207,6 +1242,6 @@ mod tests {
         );
         let (news, _) = eval(&outputs("news"), &Memory::default(), 0);
         let line = news_line(&news, "1415", "/s/runs/x");
-        assert!(line.starts_with("NEWS (health-P0, review, approval, signoff, promotion, text, notify, forge-review, rebase, health, news) at 1415: /s/runs/x/*.txt"));
+        assert!(line.starts_with("NEWS (health-P0, drive, review, approval, signoff, promotion, text, notify, forge-review, rebase, health, news) at 1415: /s/runs/x/*.txt"));
     }
 }

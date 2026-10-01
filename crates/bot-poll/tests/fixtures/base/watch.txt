@@ -2,6 +2,9 @@ Priority health:
   P0 dco https://github.com/bootc-dev/bootc/pull/2516 4e10ca5cee5e: DCO: commits lack a Signed-off-by
   P1 ci-failing https://github.com/coreos/rpm-ostree/pull/5637 498e91eb18ea: Container build, continuous-integration/jenkins/pr-merge
 
+P0 drive:
+  mergeable https://github.com/bootc-dev/bootc/pull/2516 5e20ab31c0d2: ready to merge; none
+
 Outstanding reviews by cgwalters:
   bootc-dev/bootc#2500  lint: `/ostree` symlink required
     review CHANGES_REQUESTED at 2026-09-30T12:11:27Z (+1 more): (line comments)

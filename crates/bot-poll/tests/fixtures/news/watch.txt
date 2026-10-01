@@ -4,6 +4,10 @@ Priority health:
 warning: reading https://github.com/example/flaky/pull/1 failed (status 1)
   P1 ci-failing https://github.com/coreos/rpm-ostree/pull/5637 498e91eb18ea: Container build, continuous-integration/jenkins/pr-merge
 
+P0 drive:
+  behind https://github.com/bootc-dev/bootc/pull/2510 9a1b2c3d4e5f: behind main, which must be up to date; rebase held until 13:00Z (one per PR per 1h)
+  mergeable https://github.com/bootc-dev/bootc/pull/2516 5e20ab31c0d2: ready to merge; none
+
 Sign-offs:
   Signed off: https://github.com/bootc-dev/bootc/pull/2516 (5e20ab31c0d2)
 
