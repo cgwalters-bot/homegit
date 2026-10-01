@@ -60,11 +60,25 @@ readonly ALLOW_SHARED_ENV=BOT_GIT_ALLOW_SHARED_CLONE
 # The git commands that create or rewrite commits (or the checked-out
 # branch), which the bot must not run in a shared clone.
 readonly COMMIT_COMMANDS=" am cherry-pick commit merge pull rebase revert stash "
+# bot-git's own commands that rewrite the checked-out branch.
+readonly REWRITE_COMMANDS=" rework carry-signoff drop-signoff "
+# The classes of change that an attestation for carry-signoff gives each
+# commit paired with one he signed off, and the one of them that drops his
+# sign-off: unchanged or rebase-only, a mechanical conflict resolution,
+# implementing his review asks, a small fix that keeps the intent, and
+# substantively different. See the coordinator's carry-attest.md.
+readonly CARRY_CLASSES=(unchanged conflict-resolution review-ask small-fix substantive)
+readonly CARRY_DROP_CLASS=substantive
+readonly ATTESTATION_VERSION=1
 
 usage() {
     cat <<EOF
 Usage: ${PROG} GIT-ARGS...
-       ${PROG} rework [--was OLD-HEAD] [--pair OLD=NEW]... [--patch-id] [UPSTREAM]
+       ${PROG} rework [--was OLD-HEAD] [--pair OLD=NEW]... [--patch-id]
+                     [--drop-signoff COMMIT]... [UPSTREAM]
+       ${PROG} carry-signoff --was H0 --attestation FILE [--record FILE]
+                     [--pair OLD=NEW]... [--patch-id] [UPSTREAM]
+       ${PROG} drop-signoff UPSTREAM [COMMIT]...
        ${PROG} check [--no-ai-trailer] [--promoted] [--was OLD-HEAD]
                      [--pair OLD=NEW]... [--patch-id] [RANGE]
 
@@ -105,6 +119,12 @@ that has his trailer where its pair had none, or another sign-off next
 to his. After a rebase onto a newer base, pass that base as UPSTREAM.
 Use it only when the change is what he asked for; see AGENTS.md.
 
+--drop-signoff COMMIT (repeatable) removes his sign-off from the bot's
+commit COMMIT of HEAD instead, and makes the bot its committer: for a
+commit whose change goes beyond his asks, like one where a rebase
+resolved conflicts (unless an attestation says otherwise; see
+carry-signoff).
+
 For a commit he asked to retitle, --pair OLD=NEW (repeatable) pairs the
 commit OLD of OLD-HEAD with the one of HEAD that has NEW's subject, and
 --patch-id pairs the commits left over whose patch-id is the same and
@@ -112,6 +132,39 @@ unique on both sides (a retitle with no other change). Both pair only a
 bot commit of OLD-HEAD with his sign-off and him as committer with a bot
 commit of HEAD; --pair refuses anything else, and a pair that the
 subjects would contradict. Pass 'check' the same --pair and --patch-id.
+
+${PROG} carry-signoff keeps ${HUMAN_POSSESSIVE} sign-off on commits changed beyond his
+review asks (a conflict resolution, a small fix), on an independent
+review's word that they are not substantively different. H0 is the head
+whose commits he signed off and committed on his approval (as 'bot-pr
+promote' or 'signoff' pushed it, or 'rework' kept it from that), never
+a head that carry-signoff made: each carry compares with what he
+approved ('bot-pr carry-note' refuses a chained one). HEAD (H1) is the
+change. FILE
+is that review's attestation, made by an agent other than the one that
+made the change from 'git range-diff H0...H1', the PR and his review
+(see the coordinator skill's carry-attest.md), as JSON:
+  {"version": ${ATTESTATION_VERSION}, "pr": "https://github.com/OWNER/REPO/pull/N",
+   "reviewer": "who attested, one line", "was": "H0", "head": "H1",
+   "commits": [{"old": "COMMIT OF H0", "new": "COMMIT OF H1",
+                "class": "CLASS", "reason": "one line"}, ...]}
+with full commit ids, and CLASS one of: ${CARRY_CLASSES[*]}.
+It pairs the commits as 'rework' does (UPSTREAM, --pair and --patch-id
+the same), and refuses unless "was" is H0 and "head" is HEAD, and the
+attestation classes exactly the bot commits of HEAD whose pair on H0 he
+signed off and committed, with those pairs. Each of those gets his
+sign-off and him as committer, as 'rework' gives them, except the
+'${CARRY_DROP_CLASS}' ones, which lose both. A commit new since H0 never gets it:
+an attestation that classes one is refused, and it stays as it is (one
+with his sign-off is refused, as in 'rework'); it needs his approval
+and 'bot-pr signoff'. It writes the record of what it did to --record's
+FILE (default: FILE with .carried.json for .json), which 'bot-pr
+carry-note' posts on the PR after the push, and prints the 'check' to run.
+
+${PROG} drop-signoff UPSTREAM [COMMIT]... removes ${HUMAN_POSSESSIVE} sign-off from
+the bot's commits COMMIT of UPSTREAM..HEAD (default: all of them), and
+makes the bot their committer; others' commits are never touched. 'bot-pr
+no-carry' runs it when he revokes a carried sign-off.
 
 ${PROG} check [RANGE] checks the commits in RANGE (default:
 @{upstream}..HEAD, else origin/HEAD..HEAD, which must not be empty) before
@@ -251,7 +304,7 @@ shared_clone_patterns() {
 refuse_shared_clone() {
     local cmd=$1 top pattern
     shift
-    [[ "${COMMIT_COMMANDS}" == *" ${cmd} "* ]] || test "${cmd}" = rework || return 0
+    [[ "${COMMIT_COMMANDS}${REWRITE_COMMANDS}" == *" ${cmd} "* ]] || return 0
     test "${!ALLOW_SHARED_ENV:-}" != 1 || return 0
     # Not in a work tree (a bare repository, or none): git says so itself.
     top=$(git "$@" rev-parse --show-toplevel 2>/dev/null) || return 0
@@ -667,25 +720,24 @@ pair_published() {
     done
 }
 
-cmd_rework() {
-    local was="" upstream=""
-    while test $# -gt 0; do
-        case "$1" in
-            --was) test $# -ge 2 || die "--was takes the published head"; was=$2; shift 2 ;;
-            --was=*) was=${1#*=}; shift ;;
-            --pair) test $# -ge 2 || die "--pair takes OLD=NEW"; PAIR_EXPLICIT+=("$2"); shift 2 ;;
-            --pair=*) PAIR_EXPLICIT+=("${1#*=}"); shift ;;
-            --patch-id) PAIR_BY_PATCH_ID=true; shift ;;
-            -h|--help) usage; exit 0 ;;
-            -*) die "unknown option for rework: $1 (see --help)" ;;
-            *) test -z "${upstream}" || die "rework takes one UPSTREAM"; upstream=$1; shift ;;
-        esac
-    done
-    local gitdir old head base
+# refuse_rebase_in_progress: exits if a rebase is in progress.
+refuse_rebase_in_progress() {
+    local gitdir
     gitdir=$(git rev-parse --git-dir) || die "not in a git repository"
     if test -e "${gitdir}/rebase-merge" || test -e "${gitdir}/rebase-apply"; then
         die "a rebase is in progress; finish it first"
     fi
+}
+
+# pair_with_published WAS UPSTREAM: for rework and carry-signoff, pairs
+# the commits of UPSTREAM..HEAD with those of UPSTREAM..WAS (see
+# pair_commits; WAS defaults to @{upstream}, UPSTREAM to their
+# merge-base), into PAIR_OLD and PAIR_NEW, and sets PAIRED_WAS,
+# PAIRED_OLD_HEAD, PAIRED_HEAD and PAIRED_BASE. Exits if that fails, or
+# if a rebase is in progress.
+pair_with_published() {
+    local was=$1 upstream=$2 old head base
+    refuse_rebase_in_progress
     if test -z "${was}"; then
         git rev-parse -q --verify '@{upstream}^{commit}' >/dev/null 2>&1 ||
             die "HEAD has no upstream; pass the published head with --was OLD-HEAD"
@@ -700,6 +752,7 @@ cmd_rework() {
     fi
     pair_commits "${old}" "${head}" "${base}" ||
         die "cannot pair the reworked commits with ${was}: ${PAIR_ERROR}; a change that restructures the commits needs ${HUMAN_LOGIN} to sign off again$(test -n "${upstream}" || echo " (if HEAD was rebased onto a newer base, pass it as UPSTREAM)")"
+    test "${#PAIR_NEW[@]}" -gt 0 || die "no commits in ${base}..HEAD"
     # With the merge-base as UPSTREAM, a rebase onto a newer base brings in
     # its commits, which are not ours to rewrite.
     if test -z "${upstream}"; then
@@ -710,67 +763,169 @@ cmd_rework() {
                 die "$(git rev-parse --short "${PAIR_NEW[i]}") is new since ${was} and not the bot's: if HEAD was rebased onto a newer base, pass it as UPSTREAM"
         done
     fi
+    PAIRED_WAS=${was} PAIRED_OLD_HEAD=${old} PAIRED_HEAD=${head} PAIRED_BASE=${base}
+}
 
-    local i o n parent msg new rewriting=false notes=() committer
-    test "${#PAIR_NEW[@]}" -gt 0 || die "no commits in ${base}..HEAD"
-    parent=$(git rev-parse "${PAIR_NEW[0]}^")
-    msg=$(mktemp) || die "cannot create a temporary file"
-    # shellcheck disable=SC2064 # msg is local; expand it now.
-    trap "rm -f '${msg}'" EXIT
-    for i in "${!PAIR_NEW[@]}"; do
-        o=${PAIR_OLD[i]} n=${PAIR_NEW[i]}
-        local keep=false
-        if test -z "${o}"; then
-            ! { bot_authored "${n}" && has_human_signoff "${n}"; } ||
-                die "$(git rev-parse --short "${n}") has ${HUMAN_POSSESSIVE} sign-off, but is new since ${was}: ${SIGNOFF_REFUSAL}"
-        elif signed_bot_commit "${o}"; then
-            bot_authored "${n}" ||
-                die "$(git rev-parse --short "${n}") is not the bot's commit, but its pair $(git rev-parse --short "${o}") on ${was} is; not keeping the sign-off"
-            only_human_signoff "${n}" ||
-                die "$(git rev-parse --short "${n}") has a Signed-off-by other than ${HUMAN_POSSESSIVE}: ${SIGNOFF_REFUSAL}"
-            keep=true
-        elif bot_authored "${n}" && has_human_signoff "${n}" && ! has_human_signoff "${o}"; then
-            die "$(git rev-parse --short "${n}") has ${HUMAN_POSSESSIVE} sign-off, but its pair $(git rev-parse --short "${o}") on ${was} had none: ${SIGNOFF_REFUSAL}"
-        fi
-        if ! ${rewriting} && { ! ${keep} || { human_committed "${n}" && has_human_signoff "${n}"; }; }; then
-            parent=${n}
-            continue
+# signed_pair NEW OLD WAS: for the pair OLD (of the published head WAS,
+# empty for none) and NEW, succeeds if OLD is a bot commit that he signed
+# off and committed, whose sign-off NEW may then keep; fails for any
+# other pair that leaves NEW's sign-off as it is. Exits where NEW can't
+# be either: a commit with his sign-off that is new since WAS or whose
+# pair had none, and a pair of his signed commit that is not the bot's or
+# has another sign-off.
+signed_pair() {
+    local n=$1 o=$2 was=$3
+    if test -z "${o}"; then
+        ! { bot_authored "${n}" && has_human_signoff "${n}"; } ||
+            die "$(git rev-parse --short "${n}") has ${HUMAN_POSSESSIVE} sign-off, but is new since ${was}: ${SIGNOFF_REFUSAL}"
+        return 1
+    fi
+    if signed_bot_commit "${o}"; then
+        bot_authored "${n}" ||
+            die "$(git rev-parse --short "${n}") is not the bot's commit, but its pair $(git rev-parse --short "${o}") on ${was} is; not keeping the sign-off"
+        only_human_signoff "${n}" ||
+            die "$(git rev-parse --short "${n}") has a Signed-off-by other than ${HUMAN_POSSESSIVE}: ${SIGNOFF_REFUSAL}"
+        return 0
+    fi
+    ! { bot_authored "${n}" && has_human_signoff "${n}" && ! has_human_signoff "${o}"; } ||
+        die "$(git rev-parse --short "${n}") has ${HUMAN_POSSESSIVE} sign-off, but its pair $(git rev-parse --short "${o}") on ${was} had none: ${SIGNOFF_REFUSAL}"
+    return 1
+}
+
+# What rewrite_commits does to each commit, by its id: keep (his sign-off
+# trailer, added if missing, and him as committer, as 'bot-pr promote'
+# makes them) or drop (neither: the trailer removed, the bot as
+# committer); any other commit is only recreated on its new parent, with
+# its committer and date. REWRITTEN maps each commit to what it became.
+declare -A REWRITE=() REWRITTEN=()
+REWRITE_MSG=""
+trap 'test -z "${REWRITE_MSG}" || rm -f "${REWRITE_MSG}"' EXIT
+
+# rewrite_commits BASE HEAD REASON: rewrites BASE..HEAD as REWRITE says,
+# keeping trees, authors and messages otherwise, and moves HEAD (at HEAD)
+# to the result, with REASON in the reflog. Fails, changing nothing, if
+# every commit is as REWRITE wants it already.
+rewrite_commits() {
+    local base=$1 head=$2 reason=$3 parent n action new rewriting=false committer
+    local -a rewrite_range
+    REWRITTEN=()
+    mapfile -t rewrite_range < <(git rev-list --reverse "${base}..${head}")
+    test "${#rewrite_range[@]}" -gt 0 || die "no commits in ${base}..${head}"
+    # commit-tree below gives each commit one parent.
+    test -z "$(git rev-list --merges "${base}..${head}")" || die "there are merge commits in ${base}..${head}; not rewriting them"
+    parent=$(git rev-parse "${rewrite_range[0]}^")
+    test -n "${REWRITE_MSG}" || REWRITE_MSG=$(mktemp) || die "cannot create a temporary file"
+    for n in "${rewrite_range[@]}"; do
+        action=${REWRITE[${n}]:-}
+        if ! ${rewriting}; then
+            local as_wanted=false
+            case "${action}" in
+                keep) ! { human_committed "${n}" && has_human_signoff "${n}"; } || as_wanted=true ;;
+                drop) human_committed "${n}" || has_human_signoff "${n}" || as_wanted=true ;;
+                *) as_wanted=true ;;
+            esac
+            if ${as_wanted}; then
+                REWRITTEN[${n}]=${n}
+                parent=${n}
+                continue
+            fi
         fi
         # The message, byte for byte (see bot-pr's add_signoff): the header
         # ends at the first empty line; commit-tree can't keep an encoding.
         ! git cat-file commit "${n}" |
             awk '/^$/ { in_body = 1 } !in_body && /^encoding / { found = 1 } END { exit !found }' ||
             die "$(git rev-parse --short "${n}") has a non-UTF-8 message encoding"
-        git cat-file commit "${n}" | sed '1,/^$/d' >"${msg}" || die "cannot read the message of ${n}"
-        if ${keep}; then
-            if ! has_human_signoff "${n}"; then
-                GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-                    git interpret-trailers --in-place --no-divider --where end --if-exists addIfDifferent \
-                    --trailer "${HUMAN_SIGNOFF}" "${msg}" || die "adding the sign-off to ${n} failed"
-            fi
-            committer=(GIT_COMMITTER_NAME="${HUMAN_GIT_NAME}" GIT_COMMITTER_EMAIL="${HUMAN_GIT_EMAIL}")
-        else
-            committer=(GIT_COMMITTER_NAME="$(git show -s --format=%cn "${n}")"
-                GIT_COMMITTER_EMAIL="$(git show -s --format=%ce "${n}")"
-                GIT_COMMITTER_DATE="$(git show -s --format=%cd --date=raw "${n}")")
-        fi
+        git cat-file commit "${n}" | sed '1,/^$/d' >"${REWRITE_MSG}" || die "cannot read the message of ${n}"
+        case "${action}" in
+            keep)
+                if ! has_human_signoff "${n}"; then
+                    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+                        git interpret-trailers --in-place --no-divider --where end --if-exists addIfDifferent \
+                        --trailer "${HUMAN_SIGNOFF}" "${REWRITE_MSG}" || die "adding the sign-off to ${n} failed"
+                fi
+                committer=(GIT_COMMITTER_NAME="${HUMAN_GIT_NAME}" GIT_COMMITTER_EMAIL="${HUMAN_GIT_EMAIL}") ;;
+            drop)
+                # His trailer lines, then the empty lines that leaves at the end.
+                awk -v sob="${HUMAN_SIGNOFF}" '$0 != sob { line[n++] = $0 }
+                    END { while (n > 0 && line[n - 1] == "") n--; for (i = 0; i < n; i++) print line[i] }' \
+                    "${REWRITE_MSG}" >"${REWRITE_MSG}.new" || die "removing the sign-off from ${n} failed"
+                mv "${REWRITE_MSG}.new" "${REWRITE_MSG}" || die "removing the sign-off from ${n} failed"
+                committer=(GIT_COMMITTER_NAME="${BOT_GIT_NAME}" GIT_COMMITTER_EMAIL="${BOT_GIT_EMAIL}") ;;
+            *)
+                committer=(GIT_COMMITTER_NAME="$(git show -s --format=%cn "${n}")"
+                    GIT_COMMITTER_EMAIL="$(git show -s --format=%ce "${n}")"
+                    GIT_COMMITTER_DATE="$(git show -s --format=%cd --date=raw "${n}")") ;;
+        esac
         new=$(env -u GIT_COMMITTER_DATE \
             GIT_AUTHOR_NAME="$(git show -s --format=%an "${n}")" GIT_AUTHOR_EMAIL="$(git show -s --format=%ae "${n}")" \
             GIT_AUTHOR_DATE="$(git show -s --format=%ad --date=raw "${n}")" "${committer[@]}" \
             git -c core.hooksPath=/dev/null -c commit.gpgSign=false -c i18n.commitEncoding=UTF-8 \
-            commit-tree --no-gpg-sign "${n}^{tree}" -p "${parent}" -F "${msg}") || die "rewriting ${n} failed"
-        ! ${keep} || notes+=("$(kept_note "${new}" "${o}")")
+            commit-tree --no-gpg-sign "${n}^{tree}" -p "${parent}" -F "${REWRITE_MSG}") || die "rewriting ${n} failed"
+        test "${action}" != drop || ! has_human_signoff "${new}" ||
+            die "$(git rev-parse --short "${n}") has ${HUMAN_POSSESSIVE} sign-off in a form this can't remove; not updating HEAD"
+        REWRITTEN[${n}]=${new}
         parent=${new}
         rewriting=true
     done
-    if ! ${rewriting}; then
-        echo "nothing to do: no reworked commit lacks the sign-off its pair on ${was} had"
-        return 0
-    fi
+    ${rewriting} || return 1
     test "$(git rev-parse "${parent}^{tree}")" = "$(git rev-parse "${head}^{tree}")" ||
         die "the rewritten ${parent} has a different tree from HEAD; not updating HEAD"
-    git update-ref -m "${PROG} rework: keep ${HUMAN_POSSESSIVE} sign-off from ${was}" HEAD "${parent}" "${head}" ||
-        die "cannot update HEAD to ${parent}"
+    git update-ref -m "${reason}" HEAD "${parent}" "${head}" || die "cannot update HEAD to ${parent}"
+}
+
+cmd_rework() {
+    local was="" upstream="" drops=()
+    while test $# -gt 0; do
+        case "$1" in
+            --drop-signoff) test $# -ge 2 || die "--drop-signoff takes a COMMIT"; drops+=("$2"); shift 2 ;;
+            --drop-signoff=*) drops+=("${1#*=}"); shift ;;
+            --was) test $# -ge 2 || die "--was takes the published head"; was=$2; shift 2 ;;
+            --was=*) was=${1#*=}; shift ;;
+            --pair) test $# -ge 2 || die "--pair takes OLD=NEW"; PAIR_EXPLICIT+=("$2"); shift 2 ;;
+            --pair=*) PAIR_EXPLICIT+=("${1#*=}"); shift ;;
+            --patch-id) PAIR_BY_PATCH_ID=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "unknown option for rework: $1 (see --help)" ;;
+            *) test -z "${upstream}" || die "rework takes one UPSTREAM"; upstream=$1; shift ;;
+        esac
+    done
+    pair_with_published "${was}" "${upstream}"
+    local old=${PAIRED_OLD_HEAD} head=${PAIRED_HEAD} base=${PAIRED_BASE}
+    was=${PAIRED_WAS}
+
+    local i o n d notes=()
+    REWRITE=()
+    # --drop-signoff: commits whose change goes beyond what he asked for
+    # (a rebase that resolved conflicts in them, say) lose it instead.
+    local -A in_head=()
+    for n in "${PAIR_NEW[@]}"; do
+        in_head[${n}]=1
+    done
+    for d in "${drops[@]}"; do
+        n=$(git rev-parse -q --verify "${d}^{commit}") || die "cannot resolve --drop-signoff ${d}"
+        test -n "${in_head[${n}]:-}" || die "--drop-signoff ${d} is not a commit of $(short "${base}")..HEAD"
+        bot_authored "${n}" || die "--drop-signoff ${d} is not the bot's commit; its sign-offs are not the bot's to change"
+        REWRITE[${n}]=drop
+    done
+    for i in "${!PAIR_NEW[@]}"; do
+        o=${PAIR_OLD[i]} n=${PAIR_NEW[i]}
+        test -z "${REWRITE[${n}]:-}" || continue
+        if signed_pair "${n}" "${o}" "${was}"; then
+            REWRITE[${n}]=keep
+        fi
+    done
+    if ! rewrite_commits "${base}" "${head}" "${PROG} rework: keep ${HUMAN_POSSESSIVE} sign-off from ${was}"; then
+        echo "nothing to do: no reworked commit lacks the sign-off its pair on ${was} had$(test "${#drops[@]}" -eq 0 || echo ", and none to drop it from has it")"
+        return 0
+    fi
+    for i in "${!PAIR_NEW[@]}"; do
+        o=${PAIR_OLD[i]} n=${PAIR_NEW[i]}
+        test "${REWRITTEN[${n}]}" != "${n}" || continue
+        case "${REWRITE[${n}]:-}" in
+            keep) notes+=("$(kept_note "${REWRITTEN[${n}]}" "${o}")") ;;
+            drop) notes+=("dropped ${HUMAN_POSSESSIVE} sign-off from $(short "${REWRITTEN[${n}]}") (was $(short "${n}")): it needs his approval and 'bot-pr signoff'") ;;
+        esac
+    done
     printf '%s\n' "${notes[@]}"
     if test "${#PAIR_EXPLICIT[@]}" -gt 0 || ${PAIR_BY_PATCH_ID}; then
         local args=(--was "${was}") spec
@@ -782,11 +937,200 @@ cmd_rework() {
     fi
 }
 
+# short COMMIT: COMMIT's abbreviated id.
+short() {
+    git rev-parse --short "$1"
+}
+
+# attestation_problem FILE: prints what is wrong with the attestation in
+# FILE, or nothing if it has the shape carry-signoff wants (see usage).
+attestation_problem() {
+    local classes
+    classes=$(printf '%s\n' "${CARRY_CLASSES[@]}" | jq -R . | jq -sc .) || die "jq failed"
+    jq -r --argjson classes "${classes}" --argjson v "${ATTESTATION_VERSION}" '
+        def sha: type == "string" and test("^[0-9a-f]{40}$");
+        def line: type == "string" and test("\\S") and (test("\n") | not);
+        def commit_problems: to_entries[] | .key as $i | .value |
+            if type != "object" then "commits[\($i)] is not an object"
+            elif (.old | sha | not) or (.new | sha | not) then "commits[\($i)] lacks full old and new commit ids"
+            elif (.class | IN($classes[]) | not) then "commits[\($i)].class \(.class | tojson) is not one of \($classes | join(", "))"
+            elif (.reason | line | not) then "commits[\($i)].reason is not one line"
+            else empty end;
+        [ if type != "object" then "it is not a JSON object"
+          elif .version != $v then "version is not \($v)"
+          elif (.was | sha | not) then "was is not a full commit id"
+          elif (.head | sha | not) then "head is not a full commit id"
+          elif (.pr | type == "string" and test("^https://github\\.com/[^/]+/[^/]+/pull/[0-9]+$") | not) then "pr is not a PR URL"
+          elif (.reviewer | line | not) then "reviewer does not name the reviewing agent in one line"
+          elif (.commits | type != "array") then "commits is not an array"
+          else (.commits | commit_problems),
+            (if (.commits | map(.new) | unique | length) != (.commits | length)
+                or (.commits | map(.old) | unique | length) != (.commits | length)
+             then "a commit is listed twice" else empty end)
+          end ] | .[0] // empty' "$1" 2>/dev/null || echo "it is not valid JSON"
+}
+
+cmd_carry_signoff() {
+    local was="" attestation="" record="" upstream=""
+    while test $# -gt 0; do
+        case "$1" in
+            --was) test $# -ge 2 || die "--was takes the head he signed off"; was=$2; shift 2 ;;
+            --was=*) was=${1#*=}; shift ;;
+            --attestation) test $# -ge 2 || die "--attestation takes a FILE"; attestation=$2; shift 2 ;;
+            --attestation=*) attestation=${1#*=}; shift ;;
+            --record) test $# -ge 2 || die "--record takes a FILE"; record=$2; shift 2 ;;
+            --record=*) record=${1#*=}; shift ;;
+            --pair) test $# -ge 2 || die "--pair takes OLD=NEW"; PAIR_EXPLICIT+=("$2"); shift 2 ;;
+            --pair=*) PAIR_EXPLICIT+=("${1#*=}"); shift ;;
+            --patch-id) PAIR_BY_PATCH_ID=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) die "unknown option for carry-signoff: $1 (see --help)" ;;
+            *) test -z "${upstream}" || die "carry-signoff takes one UPSTREAM"; upstream=$1; shift ;;
+        esac
+    done
+    test -n "${was}" || die "carry-signoff needs --was H0, the head whose commits ${HUMAN_LOGIN} signed off"
+    test -n "${attestation}" || die "carry-signoff needs --attestation FILE, from an independent review of the change (see --help)"
+    command -v jq >/dev/null || die "jq not found in PATH"
+    test -r "${attestation}" || die "cannot read ${attestation}"
+    record=${record:-${attestation%.json}.carried.json}
+    test "$(realpath -m "${record}")" != "$(realpath -m "${attestation}")" ||
+        die "--record ${record} is the attestation itself; write the record elsewhere"
+    local problem
+    problem=$(attestation_problem "${attestation}")
+    test -z "${problem}" || die "${attestation}: ${problem}; not carrying anything"
+
+    # The attestation is for exactly this change: from WAS to HEAD.
+    local att_was att_head old head
+    att_was=$(jq -r .was "${attestation}") att_head=$(jq -r .head "${attestation}")
+    old=$(git rev-parse -q --verify "${was}^{commit}") || die "cannot resolve '${was}'"
+    head=$(git rev-parse -q --verify 'HEAD^{commit}') || die "cannot resolve HEAD"
+    test "${old}" = "${att_was}" ||
+        die "${attestation} attests a change from ${att_was:0:12}, not from ${was} (${old:0:12}); not carrying anything"
+    test "${head}" = "${att_head}" ||
+        die "${attestation} attests the head ${att_head:0:12}, but HEAD is ${head:0:12}: have the current head attested; not carrying anything"
+    pair_with_published "${old}" "${upstream}"
+    local base=${PAIRED_BASE}
+
+    local -A att_old=() att_class=() used=()
+    local o n c i
+    while IFS=$'\t' read -r o n c; do
+        att_old[${n}]=${o} att_class[${n}]=${c}
+    done < <(jq -r '.commits[] | [.old, .new, .class] | @tsv' "${attestation}")
+    REWRITE=()
+    local -a unpaired=()
+    for i in "${!PAIR_NEW[@]}"; do
+        o=${PAIR_OLD[i]} n=${PAIR_NEW[i]}
+        if signed_pair "${n}" "${o}" "${was}"; then
+            c=${att_class[${n}]:-}
+            test -n "${c}" ||
+                die "$(short "${n}"), paired with $(short "${o}") that ${HUMAN_LOGIN} signed off, has no class in ${attestation}: every such commit needs one; not carrying anything"
+            test "${att_old[${n}]}" = "${o}" ||
+                die "${attestation} pairs $(short "${n}") with ${att_old[${n}]:0:12}, but it pairs with $(short "${o}") of ${was}; not carrying anything"
+            used[${n}]=1
+            if test "${c}" = "${CARRY_DROP_CLASS}"; then
+                REWRITE[${n}]=drop
+            else
+                REWRITE[${n}]=keep
+            fi
+        elif test -n "${att_class[${n}]:-}"; then
+            test -n "${o}" ||
+                die "${attestation} classes $(short "${n}"), but it is new since ${was}, with no counterpart there: such a commit never gets ${HUMAN_POSSESSIVE} sign-off this way, only on his approval with 'bot-pr signoff'; not carrying anything"
+            die "${attestation} classes $(short "${n}"), but its pair $(short "${o}") on ${was} is not a bot commit he signed off and committed, so there is no sign-off to carry; not carrying anything"
+        elif test -z "${o}"; then
+            unpaired+=("${n}")
+        fi
+    done
+    for n in "${!att_class[@]}"; do
+        test -n "${used[${n}]:-}" ||
+            die "${attestation} classes ${n:0:12}, which is not a commit of $(short "${base}")..HEAD; not carrying anything"
+    done
+
+    # The record is what the PR comment is made of: never rewrite without it.
+    { : >>"${record}"; } 2>/dev/null || die "cannot write ${record}; not carrying anything"
+    rewrite_commits "${base}" "${head}" "${PROG} carry-signoff: from ${was} per ${attestation}" || true
+    local new_head entries=()
+    new_head=$(git rev-parse HEAD)
+    for i in "${!PAIR_NEW[@]}"; do
+        n=${PAIR_NEW[i]}
+        case "${REWRITE[${n}]:-}" in
+            keep) echo "carried ${HUMAN_POSSESSIVE} sign-off to $(short "${REWRITTEN[${n}]}") (was $(short "${PAIR_OLD[i]}"); ${att_class[${n}]})" ;;
+            drop) echo "dropped ${HUMAN_POSSESSIVE} sign-off from $(short "${REWRITTEN[${n}]}") (was $(short "${PAIR_OLD[i]}"); ${CARRY_DROP_CLASS}): it needs his approval and 'bot-pr signoff'" ;;
+            *) continue ;;
+        esac
+        entries+=("$(jq -c --arg attested "${n}" --arg new "${REWRITTEN[${n}]}" --arg action "${REWRITE[${n}]}" \
+            '.commits[] | select(.new == $attested) | {old, attested: .new, new: $new, class, reason, carried: ($action == "keep")}' \
+            "${attestation}")")
+    done
+    for n in "${unpaired[@]}"; do
+        echo "$(short "${REWRITTEN[${n}]}") is new since ${was}: no sign-off of his; it needs his approval and 'bot-pr signoff'"
+    done
+    local new_commits
+    new_commits=$(for n in "${unpaired[@]}"; do echo "${REWRITTEN[${n}]}"; done | jq -R . | jq -sc .)
+    printf '%s\n' "${entries[@]}" | jq -s --slurpfile att "${attestation}" --arg head "${new_head}" --arg base "${base}" \
+        --argjson new_commits "${new_commits}" \
+        '{version: $att[0].version, pr: $att[0].pr, reviewer: $att[0].reviewer, was: $att[0].was,
+          attested_head: $att[0].head, head: $head, base: $base, commits: ., new_commits: $new_commits}' >"${record}" ||
+        die "cannot write ${record}"
+    local args=(--was "${was}") spec
+    for spec in "${PAIR_EXPLICIT[@]}"; do
+        args+=(--pair "${spec}")
+    done
+    ! ${PAIR_BY_PATCH_ID} || args+=(--patch-id)
+    echo "check it: ${PROG} check ${args[*]} $(short "${base}")..HEAD"
+    echo "after pushing it, post the audit comment: bot-pr carry-note $(jq -r .pr "${attestation}") ${record}"
+}
+
+cmd_drop_signoff() {
+    local upstream="" a c base head
+    local -a named=()
+    while test $# -gt 0; do
+        case "$1" in
+            -h|--help) usage; exit 0 ;;
+            -*) die "unknown option for drop-signoff: $1 (see --help)" ;;
+            *) if test -z "${upstream}"; then upstream=$1; else named+=("$1"); fi; shift ;;
+        esac
+    done
+    test -n "${upstream}" || die "drop-signoff needs UPSTREAM (see --help)"
+    refuse_rebase_in_progress
+    base=$(git rev-parse -q --verify "${upstream}^{commit}") || die "cannot resolve '${upstream}'"
+    head=$(git rev-parse -q --verify 'HEAD^{commit}') || die "cannot resolve HEAD"
+    local -a range_commits
+    local -A in_range=()
+    mapfile -t range_commits < <(git rev-list --reverse "${base}..${head}")
+    for c in "${range_commits[@]}"; do
+        in_range[${c}]=1
+    done
+    REWRITE=()
+    for a in "${named[@]}"; do
+        c=$(git rev-parse -q --verify "${a}^{commit}") || die "cannot resolve '${a}'"
+        test -n "${in_range[${c}]:-}" || die "${a} is not a commit of ${upstream}..HEAD"
+        bot_authored "${c}" || die "${a} is not the bot's commit; drop-signoff never touches anyone else's"
+        REWRITE[${c}]=drop
+    done
+    if test "${#named[@]}" -eq 0; then
+        for c in "${range_commits[@]}"; do
+            ! bot_authored "${c}" || REWRITE[${c}]=drop
+        done
+    fi
+    if ! rewrite_commits "${base}" "${head}" "${PROG} drop-signoff: drop ${HUMAN_POSSESSIVE} sign-off"; then
+        echo "nothing to do: none of those commits has ${HUMAN_POSSESSIVE} sign-off or him as committer"
+        return 0
+    fi
+    for c in "${range_commits[@]}"; do
+        test "${REWRITE[${c}]:-}" != drop || test "${REWRITTEN[${c}]}" = "${c}" ||
+            echo "dropped ${HUMAN_POSSESSIVE} sign-off from $(short "${REWRITTEN[${c}]}") (was $(short "${c}"))"
+    done
+}
+
 main() {
     case "${1:-}" in
         ""|-h|--help) usage; test $# -gt 0 ;;
         check) shift; cmd_check "$@" ;;
-        rework) shift; refuse_shared_clone rework; cmd_rework "$@" ;;
+        rework|carry-signoff|drop-signoff)
+            local cmd=$1
+            shift
+            refuse_shared_clone "${cmd}"
+            "cmd_${cmd//-/_}" "$@" ;;
         *)
             refuse_signoff "$@"
             parse_git_command "$@"

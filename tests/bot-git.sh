@@ -555,5 +555,201 @@ cgwalters' own, content changed|human|content|has a Generated-by trailer but was
 cgwalters' own, message changed|human|message|has a Generated-by trailer but was made as cgwalters
 EOF
 
+# --- rework --drop-signoff ---
+# A rebase resolved conflicts in b: rework keeps his sign-off on a and
+# drops it from b, which the rebase left with the trailer text.
+build old bot:human:a:y bot:human:b:y other:human:c:y
+OLD=$(git -C "${REPO}" rev-parse HEAD)
+build new bot:bot:a:y bot:bot:b:y other:bot:c:y
+NEW=$(git -C "${REPO}" rev-parse HEAD)
+out=$(cd "${REPO}" && "${BOT_GIT}" rework --was "${OLD}" --drop-signoff "$(sha_of HEAD b)" 2>&1) || fail "rework --drop-signoff: ${out}"
+grep -q "^dropped cgwalters' sign-off from [0-9a-f]* (was [0-9a-f]*): it needs his approval" <<<"${out}" || fail "rework --drop-signoff: ${out}"
+test "$(git -C "${REPO}" log --format='%s %cn <%ce>' "${BASE}..HEAD" | sort | paste -sd/ -)" = "a ${HUMAN}/b ${BOT}/c ${BOT}" ||
+    fail "rework --drop-signoff: $(git -C "${REPO}" log --format='%s %cn <%ce>' "${BASE}..HEAD")"
+test "$(git -C "${REPO}" log --format=%B "${BASE}..HEAD" | grep -cxF "${SOB}")" -eq 2 || fail "rework --drop-signoff: not 2 sign-offs left (a's and c's)"
+test "$(git -C "${REPO}" rev-parse "HEAD^{tree}")" = "$(git -C "${REPO}" rev-parse "${NEW}^{tree}")" || fail "rework --drop-signoff: tree changed"
+out=$(cd "${REPO}" && "${BOT_GIT}" check --was "${OLD}" "${BASE}..HEAD" 2>&1) || fail "rework --drop-signoff: check: ${out}"
+grep -q "^ok: 3 commits in .*, 1 with cgwalters' sign-off kept" <<<"${out}" || fail "rework --drop-signoff: check: ${out}"
+git -C "${REPO}" reset -q --hard "${NEW}"
+for d in c "${OLD}"; do
+    test "${d}" != c || d=$(sha_of HEAD c)
+    out=$(cd "${REPO}" && "${BOT_GIT}" rework --was "${OLD}" --drop-signoff "${d}" 2>&1) && fail "rework --drop-signoff ${d}: not refused"
+    grep -qE "is not the bot's commit|is not a commit of" <<<"${out}" || fail "rework --drop-signoff ${d}: ${out}"
+    test "$(git -C "${REPO}" rev-parse HEAD)" = "${NEW}" || fail "rework --drop-signoff ${d}: HEAD changed anyway"
+done
+
+# --- carry-signoff ---
+# attest OLD NEW ENTRIES...: an attestation of OLD -> NEW on stdout; each
+# ENTRY is SUBJECT:CLASS, for the commit of NEW with SUBJECT and the one of
+# OLD with the same subject (that of NEW if OLD has none), or !was or
+# !head to attest the other head instead of OLD or NEW.
+attest() {
+    local old=$1 new=$2 e was=$1 head=$2 commits=()
+    shift 2
+    for e in "$@"; do
+        case "${e}" in
+            '!was') was=${new}; continue ;;
+            '!head') head=${old}; continue ;;
+        esac
+        local o n
+        n=$(sha_of "${new}" "${e%%:*}")
+        o=$(sha_of "${old}" "${e%%:*}")
+        commits+=("$(jq -nc --arg o "${o:-${n}}" --arg n "${n}" --arg c "${e#*:}" \
+            '{old: $o, new: $n, class: $c, reason: "a test"}')")
+    done
+    printf '%s\n' "${commits[@]}" | jq -s --arg was "${was}" --arg head "${head}" \
+        '{version: 1, pr: "https://github.com/acme/proj/pull/7", reviewer: "a test reviewer",
+          was: $was, head: $head, commits: map(select(. != null))}'
+}
+
+# NAME|OLD SPECS|NEW SPECS|ENTRIES|EXPECT: 'carry-signoff --was OLD' on
+# NEW, both built with build, with the attestation of ENTRIES (see
+# attest). EXPECT is 'carried SUBJECTS dropped SUBJECTS' (comma-separated,
+# - for none), or a REGEX of the refusal. Carried commits must be committed
+# by cgwalters with one sign-off; dropped ones by the bot with none; all
+# others as they were; all keep their trees, authors and messages
+# otherwise; and 'check --was OLD' must pass, naming the carried ones.
+while IFS='|' read -r name olds news entries expect; do
+    test -n "${name}" || continue
+    read -ra ospecs <<<"${olds}"
+    read -ra nspecs <<<"${news}"
+    read -ra ents <<<"${entries}"
+    build old "${ospecs[@]}"
+    OLD=$(git -C "${REPO}" rev-parse HEAD)
+    build new "${nspecs[@]}"
+    NEW=$(git -C "${REPO}" rev-parse HEAD)
+    attest "${OLD}" "${NEW}" "${ents[@]}" >"${WORK}/attestation.json"
+    rm -f "${WORK}/attestation.carried.json"
+    status=0
+    out=$(cd "${REPO}" && "${BOT_GIT}" carry-signoff --was "${OLD}" --attestation "${WORK}/attestation.json" 2>&1) || status=$?
+    after=$(git -C "${REPO}" rev-parse HEAD)
+    if [[ "${expect}" != carried\ * ]]; then
+        test "${status}" -ne 0 || fail "carry: ${name}: not refused: ${out}"
+        grep -qE -- "${expect}" <<<"${out}" || fail "carry: ${name}: output lacks '${expect}': ${out}"
+        test "${after}" = "${NEW}" || fail "carry: ${name}: HEAD changed anyway"
+        test ! -e "${WORK}/attestation.carried.json" || fail "carry: ${name}: wrote a record anyway"
+        continue
+    fi
+    test "${status}" -eq 0 || { fail "carry: ${name}: exit status ${status}: ${out}"; continue; }
+    read -r _ carried _ dropped <<<"${expect}"
+    test "$(git -C "${REPO}" rev-parse "HEAD^{tree}")" = "$(git -C "${REPO}" rev-parse "${NEW}^{tree}")" || fail "carry: ${name}: tree changed"
+    mapfile -t b < <(git -C "${REPO}" rev-list --reverse "${BASE}..${NEW}")
+    mapfile -t a < <(git -C "${REPO}" rev-list --reverse "${BASE}..${after}")
+    for i in "${!b[@]}"; do
+        subj=$(git -C "${REPO}" show -s --format=%s "${a[i]}")
+        test "$(git -C "${REPO}" show -s --format='%T %an <%ae>' "${a[i]}")" = "$(git -C "${REPO}" show -s --format='%T %an <%ae>' "${b[i]}")" ||
+            fail "carry: ${name}: ${subj}: tree or author changed"
+        test "$(sans_sob "${a[i]}")" = "$(sans_sob "${b[i]}")" || fail "carry: ${name}: ${subj}: message changed"
+        sobs=$(git -C "${REPO}" show -s --format=%B "${a[i]}" | grep -cxF "${SOB}" || true)
+        committer=$(git -C "${REPO}" show -s --format='%cn <%ce>' "${a[i]}")
+        if [[ ",${carried}," == *",${subj},"* ]]; then
+            test "${committer} ${sobs}" = "${HUMAN} 1" || fail "carry: ${name}: ${subj} not carried: ${committer}, ${sobs} sign-offs"
+        elif [[ ",${dropped}," == *",${subj},"* ]]; then
+            test "${committer} ${sobs}" = "${BOT} 0" || fail "carry: ${name}: ${subj} not dropped: ${committer}, ${sobs} sign-offs"
+        else
+            test "${committer} ${sobs}" = "$(git -C "${REPO}" show -s --format='%cn <%ce>' "${b[i]}") $(git -C "${REPO}" show -s --format=%B "${b[i]}" | grep -cxF "${SOB}" || true)" ||
+                fail "carry: ${name}: ${subj} changed: ${committer}, ${sobs} sign-offs"
+        fi
+    done
+    ncarried=0
+    test "${carried}" = - || ncarried=$(tr , '\n' <<<"${carried}" | grep -c .)
+    test "$(grep -c "^carried cgwalters' sign-off to" <<<"${out}")" -eq "${ncarried}" || fail "carry: ${name}: expected ${ncarried} carried: ${out}"
+    jq -e --arg head "${after}" --argjson n "${ncarried}" \
+        '.head == $head and ([.commits[] | select(.carried)] | length) == $n and (.commits | all(.reason == "a test"))' \
+        "${WORK}/attestation.carried.json" >/dev/null || fail "carry: ${name}: record: $(cat "${WORK}/attestation.carried.json")"
+    read -ra check_args <<<"$(sed -n 's/^check it: bot-git check //p' <<<"${out}")"
+    out=$(cd "${REPO}" && "${BOT_GIT}" check "${check_args[@]}" 2>&1) || fail "carry: ${name}: check: ${out}"
+    test "$(grep -c "^    note: kept cgwalters' sign-off" <<<"${out}")" -eq "${ncarried}" || fail "carry: ${name}: check notes: ${out}"
+done <<EOF
+attested carry|bot:human:a:y bot:human:b:y|bot:bot:a:y bot:bot:b:n|a:conflict-resolution b:review-ask|carried a,b dropped -
+every class but substantive|bot:human:a:y bot:human:b:y bot:human:c:y bot:human:d:y|bot:bot:a:n bot:bot:b:n bot:bot:c:n bot:bot:d:n|a:unchanged b:conflict-resolution c:review-ask d:small-fix|carried a,b,c,d dropped -
+substantive drops it|bot:human:a:y bot:human:b:y|bot:bot:a:y bot:bot:b:n|a:substantive b:small-fix|carried b dropped a
+substantive, already committed by him|bot:human:a:y|bot:human:a:y|a:substantive|carried - dropped a
+an unpaired commit stays unsigned|bot:human:a:y|bot:bot:p:n bot:bot:a:n|a:unchanged|carried a dropped -
+an unpaired commit attested|bot:human:a:y|bot:bot:p:n bot:bot:a:n|a:unchanged p:unchanged|is new since .* with no counterpart there: such a commit never gets cgwalters' sign-off this way
+an unpaired commit with his sign-off|bot:human:a:y|bot:bot:p:y bot:bot:a:n|a:unchanged|has cgwalters' sign-off, but is new since
+the attestation is for another head|bot:human:a:y|bot:bot:a:n|a:unchanged !head|attests the head [0-9a-f]+, but HEAD is
+the attestation is from another head|bot:human:a:y|bot:bot:a:n|a:unchanged !was|attests a change from [0-9a-f]+, not from
+a signed pair left out|bot:human:a:y bot:human:b:y|bot:bot:a:n bot:bot:b:n|a:unchanged|paired with [0-9a-f]+ that cgwalters signed off, has no class
+an unknown class|bot:human:a:y|bot:bot:a:n|a:fine|class "fine" is not one of
+a pair he never signed|bot:bot:a:n|bot:bot:a:n|a:unchanged|is not a bot commit he signed off and committed, so there is no sign-off to carry
+a commit gone|bot:human:a:y bot:human:b:y|bot:bot:a:n|a:unchanged|'b' of .* is gone from
+EOF
+# A malformed attestation, and one that pairs the commits otherwise.
+build old bot:human:a:y bot:human:b:y
+OLD=$(git -C "${REPO}" rev-parse HEAD)
+build new bot:bot:a:n bot:bot:b:n
+NEW=$(git -C "${REPO}" rev-parse HEAD)
+while IFS='|' read -r name filter expect; do
+    test -n "${name}" || continue
+    attest "${OLD}" "${NEW}" a:unchanged b:unchanged | jq "${filter}" >"${WORK}/attestation.json"
+    out=$(cd "${REPO}" && "${BOT_GIT}" carry-signoff --was "${OLD}" --attestation "${WORK}/attestation.json" 2>&1) &&
+        fail "carry: ${name}: not refused: ${out}"
+    grep -qE -- "${expect}" <<<"${out}" || fail "carry: ${name}: output lacks '${expect}': ${out}"
+    test "$(git -C "${REPO}" rev-parse HEAD)" = "${NEW}" || fail "carry: ${name}: HEAD changed anyway"
+done <<EOF
+no version|del(.version)|version is not 1
+a short commit id|.commits[0].new = "abc1234"|commits\[0\] lacks full old and new commit ids
+a reason of two lines|.commits[0].reason = "a\nb"|commits\[0\].reason is not one line
+no reviewer|del(.reviewer)|reviewer does not name
+not a PR|.pr = "acme/proj#7"|pr is not a PR URL
+listed twice|.commits += [.commits[0]]|a commit is listed twice
+crossed pairs|.commits[0].old = .commits[1].new|pairs [0-9a-f]+ with [0-9a-f]+, but it pairs with
+EOF
+attest "${OLD}" "${NEW}" a:unchanged b:unchanged >"${WORK}/attestation.json"
+out=$(cd "${REPO}" && "${BOT_GIT}" carry-signoff --was "${OLD}" --attestation "${WORK}/attestation.json" --record "${WORK}/attestation.json" 2>&1) &&
+    fail "carry: the record over the attestation: not refused"
+grep -q "is the attestation itself" <<<"${out}" || fail "carry: the record over the attestation: ${out}"
+# Rebased onto a newer base, as rework takes it: UPSTREAM is that base.
+build old bot:human:a:y
+OLD=$(git -C "${REPO}" rev-parse HEAD)
+git -C "${REPO}" reset -q --hard "${BASE}"
+commit_as other other "upstream\n"
+git -C "${REPO}" branch -q -f newbase HEAD
+echo resolved >"${REPO}/a"
+git -C "${REPO}" add a
+commit_as bot bot "a\n\nnew body\n\n${AI}"
+NEW=$(git -C "${REPO}" rev-parse HEAD)
+jq -n --arg was "${OLD}" --arg head "${NEW}" --arg o "$(sha_of "${OLD}" a)" '{version: 1, pr: "https://github.com/acme/proj/pull/7",
+    reviewer: "r", was: $was, head: $head, commits: [{old: $o, new: $head, class: "conflict-resolution", reason: "r"}]}' >"${WORK}/attestation.json"
+out=$(cd "${REPO}" && "${BOT_GIT}" carry-signoff --was "${OLD}" --attestation "${WORK}/attestation.json" newbase 2>&1) || fail "carry: rebased: ${out}"
+test "$(git -C "${REPO}" rev-parse HEAD^)" = "$(git -C "${REPO}" rev-parse newbase)" || fail "carry: rebased: the base was rewritten"
+test "$(git -C "${REPO}" show -s --format='%cn <%ce>' HEAD)" = "${HUMAN}" || fail "carry: rebased: not carried"
+read -ra check_args <<<"$(sed -n 's/^check it: bot-git check //p' <<<"${out}")"
+out=$(cd "${REPO}" && "${BOT_GIT}" check "${check_args[@]}" 2>&1) || fail "carry: rebased: check: ${out}"
+echo '{' >"${WORK}/attestation.json"
+out=$(cd "${REPO}" && "${BOT_GIT}" carry-signoff --was "${OLD}" --attestation "${WORK}/attestation.json" 2>&1) && fail "carry: not JSON: not refused"
+grep -q 'it is not valid JSON' <<<"${out}" || fail "carry: not JSON: ${out}"
+
+# --- drop-signoff ---
+build old bot:human:a:y bot:human:b:y other:human:c:y
+OLD=$(git -C "${REPO}" rev-parse HEAD)
+out=$(cd "${REPO}" && "${BOT_GIT}" drop-signoff "${BASE}" "$(sha_of HEAD a)" 2>&1) || fail "drop: one: ${out}"
+test "$(grep -c '^dropped' <<<"${out}")" -eq 1 || fail "drop: one: ${out}"
+test "$(git -C "${REPO}" log --format='%s %cn <%ce>' "${BASE}..HEAD" | sort | paste -sd/ -)" = "a ${BOT}/b ${HUMAN}/c ${HUMAN}" ||
+    fail "drop: one: $(git -C "${REPO}" log --format='%s %cn <%ce>' "${BASE}..HEAD")"
+test "$(git -C "${REPO}" cat-file commit "$(sha_of HEAD a)" | tail -n1)" = "${AI}" || fail "drop: one: the message doesn't end with its other trailer"
+out=$(cd "${REPO}" && "${BOT_GIT}" check --was "${OLD}" "${BASE}..HEAD" 2>&1) || fail "drop: one: check: ${out}"
+out=$(cd "${REPO}" && "${BOT_GIT}" drop-signoff "${BASE}" "$(sha_of HEAD c)" 2>&1) && fail "drop: someone else's: not refused"
+grep -q "is not the bot's commit" <<<"${out}" || fail "drop: someone else's: ${out}"
+out=$(cd "${REPO}" && "${BOT_GIT}" drop-signoff "${BASE}" 2>&1) || fail "drop: all: ${out}"
+test "$(git -C "${REPO}" log --format='%s %cn <%ce>' "${BASE}..HEAD" | sort | paste -sd/ -)" = "a ${BOT}/b ${BOT}/c ${HUMAN}" ||
+    fail "drop: all: $(git -C "${REPO}" log --format='%s %cn <%ce>' "${BASE}..HEAD")"
+test "$(git -C "${REPO}" log --format=%B "${BASE}..HEAD" | grep -cxF "${SOB}")" -eq 1 || fail "drop: all: sign-offs left on the bot's"
+out=$(cd "${REPO}" && "${BOT_GIT}" drop-signoff "${BASE}" 2>&1) || fail "drop: again: ${out}"
+grep -q '^nothing to do' <<<"${out}" || fail "drop: again: ${out}"
+# A merge isn't flattened.
+git -C "${REPO}" reset -q --hard "${BASE}"
+commit_as bot human "side\n\n${AI}\n${SOB}"
+SIDE=$(git -C "${REPO}" rev-parse HEAD)
+git -C "${REPO}" reset -q --hard "${BASE}"
+commit_as bot bot "main\n\n${AI}"
+GIT_AUTHOR_NAME="${BOT% <*}" GIT_AUTHOR_EMAIL=walters+llm@verbum.org GIT_COMMITTER_NAME="${BOT% <*}" GIT_COMMITTER_EMAIL=walters+llm@verbum.org \
+    git -C "${REPO}" merge -q --no-ff -m "merge" -m "${AI}" "${SIDE}"
+MERGED=$(git -C "${REPO}" rev-parse HEAD)
+out=$(cd "${REPO}" && "${BOT_GIT}" drop-signoff "${BASE}" 2>&1) && fail "drop: a merge: not refused"
+grep -q "there are merge commits" <<<"${out}" || fail "drop: a merge: ${out}"
+test "$(git -C "${REPO}" rev-parse HEAD)" = "${MERGED}" || fail "drop: a merge: HEAD changed anyway"
+
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: bot-git commits as the bot, refuses to sign off, keeps cgwalters' on reworked commits, and checks commits"
+echo "ok: bot-git commits as the bot, refuses to sign off, keeps cgwalters' on reworked commits, carries it on attested ones, drops it, and checks commits"
