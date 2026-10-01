@@ -41,6 +41,9 @@ readonly TITLE_WIDTH=70
 readonly SET_OPTIONS=(--status --priority --workflow --org --why --branch --gist)
 # Free-text fields; the rest of SET_OPTIONS are single-selects.
 readonly TEXT_FIELDS=(Why Branch Gist)
+# Number fields, which only --field sets (the field list doesn't tell a
+# number field from a text one).
+readonly NUMBER_FIELDS=("Actual tokens")
 # The Org field says which organization an item's work targets, so the
 # board can be filtered to the bot's own infrastructure (the forge org's
 # and the bot's options) or to work going outbound. A fork owned by one
@@ -238,7 +241,8 @@ Commands:
                               pushed branches), Gist the write-up URL(s);
                               separate several with spaces. --field sets
                               any other text or single-select field, such
-                              as another board's (--field Area docs).
+                              as another board's (--field Area docs), or
+                              the number field Actual tokens.
                               An empty value clears a text field.
   fill-org [--all] [--dry-run]
                               Set Org on items that have none (--all:
@@ -1187,6 +1191,10 @@ cmd_set() {
                 if jq -e '.options' <<<"${field_id}" >/dev/null; then
                     option=$(option_id "$2" "$3")
                     args+=("--single-select-option-id=${option}")
+                elif one_of "$2" "${NUMBER_FIELDS[@]}"; then
+                    if test -z "$3"; then args+=(--clear)
+                    elif [[ "$3" =~ ^[0-9]+$ ]]; then args+=("--number=$3")
+                    else fatal "$2 expects a whole number, got '$3'"; fi
                 else
                     validate_links "$2" "$3"
                     if test -n "$3"; then args+=("--text=$3"); else args+=(--clear); fi
