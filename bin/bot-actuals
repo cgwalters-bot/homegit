@@ -1,0 +1,73 @@
+#!/usr/bin/env node
+// Write the inference tokens a Done board item took to its "Actual tokens"
+// field. See --help. Node's standard library only, plus bot-cost and
+// bot-board.
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const path = require("node:path");
+
+const cap = require(path.join(__dirname, "..", "lib", "capacity.js"));
+
+const PROG = path.basename(process.argv[1] || "bot-actuals");
+const COST = process.env.BOT_ACTUALS_COST || path.join(__dirname, "bot-cost");
+const BOARD = process.env.BOT_ACTUALS_BOARD || path.join(__dirname, "bot-board");
+const DEFAULT_SINCE = "30d";
+const ACTUAL_FIELD = "Actual tokens";
+const DONE_STATUS = "Done";
+const MAX_BUFFER = 256 * 1024 * 1024;
+const EX_USAGE = 2;
+
+function usage() {
+  return `Usage: ${PROG} [--since AGE] [--all] [--dry-run] [--json]
+
+Sums the fresh inference tokens (input, output and cache writes, not
+cache reads) of the transcripts whose worker prompt names a board item
+on an "Item: URL-or-PVTI_ID" line (bot-cost's tasks), and sets the sum
+as "${ACTUAL_FIELD}" on that item if its Status is ${DONE_STATUS} and the field is
+empty (--all: also overwrite). Items match by id, by issue or PR URL, or
+by a PR URL in Branch. Use --dry-run first: it prints what would be set.
+AGE is as for bot-cost (default ${DEFAULT_SINCE}); a task older than that is not
+counted, so run it before the transcripts age out of the window.
+`;
+}
+
+const run = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "inherit"] });
+
+// plan(items, tasks, all): [{id, title, tokens}] of the Done items to set.
+function plan(items, tasks, all) {
+  const sums = cap.attribute(tasks, items);
+  return items
+    .filter((it) => it.status === DONE_STATUS && sums[it.id] > 0 && (all || it["actual tokens"] == null))
+    .map((it) => ({ id: it.id, title: it.title, tokens: Math.round(sums[it.id]) }));
+}
+
+function main(argv) {
+  let since = DEFAULT_SINCE, all = false, dry = false, json = false;
+  for (let i = 0; i < argv.length; i++) {
+    switch (argv[i]) {
+      case "-h": case "--help": process.stdout.write(usage()); return 0;
+      case "--since":
+        since = argv[++i];
+        if (!since) { process.stderr.write(`${PROG}: --since needs a value\n`); return EX_USAGE; }
+        break;
+      case "--all": all = true; break;
+      case "--dry-run": dry = true; break;
+      case "--json": json = true; break;
+      default: process.stderr.write(`${PROG}: unexpected argument '${argv[i]}'\n\n${usage()}`); return EX_USAGE;
+    }
+  }
+  const tasks = JSON.parse(run(COST, ["--since", since, "--no-compute", "--tasks", "0", "--json"])).tasks;
+  const items = JSON.parse(run(BOARD, ["list", "--json"]));
+  const todo = plan(items, tasks, all);
+  if (json) process.stdout.write(`${JSON.stringify(todo, null, 2)}\n`);
+  for (const t of todo) {
+    if (!json) process.stdout.write(`${dry ? "would set" : "set"} ${ACTUAL_FIELD} = ${t.tokens} on ${t.id} (${t.title})\n`);
+    if (!dry) run(BOARD, ["set", t.id, "--field", ACTUAL_FIELD, String(t.tokens)]);
+  }
+  if (!todo.length && !json) process.stdout.write("nothing to set\n");
+  return 0;
+}
+
+if (require.main === module) process.exit(main(process.argv.slice(2)));
+else module.exports = { plan };

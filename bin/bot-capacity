@@ -1,0 +1,114 @@
+#!/usr/bin/env node
+// Planning by capacity: this week's usage and burn rate, the projection at
+// the reset, and the open P0/P1 estimates by bucket. See --help. Node's
+// standard library only, plus bot-cost and bot-board.
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const cap = require(path.join(__dirname, "..", "lib", "capacity.js"));
+
+const PROG = path.basename(process.argv[1] || "bot-capacity");
+const COST = process.env.BOT_CAPACITY_COST || path.join(__dirname, "bot-cost");
+const BOARD = process.env.BOT_CAPACITY_BOARD || path.join(__dirname, "bot-board");
+// What `bot-heartbeat statusline` saves of Claude Code's rate_limits.
+const RATE_FILE = process.env.BOT_CAPACITY_RATE_FILE
+  || path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "bot-heartbeat", "rate-limits.json");
+const BUDGET_ENV = "BOT_CAPACITY_WEEKLY_TOKENS";
+// A reading older than this is not trusted: the status line runs after
+// every assistant message, so an older one means it stopped running.
+const RATE_MAX_AGE_MS = 3600e3;
+const MAX_BUFFER = 256 * 1024 * 1024;
+const EX_USAGE = 2;
+
+function usage() {
+  return `Usage: ${PROG} [--budget TOKENS] [--json]
+
+Shows the week's capacity: usage and burn rate, the projected percent at
+the reset, and the open (Todo, In Progress) P0 and P1 items' Est. cost
+buckets summed, with what may be dispatched: all, P0 only above
+${cap.P0_ONLY_PERCENT}% projected, nothing at 100%.
+
+The percent is the seven_day.used_percentage that \`bot-heartbeat
+statusline\` saves (${RATE_FILE.replace(os.homedir(), "~")}), if it is under an hour old and
+its window hasn't reset. Otherwise, with --budget (fresh tokens per week;
+or \$${BUDGET_ENV}), it is the trailing 7 days' fresh tokens (input, output
+and cache writes, from bot-cost) over the budget. With neither there are
+only token totals. Estimates become percent at this week's percent per
+token; a bucket counts as ${cap.BUCKETS.map((b) => `${b.key} ${b.expected / 1e3}k`).join(", ")} tokens.
+`;
+}
+
+const run = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "inherit"] });
+
+// readRate(now): {usedPercent, resetsAt (ms)} of the saved seven_day
+// window, or null if missing, stale, malformed or already reset.
+function readRate(now) {
+  let saved;
+  try {
+    saved = JSON.parse(fs.readFileSync(RATE_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+  const w = saved && saved.seven_day;
+  const observed = Date.parse(saved && saved.observed_at);
+  const resets = w && Date.parse(w.resets_at);
+  if (!w || typeof w.used_percent !== "number" || !(resets > now) || !(now - observed < RATE_MAX_AGE_MS)) return null;
+  return { usedPercent: w.used_percent, resetsAt: resets };
+}
+
+const pct = (n) => (n === null || n === undefined ? "?" : `${n.toFixed(1)}%`);
+const tok = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
+
+function render(r) {
+  const out = [];
+  const src = { statusline: "plan usage (statusline)", budget: "tokens over the budget", tokens: "tokens only (no statusline reading, no budget)" }[r.source];
+  out.push(`Week (${src}): ${tok(r.used_tokens)} fresh tokens${r.used_percent === null ? "" : `, ${pct(r.used_percent)} used`}`);
+  if (r.burn_per_day !== null) out.push(`Burn: ${pct(r.burn_per_day)}/day, ${tok(r.burn_tokens_per_day)} tokens/day`);
+  else out.push(`Burn: ${tok(r.burn_tokens_per_day)} tokens/day (trailing 7 days)`);
+  if (r.resets_at) {
+    out.push(`Resets ${r.resets_at}; projected at reset: ${r.projected === null ? "too early in the week to say" : pct(r.projected)}`);
+  } else if (r.projected !== null) out.push(`Projected (rolling week): ${pct(r.projected)}`);
+  out.push("", "Open P0/P1 (Todo, In Progress) by Est. cost:");
+  const rows = [["", ...cap.BUCKETS.map((b) => b.key), "none", "tokens", "percent", "fits"]];
+  for (const prio of cap.PLANNED_PRIORITIES) {
+    const e = r.estimates[prio];
+    rows.push([prio, ...cap.BUCKETS.map((b) => e[b.key].count), e.unestimated, tok(e.tokens), pct(e.percent),
+      e.fits === null ? "?" : e.fits ? "yes" : "no"]);
+  }
+  const w = rows[0].map((_, i) => Math.max(...rows.map((x) => String(x[i]).length)));
+  for (const x of rows) out.push("  " + x.map((c, i) => (i ? String(c).padStart(w[i]) : String(c).padEnd(w[i]))).join("  "));
+  const scope = { all: "P0 and P1", p0: `P0 only (projected at or above ${cap.P0_ONLY_PERCENT}%)`, none: "nothing (the week's capacity is used up)",
+    unknown: "unknown (no percent: pass --budget or run bot-heartbeat statusline)" }[r.dispatch.scope];
+  out.push("", `Dispatch: ${scope}${r.dispatch.headroom === null ? "" : `; headroom after projection ${pct(r.dispatch.headroom)}`}`);
+  return `${out.join("\n")}\n`;
+}
+
+function main(argv) {
+  let budget = Number(process.env[BUDGET_ENV]) || null, json = false;
+  for (let i = 0; i < argv.length; i++) {
+    switch (argv[i]) {
+      case "-h": case "--help": process.stdout.write(usage()); return 0;
+      case "--json": json = true; break;
+      case "--budget":
+        budget = Number(argv[++i]);
+        if (!(budget > 0)) { process.stderr.write(`${PROG}: --budget takes a number of tokens\n`); return EX_USAGE; }
+        break;
+      default: process.stderr.write(`${PROG}: unexpected argument '${argv[i]}'\n\n${usage()}`); return EX_USAGE;
+    }
+  }
+  const now = process.env.BOT_CAPACITY_NOW ? Date.parse(process.env.BOT_CAPACITY_NOW) : Date.now();
+  const rate = readRate(now);
+  const since = new Date(rate ? rate.resetsAt - cap.WEEK_MS : now - cap.WEEK_MS).toISOString();
+  const weekTokens = JSON.parse(run(COST, ["--since", since, "--no-compute", "--tasks", "0", "--json"])).totals.fresh_tokens;
+  const items = JSON.parse(run(BOARD, ["list", "--json"]));
+  const report = cap.capacityReport({ rate, weekTokens, budget, items, now });
+  process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : render(report));
+  return 0;
+}
+
+if (require.main === module) process.exit(main(process.argv.slice(2)));
+else module.exports = { readRate, render };
