@@ -139,6 +139,14 @@ estimate in the morning brief. `bot-footer` turns one task's share into
 a run footer that fork PRs carry in their bot-meta section (see "Run
 footer" in the same doc).
 
+Planning is by cost and capacity. Items carry an `Est. cost` bucket (XS to
+XL, in fresh inference tokens; see "Cost estimates" in the `workstream`
+skill) and, once Done, their `Actual tokens`, which `bot-actuals` sums from
+the transcripts of workers whose prompt has an `Item: URL` line.
+`bot-capacity` shows the week's usage, burn rate and projection (from the
+percent `bot-heartbeat statusline` saves) next to the open P0/P1
+estimates, which the coordinator uses to decide what to dispatch.
+
 `bot-heartbeat publish` puts the coordinator's loop state and its local
 workers (names, board item links, devspaces) in one pinned comment on
 the "Bot heartbeat" issue in cgwalters-forge/tracker, edited in place,

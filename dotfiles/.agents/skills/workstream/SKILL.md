@@ -152,6 +152,39 @@ by hand; keep this list in step with them.
 Show the "Parent issue" and "Sub-issues progress" fields in table views,
 so parents show how far along they are.
 
+## Cost estimates
+
+Planning is by cost and capacity: every item moved to Todo, and every
+item dispatched without one, gets an **Est. cost** bucket, and when it
+goes Done its **Actual tokens** are filled in (`bot-actuals`, run by the
+coordinator). "Tokens" are fresh ones: input, output and cache writes,
+not cache reads (re-reading context is 90% of the raw count, grows with a
+session's length, and costs a tenth as much). Set it with
+`bot-board set "$ITEM" --field "Est. cost" "S (<1M tok)"`; a worker that
+finds its item far off (two buckets or more) fixes the estimate in the
+same `set` that claims or finishes it. Pick the bucket by the kind of
+work, not by a guess at the tokens:
+
+| Bucket | Typical work |
+|--------|--------------|
+| XS (<200k tok) | docs-only change; a CI flake classification or rerun; a review of one PR; a board or tracker chore; answering a review comment with no code |
+| S (<1M tok) | a small code fix with one devspace test; review fixes on one PR; a P0 CI-failure fix that is local |
+| M (<5M tok) | a rework with tmt runs or several review rounds; a rebase of several conflicting PRs; a new small tool with tests; a multi-step e2e re-verification |
+| L (<20M tok) | a multi-PR stack, a cross-repo design with a prototype, a new tool or service with its own tests and docs |
+| XL (>20M tok) | a large migration or a harness-sized project (a coordinator session counts, too); split it into L items where it can be |
+
+The buckets come from `bot-cost --since 5d` (315 task-agents, 2026-09-25
+to 30): the median task spent about 150k fresh tokens, 57% were XS and 30%
+S, 12% M and a handful L; single-PR reviews ran 30-180k, a P0 CI-failure
+fix 0.6-1.0M, a rework with review rounds 1.3-1.8M, rebasing seven PRs
+2.9M, a board migration 3-8M, and the roadmap-driving session 10M. Rework
+that resumes an earlier worker is a new task of its own. Devspace CPU is cheap
+relative to inference: over 2026-09-28 to 30 the runners were about
+1,400 core-hours, $219 notional at GitHub's list rates, against $1,160 of
+inference, and a 16-core devspace is the same price whether the worker
+leaves it idle or builds, so don't shrink a plan to save CPU, only to
+save tokens. Re-derive the table from `bot-cost` now and then.
+
 ## Workflow
 
 The **Workflow** single-select decides what "finished" means for an item:
@@ -598,7 +631,8 @@ bot-board show "$ITEM"
 gh pr view "$PR_URL" --json state,mergedAt,mergedBy --jq '{state, mergedAt, by: .mergedBy.login}'
 ```
 
-If `state` is `MERGED`, set Done. A PR closed without merging means go back
+If `state` is `MERGED`, set Done, and the coordinator's `bot-actuals`
+fills in Actual tokens (see "Cost estimates"). A PR closed without merging means go back
 and read why; usually that is Needs human. An issue closed without a merged
 PR (e.g. as a duplicate or not planned) is not something you mark Done: note
 it in the Why field and set Needs human, and the human decides.

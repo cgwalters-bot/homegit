@@ -75,8 +75,12 @@ the session scratchpad), and anything specific. When the task needs a
 devspace, name it after the task and give it 16 cores or fewer (16 is
 the default) and the shortest duration that fits; brief 64 cores only
 when a 16-core run has proven too slow for this work, and say why.
-Naming the board item, scratch dir and devspace in the prompt is also
-what lets `bot-cost` attribute the task's cost. For the overnight batch
+Put the board item on a line of its own, `Item: ITEM_URL` (or the
+`PVTI_` id), and tell the worker to repeat that line in the prompts of
+its own subagents (reviewer, builder): `bot-cost` joins transcripts to
+board items on it, and `bot-actuals` writes the sum to the item's Actual
+tokens. Naming the scratch dir and devspace in the prompt is also what
+lets `bot-cost` attribute the task's compute. For the overnight batch
 job of turning Draft items into review-ready forge PRs, also point the
 worker at `forge-migrate.md` in the same directory and list its batch of
 items.
@@ -167,6 +171,34 @@ report it again), which is why `bot-poll` keeps its whole output: read
 the file rather than rerunning it. `bot-tmt-number --gc` releases the
 bootc tmt test numbers workers reserved once their number is on main
 or in their open PR, or their PR closed.
+
+## Capacity
+
+Plan by cost and capacity, not by a count of workers (the CPU scales
+well; the weekly inference budget is what runs out). Every item you move
+to Todo or dispatch gets an **Est. cost** bucket, from the table in
+`workstream` ("Cost estimates"). Before dispatching, run `bot-capacity`:
+it shows the week's usage (the `seven_day` percent that `bot-heartbeat
+statusline` saves, else `--budget` tokens, else token totals), the burn
+rate, the percent projected at the reset, and the open P0/P1 estimates
+summed by bucket. Then:
+
+- dispatch only while the projected usage plus the estimate of the work
+  you are about to dispatch fits the remaining capacity (the report's
+  `fits` column and headroom), P0 work first, then P1;
+- at about 80% projected (`bot-capacity` says "P0 only"), dispatch P0
+  work only, and tell the operator in the brief; at 100% dispatch nothing
+  new and let running workers finish;
+- when the projection is "too early in the week to say" (under 12 hours
+  of the window), go by the used percent;
+- with no percent at all ("unknown"), use the token totals and the
+  operator's last word on the budget; don't guess one.
+
+After `bot-watch --apply` moves items to Done, run `bot-actuals --dry-run`
+and then `bot-actuals`: it sets Actual tokens on Done items whose workers
+carried an `Item:` line. Compare it with Est. cost when an item is far off
+(two buckets), and correct the table in `workstream` if a whole kind of
+work is.
 
 ## Acting on it
 
@@ -466,12 +498,13 @@ summary of it:
 - **reading**: analysis gists and notable upstream activity;
 - **cost**: yesterday's estimate from `bot-cost --since yesterday
   --until today`: the total, compute (core-hours) against inference, and
-  the top few tasks, labeled as an estimate at list prices.
+  the top few tasks, labeled as an estimate at list prices; and the
+  `bot-capacity` report (projected percent at reset, what was held back).
 
 Keep it scannable, and end it with
 `Generated-by: https://github.com/cgwalters/#llms` (the config's `generated_by_url`).
 
 ## Stopping
 
-There is no programmatic readout of the weekly usage left, so don't try
-to ration it or guess. Keep looping until the operator says to stop.
+Keep looping until the operator says to stop. Capacity limits dispatch
+(see "Capacity"), not the loop: poll and review at any usage.
