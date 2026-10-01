@@ -83,8 +83,17 @@ struct Cli {
     /// run would report, changing no state.
     #[arg(long)]
     dry_run: bool,
+    /// Sweep only the items whose board Lead is LEAD: a topic session's
+    /// poll (give it its own --state-dir).
+    #[arg(long, value_name = "LEAD")]
+    lead: Option<String>,
+    /// Leave the items whose board Lead is LEAD to their topic session
+    /// ('*': every Lead but the coordinator's); may be repeated.
+    #[arg(long, value_name = "LEAD")]
+    exclude_lead: Vec<String>,
     /// Where the runs and the seen-sets live [default:
-    /// $XDG_STATE_HOME/bot-poll, or ~/.local/state/bot-poll]
+    /// $XDG_STATE_HOME/bot-poll, or ~/.local/state/bot-poll; with --lead,
+    /// bot-poll-lead-LEAD there]
     #[arg(long)]
     state_dir: Option<PathBuf>,
 }
@@ -95,7 +104,7 @@ The coordinator's poll. Every --interval it sweeps:
   git pull -q --ff-only   (in the homegit checkout the bot-* tools are from)
   bot-notify
   bot-pr inbox --dry-run
-  bot-watch --apply
+  bot-watch --apply   (with --lead and --exclude-lead as given)
   bot-tmt-number --gc
 
 saving each one's output (stdout and stderr) to RUN/NAME.txt, RUN being
@@ -185,7 +194,11 @@ fn state_dir(cli: &Cli) -> Result<PathBuf> {
         )
         .join(".local/state"),
     };
-    Ok(base.join("bot-poll"))
+    // A topic's poll keeps its own seen-sets, apart from the coordinator's.
+    Ok(match &cli.lead {
+        Some(lead) => base.join(format!("bot-poll-lead-{}", lead.replace('/', "_"))),
+        None => base.join("bot-poll"),
+    })
 }
 
 /// The directory of the bot-* tools: $BOT_POLL_BIN_DIR, else bin/ of the
@@ -216,6 +229,9 @@ fn tools_dir() -> Result<PathBuf> {
 }
 
 struct Sweeper {
+    /// Extra arguments of bot-watch: the --lead and --exclude-lead
+    /// filters, which say whose items this poll's sweeps are about.
+    watch_args: Vec<String>,
     tools: PathBuf,
     /// The homegit checkout, which the tools are in.
     repo: PathBuf,
@@ -223,7 +239,7 @@ struct Sweeper {
 }
 
 impl Sweeper {
-    fn new() -> Result<Self> {
+    fn new(cli: &Cli) -> Result<Self> {
         let tools = tools_dir()?;
         let repo = tools
             .parent()
@@ -231,11 +247,31 @@ impl Sweeper {
             .unwrap_or_else(|| tools.clone());
         let git =
             std::env::var_os("BOT_POLL_GIT").map_or_else(|| PathBuf::from("git"), PathBuf::from);
-        Ok(Sweeper { tools, repo, git })
+        let watch_args = cli
+            .lead
+            .iter()
+            .flat_map(|l| ["--lead", l.as_str()])
+            .chain(cli.exclude_lead.iter().flat_map(|l| ["--exclude-lead", l]))
+            .map(str::to_string)
+            .collect();
+        Ok(Sweeper {
+            watch_args,
+            tools,
+            repo,
+            git,
+        })
     }
 
     fn command(&self, tool: Option<&str>, args: &[&str]) -> (PathBuf, Vec<String>) {
-        let args = args.iter().map(|a| a.to_string());
+        let extra = if tool == Some(LOCATOR) {
+            self.watch_args.as_slice()
+        } else {
+            &[]
+        };
+        let args = args
+            .iter()
+            .map(|a| a.to_string())
+            .chain(extra.iter().cloned());
         match tool {
             Some(t) => (self.tools.join(t), args.collect()),
             None => (
@@ -563,7 +599,7 @@ fn run(cli: Cli) -> Result<()> {
         );
         return Ok(());
     }
-    let sweeper = Sweeper::new()?;
+    let sweeper = Sweeper::new(&cli)?;
     let poller = Poller {
         cfg: &cfg,
         gh: gh_path(),

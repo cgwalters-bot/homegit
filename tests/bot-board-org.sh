@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Offline tests of how 'bot-board fill-org' derives an item's Org, against
+# Offline tests of how 'bot-board fill-org' derives an item's Org, and of
+# 'list --field' filtering by a text field (Lead), against
 # a fake 'gh' serving a fixed board and repository lookups. No network,
 # no quota.
 #   tests/bot-board-org.sh
@@ -52,7 +53,7 @@ chmod +x "${WORK}/bin/gh"
 
 jq -n '{fields: [{id: "F_org", name: "Org", options: [
     "bootc-dev", "coreos", "osbuild", "redhat-cop", "cgwalters-forge", "cgwalters-bot", "other"
-    | {id: "O_\(.)", name: .}]}]}' >"${FAKE_GH}/fields.json"
+    | {id: "O_\(.)", name: .}]}, {id: "F_lead", name: "Lead"}]}' >"${FAKE_GH}/fields.json"
 cat >"${FAKE_GH}/sources" <<'EOF'
 cgwalters-forge/bootc bootc-dev/bootc
 cgwalters-forge/image-builder osbuild/image-builder
@@ -123,3 +124,29 @@ for want in "POST labels" "POST issues/5/labels" "POST issues/6/labels" "POST is
 done
 test "$(grep -c '/labels$' "${FAKE_GH}/labels")" -eq 3 || fail "label calls for non-tracker items: $(cat "${FAKE_GH}/labels")"
 echo "all ${#CASES[@]} fill-org cases passed, tracker labels synced"
+
+# list --field NAME=VALUE: items 0 and 1 are led by wfc, 2 by coordinator,
+# the rest by nobody.
+jq '.items |= [to_entries[] | .value + (if .key < 2 then {lead: "wfc"} elif .key == 2 then {lead: "coordinator"} else {} end)]' \
+    "${FAKE_GH}/items.json" >"${WORK}/led.json"
+mv "${WORK}/led.json" "${FAKE_GH}/items.json"
+# CASE|ARGS (space separated)|EXPECTED IDS, sorted
+readonly LIST_CASES=(
+    "led by wfc|--field Lead=wfc|PVTI_0 PVTI_1"
+    "--field=NAME=VALUE form|--field=Lead=coordinator|PVTI_2"
+    "lead unset|--field Lead=none|$(seq -f 'PVTI_%g' 3 $((${#CASES[@]} - 1)) | tr '\n' ' ' | sed 's/ $//')"
+    "repeats all match|--field Lead=wfc --field Org=other|PVTI_1"
+    "no match|--field Lead=nobody|"
+)
+for c in "${LIST_CASES[@]}"; do
+    IFS='|' read -r name args want <<<"${c}"
+    # shellcheck disable=SC2086 # the words are the arguments
+    got=$("${BIN}/bot-board" --refresh list --json ${args} 2>"${WORK}/err" | jq -r '[.[].id] | sort | join(" ")') ||
+        fail "list ${name}: $(cat "${WORK}/err")"
+    want=$(tr ' ' '\n' <<<"${want}" | sort | tr '\n' ' ' | sed 's/ $//')
+    test "${got}" = "${want}" || fail "list ${name}: got '${got}', want '${want}'"
+done
+"${BIN}/bot-board" list --field Nope=x >/dev/null 2>"${WORK}/err" && fail "list --field of an unknown field succeeded"
+grep -q "no 'Nope' field" "${WORK}/err" || fail "unknown --field: $(cat "${WORK}/err")"
+"${BIN}/bot-board" list --field Lead >/dev/null 2>"${WORK}/err" && fail "list --field without a value succeeded"
+echo "list --field cases passed"

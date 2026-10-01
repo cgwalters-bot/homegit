@@ -238,6 +238,38 @@ fn assert_no_news(r: &Run) {
 }
 
 #[test]
+fn passes_the_lead_filters_to_bot_watch_only() {
+    let w = World::new();
+    let r = w.run(
+        &fixtures("base"),
+        &[
+            "--once",
+            "--lead",
+            "wfc",
+            "--exclude-lead",
+            "*",
+            "--exclude-lead",
+            "other",
+        ],
+    );
+    assert_news(&r, BASE_KINDS);
+    assert!(
+        r.calls.contains(
+            &"bot-watch --apply --lead wfc --exclude-lead * --exclude-lead other".to_string()
+        ) && r.calls.contains(&"bot-pr inbox --dry-run".to_string()),
+        "{:?}",
+        r.calls
+    );
+    // The dry run shows them too.
+    let r = w.run(&fixtures("base"), &["--dry-run", "--lead", "wfc"]);
+    assert!(
+        r.stdout.contains("/bot-watch --apply --lead wfc\n"),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
 fn reports_once_and_keeps_the_seen_sets_across_runs() {
     let w = World::new();
     // The first sweep: all of base is new. Every step runs, in order.

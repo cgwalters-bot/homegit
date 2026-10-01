@@ -309,6 +309,50 @@ sweep first 2026-09-25T14:00:00Z '{}'
 expect first "the first sweep has no news" '.items == []'
 expect first "the first sweep lists the outstanding reviews" "${outstanding_args[@]}" "${OUTSTANDING_JQ}"
 
+# Lead filters: the PR is led by wfc, the issue by the coordinator itself
+# and the bot's own repository's PR by another topic. --exclude-lead '*'
+# leaves the topics' items alone (and the coordinator's, and nobody's,
+# swept); --lead sweeps only the named topic's, and the topics' PRs are
+# never reported as "not on the board".
+jq --arg pr "${PR}" --arg issue "${ISSUE}" --arg own "${OWN_PR}" \
+    'map(if .content.url == $pr then .lead = "wfc" elif .content.url == $issue then .lead = "coordinator"
+         elif .content.url == $own then .lead = "other" else . end)' "${WORK}/board.json" >"${WORK}/lead-board.json"
+# lead_sweep NAME ARGS...: a sweep of the led board from the EARLIER state.
+lead_sweep() {
+    local name=$1
+    shift
+    printf '%s\n' "${EARLIER}" >"${WORK}/${name}.state"
+    "${BOT_WATCH}" --json --now 2026-09-25T14:00:00Z --board-file "${WORK}/lead-board.json" \
+        --state-file "${WORK}/${name}.state" "$@" >"${WORK}/${name}.json" 2>"${WORK}/${name}.err" ||
+        { cat "${WORK}/${name}.err" 1>&2; fail "${name}: sweep failed"; }
+}
+# NAME|ARGS|URLS WITH NEWS|ITEM IDS OF THE SWEPT URLS' OUTSTANDING REVIEWS
+readonly LEAD_CASES=(
+    "excl-any|--exclude-lead *|${ISSUE} ${BOT_ISSUE}|"
+    "excl-wfc|--exclude-lead wfc|${ISSUE} ${BOT_ISSUE} ${OWN_PR}|PVTI_own"
+    "excl-two|--exclude-lead wfc --exclude-lead other|${ISSUE} ${BOT_ISSUE}|"
+    "lead-wfc|--lead wfc|${PR}|PVTI_pr"
+    "lead-coord|--lead coordinator|${ISSUE} ${BOT_ISSUE}|"
+    "lead-none|--lead nobody||"
+)
+for c in "${LEAD_CASES[@]}"; do
+    IFS='|' read -r name args urls outstanding <<<"${c}"
+    read -ra argv <<<"${args}" # no globbing of the '*'
+    lead_sweep "${name}" "${argv[@]}"
+    # shellcheck disable=SC2086 # the URLs are separate words
+    want=$(jq -nc '$ARGS.positional | sort' --args ${urls})
+    jq -e --argjson want "${want}" '[.items[].changes[].url] | unique == $want' "${WORK}/${name}.json" >/dev/null ||
+        fail "${name}: expected news from ${urls}; report: $(jq -c '[.items[].changes[].url]' "${WORK}/${name}.json")"
+    got=$(jq -r '[.outstanding_reviews[] | .items[].id] | sort | join(" ")' "${WORK}/${name}.json")
+    test "${got}" = "${outstanding}" || fail "${name}: outstanding reviews of items '${got}', not '${outstanding}'"
+    # The topics' PRs are on the board: never reported as off it.
+    jq -e '[.outstanding_reviews[] | select(.items == []) | .url] | index("'"${PR}"'") == null' "${WORK}/${name}.json" >/dev/null ||
+        fail "${name}: the led PR is reported as off the board"
+done
+"${BOT_WATCH}" --lead '*' --board-file "${WORK}/lead-board.json" --state-file "${WORK}/x.state" >/dev/null 2>"${WORK}/err" &&
+    fail "--lead '*' was accepted"
+grep -q "takes a topic name" "${WORK}/err" || fail "--lead '*': $(cat "${WORK}/err")"
+
 # Leave and return: the PR leaves the board, cgwalters comments while
 # it's away, and it comes back. Only that comment is news, not his
 # review from before it left, which the first sweep reported.

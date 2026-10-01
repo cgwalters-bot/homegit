@@ -27,7 +27,15 @@ readonly FORK_PR_JQ='def fork_pr($owner): .user.login == $bot and ($forks | inde
     and ((.body // "") | contains($meta));'
 # The search API returns at most 1000 results.
 readonly SEARCH_MAX_PAGES=10
-readonly STATE_NAME=watch
+# A sweep of one topic lead's items keeps its own state (STATE_NAME, then
+# a suffix), so that it neither drops the URLs of the other sweeps nor
+# is dropped by them.
+STATE_NAME=watch
+# The Lead field says which topic session owns an item; the coordinator
+# owns the rest, and the items it names itself.
+readonly COORDINATOR_LEAD=coordinator
+# --exclude-lead ANY_LEAD: every Lead but COORDINATOR_LEAD.
+readonly ANY_LEAD='*'
 readonly STATE_VERSION=1
 # Items in these statuses or workflows are not swept.
 readonly SKIP_STATUSES='["Done"]'
@@ -82,7 +90,7 @@ source "$(dirname "$(readlink -f "$0")")/review-state.sh" || {
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--dry-run] [--apply] [--json]
+Usage: $(basename "$0") [--dry-run] [--apply] [--json] [--lead LEAD] [--exclude-lead LEAD]...
 
 Sweep the upstream issues and PRs of the Workstream board's items (not
 ${SKIP_STATUSES}, not Workflow ${SKIP_WORKFLOWS}): each item's own issue or PR, and
@@ -179,10 +187,25 @@ Only --apply makes these changes, through bot-board (on a fresh board
 listing), and only for items in ${APPLY_FROM}. Each change is suggested
 once: the next sweep sees no transition any more.
 
+A topic session owns the items whose Lead field names it (see the
+topic-lead skill). The coordinator leaves those to it with
+--exclude-lead '${ANY_LEAD}' (any Lead but ${COORDINATOR_LEAD}); a topic session sweeps only
+its own with --lead TOPIC, keeping its own last-seen state. The filters
+apply to the item news, rebase and bookkeeping sections (--lead $COORDINATOR_LEAD
+includes the items with no Lead); --lead also skips the search for the
+bot's PRs on no item. The priority health and P0 drive sections are
+deterministic and shared: they cover every item (with --lead, only that
+lead's). The sign-offs and promotions always cover every item.
+
 Options:
   --dry-run   Report only: apply nothing and keep the last-seen state
   --apply     Make the suggested status changes (a run without --apply
               or --dry-run only reports them, and the next doesn't)
+  --lead LEAD
+              Sweep only the items whose Lead is LEAD
+  --exclude-lead LEAD
+              Skip the items whose Lead is LEAD ('${ANY_LEAD}': any but
+              ${COORDINATOR_LEAD}); repeatable
   --json      Print one JSON object for agents instead of the report
   -h, --help  Show this help
 
@@ -245,11 +268,15 @@ board_file=
 epic_board_file=
 state_file=
 now=
+lead=
+exclude_leads=()
 while test $# -gt 0; do
     case "$1" in
         --dry-run) dry_run=true; shift ;;
         --apply) apply=true; shift ;;
         --json) json=true; shift ;;
+        --lead) test $# -ge 2 || fatal "--lead requires a value"; lead=$2; shift 2 ;;
+        --exclude-lead) test $# -ge 2 || fatal "--exclude-lead requires a value"; exclude_leads+=("$2"); shift 2 ;;
         --board-file) test $# -ge 2 || fatal "--board-file requires a file"; board_file=$2; shift 2 ;;
         --state-file) test $# -ge 2 || fatal "--state-file requires a file"; state_file=$2; shift 2 ;;
         --epic-board-file) test $# -ge 2 || fatal "--epic-board-file requires a file"; epic_board_file=$2; shift 2 ;;
@@ -339,6 +366,12 @@ if test -d "${ETAG_DIR}"; then
     find "${ETAG_DIR}" -type f -mtime "+${ETAG_KEEP_DAYS}" -delete || warn "pruning ${ETAG_DIR} failed"
 fi
 
+if test -n "${lead}"; then
+    test "${lead}" != "${ANY_LEAD}" || fatal "--lead takes a topic name, not '${ANY_LEAD}'"
+    # Free-text, case-sensitive: the same as the board shows.
+    STATE_NAME=watch-lead-${lead//[^A-Za-z0-9._-]/_}
+fi
+
 login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
 test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}"
 
@@ -369,8 +402,21 @@ seen=$(jq -ce --argjson v "${STATE_VERSION}" '
     if (.version // $v) != $v then error("unsupported version \(.version)") else .items // {} end' <<<"${state}") ||
     fatal "cannot use the last-seen state (bot-state: ${STATE_NAME}); fix it, or empty it to start over"
 
-# One record per swept URL, with the board items it belongs to.
-watch=$(jq -c --argjson skip_status "${SKIP_STATUSES}" --argjson skip_workflow "${SKIP_WORKFLOWS}" '
+# The items this sweep owns, by Lead (see --help).
+exclude_json=$(printf '%s\n' "${exclude_leads[@]}" | jq -Rsc 'split("\n")[:-1]')
+test "${#exclude_leads[@]}" -gt 0 || exclude_json='[]'
+LEAD_FILTER_JQ='def led_by($want): (.lead // "") as $l | $l == $want or ($l == "" and $want == $coord);
+    def excluded($ex): (.lead // "") as $l | $l != "" and any($ex[]; . == $l or (. == $any and $l != $coord));'
+filter_leads() { # filter_leads BOARD_JSON: the items --lead and --exclude-lead leave
+    jq -c --arg lead "${lead}" --argjson ex "${exclude_json}" --arg any "${ANY_LEAD}" --arg coord "${COORDINATOR_LEAD}" \
+        "${LEAD_FILTER_JQ}"' [.[] | select($lead == "" or led_by($lead)) | select(excluded($ex) | not)]' <<<"$1"
+}
+swept_board=$(filter_leads "${board}")
+
+# watch_records BOARD_JSON: one record per swept URL, with the board
+# items it belongs to.
+watch_records() {
+    jq -c --argjson skip_status "${SKIP_STATUSES}" --argjson skip_workflow "${SKIP_WORKFLOWS}" '
     [.[] | select((.status // "") as $s | $skip_status | index($s) | not)
          | select((.workflow // "") as $w | $skip_workflow | index($w) | not)
          | {id, title, status, workflow, why} as $item
@@ -378,7 +424,12 @@ watch=$(jq -c --argjson skip_status "${SKIP_STATUSES}" --argjson skip_workflow "
             ((.branch // "") | split(" ")[]
              | capture("^(?<u>https://github\\.com/[^/]+/[^/]+/pull/[0-9]+)(?:[/#?]|$)").u))
          | {url: ., item: $item}]
-    | group_by(.url) | map({url: .[0].url, items: [.[].item] | unique_by(.id)})' <<<"${board}")
+    | group_by(.url) | map({url: .[0].url, items: [.[].item] | unique_by(.id)})' <<<"$1"
+}
+watch=$(watch_records "${swept_board}")
+# The PRs of every item, led or not: not "off the board" for the search
+# that finds the bot's PRs on no item.
+board_urls=$(watch_records "${board}" | jq -c '[.[].url]')
 nurls=$(jq length <<<"${watch}")
 # When the last sweep that wrote the state started (older states only
 # have when they were written). Without either, this is the first sweep,
@@ -780,6 +831,8 @@ outstanding=$(jq -c --slurpfile results "${scratch}/results.json" '
 # their reviews and CI. Fails if the search does; a PR that can't be read
 # is skipped with a warning.
 off_board() {
+    # The PRs on no item are the coordinator's safety net, not a topic's.
+    test -z "${lead}" || return 0
     local search_q search found='' page=1 total extra url o rc
     # Oldest first: a PR opened during the paging lands on the last page
     # rather than shifting the others (duplicates are dropped below).
@@ -797,10 +850,9 @@ off_board() {
         fi
         page=$((page + 1))
     done
-    extra=$(jq -rs --slurpfile watch <(printf '%s\n' "${watch}") --arg bot "${BOT_LOGIN}" --argjson forks "${FORK_OWNERS}" \
+    extra=$(jq -rs --argjson swept "${board_urls}" --arg bot "${BOT_LOGIN}" --argjson forks "${FORK_OWNERS}" \
         --arg meta "${FORK_META}" "${FORK_PR_JQ}"'
-        [$watch[0][].url] as $swept
-        | [.[] | select(fork_pr(.html_url | capture("^https://github\\.com/(?<o>[^/]+)/").o) | not) | .html_url
+        [.[] | select(fork_pr(.html_url | capture("^https://github\\.com/(?<o>[^/]+)/").o) | not) | .html_url
            | select(IN($swept[]) | not)] | unique[]' <<<"${found}")
     while IFS= read -r url; do
         test -n "${url}" || continue
@@ -891,7 +943,10 @@ needs_rebase=$(jq -c --argjson co "${conflicts_only}" "${REBASE_REPO_JQ}"'
 # sections above, a to-do on every sweep. Its failing costs only the
 # section, with a warning and a nonzero exit.
 health_failed=false
-printf '%s\n' "${board}" >"${scratch}/board.json"
+# With --lead, only that lead's items; --exclude-lead leaves it every one.
+health_board=${board}
+test -z "${lead}" || health_board=${swept_board}
+printf '%s\n' "${health_board}" >"${scratch}/board.json"
 health_args=(--json --board-file "${scratch}/board.json")
 test -z "${now}" || health_args+=(--now "${now}")
 if test -n "${epic_board_file}"; then

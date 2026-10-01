@@ -186,11 +186,15 @@ Read and update the Workstream board, or another of the bot's boards
 (${BOARD_URL} here).
 
 Commands:
-  list [--status S] [--org O] [--json]
+  list [--status S] [--org O] [--field NAME=VALUE]... [--json]
                               List items by priority (P0 first): item id,
                               priority, status, workflow, org, title, url.
                               '--status none' lists untriaged items,
                               '--org none' items without an Org.
+                              --field keeps the items whose text or
+                              single-select field NAME (any other, such
+                              as Lead) is VALUE ('none': unset); repeats
+                              all have to match.
   show ITEM                   Show all fields of one item
   add [--priority P] URL      Add an issue or PR and set its Org from the
                               URL's repository (a fork's upstream, for
@@ -649,13 +653,23 @@ resolve_item() {
 }
 
 cmd_list() {
-    local status="" org="" json=false
+    local status="" org="" json=false field
+    local fields=() i # NAME VALUE pairs, one per --field
     while test $# -gt 0; do
         case "$1" in
             --status) test $# -ge 2 || fatal "--status requires an argument"; status=$2; shift 2 ;;
             --status=*) status=${1#--status=}; shift ;;
             --org) test $# -ge 2 || fatal "--org requires an argument"; org=$2; shift 2 ;;
             --org=*) org=${1#--org=}; shift ;;
+            --field|--field=*)
+                if test "$1" = --field; then
+                    test $# -ge 2 || fatal "--field requires NAME=VALUE"
+                    field=$2; shift 2
+                else
+                    field=${1#--field=}; shift
+                fi
+                [[ ${field} == ?*=?* ]] || fatal "--field wants NAME=VALUE, not '${field}'"
+                fields+=("${field%%=*}" "${field#*=}") ;;
             --json) json=true; shift ;;
             *) fatal "unknown argument for list: $1 (see --help)" ;;
         esac
@@ -668,13 +682,25 @@ cmd_list() {
         load_fields
         option_id Org "${org}" >/dev/null
     fi
+    if test "${#fields[@]}" -gt 0; then
+        load_fields
+        for ((i = 0; i < ${#fields[@]}; i += 2)); do
+            has_field "${fields[i]}" || fatal "the board has no '${fields[i]}' field (try --refresh)"
+        done
+    fi
     load_items
     # Unset priorities sort last; sort_by is stable, so board order is kept
     # within a priority.
-    local sorted
-    sorted=$(jq --arg status "${status}" --arg org "${org}" '
+    local sorted fields_json='[]'
+    if test "${#fields[@]}" -gt 0; then
+        fields_json=$(printf '%s\n' "${fields[@]}" |
+            jq -Rsc 'split("\n")[:-1] | [range(0; length; 2) as $i | {name: .[$i], value: .[$i + 1]}]')
+    fi
+    sorted=$(jq --arg status "${status}" --arg org "${org}" --argjson fields "${fields_json}" '
         def matches($want; $have): $want == "" or ($want == "none" and $have == null) or $have == $want;
-        [.items[] | select(matches($status; .status) and matches($org; .org))]
+        def blank: if . == "" then null else . end;
+        [.items[] | select(matches($status; .status) and matches($org; .org))
+           | select(. as $item | all($fields[]; matches(.value; ($item[.name | ascii_downcase] | blank))))]
         | sort_by(.priority // "P9")' <<<"${ITEMS_JSON}")
     if ${json}; then
         echo "${sorted}"
