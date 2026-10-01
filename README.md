@@ -369,3 +369,22 @@ useful.
 ## Agent configuration
 
 This repository also contains [AGENTS.md](AGENTS.md), my default system prompt for agents.
+
+## Praxis credential broker Quadlet
+
+The rootless Praxis credential broker Quadlets are tracked in
+`dotfiles/.config/containers/systemd/praxis-credential-broker/`. The normal
+`install-dotfiles.sh` deployment places them under
+`~/.config/containers/systemd/`. Each pod and container unit is gated with
+`ConditionHost=xenon`, so the user manager will not start it on another host.
+
+The Praxis checkout must remain at
+`~/src/github/cgwalters-bot/praxis-credential-broker`: the gateway unit mounts
+`%h/src/github/cgwalters-bot/praxis-credential-broker/praxis.yaml`, which
+systemd expands to the user manager's home directory. Podman secrets and the
+persisted authentication volume are deliberately not tracked here.
+
+Do not install this alongside an older manually managed Quadlet directory or
+symlink. Replace that deployment only in a planned migration, then run
+`systemctl --user daemon-reload`; this prevents duplicate unit sources and does
+not require putting credentials in this repository.
