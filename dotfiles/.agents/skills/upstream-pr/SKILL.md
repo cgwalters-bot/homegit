@@ -116,7 +116,13 @@ topic branch per change.
   a PR promote opened without it, on the same approval of the same head,
   or, after rework pushed since promote, on their approving review of the
   current head on the upstream PR itself) are the only ways their sign-off
-  gets added; never add it by hand.
+  gets added; never add it by hand. Once added, `bot-git rework` keeps it
+  on commits reworked per their review, and `bot-git carry-signoff` on
+  commits an independent review attests are not substantively different
+  (a rebase, a mechanical conflict resolution, a small fix), with a PR
+  comment from `bot-pr carry-note` that the operator can answer with
+  `/no-carry`; see "Commit attribution" in the shared AGENTS.md. A commit
+  new since they signed off never gets it either way.
   Commits by anyone else get it only if the operator asks
   (`promote --include-others`); with `--no-signoff`, promote instead
   tells the maintainers to comment `/signoff` where the repository has

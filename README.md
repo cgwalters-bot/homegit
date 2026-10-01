@@ -301,6 +301,17 @@ upstream PR promote opened without my sign-off, `bot-pr signoff
 <upstream-pr-url>` adds it on the same approval, as long as the PR's head
 is still what promote opened it with.
 
+Once my sign-off is on a commit, the bot keeps it through a rework of what
+I asked for (`bot-git rework`), and through other changes that aren't
+completely different, such as a conflict resolution or a small fix, when
+a separate review agent attests that from the range-diff (`bot-git
+carry-signoff`). Commits new since I signed off never get it that way.
+Each carry ends with a PR comment listing the commits, their classes and
+the range-diff to check; replying `/no-carry` makes the bot drop it again
+(`bot-pr no-carry`, run by the sweeps). Where a repository dismisses stale
+reviews, merging still needs my approval; this only spares the separate
+sign-off step.
+
 Upstream PRs that didn't go through promote still sit with a failing DCO
 check until a human signs off. `bin/dco-signoff`, run by me with my own git
 identity and gh login, finds them and fixes that:
