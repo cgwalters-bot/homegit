@@ -121,7 +121,7 @@ expect "broken config (node)" "unknown key 'operator.logn'"
 
 # --- Every tool's help ---
 for tool in bot-board bot-notify bot-watch bot-pr bot-git bot-land bot-heartbeat bot-priority-health \
-    upstream-policy bot-drive bot-signoff-due bot-promote-due bot-tmt-number bot-review-guide bot-devspace bot-work bot-feedback \
+    upstream-policy bot-drive bot-operator-activity bot-signoff-due bot-promote-due bot-tmt-number bot-review-guide bot-devspace bot-work bot-feedback \
     bot-runs dco-signoff bot-operator; do
     run "help-${tool}" "${BIN}/${tool}" --help
 done

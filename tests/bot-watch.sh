@@ -102,6 +102,9 @@ put() {
     mkdir -p "$(dirname "${REST}/$1.json")"
     printf '%s\n' "$2" >"${REST}/$1.json"
 }
+# The operator's activity (bot-operator-activity): nothing new.
+put users/cgwalters/events '[]'
+put notifications '[]'
 
 # pr REPO NUMBER HEAD UPDATED_AT [BODY]: an open PR, opened by the bot at
 # 13:17.

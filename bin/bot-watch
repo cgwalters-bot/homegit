@@ -77,6 +77,8 @@ PROMOTE_DUE=$(dirname "$(readlink -f "$0")")/bot-promote-due
 readonly PROMOTE_DUE
 DRIVE=$(dirname "$(readlink -f "$0")")/bot-drive
 readonly DRIVE
+OPERATOR_ACTIVITY=$(dirname "$(readlink -f "$0")")/bot-operator-activity
+readonly OPERATOR_ACTIVITY
 # shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
     echo "error: ${0##*/} needs gh-http.sh from homegit's bin/ next to it" 1>&2
@@ -150,6 +152,14 @@ With --apply, each gets 'bot-pr promote' (with --draft after his
 refused; with --dry-run (or --board-file), the command it would run;
 otherwise they are only listed. Approved fork PRs for a human-text
 repository are never promoted: they are listed under "Needs your text".
+
+Then the "Operator activity" of 'bot-operator-activity' (see its
+--help): what ${REQUESTER} did on GitHub lately that the bot should act
+on, one line per event, "KIND ACTION URL: SUMMARY": their events on the
+bot's work (the board's, the bot's issues and PRs, threads it commented
+in), classified once each by a small model. Mentions, requests and
+approvals are left to bot-notify and the sign-off and promotion steps.
+With --dry-run (or --board-file), nothing new is classified.
 
 Apart from those changes, every sweep lists the "Outstanding reviews by
 ${REQUESTER}" on the bot's open PRs other than fork PRs (upstream ones
@@ -1015,6 +1025,11 @@ signoffs=$(due_step "${SIGNOFF_DUE}" "sign-offs due") || signoff_failed=true
 # "Needs your text".
 promotion_failed=false
 promotions=$(due_step "${PROMOTE_DUE}" "promotions due") || promotion_failed=true
+# What the operator did that the bot should act on (by event, so
+# bot-poll wakes once per event however often a sweep lists it).
+activity_failed=false
+activity=$(due_step "${OPERATOR_ACTIVITY}" "operator activity" --board-file "${scratch}/board.json" ${now:+--now "${now}"}) ||
+    activity_failed=true
 needs_text=$(jq -c '[.[] | select(.result == "needs-text")]' <<<"${promotions}")
 promotions=$(jq -c '[.[] | select(.result != "needs-text")]' <<<"${promotions}")
 
@@ -1105,12 +1120,13 @@ if ${json}; then
         --argjson drive_failed "${drive_failed}" --slurpfile signoffs <(printf '%s\n' "${signoffs}") \
         --argjson signoff_failed "${signoff_failed}" --slurpfile promotions <(printf '%s\n' "${promotions}") \
         --slurpfile needs_text <(printf '%s\n' "${needs_text}") --argjson promotion_failed "${promotion_failed}" \
+        --slurpfile activity <(printf '%s\n' "${activity}") --argjson activity_failed "${activity_failed}" \
         '$new[0] as $new | $failed[0] as $failed | $gone[0] as $gone
          | $outstanding[0] as $outstanding | $needs_rebase[0] as $needs_rebase
          | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], p0_drive: $drive[0], signoffs: $signoffs[0], promotions: $promotions[0],
-          needs_text: $needs_text[0], items: ., outstanding_reviews: $outstanding,
+          operator_activity: $activity[0], needs_text: $needs_text[0], items: ., outstanding_reviews: $outstanding,
           needs_rebase: $needs_rebase, new_urls: $new, failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed,
-          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, state_advanced: $advance}' <<<"${report}"
+          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, operator_activity_failed: $activity_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news. The P0 and P1
     # health lines come first of all.
@@ -1119,6 +1135,7 @@ else
     jq -r 'if length == 0 then empty else "Sign-offs:", (.[] | "  \(.line)"), "" end' <<<"${signoffs}"
     jq -r 'if length == 0 then empty else "Promotions:", (.[] | "  \(.line)"), "" end' <<<"${promotions}"
     jq -r 'if length == 0 then empty else "Needs your text:", (.[] | "  \(.line)"), "" end' <<<"${needs_text}"
+    jq -r 'if length == 0 then empty else "Operator activity:", (.[] | "  \(.line)"), "" end' <<<"${activity}"
     jq -r --arg req "${REQUESTER}" "${REPO_REF_JQ}"'
         if length == 0 then empty else
             "Outstanding reviews by \($req):",
@@ -1160,7 +1177,7 @@ else
               elif .allowed then " (with --apply)"
               else " (not applied from \($status // "no status"); a human decides)" end),
         ""' <<<"${report}"
-    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${drive}") P0 PRs driven, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${drive}") P0 PRs driven, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${activity}") operator activity lines, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
 # Failed URLs kept their last-seen state in new_seen, so their changes
@@ -1188,5 +1205,6 @@ test "${napply_failed}" -eq 0 || exit 1
 ! ${search_failed} || exit 1
 ! ${health_failed} || exit 1
 ! ${drive_failed} || exit 1
+! ${activity_failed} || exit 1
 ! ${signoff_failed} || exit 1
 ! ${promotion_failed} || exit 1
