@@ -114,6 +114,28 @@ readonly SIGNOFF_RECORD='<!-- bot-pr signoff'
 readonly SIGNOFF_RECORD_RE='<!-- bot-pr signoff approved=(?<approved>[0-9a-f]{40}) signed=(?<signed>[0-9a-f]{40}) approval=(?<approval>[^ ]+) review=(?<review>[^ ]+) -->[[:space:]]*$'
 # Returned by add_signoff() when commits by others lack the sign-off.
 readonly EX_OTHERS=11
+# The start of the hidden last line of the bot's comment on an upstream
+# PR that records the sign-offs 'bot-git carry-signoff' carried (see
+# carry-note): the head he signed off, the head pushed, and the carried
+# commits.
+readonly CARRY_RECORD='<!-- bot-pr carry'
+# shellcheck disable=SC2016 # jq, not shell
+readonly CARRY_RECORD_RE='<!-- bot-pr carry was=(?<was>[0-9a-f]{40}) head=(?<head>[0-9a-f]{40}) carried=(?<carried>[0-9a-f,]*) -->'
+# A line consisting of this, in a comment by REVIEWER after such a
+# comment, revokes the sign-offs it carried (see no-carry) ...
+readonly NO_CARRY_COMMAND=/no-carry
+# ... and the start of the hidden last line of the bot's reply, which
+# settles every such comment before it.
+readonly NO_CARRY_RECORD='<!-- bot-pr no-carry'
+# How the carry comment names each class of an attestation (see bot-git's
+# CARRY_CLASSES).
+declare -rA CARRY_CLASS_LABEL=(
+    [unchanged]="(a) unchanged or rebase-only"
+    [conflict-resolution]="(b) mechanical conflict resolution"
+    [review-ask]="(c) implements ${HUMAN_POSSESSIVE} review asks"
+    [small-fix]="(d) small fix, same intent"
+    [substantive]="(e) substantively different"
+)
 BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
 readonly BOT_BOARD
 # The contribution policy gate that promote and signoff pass first. The
@@ -264,6 +286,28 @@ Commands:
         rebases it regardless.
         --dry-run does the rebase and checks in the cache clone and
         pushes, syncs and posts nothing.
+  carry-note UPSTREAM_PR_URL RECORD
+        After pushing a head that 'bot-git carry-signoff' made, comment
+        once on the upstream PR for ${REVIEWER} to audit it: the commits
+        whose sign-off it carried and those it dropped, each with its
+        class and the attesting review's reason, the commits new since
+        the head he signed off (never signed this way), the range-diff
+        that reproduces the review, and that a '${NO_CARRY_COMMAND}' line in his
+        reply revokes it. RECORD is carry-signoff's record; it refuses
+        unless the PR's head is the one that record names. Posts nothing
+        when no sign-off was carried, or when the PR has that comment
+        already.
+  no-carry UPSTREAM_PR_URL [--dry-run] [--no-ai-trailer]
+        Act on ${REVIEWER}'s '${NO_CARRY_COMMAND}' line in a comment on the upstream PR
+        after a carry-note comment (and after the bot's last no-carry
+        reply): drop his sign-off from the commits those comments name
+        ('bot-git drop-signoff'), or, if the head moved since the last of
+        them, from all of the bot's commits; run 'bot-git check'
+        (--no-ai-trailer is passed on) against the pushed head;
+        force-push with a lease on it; and reply once, which settles
+        those comments. Without such a line it does nothing. Prints the
+        new head. bot-signoff-due --apply runs it on every sweep.
+        Those commits then need his approval and 'signoff'.
   set-item FORK_PR_URL PVTI_... [--force]
         Change the board item recorded in a fork PR's bot-meta section,
         which promote moves to In Review, and leave the rest of the body
@@ -2557,6 +2601,195 @@ cmd_rebase() {
     echo "${new_sha}"
 }
 
+# read_upstream_pr URL: for carry-note and no-carry, sets REPO, NUMBER,
+# PR (the PR's JSON), HEAD_REF, HEAD_REPO, HEAD_SHA, BASE_REF and
+# BASE_REPO for one of the bot's open upstream PRs from a fork in
+# FORGE_ORG or the bot's own; exits otherwise.
+read_upstream_pr() {
+    [[ "$1" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)$ ]] ||
+        fatal "expected a PR URL (https://github.com/OWNER/REPO/pull/N), got '$1'"
+    REPO=${BASH_REMATCH[1]} NUMBER=${BASH_REMATCH[2]}
+    [[ ! "${REPO}" =~ ^(${FORGE_ORG}|${BOT_LOGIN})/ ]] ||
+        fatal "$1 is not an upstream PR; ${REVIEWER}'s sign-off is only carried on those"
+    PR=$(ghapi "repos/${REPO}/pulls/${NUMBER}") || fatal "cannot read $1"
+    local author state
+    read -r author state HEAD_REF HEAD_REPO HEAD_SHA BASE_REF BASE_REPO < <(jq -r \
+        '"\(.user.login) \(.state) \(.head.ref) \(.head.repo.full_name) \(.head.sha) \(.base.ref) \(.base.repo.full_name)"' <<<"${PR}")
+    test "${author}" = "${BOT_LOGIN}" || fatal "$1 was opened by ${author}, not ${BOT_LOGIN}"
+    test "${state}" = open || fatal "$1 is ${state}"
+    [[ "${HEAD_REPO}" =~ ^(${FORGE_ORG}|${BOT_LOGIN})/ ]] ||
+        fatal "$1's head is in ${HEAD_REPO}, not in a fork in ${FORGE_ORG} or ${BOT_LOGIN}'s"
+}
+
+# pr_comments REPO NUMBER: the PR's conversation comments, oldest first.
+pr_comments() {
+    ghapi --paginate "repos/$1/issues/$2/comments?per_page=100" --jq '.[]' | jq -sc 'sort_by(.id)' ||
+        fatal "cannot list the comments of $1#$2"
+}
+
+cmd_carry_note() {
+    local url="" record=""
+    while test $# -gt 0; do
+        case "$1" in
+            -*) fatal "unknown argument for carry-note: $1 (see --help)" ;;
+            *)
+                if test -z "${url}"; then url=${1%/}
+                elif test -z "${record}"; then record=$1
+                else fatal "carry-note takes a PR URL and a RECORD"
+                fi
+                shift ;;
+        esac
+    done
+    test -n "${record}" || fatal "usage: $(basename "$0") carry-note UPSTREAM_PR_URL RECORD"
+    local labels
+    labels=$(for c in "${!CARRY_CLASS_LABEL[@]}"; do jq -n --arg k "${c}" --arg v "${CARRY_CLASS_LABEL[${c}]}" '{($k): $v}'; done | jq -sc add)
+    jq -e --argjson labels "${labels}" '.version == 1 and (.pr | type == "string") and (.reviewer | type == "string")
+        and ([.was, .head, .base] | all(type == "string" and test("^[0-9a-f]{40}$")))
+        and (.commits | type == "array" and all(.class as $c | $labels | has($c))) and (.new_commits | type == "array")' \
+        "${record}" >/dev/null 2>&1 || fatal "${record} is not a record of 'bot-git carry-signoff'"
+    test "$(jq -r .pr "${record}")" = "${url}" || fatal "${record} is for $(jq -r .pr "${record}"), not ${url}"
+    local REPO NUMBER PR HEAD_REF HEAD_REPO HEAD_SHA BASE_REF BASE_REPO
+    check_login
+    read_upstream_pr "${url}"
+    local head
+    head=$(jq -r .head "${record}")
+    test "${HEAD_SHA}" = "${head}" ||
+        fatal "${url}'s head is ${HEAD_SHA:0:12}, not ${head:0:12} that ${record} names: push that first; nothing was posted"
+    local carried
+    carried=$(jq -r '[.commits[] | select(.carried) | .new] | join(",")' "${record}")
+    if test -z "${carried}"; then
+        info "no sign-off was carried to ${head:0:12}; nothing to post"
+        return 0
+    fi
+    local commits missing marker
+    commits=$(ghapi --paginate "repos/${REPO}/pulls/${NUMBER}/commits?per_page=100" \
+        --jq '.[] | {key: .sha, value: (.commit.message | split("\n")[0])}' | jq -sc from_entries) ||
+        fatal "cannot list the commits of ${url}"
+    missing=$(jq -r --argjson commits "${commits}" '[.commits[].new, .new_commits[]] | map(select($commits[.] == null)) | join(", ")' "${record}")
+    test -z "${missing}" || fatal "${url} lacks the commits ${missing} that ${record} names; nothing was posted"
+    marker="${CARRY_RECORD} was=$(jq -r .was "${record}") head=${head} carried=${carried} -->"
+    local comments chained
+    comments=$(pr_comments "${REPO}" "${NUMBER}")
+    if jq -e --arg bot "${BOT_LOGIN}" --arg m "${marker}" \
+        'any(.[]; .user.login == $bot and ((.body // "") | contains($m)))' <<<"${comments}" >/dev/null; then
+        info "${url} has the comment on ${head:0:12} already"
+        return 0
+    fi
+    # A carry compares with what he approved, never with an earlier carry.
+    chained=$(jq -r --arg bot "${BOT_LOGIN}" --arg re "${CARRY_RECORD_RE}" --arg was "$(jq -r .was "${record}")" \
+        '[.[] | select(.user.login == $bot) | (.body // "") | capture($re) | select(.head == $was)] | first | .was // empty' <<<"${comments}")
+    test -z "${chained}" ||
+        fatal "${record} carries from $(jq -r '.was[:12]' "${record}"), which an earlier carry on ${url} made: redo 'bot-git carry-signoff' from ${chained:0:12}, the head he approved before it, with an attestation of that change, and push that; nothing was posted"
+    local body
+    body=$(jq -r --argjson commits "${commits}" --argjson labels "${labels}" --arg req "${REVIEWER}" --arg reqs "${HUMAN_POSSESSIVE}" \
+        --arg cmd "${NO_CARRY_COMMAND}" --arg trailer "${LLMS_TRAILER}" --arg marker "${marker}" '
+        def item: "- `\(.new[:12])` \($commits[.new]): \($labels[.class]). \(.reason)";
+        [.commits[] | select(.carried)] as $kept | [.commits[] | select(.carried | not)] as $dropped
+        | [ "Kept \($reqs) `Signed-off-by` on \($kept | length) commit(s) since `\(.was[:12])`, the head he signed off, on an independent review of the range-diff:", "",
+            ($kept[] | item),
+            (if ($dropped | length) > 0 then "", "Dropped it (these need his approval and `bot-pr signoff`):", "", ($dropped[] | item) else empty end),
+            (if (.new_commits | length) > 0 then "", "New since then, so never signed this way (these need his approval and `bot-pr signoff`):", "",
+                (.new_commits[] | "- `\(.[:12])` \($commits[.])") else empty end),
+            "", "Attested by: \(.reviewer).",
+            "", "To check: `git range-diff \(.base[:12])..\(.was[:12]) \(.base[:12])..\(.head[:12])`. To revoke, \($req) replies `\($cmd)` and the bot drops the carried sign-offs.",
+            "", $trailer, $marker ] | join("\n")' "${record}")
+    ghapi -X POST "repos/${REPO}/issues/${NUMBER}/comments" -f body="${body}" >/dev/null ||
+        fatal "commenting on ${url} failed"
+    info "Commented on ${url}: $(jq '[.commits[] | select(.carried)] | length' "${record}") carried sign-off(s) on ${head:0:12}"
+}
+
+# NO_CARRY_PENDING_JQ, on a PR's comments sorted by id: the first comment by
+# $req with a $cmd line that some carry comment by $bot precedes, after the
+# bot's last no-carry reply, as {ask: URL, ask_id, carries: [{was, head,
+# carried}]} with the carry comments before it; null if there is none.
+# bot-signoff-due decides the same.
+# shellcheck disable=SC2016 # jq, not shell
+readonly NO_CARRY_PENDING_JQ='
+def lines: (.body // "") | gsub("\r"; "") | split("\n") | map(sub("^\\s+"; "") | sub("\\s+$"; ""));
+([.[] | select(.user.login == $bot and ((.body // "") | contains($settled))) | .id] | max // 0) as $last_reply
+| [.[] | select(.id > $last_reply)] as $after
+| first($after[] | select(.user.login == $req and (lines | index($cmd) != null)) | . as $a
+    | [$after[] | select(.user.login == $bot and .id < $a.id) | (.body // "") | capture($carry_re)] as $c
+    | select($c | length > 0) | {ask: $a.html_url, ask_id: $a.id, carries: $c}) // null'
+
+cmd_no_carry() {
+    local url="" dry_run=false check_args=()
+    while test $# -gt 0; do
+        case "$1" in
+            --dry-run) dry_run=true; shift ;;
+            --no-ai-trailer) check_args+=(--no-ai-trailer); shift ;;
+            -*) fatal "unknown argument for no-carry: $1 (see --help)" ;;
+            *) test -z "${url}" || fatal "no-carry takes one PR URL"; url=${1%/}; shift ;;
+        esac
+    done
+    test -n "${url}" || fatal "usage: $(basename "$0") no-carry UPSTREAM_PR_URL [--dry-run] [--no-ai-trailer]"
+    local REPO NUMBER PR HEAD_REF HEAD_REPO HEAD_SHA BASE_REF BASE_REPO
+    check_login
+    read_upstream_pr "${url}"
+    local pending
+    pending=$(pr_comments "${REPO}" "${NUMBER}" | jq -c --arg bot "${BOT_LOGIN}" --arg req "${REVIEWER}" \
+        --arg cmd "${NO_CARRY_COMMAND}" --arg settled "${NO_CARRY_RECORD}" --arg carry_re "${CARRY_RECORD_RE}" \
+        "${NO_CARRY_PENDING_JQ}") || fatal "cannot read the comments of ${url}"
+    if test "${pending}" = null; then
+        info "${url} has no '${NO_CARRY_COMMAND}' by ${REVIEWER} after a carried sign-off; nothing to do"
+        echo "${HEAD_SHA}"
+        return 0
+    fi
+    local ask targets=() scope
+    ask=$(jq -r .ask <<<"${pending}")
+    # Only while the head is the one the last carry pushed are its commits
+    # known; after a later push, all of the bot's commits lose it.
+    if jq -e --arg h "${HEAD_SHA}" '.carries | last | .head == $h' <<<"${pending}" >/dev/null; then
+        mapfile -t targets < <(jq -r '[.carries[].carried | split(",")[]] | unique[] | select(. != "")' <<<"${pending}")
+        scope="the commits whose sign-off was carried"
+    else
+        scope="all of the bot's commits, since the head moved after the carry"
+    fi
+    info "${REVIEWER} revoked the carried sign-off in ${ask}: dropping it from ${scope}$(! ${dry_run} || echo " (dry run)")"
+
+    local CLONE dir base new_sha out
+    open_clone "${HEAD_REPO}" "${HEAD_REF}" "${HEAD_SHA}" "${BASE_REPO}" "${BASE_REF}"
+    dir=${CLONE}
+    sgit -C "${dir}" checkout -q --force --detach refs/bot-pr/head 1>&2 || fatal "checking out ${HEAD_REF} in ${dir} failed"
+    base=$(sgit -C "${dir}" merge-base refs/bot-pr/base HEAD) || fatal "${HEAD_REF} and ${BASE_REPO}:${BASE_REF} have no merge-base"
+    # A carried commit no longer on the head (after a later push) is
+    # nothing to drop: keep only those that are.
+    local t kept_targets=()
+    for t in "${targets[@]}"; do
+        ! sgit -C "${dir}" merge-base --is-ancestor "${t}" HEAD 2>/dev/null || kept_targets+=("${t}")
+    done
+    if test "${#targets[@]}" -gt 0 && test "${#kept_targets[@]}" -eq 0; then
+        fatal "none of the carried commits is on ${url}'s head ${HEAD_SHA:0:12}; nothing was pushed"
+    fi
+    out=$(cd "${dir}" && "${BOT_GIT}" drop-signoff "${base}" "${kept_targets[@]}") ||
+        fatal "'bot-git drop-signoff' failed in ${dir}; nothing was pushed"
+    (cd "${dir}" && "${BOT_GIT}" check "${check_args[@]}" --was "${HEAD_SHA}" "${base}..HEAD") 1>&2 ||
+        fatal "'bot-git check' found problems with ${HEAD_REF} in ${dir} without the sign-offs (see above); nothing was pushed"
+    new_sha=$(sgit -C "${dir}" rev-parse HEAD) || fatal "cannot read the new head in ${dir}"
+    local dropped body
+    # shellcheck disable=SC2016 # backquotes for Markdown
+    dropped=$(sed -n 's/^dropped .* from \([0-9a-f]*\) (was .*/`\1`/p' <<<"${out}" | paste -sd, - | sed 's/,/, /g')
+    if test "${new_sha}" = "${HEAD_SHA}"; then
+        body="Re ${ask}: no commit here has ${HUMAN_POSSESSIVE} sign-off from a carry any more; nothing to drop."
+    else
+        body="Dropped ${HUMAN_POSSESSIVE} \`Signed-off-by\` from ${dropped}, per ${ask}. Those commits now need his approval of this head and \`bot-pr signoff\`."
+    fi
+    if ${dry_run}; then
+        info "Would push ${new_sha:0:12} and comment: ${body}"
+        echo "${new_sha}"
+        return 0
+    fi
+    test "${new_sha}" = "${HEAD_SHA}" || push_rebased "${dir}" "${HEAD_REPO}" "${HEAD_REF}" "${HEAD_SHA}" "${new_sha}"
+    body+=$'\n\n'"${LLMS_TRAILER}"$'\n'"${NO_CARRY_RECORD} ask=$(jq -r .ask_id <<<"${pending}") head=${new_sha} -->"
+    # The reply settles his request: without it, a rerun takes the head
+    # as moved and drops his sign-off from all of the bot's commits.
+    ghapi -X POST "repos/${REPO}/issues/${NUMBER}/comments" -f body="${body}" >/dev/null ||
+        ghapi -X POST "repos/${REPO}/issues/${NUMBER}/comments" -f body="${body}" >/dev/null ||
+        fatal "pushed ${new_sha:0:12} to ${url}, but commenting failed twice: post this reply there by hand, since a rerun would drop ${HUMAN_POSSESSIVE} sign-off from all of the bot's commits:"$'\n'"${body}"
+    info "${body%%$'\n'*}"
+    echo "${new_sha}"
+}
+
 # upstream_approval UPSTREAM NUMBER: prints REVIEWER's latest approving
 # review on UPSTREAM#NUMBER as {url, id, commit_id}, if a later change
 # request or dismissal didn't cancel it; nothing otherwise. It approves
@@ -2867,6 +3100,8 @@ case "${command}" in
     prune-runs) command=prune_runs ;;
     set-item) command=set_item ;;
     refresh-meta) command=refresh_meta ;;
+    carry-note) command=carry_note ;;
+    no-carry) command=no_carry ;;
     promote|signoff|inbox|rebase) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
