@@ -122,7 +122,9 @@ bot's upstream PRs whose DCO check fails although ${REQUESTER} approved
 their head. With --apply, each gets 'bot-pr signoff' and a line
 "Signed off: URL (NEW-HEAD)", or why it was refused; with --dry-run
 (or --board-file), the command it would run; otherwise they are only
-listed.
+listed. The same goes for the PRs where he revoked a sign-off the bot
+carried, with '/no-carry': 'bot-pr no-carry' drops it ("Carried
+sign-off dropped: URL (NEW-HEAD)").
 
 Then the "Promotions" of 'bot-promote-due' (see its --help): the bot's
 fork PRs whose current head ${REQUESTER} approved (a review or a

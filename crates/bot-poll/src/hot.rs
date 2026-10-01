@@ -32,6 +32,9 @@ const WEB: &str = "https://github.com/";
 /// A line of the operator's comment on a fork PR that approves its head
 /// (see `bot-pr inbox`).
 const PROMOTE: &str = "/promote";
+/// A line that is exactly this, in his comment on an upstream PR, revokes
+/// a sign-off the bot carried (see bot-pr no-carry).
+const NO_CARRY: &str = "/no-carry";
 const APPROVED: &str = "APPROVED";
 const SHORT_SHA: usize = 12;
 /// The query parameter of the comment listings, which is the cursor.
@@ -553,8 +556,9 @@ struct Comment {
 pub enum Act {
     /// A review, in STATE (APPROVED, ...) of COMMIT.
     Review { state: String, commit: String },
-    /// A conversation comment; with a line that is exactly /promote.
-    Comment { promote: bool },
+    /// A conversation comment; with a line that is exactly /promote, or
+    /// /no-carry (with blanks around it).
+    Comment { promote: bool, no_carry: bool },
     /// An inline review comment whose review (by id) isn't among the
     /// events.
     ReviewComment { review: Option<u64> },
@@ -674,6 +678,7 @@ pub fn operator_events(pages: &Pages, operator: &str, cursor: i64) -> Result<Vec
                 at,
                 act: Act::Comment {
                     promote: body.lines().any(|l| l.trim_end() == PROMOTE),
+                    no_carry: body.lines().any(|l| l.trim() == NO_CARRY),
                 },
                 excerpt: excerpt(Some(&body)),
                 also: Vec::new(),
@@ -712,7 +717,8 @@ pub struct Classified {
     pub kind: &'static str,
     pub text: String,
     /// An approval of an upstream PR's head, which may make a sign-off
-    /// due.
+    /// due, or a /no-carry there, which may make dropping one due: both
+    /// are bot-signoff-due's.
     pub signoff: bool,
 }
 
@@ -740,7 +746,8 @@ pub fn classify(
         || (item.class == Class::Recent
             && item.pr
             && owner.eq_ignore_ascii_case(&places.forge_org));
-    let promote = matches!(ev.act, Act::Comment { promote: true });
+    let promote = matches!(ev.act, Act::Comment { promote: true, .. });
+    let no_carry = matches!(ev.act, Act::Comment { no_carry: true, .. });
     let kind = if forge && (at_head || promote) {
         "approval"
     } else if forge {
@@ -758,8 +765,9 @@ pub fn classify(
             let head_note = if at_head { " (the head)" } else { "" };
             format!("review {state} at {short}{head_note}")
         }
-        Act::Comment { promote: true } => format!("comment {PROMOTE}"),
-        Act::Comment { promote: false } => "comment".to_string(),
+        Act::Comment { promote: true, .. } => format!("comment {PROMOTE}"),
+        Act::Comment { no_carry: true, .. } => format!("comment {NO_CARRY}"),
+        Act::Comment { .. } => "comment".to_string(),
         Act::ReviewComment { .. } => "review comment".to_string(),
     };
     let title = if item.title.is_empty() {
@@ -775,7 +783,7 @@ pub fn classify(
     Classified {
         kind,
         text: format!("{key}{title}: {what}{excerpt}"),
-        signoff: at_head && item.class == Class::Upstream,
+        signoff: (at_head || no_carry) && item.class == Class::Upstream,
     }
 }
 
@@ -916,7 +924,8 @@ mod tests {
     ]"#;
     const COMMENTS: &str = r#"[
       {"id":7,"user":{"login":"cgwalters"},"html_url":"https://github.com/o/r/pull/1#issuecomment-7","created_at":"2026-09-30T10:02:00Z","body":"Looks good\n/promote\n"},
-      {"id":8,"user":{"login":"cgwalters-bot"},"html_url":"https://github.com/o/r/pull/1#issuecomment-8","created_at":"2026-09-30T10:03:00Z","body":"/promote"}
+      {"id":8,"user":{"login":"cgwalters-bot"},"html_url":"https://github.com/o/r/pull/1#issuecomment-8","created_at":"2026-09-30T10:03:00Z","body":"/promote"},
+      {"id":9,"user":{"login":"cgwalters"},"html_url":"https://github.com/o/r/pull/1#issuecomment-9","created_at":"2026-09-30T10:06:00Z","body":"Not that one.\r\n  /no-carry \r\n"}
     ]"#;
     /// His inline comments: one of review 3, one of a review before the
     /// cursor (a lone reply), and the bot's.
@@ -940,14 +949,32 @@ mod tests {
         let ids: Vec<&str> = evs.iter().map(|e| e.id.as_str()).collect();
         assert_eq!(
             ids,
-            ["pullrequestreview-3", "issuecomment-7", "discussion_r21"]
+            [
+                "pullrequestreview-3",
+                "issuecomment-7",
+                "discussion_r21",
+                "issuecomment-9"
+            ]
         );
         assert_eq!(evs[0].also, ["discussion_r20"]);
         assert_eq!(evs[2].act, Act::ReviewComment { review: Some(1) });
         assert_eq!(evs[0].excerpt, "LGTM, thanks");
         assert!(evs[0].approves("bbbbbbbbbbbbbbbb"));
         assert!(!evs[0].approves("cccc"));
-        assert_eq!(evs[1].act, Act::Comment { promote: true });
+        assert_eq!(
+            evs[1].act,
+            Act::Comment {
+                promote: true,
+                no_carry: false
+            }
+        );
+        assert_eq!(
+            evs[3].act,
+            Act::Comment {
+                promote: false,
+                no_carry: true
+            }
+        );
         assert!(
             operator_events(
                 &Pages {
@@ -981,7 +1008,7 @@ mod tests {
             &places(),
         );
         assert_eq!((c.kind, c.signoff), ("approval", false));
-        let (approve, promote) = (&evs[0], &evs[1]);
+        let (approve, promote, no_carry) = (&evs[0], &evs[1], &evs[3]);
         let item = |class, pr| HotItem {
             class,
             pr,
@@ -1037,6 +1064,22 @@ mod tests {
                 promote,
                 None,
                 "review",
+                false,
+            ),
+            (
+                "o/r#1",
+                item(Class::Upstream, true),
+                no_carry,
+                None,
+                "review",
+                true,
+            ),
+            (
+                "o/r#1",
+                item(Class::Forge, true),
+                no_carry,
+                None,
+                "forge-review",
                 false,
             ),
             (

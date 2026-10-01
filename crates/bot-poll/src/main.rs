@@ -152,8 +152,9 @@ events points at, and each he was active on in the last 3 hours (at most
 since the sweep before the last are new events, by their ids: an
 approval of a fork PR's head (or /promote) is an approval, other
 activity there forge-review; on a tracker issue notify; on another PR
-review (an approval of an upstream PR's head also runs
-bot-signoff-due --apply, whose results are signoff), else news. A
+review (an approval of an upstream PR's head, or a /no-carry there,
+also runs bot-signoff-due --apply, whose results are signoff), else
+news. A
 thread updated for a mention, review request or assignment runs
 bot-notify, whose output counts as a sweep's. What a hot cycle reports,
 a sweep doesn't report again, and the other way round. Its files are in

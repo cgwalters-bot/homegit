@@ -98,7 +98,32 @@ const CASES = [
   { name: "every commit signed off already, DCO failing anyway", repo: "example/unchanged", number: 12,
     reviews: [review("APPROVED", HEAD)], runs: [dco("failure")], due: true },
 ];
+// The PRs where cgwalters may have revoked a carried sign-off: each with
+// its comments (WHO:BODY, ids in order), and whether 'bot-pr no-carry' is
+// due. The bot's fake refuses the one in a repository named "refused".
+const CARRY = `Kept cgwalters' sign-off ...\n<!-- bot-pr carry was=${OLD} head=${HEAD} carried=${HEAD} -->`;
+const ANSWER = `Dropped it.\n<!-- bot-pr no-carry ask=2 head=${HEAD} -->`;
+const NO_CARRY_CASES = [
+  { name: "revoked", repo: "example/revoked", number: 20, comments: [`cgwalters-bot:${CARRY}`, "cgwalters:/no-carry"], due: true },
+  { name: "revoked among other lines, CRLF", repo: "example/crlf", number: 21,
+    comments: [`cgwalters-bot:${CARRY}`, "cgwalters:No, that is new code.\r\n  /no-carry \r\nThanks"], due: true },
+  { name: "answered already", repo: "example/answered", number: 22,
+    comments: [`cgwalters-bot:${CARRY}`, "cgwalters:/no-carry", `cgwalters-bot:${ANSWER}`], due: false },
+  { name: "revoked before any carry", repo: "example/early", number: 23, comments: ["cgwalters:/no-carry", `cgwalters-bot:${CARRY}`], due: false },
+  { name: "someone else's /no-carry", repo: "example/someone", number: 24, comments: [`cgwalters-bot:${CARRY}`, "maintainer:/no-carry"], due: false },
+  { name: "only mentioned", repo: "example/mention", number: 25, comments: [`cgwalters-bot:${CARRY}`, "cgwalters:why the /no-carry?"], due: false },
+  { name: "a fork PR", repo: "cgwalters-forge/nc", number: 26, body: FORK_BODY,
+    comments: [`cgwalters-bot:${CARRY}`, "cgwalters:/no-carry"], due: false },
+  { name: "bot-pr no-carry refuses", repo: "nc/refused", number: 27, comments: [`cgwalters-bot:${CARRY}`, "cgwalters:/no-carry"], due: true },
+];
 const prUrl = (c) => `${GH}/${c.repo}/pull/${c.number}`;
+for (const c of NO_CARRY_CASES) {
+  put(`repos/${c.repo}/pulls/${c.number}`, { state: "open", user: { login: "cgwalters-bot" }, body: c.body || "Fix it.", head: { sha: HEAD } });
+  put(`repos/${c.repo}/issues/${c.number}/comments`, c.comments.map((w, i) => {
+    const [login, ...body] = w.split(":");
+    return { id: i + 1, user: { login }, body: body.join(":"), html_url: `${prUrl(c)}#issuecomment-${i + 1}` };
+  }));
+}
 for (const c of CASES) {
   put(`repos/${c.repo}/pulls/${c.number}`, {
     state: c.state || "open", user: { login: "cgwalters-bot" }, body: c.body || "Fix it.", head: { sha: HEAD },
@@ -107,7 +132,9 @@ for (const c of CASES) {
   put(`repos/${c.repo}/commits/${HEAD}/check-runs`, { total_count: c.runs.length, check_runs: c.runs });
   put(`repos/${c.repo}/commits/${HEAD}/status`, { total_count: 0, state: "pending", statuses: [] });
 }
-put("search/issues", { total_count: CASES.length, items: CASES.map((c) => ({ html_url: prUrl(c) })) });
+// The fake answers both searches alike, with every PR.
+const ALL = [...CASES, ...NO_CARRY_CASES];
+put("search/issues", { total_count: ALL.length, items: ALL.map((c) => ({ html_url: prUrl(c), body: c.body })) });
 
 const tool = (args, env = {}) => {
   fs.rmSync(BOT_PR_LOG, { force: true });
@@ -116,20 +143,33 @@ const tool = (args, env = {}) => {
   return { ...r, log };
 };
 const dueUrls = CASES.filter((c) => c.due).map(prUrl);
+const noCarryUrls = NO_CARRY_CASES.filter((c) => c.due).map(prUrl);
+const ofKind = (got, kind) => got.filter((x) => x.kind === kind);
 
 test("only the PRs approved at their head with DCO failing are due", () => {
   const r = tool(["--json"]);
   assert.equal(r.status, 0, r.stderr);
-  const got = JSON.parse(r.stdout);
+  const got = ofKind(JSON.parse(r.stdout), "signoff");
   assert.deepEqual(got.map((x) => x.url).sort(), [...dueUrls].sort());
   for (const x of got) assert.equal(x.result, "due");
+  assert.deepEqual(r.log, [], "listing runs nothing");
+});
+
+test("only a /no-carry of cgwalters after a carry, unanswered, on an upstream PR, is due", () => {
+  const r = tool(["--json"]);
+  assert.equal(r.status, 0, r.stderr);
+  const got = ofKind(JSON.parse(r.stdout), "no-carry");
+  assert.deepEqual(got.map((x) => x.url).sort(), [...noCarryUrls].sort());
+  const revoked = got.find((x) => x.url === `${GH}/example/revoked/pull/20`);
+  assert.equal(revoked.line, `No-carry due: ${GH}/example/revoked/pull/20 at ${HEAD.slice(0, 12)} (${GH}/example/revoked/pull/20#issuecomment-2)`);
   assert.deepEqual(r.log, [], "listing runs nothing");
 });
 
 test("--dry-run prints the commands and runs none", () => {
   const r = tool(["--dry-run"]);
   assert.equal(r.status, 0, r.stderr);
-  assert.deepEqual(r.stdout.trim().split("\n").sort(), dueUrls.map((u) => `Would run: bot-pr signoff ${u}`).sort());
+  assert.deepEqual(r.stdout.trim().split("\n").sort(),
+    [...dueUrls.map((u) => `Would run: bot-pr signoff ${u}`), ...noCarryUrls.map((u) => `Would run: bot-pr no-carry ${u}`)].sort());
   assert.deepEqual(r.log, []);
 });
 
@@ -137,7 +177,7 @@ test("--apply runs bot-pr signoff on each due PR and reports the result, once pe
   fs.rmSync(ATTEMPTS, { force: true });
   const r = tool(["--apply"]);
   assert.equal(r.status, 0, r.stderr);
-  assert.deepEqual(r.log.sort(), dueUrls.map((u) => `signoff ${u}`).sort());
+  assert.deepEqual(r.log.sort(), [...dueUrls.map((u) => `signoff ${u}`), ...noCarryUrls.map((u) => `no-carry ${u}`)].sort());
   const lines = r.stdout.trim().split("\n");
   const refused = `Sign-off refused: ${GH}/example/refused/pull/11 at ${HEAD.slice(0, 12)}: `
     + `not signing off ${GH}/example/refused/pull/11: the policy record is stale`;
@@ -146,12 +186,15 @@ test("--apply runs bot-pr signoff on each due PR and reports the result, once pe
   assert.ok(lines.includes(`Signed off: ${GH}/bootc-dev/bootc/pull/2516 (${NEW_HEAD.slice(0, 12)})`), r.stdout);
   assert.ok(lines.includes(refused), r.stdout);
   assert.ok(lines.includes(unchanged), r.stdout);
-  assert.equal(lines.length, dueUrls.length);
+  assert.ok(lines.includes(`Carried sign-off dropped: ${GH}/example/revoked/pull/20 (${NEW_HEAD.slice(0, 12)})`), r.stdout);
+  assert.ok(lines.includes(`No-carry refused: ${GH}/nc/refused/pull/27 at ${HEAD.slice(0, 12)}: not signing off ${GH}/nc/refused/pull/27: the policy record is stale`), r.stdout);
+  assert.equal(lines.length, dueUrls.length + noCarryUrls.length);
   // Again at the same heads (the fixtures don't move): the refused and
   // unchanged ones aren't retried, and are listed alike.
   const again = tool(["--apply"]);
   assert.equal(again.status, 0, again.stderr);
   assert.ok(!again.log.some((l) => /refused|unchanged/.test(l)), again.log.join("\n"));
+  assert.ok(again.log.includes(`no-carry ${GH}/example/revoked/pull/20`), "a dropped one is due again only while unanswered, as here");
   assert.ok(again.stdout.includes(`${refused}\n`) && again.stdout.includes(`${unchanged}\n`), again.stdout);
   assert.match(tool(["--dry-run"]).stdout, /^Sign-off refused: /m, "--dry-run tells it won't retry");
   // Six hours later, both are tried again.
@@ -159,7 +202,7 @@ test("--apply runs bot-pr signoff on each due PR and reports the result, once pe
   for (const a of Object.values(aged)) a.at = new Date(Date.now() - 6 * 3600 * 1000 - 1000).toISOString();
   fs.writeFileSync(ATTEMPTS, JSON.stringify(aged));
   const later = tool(["--apply"]);
-  assert.equal(later.log.filter((l) => /refused|unchanged/.test(l)).length, 2, later.log.join("\n"));
+  assert.equal(later.log.filter((l) => /refused|unchanged/.test(l)).length, 3, later.log.join("\n"));
   fs.rmSync(ATTEMPTS, { force: true });
 });
 
@@ -180,7 +223,7 @@ test("a PR that can't be read is skipped, and exits 1; a failed search exits 1",
   try {
     const r = tool(["--json"]);
     assert.equal(r.status, 1, r.stderr);
-    assert.deepEqual(JSON.parse(r.stdout).map((x) => x.url).sort(), [...dueUrls].sort());
+    assert.deepEqual(ofKind(JSON.parse(r.stdout), "signoff").map((x) => x.url).sort(), [...dueUrls].sort());
     assert.match(r.stderr, /reading https:\/\/github\.com\/example\/stale\/pull\/5 failed/);
   } finally {
     fs.rmSync(fail);
