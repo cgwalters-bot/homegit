@@ -72,7 +72,8 @@ class Exit extends Error {
 }
 
 function usage() {
-  return `Usage: ${PROG} [--board-file FILE] [--epic-board-file FILE] [--now TIME] [--json]
+  return `Usage: ${PROG} [--board-file FILE] [--epic-board-file FILE] [--write-epic-board FILE]
+       [--now TIME] [--json]
 
 Lists the open PRs of the Workstream board's items with Priority ${PRIORITIES.join(" or ")}
 (the item's own PR, and the PRs in its Branch field; not ${SKIP_STATUSES.join(", ")}),
@@ -114,6 +115,9 @@ Options:
   --board-file FILE       the Workstream board as 'bot-board list --json'
                           prints it (default: run that)
   --epic-board-file FILE  the same for the ${EPIC_PROJECT || "epic"} board
+  --write-epic-board FILE write the ${EPIC_PROJECT || "epic"} board it read to FILE
+                          (as --epic-board-file takes it), so that
+                          bot-watch's next step doesn't list it again
   --now TIME              take TIME as now
   --json                  print a JSON array of {priority, reason, url,
                           head, detail, items, line}
@@ -125,7 +129,7 @@ ${EX_RATELIMIT} if GitHub is rate limiting the bot.
 }
 
 function parseArgs(argv) {
-  const opts = { boardFile: null, epicBoardFile: null, now: new Date(), json: false };
+  const opts = { boardFile: null, epicBoardFile: null, writeEpicBoard: null, now: new Date(), json: false };
   const value = (i, name) => {
     if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
     return argv[i + 1];
@@ -139,6 +143,7 @@ function parseArgs(argv) {
         process.exit(0);
       case "--board-file": opts.boardFile = value(i++, a); break;
       case "--epic-board-file": opts.epicBoardFile = value(i++, a); break;
+      case "--write-epic-board": opts.writeEpicBoard = value(i++, a); break;
       case "--now": {
         const s = value(i++, a);
         opts.now = new Date(s);
@@ -486,7 +491,9 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   pruneCache(opts.now);
   const boards = [["workstream", await loadBoard(opts.boardFile, null)]];
-  if (EPIC_PROJECT) boards.push([EPIC_PROJECT, await loadBoard(opts.epicBoardFile, EPIC_PROJECT)]);
+  const epic = EPIC_PROJECT ? await loadBoard(opts.epicBoardFile, EPIC_PROJECT) : [];
+  if (EPIC_PROJECT) boards.push([EPIC_PROJECT, epic]);
+  if (opts.writeEpicBoard) fs.writeFileSync(opts.writeEpicBoard, `${JSON.stringify(epic)}\n`);
   const { problems, failed } = await sweep(boards, opts.now);
   process.stdout.write(opts.json ? `${JSON.stringify(problems)}\n` : render(problems));
   if (failed.length) throw new Exit(EX_ERROR, `${failed.length} PR(s) could not be read; they are not listed`);
@@ -499,6 +506,10 @@ if (require.main === module) {
     process.exit(e.status);
   });
 } else {
-  // Shared with bot-signoff-due and bot-promote-due, which read PRs the same way.
-  module.exports = { Exit, restGet, pages, checkRuns, checkProblems, pool, targets, render, BOT_LOGIN, FORK_OWNERS, FORK_META, EX_RATELIMIT };
+  // Shared with bot-signoff-due, bot-promote-due and bot-drive, which
+  // read PRs the same way; bot-drive also reads the boards, and the latest of each check.
+  module.exports = {
+    Exit, restGet, pages, checkRuns, checkProblems, pool, targets, render, loadBoard, latestByKey, runKey, statusKey, isDco,
+    BOT_LOGIN, FORK_OWNERS, FORK_META, EPIC_PROJECT, PR_URL_RE, FAILED_CONCLUSIONS, FAILED_STATUSES, SHORT_SHA, EX_RATELIMIT,
+  };
 }

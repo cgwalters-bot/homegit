@@ -118,7 +118,7 @@ saving each one's whole output under `~/.local/state/bot-poll/runs/`,
 and compares what they list against what it has already reported:
 approvals, the operator's activity on fork PRs, outstanding reviews,
 rebase needs, priority health lines (a new P0 one is its own kind),
-sign-offs, requests, answers and coordination questions from
+P0 drive lines (each new blocker of a P0 PR), sign-offs, requests, answers and coordination questions from
 `bot-notify`, and item news other
 than bots'. A review, comment or sign-off is news once, by its id,
 whichever report lists it.
@@ -225,6 +225,39 @@ work is.
   sure there is an ask for it (see `workstream`). P1 lines come after
   the outstanding reviews below. A line that stays while someone is
   on it needs nothing more.
+- **P0 drive.** Driving P0 work to a merge is level-triggered: events
+  are edges, and a PR that silently falls behind again (bootc#2500
+  after bootc#2516 merged) raises none. So every sweep, `bot-drive`
+  re-derives each open P0 PR of the bot's (but fork PRs) its merge
+  blocker from its current state, and `bot-watch --apply` takes the one
+  step that is safe unattended: `bot-pr rebase` on a conflict, or on a
+  PR that is behind a base that must be up to date and otherwise
+  mergeable, at most once per PR per hour. One line per PR,
+  `BLOCKER URL HEAD: DETAIL; ACTION`:
+
+  ```
+  P0 drive:
+    behind https://github.com/bootc-dev/bootc/pull/2500 250025002500: behind main, which must be up to date; rebased -> 999999999999; that voided the approval (stale reviews are dismissed)
+  ```
+
+  `bot-poll` wakes (`drive`) once per new blocker, PR and head. What
+  each needs:
+  - `needs-regen`: the rebase conflicted only in generated files
+    (bootc's tmt plan and test lists). Dispatch a worker to rebase,
+    regenerate them on a devspace and push.
+  - `conflict` with "rebase refused, conflicts in ...": dispatch a
+    worker to resolve them. Other refusals (an unanswered review of the
+    operator's, a conflicts-only repository) say why; handle them as
+    the refusal says.
+  - `behind` with "not rebased while X blocks too": handle X; the
+    rebase comes once nothing else blocks.
+  - `dco`: `bot-signoff-due` signs off an approved head; otherwise it
+    waits on the operator's approval.
+  - `ci-failing`: look at the linked job, like a P0 health line.
+  - `review`: it waits on the operator's (or a maintainer's) review;
+    make sure it is in their queue (see `workstream`).
+  - `ci-pending`, `mergeable`, and "rebased -> ...": nothing. A rebase
+    that voided an approval comes back as `review` at the new head.
 - **Sign-offs.** `bot-watch --apply` runs `bot-pr signoff` itself on
   each of the bot's upstream PRs whose DCO check fails although
   the operator approved its current head (`bot-signoff-due`), and lists

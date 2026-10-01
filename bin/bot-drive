@@ -1,0 +1,414 @@
+#!/usr/bin/env node
+// Drives the bot's P0 PRs toward a merge, level-triggered: every sweep
+// re-derives each PR's merge blocker from its current state and, with
+// --apply, takes the one step that is safe to take unattended (a rebase).
+// bot-watch prints the result as its "P0 drive" section. See --help.
+// Node's standard library only, plus gh (through bot-priority-health's
+// REST helpers, with their ETag cache), bot-board and bot-pr.
+"use strict";
+
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { promisify } = require("node:util");
+
+const execFileP = promisify(execFile);
+
+const PROG = path.basename(process.argv[1] || "bot-drive");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const {
+  Exit, restGet, pages, checkRuns, checkProblems, pool, targets, loadBoard, latestByKey, runKey, statusKey, isDco,
+  BOT_LOGIN, FORK_OWNERS, FORK_META, EPIC_PROJECT, PR_URL_RE, FAILED_CONCLUSIONS, FAILED_STATUSES, SHORT_SHA, EX_RATELIMIT,
+} = require(path.join(BIN_DIR, "bot-priority-health"));
+const retry = require(path.join(__dirname, "..", "lib", "retry-cache.js"));
+const BOT_PR = process.env.BOT_DRIVE_BOT_PR || path.join(BIN_DIR, "bot-pr");
+// The operator (see lib/operator.js).
+const REVIEWER = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG).operator.login;
+const PRIORITY = "P0";
+// Reviews that decide whether a PR is approved: a later comment-only
+// review leaves an approval or a change request be.
+const DECIDING_STATES = ["APPROVED", "CHANGES_REQUESTED", "DISMISSED"];
+// GitHub's mergeable_state values that let a merge through.
+const MERGEABLE_STATES = ["clean", "has_hooks", "unstable"];
+// Paths a repository generates from others (and checks in CI): a rebase
+// conflicting only in these needs them regenerated, which takes a build,
+// rather than a conflict resolved. bot-pr names the conflicts of the
+// first commit that conflicts, so a later commit may still conflict
+// elsewhere: the worker regenerating them finds out.
+const GENERATED_FILES = {
+  "bootc-dev/bootc": ["tmt/plans/integration.fmf", "tmt/tests/tests.fmf"],
+};
+const HOUR_MS = 3600 * 1000;
+// At most one automatic rebase per PR in this time, so that a base that
+// keeps moving doesn't keep restarting CI.
+const REBASE_EVERY_MS = HOUR_MS;
+// bot-pr rebase's exit status when the rebase conflicts.
+const EX_CONFLICT = 10;
+// {URL: {at, head, result, detail, new_head}}: the last rebase run on
+// each PR, for the rate guard; only the ones within REBASE_EVERY_MS are
+// kept.
+const ATTEMPTS_FILE = retry.cacheFile("bot-drive");
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+function usage() {
+  return `Usage: ${PROG} [--apply | --dry-run] [--board-file FILE] [--epic-board-file FILE]
+       [--now TIME] [--json]
+
+Drives the ${PRIORITY} PRs opened by ${BOT_LOGIN} toward a merge: those of the
+Workstream board's ${PRIORITY} items${EPIC_PROJECT ? ` and of the ${EPIC_PROJECT} board's` : ""} (as bot-priority-health
+finds them), but for its fork PRs, which 'bot-pr promote' takes upstream.
+Every run derives each PR's merge blocker from its current state, the
+first of:
+
+  conflict     the PR conflicts with its base
+  needs-regen  a rebase conflicted only in files the repository
+               generates (${Object.entries(GENERATED_FILES).map(([r, f]) => `${r}: ${f.join(", ")}`).join("; ")}):
+               a worker regenerates them, which needs a devspace build
+  behind       the PR is behind a base that must be up to date
+  dco          the DCO check fails
+  ci-failing   checks fail (named, with a link to the first failing job)
+  ci-pending   checks still run, or GitHub hasn't worked out mergeability
+  review       no approval, changes requested, or a review GitHub still
+               requires
+  mergeable    nothing blocks the merge
+
+and the step it takes:
+
+  conflict     'bot-pr rebase URL' (a conflicting PR runs no CI); on
+               conflicts in generated files only, needs-regen
+  behind       'bot-pr rebase URL', only when nothing else blocks the
+               merge; a rebase of an approved PR on a base whose rules
+               dismiss stale reviews voids the approval, which the line
+               says
+  dco          none: 'bot-signoff-due' signs off a head ${REVIEWER} approved
+  others       none: reported
+
+'bot-pr rebase' keeps ${REVIEWER}'s sign-off on a conflict-free rebase and
+refuses one it must not do (an unanswered review of his, a repository
+rebased only on conflicts, commits by others). At most one rebase per PR
+per ${REBASE_EVERY_MS / HOUR_MS}h runs: until then a refused head's result is repeated, and a
+PR whose head moved since is held (from ${ATTEMPTS_FILE.replace(os.homedir(), "~")}).
+
+One line per PR:
+
+  BLOCKER URL HEAD: DETAIL; ACTION
+
+HEAD is the first ${SHORT_SHA} characters of the head commit the blocker was
+found on. The first three fields stay the same until the blocker or the
+head changes, so a poll can wake once per new state while every sweep
+checks the state again.
+
+Options:
+  --apply                 run the rebases due
+  --dry-run               print what --apply would run, and change nothing
+  --board-file FILE       the Workstream board as 'bot-board list --json'
+                          prints it (default: run that)
+  --epic-board-file FILE  the same for the ${EPIC_PROJECT || "epic"} board
+  --now TIME              take TIME as now
+  --json                  print a JSON array of {url, head, blocker,
+                          detail, action, result, new_head, blockers, line}
+                          (result: none, due, would-rebase, rebased,
+                          up-to-date, held, conflict, needs-regen, refused)
+  -h, --help              show this help
+
+Exits 1 if a PR could not be read (the others are still listed), and
+${EX_RATELIMIT} if GitHub is rate limiting the bot (having printed the
+rebases run before). A refused rebase is reported, not an error.
+`;
+}
+
+function parseArgs(argv) {
+  const opts = { apply: false, dryRun: false, boardFile: null, epicBoardFile: null, now: new Date(), json: false };
+  const value = (i, name) => {
+    if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
+    return argv[i + 1];
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "-h":
+      case "--help":
+        process.stdout.write(usage());
+        process.exit(0);
+      case "--apply": opts.apply = true; break;
+      case "--dry-run": opts.dryRun = true; break;
+      case "--board-file": opts.boardFile = value(i++, a); break;
+      case "--epic-board-file": opts.epicBoardFile = value(i++, a); break;
+      case "--now": {
+        const s = value(i++, a);
+        opts.now = new Date(s);
+        if (Number.isNaN(opts.now.getTime())) throw new Exit(EX_USAGE, `--now takes a time, not '${s}'`);
+        break;
+      }
+      case "--json": opts.json = true; break;
+      default:
+        throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    }
+  }
+  if (opts.apply && opts.dryRun) throw new Exit(EX_USAGE, "--apply and --dry-run exclude each other");
+  return opts;
+}
+
+const warn = (msg) => process.stderr.write(`${PROG}: warning: ${msg}\n`);
+const short = (sha) => (sha || "").slice(0, SHORT_SHA);
+
+// reviewState(reviews): {approved, operatorApproved, changes}: whether
+// anyone's latest deciding review approves, whether REVIEWER's latest
+// approves the commit it names (null if not), and who requests changes.
+function reviewState(reviews) {
+  const latest = new Map();
+  const deciding = reviews
+    .filter((r) => r.user && DECIDING_STATES.includes(r.state) && r.submitted_at)
+    .sort((a, b) => Date.parse(a.submitted_at) - Date.parse(b.submitted_at));
+  for (const r of deciding) latest.set(r.user.login, r);
+  const states = [...latest.values()];
+  const his = latest.get(REVIEWER);
+  return {
+    approved: states.some((r) => r.state === "APPROVED"),
+    operatorApproved: his && his.state === "APPROVED" ? his.commit_id || null : null,
+    changes: states.filter((r) => r.state === "CHANGES_REQUESTED").map((r) => r.user.login).sort(),
+  };
+}
+
+// failingChecks(runs, statuses): [{name, link}] of the checks that fail,
+// the latest of each name/context only, DCO aside.
+function failingChecks(runs, statuses) {
+  const out = [];
+  for (const r of latestByKey(runs, runKey)) {
+    if (r.status === "completed" && FAILED_CONCLUSIONS.includes(r.conclusion) && !isDco(r)) {
+      out.push({ name: r.name, link: r.html_url || r.details_url || "" });
+    }
+  }
+  for (const s of latestByKey(statuses, statusKey)) {
+    if (FAILED_STATUSES.includes(s.state) && !isDco({ name: s.context })) out.push({ name: s.context, link: s.target_url || "" });
+  }
+  return out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+}
+
+// blockers(pr, runs, statuses, reviews, now): [[blocker, detail]], all
+// those the PR (REST pull) has, in the order of --help (the first is its
+// blocker); just mergeable when nothing blocks it.
+function blockers(pr, runs, statuses, reviews, now) {
+  const base = (pr.base && pr.base.ref) || "its base";
+  const out = [];
+  if (pr.mergeable_state === "dirty") out.push(["conflict", `conflicts with ${base}`]);
+  else if (pr.mergeable_state === "behind") out.push(["behind", `behind ${base}, which must be up to date`]);
+  const problems = new Map(checkProblems(runs, statuses, now));
+  const reviewed = reviewState(reviews);
+  if (problems.has("dco")) {
+    out.push(["dco", reviewed.operatorApproved === pr.head.sha
+      ? "DCO fails; you approved this head, so bot-signoff-due signs it off"
+      : "DCO fails; needs your approval of this head, then bot-signoff-due signs it off"]);
+  }
+  const failing = failingChecks(runs, statuses);
+  if (failing.length) {
+    const link = (failing.find((f) => f.link) || {}).link;
+    out.push(["ci-failing", `${failing.map((f) => f.name).join(", ")}${link ? ` (${link})` : ""}`]);
+  }
+  const pending = latestByKey(runs, runKey).filter((r) => r.status !== "completed").map((r) => r.name)
+    .concat(latestByKey(statuses, statusKey).filter((s) => s.state === "pending").map((s) => s.context));
+  if (pending.length) out.push(["ci-pending", `still running: ${[...new Set(pending)].sort().join(", ")}`]);
+  else if (!pr.mergeable_state || pr.mergeable_state === "unknown") {
+    out.push(["ci-pending", "GitHub hasn't worked out yet whether it can merge"]);
+  }
+  if (reviewed.changes.length) out.push(["review", `changes requested by ${reviewed.changes.join(", ")}`]);
+  else if (!reviewed.approved) out.push(["review", "waiting on you: no approval yet"]);
+  else if (!out.length && !MERGEABLE_STATES.includes(pr.mergeable_state)) {
+    out.push(["review", `approved, but GitHub still blocks the merge (${pr.mergeable_state}): a required review or rule`]);
+  }
+  if (!out.length) out.push(["mergeable", pr.auto_merge ? "auto-merge is on" : "ready to merge"]);
+  return out;
+}
+
+// wantsRebase(blockers): whether the PR's blocker is one a rebase
+// resolves, and nothing else would keep it from merging: a conflict
+// always (no CI runs on one), being behind only when it is otherwise
+// mergeable, since each rebase restarts CI and may void approvals.
+function wantsRebase(list) {
+  const [first] = list[0];
+  if (first === "conflict") return true;
+  return first === "behind" && list.length === 1;
+}
+
+// dismissesStale(repo, base): whether a ruleset on base dismisses
+// approvals on a push. Classic branch protection needs admin to read,
+// so it's only seen through rulesets.
+async function dismissesStale(repo, base) {
+  const rules = await restGet(`repos/${repo}/rules/branches/${encodeURIComponent(base)}`);
+  return Array.isArray(rules)
+    && rules.some((r) => r.type === "pull_request" && r.parameters && r.parameters.dismiss_stale_reviews_on_push);
+}
+
+// assess(url, now): the state of one PR: {url, repo, head, blockers,
+// approved, base}; null for one that isn't open, isn't the bot's, or is a
+// fork PR.
+async function assess(url, now) {
+  const [, , owner, name, number] = PR_URL_RE.exec(url);
+  const repo = `${owner}/${name}`;
+  const pr = await restGet(`repos/${repo}/pulls/${number}`);
+  if (!pr || pr.state !== "open" || !pr.user || pr.user.login !== BOT_LOGIN) return null;
+  if (FORK_OWNERS.includes(owner) && (pr.body || "").includes(FORK_META)) return null;
+  const head = pr.head.sha;
+  const runs = await checkRuns(repo, head);
+  const status = await restGet(`repos/${repo}/commits/${head}/status?per_page=100`);
+  const reviews = await pages(`repos/${repo}/pulls/${number}/reviews`);
+  return {
+    url, repo, head, base: pr.base && pr.base.ref, approved: reviewState(reviews).approved,
+    blockers: blockers(pr, runs, (status && status.statuses) || [], reviews, now),
+  };
+}
+
+// conflictResult(repo, stderr): the result of a rebase bot-pr refused on
+// conflicts: needs-regen when every conflicting path is a generated one.
+function conflictResult(repo, stderr) {
+  const m = /conflicts with \S+ in: (.*?); nothing was pushed/.exec(stderr || "");
+  const paths = m ? m[1].split(",").filter(Boolean) : [];
+  const generated = GENERATED_FILES[repo] || [];
+  if (paths.length && paths.every((p) => generated.includes(p))) {
+    return { result: "needs-regen", detail: `only generated files conflict (${paths.join(", ")})` };
+  }
+  return { result: "conflict", detail: paths.length ? `conflicts in ${paths.join(", ")}` : "conflicts" };
+}
+
+// rebase(s): {result, new_head, detail} of running 'bot-pr rebase' on
+// the PR of state s.
+async function rebase(s) {
+  try {
+    const { stdout } = await execFileP(BOT_PR, ["rebase", s.url], { maxBuffer: 64 << 20 });
+    const newHead = stdout.trim().split("\n").pop() || "";
+    if (!newHead) return { result: "up-to-date", new_head: null, detail: "" };
+    return { result: "rebased", new_head: newHead, detail: "" };
+  } catch (e) {
+    if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (bot-pr rebase ${s.url})`);
+    if (e.code === EX_CONFLICT) return { new_head: null, ...conflictResult(s.repo, e.stderr) };
+    const lines = (e.stderr || e.message || "").trim().split("\n").filter(Boolean);
+    return { result: "refused", new_head: null, detail: (lines.pop() || `exit status ${e.code}`).replace(/^error: /, "") };
+  }
+}
+
+// action(r, s): the ACTION part of a PR's line.
+function action(r, s) {
+  const first = s.blockers[0];
+  switch (r.result) {
+    case "due": return "rebase due (bot-watch --apply runs bot-pr rebase)";
+    case "would-rebase": return `would run: bot-pr rebase ${s.url}`;
+    case "rebased": {
+      const voids = r.voids ? "; that voided the approval (stale reviews are dismissed)"
+        : r.voids === null ? "; that may have voided the approval (its base's rules couldn't be read)" : "";
+      return `rebased -> ${short(r.new_head)}${voids}`;
+    }
+    case "up-to-date": return "bot-pr rebase found it up to date; GitHub catches up";
+    case "held": return `rebase held until ${r.until} (one per PR per ${REBASE_EVERY_MS / HOUR_MS}h)`;
+    case "needs-regen": return `${r.detail}: a worker regenerates them (devspace build) and pushes`;
+    case "conflict": return `rebase refused, ${r.detail}: a worker resolves them`;
+    case "refused": return `rebase refused: ${r.detail}`;
+    default:
+      break;
+  }
+  switch (first[0]) {
+    case "behind": {
+      const next = s.blockers[1];
+      return `not rebased while ${next[0]} blocks too: ${next[1]}`;
+    }
+    case "dco": return "bot-signoff-due's";
+    case "ci-failing": return "a look at the failing job";
+    case "ci-pending": return "none yet";
+    case "review": return "waiting on review";
+    default: return "none";
+  }
+}
+
+// step(s, attempt, opts): {result, new_head, detail, ran?, until?,
+// voids?} for the PR of state s, attempt being the last rebase on it (or
+// undefined); runs the rebase with --apply (ran).
+async function step(s, attempt, opts) {
+  const none = { result: "none", new_head: null, detail: "" };
+  if (!wantsRebase(s.blockers)) return none;
+  const recent = attempt && opts.now - Date.parse(attempt.at) < REBASE_EVERY_MS;
+  if (recent && attempt.head === s.head) {
+    const { at, head, ...last } = attempt;
+    return last;
+  }
+  if (recent) {
+    return { ...none, result: "held", until: new Date(Date.parse(attempt.at) + REBASE_EVERY_MS).toISOString().slice(11, 16) + "Z" };
+  }
+  if (opts.dryRun) return { ...none, result: "would-rebase" };
+  if (!opts.apply) return { ...none, result: "due" };
+  const r = { ...(await rebase(s)), ran: true };
+  if (r.result === "rebased" && s.approved && s.base) {
+    // The push happened: failing to read the rules must not lose it.
+    try {
+      r.voids = await dismissesStale(s.repo, s.base);
+    } catch (e) {
+      warn(`reading the rules of ${s.repo}:${s.base} failed: ${e.message}`);
+      r.voids = null;
+    }
+  }
+  return r;
+}
+
+function line(s, r) {
+  const [blocker, detail] = r.result === "needs-regen" ? ["needs-regen", s.blockers[0][1]] : s.blockers[0];
+  const act = action(r, s);
+  return { blocker, detail, action: act, line: `${blocker} ${s.url} ${short(s.head)}: ${detail}; ${act}` };
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const boards = [["workstream", await loadBoard(opts.boardFile, null)]];
+  if (EPIC_PROJECT) boards.push([EPIC_PROJECT, await loadBoard(opts.epicBoardFile, EPIC_PROJECT)]);
+  const urls = targets(boards).filter((t) => t.priority === PRIORITY).map((t) => t.url).sort();
+  const failed = [];
+  const states = (await pool(urls, async (url) => {
+    try {
+      return await assess(url, opts.now);
+    } catch (e) {
+      if (e instanceof Exit && e.status === EX_RATELIMIT) throw e;
+      warn(`reading ${url} failed: ${e.message}`);
+      failed.push(url);
+      return null;
+    }
+  })).filter(Boolean);
+  const tried = retry.load(ATTEMPTS_FILE, warn);
+  // Rebases age out of the guard, and PRs no longer swept are forgotten
+  // with them.
+  const attempts = Object.fromEntries(Object.entries(tried)
+    .filter(([, a]) => opts.now - Date.parse(a.at) < REBASE_EVERY_MS));
+  const results = [];
+  let rateLimited = null;
+  // One at a time: each rebase clones and pushes.
+  for (const s of states) {
+    let r;
+    try {
+      r = await step(s, attempts[s.url], opts);
+    } catch (e) {
+      // What was rebased already must still be reported.
+      if (!(e instanceof Exit && e.status === EX_RATELIMIT)) throw e;
+      rateLimited = e;
+      break;
+    }
+    if (r.ran) {
+      const { ran, ...kept } = r;
+      attempts[s.url] = { at: opts.now.toISOString(), head: s.head, ...kept };
+    }
+    results.push({
+      url: s.url, head: s.head, ...line(s, r), result: r.result, new_head: r.new_head, blockers: s.blockers.map(([b]) => b),
+    });
+  }
+  if (opts.apply) retry.save(ATTEMPTS_FILE, attempts);
+  process.stdout.write(opts.json ? `${JSON.stringify(results)}\n` : results.map((r) => `${r.line}\n`).join(""));
+  if (rateLimited) throw rateLimited;
+  if (failed.length) throw new Exit(EX_ERROR, `${failed.length} PR(s) could not be read; they are not listed`);
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  });
+} else {
+  module.exports = { blockers, wantsRebase, conflictResult };
+}
