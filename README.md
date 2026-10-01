@@ -31,7 +31,10 @@ opencode, Codex, Gemini CLI and Cursor look; Claude Code reads only
 `upstream-pr` (how to contribute as the bot, with `bot-pr`), `devspace-work` (building
 and testing on a remote runner), `coordinator` (running a top-level
 session that polls, dispatches worker and reviewer subagents, and writes
-the morning brief; the preambles it briefs them with live next to it), plus the upstream ones like
+the morning brief; the preambles it briefs them with live next to it),
+`topic-lead` (a session of its own for one topic, which owns the board items
+whose Lead field names it and coordinates with the coordinator only through
+the board and issues), plus the upstream ones like
 `commit-review`.
 
 The bot uses two agents, each on its own subscription. opencode is
