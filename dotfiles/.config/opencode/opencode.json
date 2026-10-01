@@ -4,7 +4,7 @@
   // Anthropic subscription OAuth must not be used through opencode; use Claude Code for that.
   "enabled_providers": ["openai"],
   "model": "openai/gpt-6.1-sol",
-  "small_model": "openai/gpt-5.6-luna",
+  "small_model": "openai/gpt-6-luna",
   "formatter": false,
   "autoupdate": false,
   "permission": "allow",
@@ -18,8 +18,8 @@
         // 200k cap needs "input" as well as "context" to take effect.
         // Sol is the GPT-6.1 frontier tier — cap at 200k
         "gpt-6.1-sol": { "limit": { "context": 200000, "input": 200000, "output": 128000 } },
-        // Luna is the GPT-5.6 cost-sensitive/nano tier — cheap/fast execution model
-        "gpt-5.6-luna": { "limit": { "context": 200000, "input": 200000, "output": 65536 } }
+        // Luna is the GPT-6 cost-sensitive/nano tier — cheap/fast execution model
+        "gpt-6-luna": { "limit": { "context": 200000, "input": 200000, "output": 65536 } }
       }
     }
   },
@@ -38,18 +38,18 @@
     "explore": {
       "description": "Fast read-only codebase exploration.",
       "mode": "subagent",
-      "model": "openai/gpt-5.6-luna"
+      "model": "openai/gpt-6-luna"
     },
     "fast": {
       "description": "Cheap/fast subagent for simple, low-stakes tasks.",
       "mode": "subagent",
-      "model": "openai/gpt-5.6-luna"
+      "model": "openai/gpt-6-luna"
     },
     "compaction": {
       "model": "openai/gpt-6.1-sol"
     },
     "title": {
-      "model": "openai/gpt-5.6-luna"
+      "model": "openai/gpt-6-luna"
     },
     "architect": {
       "description": "Architect for hard problems: planning, design, complex debugging, architectural decisions, tricky refactors.",
