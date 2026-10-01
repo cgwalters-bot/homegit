@@ -37,9 +37,8 @@ whose Lead field names it and coordinates with the coordinator only through
 the board and issues), plus the upstream ones like
 `commit-review`.
 
-The bot uses two agents, each on its own subscription. opencode is
-configured for OpenAI only; authenticate it with `opencode auth login` and
-pick OpenAI (ChatGPT Plus/Pro). Claude Code uses a Claude subscription; for
+The bot uses two agents. opencode is configured for the Praxis proxy, which
+supplies its authentication. Claude Code uses a Claude subscription; for
 headless runs generate a long-lived token with `claude setup-token` and
 export it as `CLAUDE_CODE_OAUTH_TOKEN`. (Anthropic subscription credentials
 must not be used through opencode.) Both need the `gh` CLI logged in as
