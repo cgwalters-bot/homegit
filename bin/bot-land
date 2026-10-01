@@ -16,8 +16,8 @@ const BOT_BOARD = path.join(BIN_DIR, "bot-board");
 // approval (--no-auto).
 const WAITING_STATUS = "Draft";
 const REMOTE = "origin";
-// The job the main branch rulesets require.
-const CHECK_NAME = "ci";
+// The check to wait for when the base branch's rules require none.
+const DEFAULT_CHECK = "ci";
 const AI_TRAILER = "Generated-by: AI";
 // Whose approval a --no-auto pull request waits for, the operator (see
 // lib/operator.js): requesting their review puts it in their queue (the
@@ -48,7 +48,8 @@ function usage() {
 
 Lands the current branch of this worktree on one of the bot's own
 repositories (homegit, and the bot's and the forge org's own), whose
-main takes changes only as pull requests with a green '${CHECK_NAME}' check,
+main takes changes only as pull requests with green required checks
+(such as homegit's 'required-checks' gate),
 up to date with main, rebase-merged:
 
   1. runs 'bot-git check ${REMOTE}/BASE..HEAD';
@@ -71,14 +72,14 @@ up to date with main, rebase-merged:
      changes;
   5. unless --no-wait (or --no-auto), waits until it merges: when main
      moved on, it rebases the branch with bot-git and pushes it again;
-     when '${CHECK_NAME}' fails or the pull request closes, it stops. Then it
+     when a required check fails or the pull request closes, it stops. Then it
      fast-forwards the shared clone this worktree belongs to, if that has
      BASE checked out and is clean.
 
 --repo defaults to the OWNER/REPO of ${REMOTE}'s URL. --timeout (default
 ${DEFAULT_TIMEOUT_MIN}) bounds the wait.
 
-Exit status: 0 merged (or opened, without waiting), ${EX_FAILED} '${CHECK_NAME}' failed
+Exit status: 0 merged (or opened, without waiting), ${EX_FAILED} a required check failed
 or the pull request was closed, ${EX_TIMEOUT} still open after the timeout,
 ${EX_USAGE} usage, ${EX_ERROR} anything else.
 `;
@@ -245,13 +246,27 @@ function shellQuote(s) {
   return /^[A-Za-z0-9_@%+=:,./-]+$/.test(s) ? s : `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-// checkFailed(repo, sha): the URL of a failed CHECK_NAME run on SHA, if any.
-function checkFailed(repo, sha) {
-  const runs = ghJSON([`repos/${repo}/commits/${sha}/check-runs?check_name=${CHECK_NAME}`], `read the ${CHECK_NAME} check`);
-  const failed = ((runs && runs.check_runs) || []).find(
-    (r) => r.status === "completed" && !["success", "neutral", "skipped"].includes(r.conclusion),
-  );
-  return failed ? failed.html_url || failed.conclusion : null;
+// requiredChecks(repo, base): the names of the status checks the rules
+// of BASE require (DEFAULT_CHECK if none).
+function requiredChecks(repo, base) {
+  const rules = ghJSON([`repos/${repo}/rules/branches/${encodeURIComponent(base)}`], `read the rules of ${base}`) || [];
+  const names = rules
+    .filter((r) => r.type === "required_status_checks")
+    .flatMap((r) => r.parameters.required_status_checks.map((c) => c.context));
+  return names.length ? [...new Set(names)] : [DEFAULT_CHECK];
+}
+
+// checkFailed(repo, sha, names): "NAME URL" of a failed run on SHA of
+// one of the checks NAMES, if any.
+function checkFailed(repo, sha, names) {
+  for (const name of names) {
+    const runs = ghJSON([`repos/${repo}/commits/${sha}/check-runs?check_name=${encodeURIComponent(name)}`], `read the ${name} check`);
+    const failed = ((runs && runs.check_runs) || []).find(
+      (r) => r.status === "completed" && !["success", "neutral", "skipped"].includes(r.conclusion),
+    );
+    if (failed) return `${name} ${failed.html_url || failed.conclusion}`;
+  }
+  return null;
 }
 
 // rebaseIfBehind(branch, base): rebase HEAD onto REMOTE/BASE with
@@ -334,6 +349,7 @@ function main() {
     console.log(pr.html_url);
     return;
   }
+  const checks = requiredChecks(repo, base);
   const deadline = Date.now() + opts.timeout * 60 * 1000;
   for (;;) {
     const cur = ghJSON([`repos/${repo}/pulls/${pr.number}`], `read ${pr.html_url}`);
@@ -347,8 +363,8 @@ function main() {
     if (cur.state === "closed") throw new Exit(EX_FAILED, `${pr.html_url} was closed without merging`);
     // Only this head's runs count: a rebase cancels the previous one's.
     const head = git(["rev-parse", "HEAD"], "read HEAD");
-    const failed = cur.head.sha === head ? checkFailed(repo, head) : null;
-    if (failed) throw new Exit(EX_FAILED, `${CHECK_NAME} failed on ${pr.html_url}: ${failed}`);
+    const failed = cur.head.sha === head ? checkFailed(repo, head, checks) : null;
+    if (failed) throw new Exit(EX_FAILED, `a required check failed on ${pr.html_url}: ${failed}`);
     // Behind main: auto-merge waits for the branch to be up to date.
     if (cur.mergeable_state === "behind") rebaseIfBehind(branch, base);
     if (Date.now() > deadline) throw new Exit(EX_TIMEOUT, `${pr.html_url} is still open after ${opts.timeout} minutes`);

@@ -1,4 +1,7 @@
-# The one job named ci is what the main branch ruleset requires.
+# The main branch rulesets require only the required-checks job (at the
+# end), which gates on all the others, as bootc-dev/bootc's CI does: jobs
+# can be added, split or made conditional here without touching the
+# rulesets.
 name: ci
 
 on:
@@ -14,7 +17,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ci:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      - name: Install shellcheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: shellcheck
+        env:
+          # cgwalters' older scripts, from before this check.
+          LEGACY: bin/git-hubclone bin/git-multigrep bin/git-pr bin/makesudoinstall
+        run: |
+          { grep -lE '^#!.*[/ ](ba)?sh$' bin/* tests/*.sh; ls bin/*.sh; } | sort -u |
+            grep -vxF -f <(tr ' ' '\n' <<<"${LEGACY}") | xargs shellcheck -x
+      - name: node --check
+        run: grep -lE '^#!.*[/ ]node$' bin/* | xargs -n1 node --check
+      - name: cargo fmt
+        run: cargo fmt --all --check
+
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --locked
+
+  tests:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -24,27 +61,35 @@ jobs:
         with:
           node-version: 24
       - name: Install the tools the tests use
-        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
-      - name: shellcheck
-        env:
-          # cgwalters' older scripts, from before this check.
-          LEGACY: bin/git-hubclone bin/git-multigrep bin/git-pr bin/makesudoinstall
+        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Build the crates' tools
         run: |
-          { grep -lE '^#!.*[/ ](ba)?sh$' bin/* tests/*.sh; ls bin/*.sh; } | sort -u |
-            grep -vxF -f <(tr ' ' '\n' <<<"${LEGACY}") | xargs shellcheck -x
-      - name: Rust
-        run: |
-          cargo fmt --all --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
           cargo build --locked --release
-          # For the tests below, which run the crates' tools from PATH.
+          # For the tests, which run the crates' tools from PATH.
           echo "${PWD}/target/release" >>"${GITHUB_PATH}"
-      - name: node --check
-        run: grep -lE '^#!.*[/ ]node$' bin/* | xargs -n1 node --check
       - name: tests
         run: |
           git config --global user.name ci && git config --global user.email ci@example.com
           rc=0
           for t in tests/*.sh; do echo "::group::${t}"; bash "${t}" || { echo "::error::${t} failed"; rc=1; }; echo "::endgroup::"; done
           exit "${rc}"
+
+  # The one job the rulesets require. It runs always(), even when a job
+  # it needs failed or the run was cancelled (a skipped required check
+  # would count as passing), and fails unless every job it needs
+  # succeeded or was skipped by its own if: condition. List every job
+  # above in needs.
+  required-checks:
+    if: always()
+    needs: [lint, rust, tests]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the jobs it needs
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          FAILED=$(jq -r 'to_entries[] | select(.value.result | IN("success", "skipped") | not) | .key' <<<"${NEEDS}")
+          if [ -n "${FAILED}" ]; then
+            echo "The following jobs did not succeed: ${FAILED}"
+            exit 1
+          fi

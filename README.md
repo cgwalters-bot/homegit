@@ -253,15 +253,22 @@ The bot's own repositories (this one, cgwalters-bot/cgwalters-bot,
 debug-bootc-to-disk-virtiofsd, ostree-missing-refs and
 praxis-credential-broker, plus cgwalters-forge/review,
 cgwalters-forge/agentic-job and cgwalters-forge/.github) take changes
-only as pull requests: a ruleset on main requires one with a green `ci` check, up to date with main,
-and linear history, with no bypass, and blocks force-pushes and
-deleting main. They only allow rebase merges, to keep the commits as
-written, with auto-merge on and branches deleted on merge. `bot-land`
-lands a branch: it pushes it, opens the pull request, enables
-auto-merge and waits, rebasing when main moved on. A rebase merge
-re-commits the commits unsigned, with the merging account (the bot) as
-committer. Here `ci` (`.github/workflows/ci.yml`) runs shellcheck,
-`node --check` and every `tests/*.sh`.
+only as pull requests: a ruleset on main requires one with green
+required checks, up to date with main, and linear history, with no
+bypass, and blocks force-pushes and deleting main. They only allow
+rebase merges, to keep the commits as written, with auto-merge on and
+branches deleted on merge. `bot-land` lands a branch: it pushes it,
+opens the pull request, enables auto-merge and waits, rebasing when main
+moved on. A rebase merge re-commits the commits unsigned, with the
+merging account (the bot) as committer. Here the `ci` workflow
+(`.github/workflows/ci.yml`) runs shellcheck, `node --check`, the
+crates' checks and every `tests/*.sh` in parallel jobs, and the ruleset
+requires only its `required-checks` job, a gate that fails unless every
+other job succeeded or was skipped by its own condition, as bootc's CI
+does: jobs can be added, split or made conditional without touching the
+ruleset (`tests/ci-gate.test.js` checks that the gate needs them all and
+runs always()). Other repositories may require just a `ci` job;
+`bot-land` waits for whatever checks the ruleset requires.
 
 ### Contribution policy gate
 
