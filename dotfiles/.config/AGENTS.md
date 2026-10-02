@@ -13,7 +13,7 @@ Emojis should be used *sparingly*. Don't overuse bulleted lists; if a document i
 Keep PR descriptions and GitHub comments short and factual. The operator adds the human framing on nontrivial changes themselves; short bot text makes their edits visible as the human review, while long AI prose buries the signal.
 
 - **PR descriptions:** a brief what and why, the testing facts (what ran, where, linked results), and for a nontrivial change an empty `<!-- LOGIN: context/rationale -->` line (LOGIN being the operator's login) for them to fill (it renders invisibly if left). No essays or restated diffs.
-- **Comments** (including replies where the operator tagged the bot): a few lines, verdict first. Put long analyses in a secret gist and link it.
+- **Comments:** a few lines, verdict first. Put long analyses in a secret gist and link it, except in a reply or review where the operator summoned the bot: that stays on the thread (in a collapsed `<details>` block if long), since a gist linked from public text isn't secret.
 
 Commit messages keep following "Commit Messages" below.
 

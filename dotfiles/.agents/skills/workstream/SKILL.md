@@ -218,7 +218,11 @@ The **Workflow** single-select decides what "finished" means for an item:
   reproduction, a bisect or an explainer. Publish it as a secret gist
   (`gh gist create --desc "..." writeup.md`; gists are secret unless
   `--public` is given, which you never pass), put its URL in Gist and a
-  one-line summary in Why, and set Draft. Nothing is posted upstream.
+  one-line summary in Why, and set Draft. Nothing is posted upstream,
+  except when the operator summoned the bot on the thread for it (a
+  review or a question): then the answer goes on that thread, never in a
+  gist (see "Replying where the operator summoned the bot"), and the
+  item is Done with the posted URL in Why (no human needs to move it).
 - **pr**: the operator explicitly asked for an upstream PR, so skip the fork
   review: open a draft PR upstream following `upstream-pr`, put its URL
   in Branch, and set In Review. Only a human sets this value; never set it
@@ -282,18 +286,42 @@ be a question for maintainers), ask with `bot-board question`.
   it helps its maintainers, for example claiming a long-open issue that
   someone might otherwise duplicate work on. Questions for the operator are
   question issues in the tracker, never upstream comments.
-- **Replying where the operator tagged the bot.** When the operator (by login,
-  `operator.login`) explicitly @-mentions the bot in a thread and asks it something,
-  the bot may reply directly in that thread with its answer, once the work
-  is done and self-reviewed. Keep the reply to what they asked: a few lines,
-  verdict first, evidence-backed (links, and test results with where they
-  ran), with long analysis in a linked gist (see "Upstream-facing text" in
-  the shared AGENTS.md), ending
-  with `Generated-by: https://github.com/cgwalters/#llms` (the config's `generated_by_url`). Post one reply
-  per ask, in the same thread (a review-comment reply if they asked in a
-  review comment, otherwise an issue/PR comment). No other upstream actions
-  follow from the tag: no pushing to others' branches, reviews, approvals,
-  labels or new PRs. A mention by anyone else never permits a reply.
+- **Replying where the operator summoned the bot.** When the operator (by
+  login, `operator.login`, as GitHub recorded it) explicitly summons the
+  bot on a thread, by @-mentioning it with an ask or requesting its
+  review on a PR, the bot answers directly on that thread, once the work
+  is done and reviewed. The summons is the operator's consent to post
+  there, so this holds in `human-text` repositories too, but only for
+  that thread and that ask: everything else in such a repository (text
+  nobody summoned the bot for, and the commit messages and PR bodies of a
+  promote) stays the operator's own. Never route a summoned answer
+  through a tracker question or a gist: a public tracker issue links
+  the thread, and a gist linked from public text isn't secret anymore.
+  - **Form:** an ask in a comment gets one reply in the same thread (a
+    review-comment reply if they asked in a review comment, otherwise
+    an issue/PR comment). A review request (`review this`, or a
+    requested review) gets one PR review with event `COMMENT`, never
+    `APPROVE` or `REQUEST_CHANGES` unless they asked for that: a short
+    summary in the body and the line-level points, suggestions included,
+    as its inline comments on the current head.
+  - **Text:** what they asked, a few lines, verdict first and calibrated
+    (say what is a live bug and what is latent), evidence-backed (links,
+    and test results with where they ran). Keep it on the thread, in a
+    collapsed `<details>` block if it is long, and leave out notes meant
+    only for the operator. End with `Generated-by:
+    https://github.com/cgwalters/#llms` (the config's
+    `generated_by_url`). Mention an out-of-scope finding in a sentence
+    rather than filing an issue for it.
+  - **Limits:** in a `human-only` or `no-go` repository the project
+    refuses AI-written contributions outright, so post nothing there:
+    set the item Needs human with that reason in Why. No other upstream
+    action follows from a summons: no pushing to others' branches,
+    approvals, labels or new PRs. A mention by anyone else never permits
+    a reply.
+  - **Enforcement:** this is skill guidance until hosted workflows
+    enforce it: a workflow's generated safe-outputs restriction must
+    allow a reply only on the summoning thread, verified against the
+    operator's comment, not merely suggest it in a skill.
 
 ## Using the board
 
@@ -672,7 +700,10 @@ unprompted. The output instead is, by Workflow:
   and say in Why what they fix and which of their commits changed
   (`Fix the clippy failure, in "lib: Add foo"`).
 - **analysis**: for reviews, bisects or reproductions, a write-up in a
-  secret gist (its URL in Gist), not posted on the PR.
+  secret gist (its URL in Gist), not posted on the PR. A review they
+  summoned the bot for on the PR (`@cgwalters-bot review this`, or a
+  requested review) is the exception: post it there as the bot's own
+  review (see "Replying where the operator summoned the bot").
 
 `pr` never applies to the operator's PRs: the bot doesn't open PRs on their behalf.
 
