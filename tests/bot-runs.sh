@@ -697,8 +697,10 @@ test_dispatch() {
     local run=${RUNS_URL}/1006
     expect_eq "$(cat "${FAKE_GH}/board-calls")" "field-ensure Run
 set PVTI_item1 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 16 cores)
+pace budget PVTI_item1
 field-ensure Run
-set PVTI_item2 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 4 cores)" "board calls"
+set PVTI_item2 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 4 cores)
+pace budget PVTI_item2" "board calls"
     # --dry-run sends nothing.
     : >"${FAKE_GH}/calls"
     : >"${FAKE_GH}/board-calls"
@@ -879,7 +881,10 @@ run_test() {
     write_fake_gh "${WORK}/bin"
     write_fake_board "${WORK}/bin"
     echo "[]" >"${FAKE_GH}/board.json"
-    export BOT_RUNS_BOT_BOARD=${WORK}/bin/bot-board
+    # The fake bot-pace logs its calls with the board's.
+    printf '#!/usr/bin/env bash\necho "pace $*" >>"${FAKE_GH:?}/board-calls"\n' >"${WORK}/bin/bot-pace"
+    chmod +x "${WORK}/bin/bot-pace"
+    export BOT_RUNS_BOT_BOARD=${WORK}/bin/bot-board BOT_RUNS_BOT_PACE=${WORK}/bin/bot-pace
     export FAKE_GH WORK
     export PATH=${WORK}/bin:${PATH}
     export HOME=${WORK}/home XDG_STATE_HOME=${WORK}/home/state XDG_CACHE_HOME=${WORK}/home/cache

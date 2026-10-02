@@ -84,6 +84,8 @@ readonly HARDENING_PR=https://github.com/cgwalters-bot/homegit/pull/82
 readonly WHY_MAX=300
 BOT_BOARD=${BOT_RUNS_BOT_BOARD:-$(dirname "$(readlink -f "$0")")/bot-board}
 readonly BOT_BOARD
+BOT_PACE=${BOT_RUNS_BOT_PACE:-$(dirname "$(readlink -f "$0")")/bot-pace}
+readonly BOT_PACE
 # Returned when GitHub says a resource doesn't exist (any more): EX_NOINPUT.
 readonly EX_NOTFOUND=66
 
@@ -101,7 +103,8 @@ Commands:
            [--workflow branch|analysis] [--no-preamble] [--dry-run] BRIEF
       Start a run on BRIEF (a file, or - for stdin) and print its id and
       URL, then put the run URL in the item's ${RUN_FIELD} field (added to the
-      board if missing), with Status ${RUN_STATUS} and a News line.
+      board if missing), with Status ${RUN_STATUS} and a News line, and give the
+      item a token budget ('bot-pace budget ITEM', unless it has one).
       Defaults: base main, agent ${DEFAULT_AGENT}, 4 cores, ${DEFAULT_TIMEOUT} minutes,
       budget ${DEFAULT_BUDGET} AIC, workflow branch. The task sent is the
       runner-side worker brief (runner-preamble.md in the coordinator
@@ -662,6 +665,9 @@ cmd_dispatch() {
     pass_ratelimit "${rc}"
     test "${rc}" -eq 0 ||
         fatal "the run was dispatched, but recording it on the board failed; run: bot-board set ${item} --status '${RUN_STATUS}' --field ${RUN_FIELD} ${url}"
+    # Its budget, for pacing (the run's own spend cap is --budget AIC).
+    "${BOT_PACE}" budget "${item}" >/dev/null ||
+        warn "setting the token budget of ${item} failed; run: bot-pace budget ${item}"
 }
 
 # --- reconcile ---------------------------------------------------------------
