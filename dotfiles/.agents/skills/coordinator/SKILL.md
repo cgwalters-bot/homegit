@@ -255,7 +255,10 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
 - **lead-orphan:** each of your busy items (Lead `coordinator`, or any
   Lead not in the topic-lead skill's table) has a worker in the
   heartbeat, and each worker there a busy item; an In Progress item with
-  neither Lead nor Run is nobody's.
+  neither Lead nor Run is nobody's. An umbrella (an epic like Composefs
+  Stable) is busy through its children: with an open sub-issue whose
+  item is In Progress, Draft or In Review, it needs no worker of its own
+  (don't list a placeholder one) and isn't an agent for capacity.
 - **drive:** the latest sweep's P0 drive blockers that need you, its P0
   health lines, and approved fork PRs its promotions didn't take, carried
   over as they are. A health line whose PR waits on a human with an ask
