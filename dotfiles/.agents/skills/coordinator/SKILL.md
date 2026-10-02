@@ -151,8 +151,11 @@ topic session to it; see "Topic sessions" below.) Never run `bot-watch
 consume its news). `systemctl --user status bot-sweep.timer
 bot-sweep` shows the schedule and the last run.
 
-To wait for news, run `bin/bot-poll-loop` in the background (in Claude
-Code, `run_in_background`). It never sweeps either: each cycle it reads
+To wait for news, run `bin/bot-poll-loop --until-actions` as one
+background command (in Claude Code, `run_in_background`); the harness
+re-invokes you when it exits, which is only when there is something to
+do. Don't hand the waiting to a watcher subagent: a model isn't needed
+to rerun a command. It never sweeps either: each cycle it reads
 the sweep runs it hasn't read yet, applies its seen-sets to them, and runs
 `bot-reconcile` (see "Reconcile" below) against its actions state; every
 3 minutes it reads the operator's events feed, and runs
@@ -160,8 +163,16 @@ the sweep runs it hasn't read yet, applies its seen-sets to them, and runs
 approval, waking you only if they did something or the PR is one the
 bot tracks (its own, a fork PR, or on the board). It exits `ACTIONS (KINDS) at HHMM: WHERE` followed by
 bot-reconcile's report when something is new (a sweep's news, a sweep
-problem at most hourly, a fast approval, or a fired action), else after
-about 9 minutes `QUIET` with the report's Observed line; start it again.
+problem at most hourly, a fast approval, or a fired action, or
+bot-reconcile or the heartbeat refresh failing 3 cycles in a row). A
+quiet window doesn't end it: it keeps cycling until `--max-wait`
+(default 25 minutes, under the background command's default 30-minute
+limit), then exits `TIMEOUT: no news in N min; run it again` with the
+report's Observed line. On TIMEOUT just start it again, without looking
+further: its state is on disk, so a run that ended, was stopped or was
+killed loses nothing, and a second run waits for the first's lock and
+then fails rather than both waking on the same news. (Without
+`--until-actions` it exits `QUIET` after about 9 minutes instead.)
 `bot-poll-loop --help` lists the kinds. Its state is in
 `~/.local/state/bot-coordinator/poll/`.
 
@@ -718,10 +729,12 @@ cost when an item is far off (two buckets), and correct the table in
 
 ## Loop cadence
 
-`bot-poll-loop` in the background is the loop's heartbeat: it wakes the
-session on news and new actions, or after its window. Worker completions
-wake the session too; handle them as they arrive, then run
-`bot-reconcile` to see what is left, and keep one loop running.
+`bot-poll-loop --until-actions` in the background is the loop's
+heartbeat: it wakes the session on news and new actions, and otherwise
+exits `TIMEOUT` at its `--max-wait`, to be started again at once. Worker
+completions wake the session too; handle them as they arrive, then run
+`bot-reconcile` to see what is left, and keep exactly one loop running
+(no watcher subagents).
 
 ## Heartbeat
 
@@ -748,8 +761,8 @@ jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
 
 `session` is this session's id, `loop_state` what the loop does next
 (`polling`, `working`, `sleeping`, or `stopped` when the operator says to
-stop), `next_wake_at` when the running `bot-poll` gives up (its start plus its
---max-duration; it wakes the session sooner on news), and each running worker is listed by the name, board item and
+stop), `next_wake_at` when the running poller gives up (its start plus
+`bot-poll-loop`'s --max-wait, or `bot-poll`'s --max-duration; it wakes the session sooner on news), and each running worker is listed by the name, board item and
 devspace in its brief, with the `status` it last reported (`starting`,
 `working`, `testing`, `reviewing`, `landing`, `waiting`); a finished one
 is left out. `agent_ids` are the agentIds the Agent tool returned for the
