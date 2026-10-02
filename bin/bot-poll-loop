@@ -23,11 +23,15 @@ readonly STALE_S=$((30 * 60)) SP_EVERY_S=3600
 # how long an unresolved action waits before it wakes again.
 readonly CYCLES=${BOT_POLL_LOOP_CYCLES:-3} FAST_S=${BOT_POLL_LOOP_FAST_S:-180}
 readonly RESYNC_MIN=${BOT_POLL_LOOP_RESYNC_MIN:-120}
+# --until-actions: how long it waits at most by default (under the 30
+# minutes a Claude Code background command gets by default), and after
+# how many failing cycles in a row a failure wakes it.
+readonly MAX_WAIT_DEFAULT=25m FAIL_STREAK=3
 readonly KEYS="approved outstanding rebase forgerev health ask drive"
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0")
+Usage: $(basename "$0") [--until-actions [--max-wait DURATION]]
 
 Waits for something for the coordinator to do, and exits saying what:
 
@@ -42,6 +46,20 @@ or, after about $(((CYCLES * FAST_S + 59) / 60)) minutes with nothing,
    its exit status if it failed>
 
 Both end with why the heartbeat wasn't refreshed, when it wasn't.
+
+With --until-actions it doesn't stop after a quiet window: it keeps
+cycling, so a background run of it ends only when there is something to
+do. It ends with ACTIONS as above, also when bot-reconcile failed or the
+heartbeat wasn't refreshed ${FAIL_STREAK} cycles in a row (reconcile-failing,
+heartbeat-refresh), or once the next cycle would end after DURATION
+(default ${MAX_WAIT_DEFAULT}; Ns, Nm or Nh, a bare number being minutes) with
+
+  TIMEOUT: no news in N min; run it again
+  <the same lines as QUIET>
+
+which needs nothing but running it again: all its state is on disk, so
+a run that is stopped or killed loses nothing either. Only one run at a
+time holds the state: another waits up to a minute, then fails.
 
 It never sweeps: the bot-sweep.timer does, publishing runs under
 ${SW}. Each cycle reads the complete
@@ -75,13 +93,49 @@ The seen-sets and the actions state live in ${S}.
 EOF
 }
 
-case "${1:-}" in
-    -h|--help) usage; exit 0 ;;
-    "") ;;
-    *) echo "error: $(basename "$0") takes no arguments (see --help)" 1>&2; exit 2 ;;
-esac
+die() {
+    echo "error: $(basename "$0"): $*" 1>&2
+    exit 2
+}
+
+# seconds DURATION: DURATION (Ns, Nm, Nh, or N minutes) in seconds.
+seconds() {
+    [[ "$1" =~ ^([0-9]+)([smh]?)$ ]] || return 1
+    case "${BASH_REMATCH[2]}" in
+        s) echo "${BASH_REMATCH[1]}" ;;
+        h) echo $((BASH_REMATCH[1] * 3600)) ;;
+        *) echo $((BASH_REMATCH[1] * 60)) ;;
+    esac
+}
+
+until_actions="" max_wait=""
+while test $# -gt 0; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --until-actions) until_actions=1 ;;
+        --max-wait)
+            test $# -ge 2 || die "--max-wait needs a DURATION, e.g. 25m"
+            max_wait=$2
+            shift ;;
+        --max-wait=*) max_wait=${1#*=} ;;
+        *) die "unknown argument '$1' (see --help)" ;;
+    esac
+    shift
+done
+if test -n "${max_wait}"; then
+    test -n "${until_actions}" || die "--max-wait only applies with --until-actions"
+else
+    max_wait=${MAX_WAIT_DEFAULT}
+fi
+max_wait_s=$(seconds "${max_wait}") || die "--max-wait: '${max_wait}' is not a duration like 90s, 25m or 1h"
+readonly until_actions max_wait_s
 
 mkdir -p "${S}" || exit 1
+# One run at a time: two would race on the seen-sets and both wake on
+# the same news. A run the harness just killed may leave a child (a
+# reconcile, say) that holds the lock a little longer: wait for it.
+exec {lock_fd}>"${S}/lock" || exit 1
+flock -w "${BOT_POLL_LOOP_LOCK_WAIT:-60}" "${lock_fd}" || die "another $(basename "$0") run holds ${S}/lock"
 for k in ${KEYS} evapprove; do touch "${S}/${k}-now" "${S}/${k}-seen"; done
 
 # events: the operator's approving reviews in their public events feed.
@@ -91,6 +145,12 @@ events() {
 }
 events >>"${S}/evapprove-seen"
 sort -u "${S}/evapprove-seen" -o "${S}/evapprove-seen"
+
+# merge K: adds K's -now set to its -seen set, replacing that file at
+# once, so a run killed meanwhile leaves the old set or the new one.
+merge() {
+    sort -u "${S}/$1-seen" "${S}/$1-now" >"${S}/$1-seen.tmp" && mv "${S}/$1-seen.tmp" "${S}/$1-seen"
+}
 
 # tracked REVIEW_URL...: prints those of the approvals that are of PRs
 # the bot tracks: in the forge org or the bot's own account, on the board
@@ -150,7 +210,7 @@ process() {
     new_health=$(comm -13 "${S}/health-seen" "${S}/health-now")
     test -n "${new_health}" && hit="${hit} health"
     grep -q '^  P0 ' <<<"${new_health}" && hit="${hit} health-P0"
-    for k in approved outstanding rebase forgerev health ask drive; do sort -u "${S}/${k}-seen" "${S}/${k}-now" -o "${S}/${k}-seen"; done
+    for k in approved outstanding rebase forgerev health ask drive; do merge "${k}"; done
     hits="${hits}${hit}"
     return 0
 }
@@ -186,15 +246,25 @@ refresh() {
     local rc=0 out
     out=$("${TOOLS}/bot-heartbeat" refresh 2>&1) || rc=$?
     refreshed=""
-    test "${rc}" -eq 0 || refreshed="$(tail -n1 <<<"${out}") (exit ${rc})"
+    if test "${rc}" -eq 0; then
+        refresh_fails=0
+    else
+        refreshed="$(tail -n1 <<<"${out}") (exit ${rc})"
+        refresh_fails=$((refresh_fails + 1))
+    fi
 }
 
 # reconcile: runs bot-reconcile against the actions state into
 # ${S}/reconcile.txt, adding the kinds of its fired actions to hits.
 reconcile() {
-    local kinds
-    "${TOOLS}/bot-reconcile" --state "${S}/actions.json" --resync "${RESYNC_MIN}" >"${S}/reconcile.txt" 2>&1 ||
-        echo "(bot-reconcile exited $?)" >>"${S}/reconcile.txt"
+    local kinds rc=0
+    "${TOOLS}/bot-reconcile" --state "${S}/actions.json" --resync "${RESYNC_MIN}" >"${S}/reconcile.txt" 2>&1 || rc=$?
+    if test "${rc}" -eq 0; then
+        reconcile_fails=0
+    else
+        echo "(bot-reconcile exited ${rc})" >>"${S}/reconcile.txt"
+        reconcile_fails=$((reconcile_fails + 1))
+    fi
     kinds=$(grep -oE '^\* [a-z-]+' "${S}/reconcile.txt" | cut -c3- | sort -u | tr '\n' ' ')
     test -z "${kinds}" || hits="${hits} actions: ${kinds% }"
 }
@@ -211,7 +281,20 @@ heartbeat_note() {
     test -z "${refreshed}" || echo "Heartbeat not refreshed: ${refreshed}"
 }
 
-cycle=0
+# quiet_report: what a window without news ends with: what bot-reconcile
+# couldn't read, or its failure (neither wakes it, but a reconcile that
+# keeps failing shouldn't go unseen), and the heartbeat note.
+quiet_report() {
+    grep -E '^(Observed:|  unread: |\(bot-reconcile exited )' "${S}/reconcile.txt"
+    heartbeat_note
+    exit 0
+}
+
+# A stop (the harness's, or the coordinator's) ends the sleep at once.
+trap 'test -z "${sleeper:-}" || kill "${sleeper}" 2>/dev/null; exit 143' TERM INT HUP
+sleeper=""
+
+cycle=0 refresh_fails=0 reconcile_fails=0
 while :; do
     t=$(date +%H%M)
     hits=""
@@ -238,15 +321,37 @@ while :; do
         wake "${why}"
     fi
     test -n "${hits}" && wake "see ${SW}/runs/$(cat "${S}/lastrun" 2>/dev/null)/{watch,notify,inbox}.txt"
-    test "${cycle}" -ge "${CYCLES}" && break
+    if test -n "${until_actions}"; then
+        # What a QUIET window would have shown, it wakes for once it
+        # persists, rather than cycling on with it unseen.
+        if test "${reconcile_fails}" -ge "${FAIL_STREAK}"; then
+            hits="reconcile-failing"
+            wake "bot-reconcile failed ${reconcile_fails} cycles in a row; see ${S}/reconcile.txt"
+        fi
+        if test "${refresh_fails}" -ge "${FAIL_STREAK}"; then
+            hits="heartbeat-refresh"
+            wake "bot-heartbeat refresh failed ${refresh_fails} cycles in a row: ${refreshed}"
+        fi
+        # Stop before a cycle that would end past the deadline.
+        if test $((SECONDS + FAST_S)) -ge "${max_wait_s}"; then
+            echo "TIMEOUT: no news in $(((SECONDS + 30) / 60)) min; run it again"
+            quiet_report
+        fi
+    else
+        test "${cycle}" -ge "${CYCLES}" && break
+    fi
     cycle=$((cycle + 1))
     # The fast path: their approvals through the events feed (one call),
-    # acted on at once.
-    sleep "${FAST_S}"
+    # acted on at once. The sleep doesn't hold the lock, and a stop
+    # interrupts it.
+    sleep "${FAST_S}" {lock_fd}>&- &
+    sleeper=$!
+    wait "${sleeper}"
+    sleeper=""
     t=$(date +%H%M)
     events >"${S}/evapprove-now"
     new_ev=$(comm -13 "${S}/evapprove-seen" "${S}/evapprove-now")
-    sort -u "${S}/evapprove-seen" "${S}/evapprove-now" -o "${S}/evapprove-seen"
+    merge evapprove
     if test -n "${new_ev}"; then
         # Cheap and idempotent, so run on any approval; but wake only when
         # they did something, or the approval is of a PR the bot tracks
@@ -264,8 +369,4 @@ while :; do
     fi
 done
 echo "QUIET: no news in this window"
-# With what bot-reconcile couldn't read, or its failure: neither wakes
-# it, but a reconcile that keeps failing shouldn't go unseen.
-grep -E '^(Observed:|  unread: |\(bot-reconcile exited )' "${S}/reconcile.txt"
-heartbeat_note
-exit 0
+quiet_report

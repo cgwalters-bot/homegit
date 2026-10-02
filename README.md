@@ -172,9 +172,10 @@ config's `pacing.agents` work agents busy, split between harness and
 upstream work; keep the heartbeat in step with the board; carry over the
 sweep's P0 drive and approvals; apply answered questions; set items Done
 whose issue or PR closed (which `bot-watch --apply` does itself).
-`bot-poll-loop`
+`bot-poll-loop --until-actions`
 waits on the sweeps and wakes the coordinator on news and on new (or, after
-2 hours, still open) actions.
+2 hours, still open) actions, run as one background command that exits
+only then (or `TIMEOUT` at its `--max-wait`, to be rerun).
 
 `bot-heartbeat publish` puts the coordinator's loop state and its local
 workers (names, board item links, devspaces) in one pinned comment on
