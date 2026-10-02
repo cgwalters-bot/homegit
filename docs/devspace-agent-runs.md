@@ -19,7 +19,7 @@ follow it.
 
 `bot-runs dispatch` calls the REST
 [workflow dispatch API](https://docs.github.com/en/rest/actions/workflows#create-a-workflow-dispatch-event)
-on `agent.yml` at `main` with `return_run_details: true`, which answers
+on `agent.yml` at `BOT_RUNS_REF` (`bot/agent-run-praxis` until the workflow lands on `main`) with `return_run_details: true`, which answers
 `200` with `workflow_run_id`, `run_url` and `html_url` instead of `204`,
 so no polling is needed to find the run. The inputs are all strings:
 
@@ -28,7 +28,7 @@ so no polling is needed to find the run. The inputs are all strings:
 | `item`     | the board item id (`PVTI_...`) |
 | `repo`     | the target repository, `OWNER/REPO` |
 | `base`     | its base ref |
-| `agent`    | `claude` or `opencode` |
+| `agent`    | `opencode`, `fake` (scripted, no inference) or `claude` (once the broker holds its credential) |
 | `model`    | the model name, empty for the agent's default |
 | `cores`    | `4`, `16` or `64` |
 | `timeout`  | minutes, at most 330 |
@@ -49,6 +49,22 @@ or doubt refuses.
 The workflow sets `run-name: agent ${{ inputs.item }} ${{ inputs.repo }}`:
 `bot-runs` reads the item and repository from a run's `display_title`
 when nothing else is left of the run.
+
+### On the board
+
+The run, not the session that dispatched it, is the source of truth for
+its item. `bot-runs dispatch` writes the run URL into the item's `Run`
+text field (adding the field to the board if it has none) and sets
+Status In Progress with a News line. `bot-runs reconcile`, which
+`bot-watch` runs on every sweep, follows that field: while the run goes
+on the item stays In Progress; once it is over, an item still In
+Progress moves to Draft if the run succeeded with a patch (ready for
+`bot-runs apply`, which isn't run unattended until
+[homegit#82](https://github.com/cgwalters-bot/homegit/pull/82) hardens
+it), and back to Todo otherwise (failure, timeout, budget, cancelled, or
+no change), with Why and News linking the run. Either way `Run` is
+cleared, so an item In Progress without a `Run` is local work, and a
+finished run never moves an item twice.
 
 ## Artifacts
 

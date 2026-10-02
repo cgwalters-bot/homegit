@@ -18,7 +18,8 @@ source "$(dirname "$(readlink -f "$0")")/operator.sh"
 readonly SUMMARY_SCHEMA=agent-run-summary/v1
 readonly RUNS_REPO=${BOT_RUNS_REPO:-${OP_DEVSPACE_REPO}}
 readonly RUNS_WORKFLOW=${BOT_RUNS_WORKFLOW:-agent.yml}
-readonly RUNS_REF=${BOT_RUNS_REF:-main}
+# agent.yml is on this branch until it lands on main.
+readonly RUNS_REF=${BOT_RUNS_REF:-bot/agent-run-praxis}
 readonly SUMMARY_ARTIFACT=agent-run
 readonly TRANSCRIPT_ARTIFACT=agent-transcript
 # A branch run's change: changes.patch and base.json.
@@ -42,7 +43,10 @@ readonly BOT_LOGIN=${OP_BOT_LOGIN}
 # A run whose summary could not be found at all is looked up again after
 # this many minutes (its footer may be written after the run).
 readonly NONE_RETRY_MINUTES=1440
-readonly AGENTS='["claude", "opencode"]'
+# agent.yml's choices: claude joins once the praxis broker holds its
+# credential; fake is the scripted agent, which needs no inference.
+readonly AGENTS='["opencode", "fake", "claude"]'
+readonly DEFAULT_AGENT=opencode
 readonly CORES='["4", "16", "64"]'
 readonly WORKFLOWS='["branch", "analysis"]'
 readonly MAX_TIMEOUT=330
@@ -68,6 +72,18 @@ readonly TRANSCRIPT_KEEP_DAYS=30
 readonly ITEM_SCAN_MAX=500
 # Exit status for an exhausted quota (EX_TEMPFAIL), as in bot-board.
 readonly EX_RATELIMIT=75
+# The board's text field holding the run that works an item: dispatch
+# sets it, reconcile clears it once the run is over.
+readonly RUN_FIELD=Run
+readonly RUN_STATUS='In Progress'
+readonly PATCH_STATUS=Draft
+readonly RETRY_STATUS=Todo
+# reconcile only reports a successful run's patch as ready: applying it
+# unattended waits for apply's hardening (cgwalters-bot/homegit#82).
+readonly HARDENING_PR=https://github.com/cgwalters-bot/homegit/pull/82
+readonly WHY_MAX=300
+BOT_BOARD=${BOT_RUNS_BOT_BOARD:-$(dirname "$(readlink -f "$0")")/bot-board}
+readonly BOT_BOARD
 # Returned when GitHub says a resource doesn't exist (any more): EX_NOINPUT.
 readonly EX_NOTFOUND=66
 
@@ -84,11 +100,23 @@ Commands:
            [--model MODEL] [--cores N] [--timeout MIN] [--budget AIC]
            [--workflow branch|analysis] [--no-preamble] [--dry-run] BRIEF
       Start a run on BRIEF (a file, or - for stdin) and print its id and
-      URL. Defaults: base main, agent claude, 4 cores, ${DEFAULT_TIMEOUT} minutes,
+      URL, then put the run URL in the item's ${RUN_FIELD} field (added to the
+      board if missing), with Status ${RUN_STATUS} and a News line.
+      Defaults: base main, agent ${DEFAULT_AGENT}, 4 cores, ${DEFAULT_TIMEOUT} minutes,
       budget ${DEFAULT_BUDGET} AIC, workflow branch. The task sent is the
       runner-side worker brief (runner-preamble.md in the coordinator
       skill), the run's target, then BRIEF; --no-preamble sends BRIEF
       alone. --dry-run prints the request.
+  reconcile [--apply | --dry-run] [--board-file FILE]
+      Move the board items with a ${RUN_FIELD} whose run is over (bot-watch
+      runs it on every sweep): from ${RUN_STATUS}, a success with a patch
+      to ${PATCH_STATUS} (patch ready for 'apply'), anything else to ${RETRY_STATUS}, with Why
+      and News linking the run; ${RUN_FIELD} is then cleared. A run still
+      going leaves its item alone, and so does a finished run whose item
+      left ${RUN_STATUS} (only ${RUN_FIELD} is cleared). Only --apply changes the
+      board; --dry-run prints the bot-board calls. FILE is a 'bot-board
+      list --json' array (default: the board). Prints one line per item
+      with a ${RUN_FIELD} (--json: an array of {item, run, line, ...}).
   list [--item ITEM] [--since AGE] [--status STATUS] [--limit N]
       Recent runs, newest first (at most ${DEFAULT_LIST_LIMIT} by default): item, target
       repository, agent, result, duration, tokens (in/out), estimated AIC
@@ -545,7 +573,7 @@ require_public_repo() {
 }
 
 cmd_dispatch() {
-    local item="" repo="" base=main agent=claude model="" cores=4 timeout=${DEFAULT_TIMEOUT}
+    local item="" repo="" base=main agent=${DEFAULT_AGENT} model="" cores=4 timeout=${DEFAULT_TIMEOUT}
     local budget=${DEFAULT_BUDGET} workflow=branch brief_file="" dry_run=false json=false preamble=true
     local inputs body len resp rc=0
     while test $# -gt 0; do
@@ -622,6 +650,145 @@ cmd_dispatch() {
     else
         jq -r '"Dispatched run \(.workflow_run_id): \(.html_url)"' <<<"${resp}"
     fi
+    local url
+    url=$(jq -r .html_url <<<"${resp}")
+    # The run is the source of truth for the item from now on: reconcile
+    # follows it from this field.
+    rc=0
+    "${BOT_BOARD}" field-ensure "${RUN_FIELD}" || rc=$?
+    test "${rc}" -ne 0 ||
+        "${BOT_BOARD}" set "${item}" --status "${RUN_STATUS}" --field "${RUN_FIELD}" "${url}" \
+            --news "Dispatched devspace agent run ${url} (${agent}, ${cores} cores)" >/dev/null || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 ||
+        fatal "the run was dispatched, but recording it on the board failed; run: bot-board set ${item} --status '${RUN_STATUS}' --field ${RUN_FIELD} ${url}"
+}
+
+# --- reconcile ---------------------------------------------------------------
+
+# reconcile_one ITEM_JSON: prints the reconcile entry of a board item
+# with a Run, {item, title, status, run, result, set: [bot-board set
+# arguments] or null, line}. Fails only when the run can't be read.
+reconcile_one() {
+    local item=$1 id title status run run_id meta rec flat result patch url why news set=null
+    read -r id status < <(jq -r '"\(.id) \(.status // "")"' <<<"${item}")
+    title=$(jq -r '.title // ""' <<<"${item}")
+    run=$(jq -r .run <<<"${item}")
+    entry() { # entry RESULT LINE
+        jq -nc --arg item "${id}" --arg title "${title}" --arg status "${status}" --arg run "${run}" \
+            --arg result "$1" --argjson set "${set}" --arg line "$2" \
+            '{item: $item, title: $title, status: $status, run: $run, result: (if $result == "" then null else $result end),
+              set: $set, line: "\($title) [\($status)] \($item): \($line)"}'
+    }
+    # Only a run of RUNS_REPO: parse_run takes any repository's run URL.
+    if [[ "${run}" != "https://github.com/${RUNS_REPO}/actions/runs/"* ]] ||
+        ! run_id=$(parse_run "${run}" 2>/dev/null); then
+        entry "" "${RUN_FIELD} is not a run URL of ${RUNS_REPO}: ${run}"
+        return 0
+    fi
+    meta=$(fetch_run "${run_id}") || return
+    rec=$(load_record "${meta}") || return
+    flat=$(jqlib -c flat <<<"${rec}")
+    url=$(jq -r .url <<<"${flat}")
+    if test "$(jq -r .status <<<"${flat}")" != completed; then
+        entry "" "run ${run_id} is $(jq -r .status <<<"${flat}")"
+        return 0
+    fi
+    # ensure_run_files keeps nothing when reading the run's files failed
+    # (it warned): without its summary a patch would look like no change.
+    if ! test -e "$(run_dir "${meta}")"; then
+        warn "the files of run ${run_id} could not be read"
+        return 1
+    fi
+    result=$(jq -r '.result // "unknown"' <<<"${flat}")
+    patch=$(jq -r '.summary.patch.bytes // 0 | numbers | select(. > 0)' <<<"${rec}")
+    if test "${status}" != "${RUN_STATUS}"; then
+        set=$(jq -nc --arg f "${RUN_FIELD}" '["--field", $f, ""]')
+        entry "${result}" "run ${run_id} ended (${result}) after the item left ${RUN_STATUS}: clear ${RUN_FIELD}"
+        return 0
+    fi
+    if test "${result}" = success && test -n "${patch}"; then
+        why="Agent run ${url} succeeded with a patch (${patch} bytes): ready for bot-runs apply ${run_id} --slug SLUG --message FILE, then bot-pr fork-pr (not applied unattended until ${HARDENING_PR} merges)"
+        news="Devspace agent run ${run_id} succeeded; patch ready"
+        set=$(jq -nc --arg s "${PATCH_STATUS}" --arg f "${RUN_FIELD}" --arg why "${why}" --arg news "${news}" \
+            '["--status", $s, "--field", $f, "", "--why", $why, "--news", $news]')
+        entry "${result}" "run ${run_id} succeeded, patch ready: set ${PATCH_STATUS}"
+        return 0
+    fi
+    if test "${result}" = success; then
+        why="Agent run ${url} succeeded without a change"
+    else
+        why="Agent run ${url} ended: ${result}"
+    fi
+    # The run's own account of why, if it gave one.
+    why+=$(jq -r '(.summary.outcome.why // .summary.failures[0]?.message // .summary.patch.error? // "") | select(. != "") | "; " + .' <<<"${rec}")
+    why=${why:0:${WHY_MAX}}
+    news="Devspace agent run ${run_id} ended (${result}): ${url}"
+    set=$(jq -nc --arg s "${RETRY_STATUS}" --arg f "${RUN_FIELD}" --arg why "${why}" --arg news "${news}" \
+        '["--status", $s, "--field", $f, "", "--why", $why, "--news", $news]')
+    entry "${result}" "run ${run_id} ended (${result}): set ${RETRY_STATUS}"
+}
+
+cmd_reconcile() {
+    local mode=report board_file="" json=false board items item rc entry entries args applied
+    while test $# -gt 0; do
+        case "$1" in
+            --apply) mode=apply; shift ;;
+            --dry-run) mode=dry-run; shift ;;
+            --board-file) test $# -ge 2 || fatal "--board-file requires a file"; board_file=$2; shift 2 ;;
+            --json) json=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            *) fatal "unknown reconcile argument: $1 (see --help)" ;;
+        esac
+    done
+    if test -n "${board_file}"; then
+        board=$(jq -ce 'arrays' "${board_file}") || fatal "--board-file ${board_file} is not a 'bot-board list --json' array"
+    else
+        rc=0
+        # A stale listing could move an item back.
+        board=$("${BOT_BOARD}" --refresh list --json) || rc=$?
+        pass_ratelimit "${rc}"
+        test "${rc}" -eq 0 || fatal "listing the board failed"
+    fi
+    items=$(jq -c --arg f "${RUN_FIELD,,}" '.[] | select((.[$f] // "") != "") | {id, title, status, run: .[$f]}' <<<"${board}")
+    entries=${scratch}/reconcile
+    : >"${entries}"
+    rc=0
+    while IFS= read -r item; do
+        test -n "${item}" || continue
+        local one=0
+        entry=$(reconcile_one "${item}") || one=$?
+        pass_ratelimit "${one}"
+        if test "${one}" -ne 0; then
+            warn "reading the run of item $(jq -r .id <<<"${item}") failed; a later reconcile retries"
+            rc=1
+            continue
+        fi
+        if test "${mode}" != report && jq -e '.set != null' <<<"${entry}" >/dev/null; then
+            mapfile -t args < <(jq -r '.set[]' <<<"${entry}")
+            if test "${mode}" = dry-run; then
+                applied=would-apply
+                printf 'bot-board set %s%s\n' "$(jq -r .item <<<"${entry}")" "$(printf ' %q' "${args[@]}")" 1>&2
+            elif "${BOT_BOARD}" set "$(jq -r .item <<<"${entry}")" "${args[@]}" >/dev/null; then
+                applied=applied
+            else
+                one=$?
+                pass_ratelimit "${one}"
+                applied=failed
+                rc=1
+            fi
+            entry=$(jq -c --arg a "${applied}" '.applied = $a | .line += {applied: " (done)", "would-apply": " (--apply would do it)", failed: " (FAILED)"}[$a]' <<<"${entry}")
+        elif jq -e '.set != null' <<<"${entry}" >/dev/null; then
+            entry=$(jq -c '.line += " (with --apply)"' <<<"${entry}")
+        fi
+        printf '%s\n' "${entry}" >>"${entries}"
+    done <<<"${items}"
+    if ${json}; then
+        jq -s . "${entries}"
+    else
+        jq -r '.line' "${entries}"
+    fi
+    return "${rc}"
 }
 
 # --- list --------------------------------------------------------------------
@@ -1149,14 +1316,14 @@ cmd=$1
 shift
 case "${cmd}" in
     -h|--help|help) usage; exit 0 ;;
-    dispatch|list|show|log|transcript|diff|stats|apply) ;;
+    dispatch|reconcile|list|show|log|transcript|diff|stats|apply) ;;
     *) fatal "unknown command: ${cmd} (see --help)" ;;
 esac
 
 require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
 require_cmd jq "install jq"
 case "${cmd}" in
-    list|show|log|diff|stats) require_cmd unzip "install unzip" ;;
+    list|show|log|diff|stats|reconcile) require_cmd unzip "install unzip" ;;
     apply)
         require_cmd unzip "install unzip"
         require_cmd git "install git"
