@@ -97,7 +97,7 @@ rg 'fn join_path\|fn build_path\|fn make_path' src/
 
 - No new `unsafe` block without a `// SAFETY:` comment explaining the invariant.
 - `.unwrap()` on a `Result` or `Option` in non-test code needs justification. Prefer `.context("...")` (anyhow) or `.expect("invariant: ...")` with an explanation.
-- Prefer `rustix` over `libc` for syscall wrappers — safer types, no raw pointers.
+- Prefer `rustix` over `libc` for syscall wrappers (`memfd_create`, `open`, `mount`, ...) — safer types, no raw pointers or fd ownership by hand. This holds in tests too, and when nearby code already calls `libc`, which is no precedent to copy.
 - TOCTOU: never do `if path.exists() { open(path) }`. Open directly and handle the error.
 - Before adding a new dependency, check whether an existing crate already in `Cargo.toml` covers it, or whether a well-known alternative (`bstr`, `camino`, `rustix`, etc.) is a better fit.
 - Prefer `split_once`/`rsplit_once` or other structured parsing (`strip_prefix`/`strip_suffix`, a proper parser) over manual index/`find`+slice juggling to pull a substring out of a string.
