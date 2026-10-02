@@ -49,6 +49,10 @@ readonly MAX_TIMEOUT=330
 readonly DEFAULT_TIMEOUT=120
 readonly DEFAULT_BUDGET=500
 readonly MAX_INPUTS_LEN=65535
+# The runner-side worker brief, put before every dispatched brief: the
+# agent runs without credentials, and its only outputs are the working
+# tree and ~/out/outcome.json.
+readonly RUNNER_PREAMBLE=${BOT_RUNS_PREAMBLE:-$(dirname "$(readlink -f "$0")")/../dotfiles/.agents/skills/coordinator/runner-preamble.md}
 readonly DEFAULT_LIST_LIMIT=20
 readonly DEFAULT_STATS_LIMIT=200
 readonly DEFAULT_STATS_SINCE=30d
@@ -78,10 +82,13 @@ docs/devspace-agent-runs.md in homegit.
 Commands:
   dispatch --item ITEM --repo OWNER/REPO [--base REF] [--agent AGENT]
            [--model MODEL] [--cores N] [--timeout MIN] [--budget AIC]
-           [--workflow branch|analysis] [--dry-run] BRIEF
+           [--workflow branch|analysis] [--no-preamble] [--dry-run] BRIEF
       Start a run on BRIEF (a file, or - for stdin) and print its id and
       URL. Defaults: base main, agent claude, 4 cores, ${DEFAULT_TIMEOUT} minutes,
-      budget ${DEFAULT_BUDGET} AIC, workflow branch. --dry-run prints the request.
+      budget ${DEFAULT_BUDGET} AIC, workflow branch. The task sent is the
+      runner-side worker brief (runner-preamble.md in the coordinator
+      skill), the run's target, then BRIEF; --no-preamble sends BRIEF
+      alone. --dry-run prints the request.
   list [--item ITEM] [--since AGE] [--status STATUS] [--limit N]
       Recent runs, newest first (at most ${DEFAULT_LIST_LIMIT} by default): item, target
       repository, agent, result, duration, tokens (in/out), estimated AIC
@@ -539,7 +546,8 @@ require_public_repo() {
 
 cmd_dispatch() {
     local item="" repo="" base=main agent=claude model="" cores=4 timeout=${DEFAULT_TIMEOUT}
-    local budget=${DEFAULT_BUDGET} workflow=branch brief_file="" dry_run=false json=false inputs body len resp rc=0
+    local budget=${DEFAULT_BUDGET} workflow=branch brief_file="" dry_run=false json=false preamble=true
+    local inputs body len resp rc=0
     while test $# -gt 0; do
         case "$1" in
             --item|--repo|--base|--agent|--model|--cores|--timeout|--budget|--workflow)
@@ -549,6 +557,7 @@ cmd_dispatch() {
                 shift 2
                 ;;
             --dry-run) dry_run=true; shift ;;
+            --no-preamble) preamble=false; shift ;;
             --json) json=true; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) test "$1" = - || fatal "unknown dispatch option: $1 (see --help)"; brief_file=-; shift ;;
@@ -576,6 +585,15 @@ cmd_dispatch() {
         cp "${brief_file}" "${scratch}/brief"
     fi
     grep -q '[^[:space:]]' "${scratch}/brief" || fatal "the brief is empty"
+    if ${preamble}; then
+        test -r "${RUNNER_PREAMBLE}" || fatal "cannot read the runner brief ${RUNNER_PREAMBLE} (or pass --no-preamble)"
+        mv "${scratch}/brief" "${scratch}/task"
+        {
+            cat "${RUNNER_PREAMBLE}"
+            printf '\n---\n\nThis run: a `%s` run on %s at `%s`.\n\nThe task:\n\n' "${workflow}" "${repo}" "${base}"
+            cat "${scratch}/task"
+        } >"${scratch}/brief"
+    fi
     inputs=$(jq -nc --arg item "${item}" --arg repo "${repo}" --arg base "${base}" --arg agent "${agent}" \
         --arg model "${model}" --arg cores "${cores}" --arg timeout "${timeout}" --arg budget "${budget}" \
         --arg workflow "${workflow}" --rawfile brief "${scratch}/brief" \

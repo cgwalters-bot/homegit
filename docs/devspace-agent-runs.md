@@ -35,7 +35,7 @@ so no polling is needed to find the run. The inputs are all strings:
 | `budget`   | the spend cap in AIC (1 AIC = $0.01) |
 | `max_tokens` | optional: a token cap for inference through the praxis broker, which can only lower the broker's per-run cap; empty (the default) keeps it |
 | `workflow` | `branch` or `analysis` |
-| `brief`    | the task text |
+| `brief`    | the task text: `bot-runs dispatch` sends the runner-side worker brief (`dotfiles/.agents/skills/coordinator/runner-preamble.md`), the run's target, then the given brief, unless `--no-preamble` |
 
 Dispatch inputs are public in a public repository and capped at 65,535
 characters in total, so a brief follows the board's no-private-data rule.
@@ -63,9 +63,10 @@ maximum), holds small, unencrypted files at its root:
   `$GITHUB_STEP_SUMMARY` (the REST API can't read a step summary back);
 - `condensed.log`: the condensed transcript, one line per event, the
   same lines the job log shows;
-- `outcome.json`: the agent's own outcome (tests run, early-stop
-  reasons); step 3 of the plan defines it along with the rest of
-  `outputs/v1`.
+- `outcome.json`: the agent's own outcome, which it writes to
+  `~/out/outcome.json` (at most 64 KiB): `summary`, `tests`
+  (`{command, exit_code, duration_s}`, copied into `summary.json`),
+  `questions` and `stopped_early`, as the runner-side worker brief asks.
 
 **`agent-out`**, with `retention-days: 30`, is uploaded only by a
 `branch` run that changed files. It holds `changes.patch`, the change as
