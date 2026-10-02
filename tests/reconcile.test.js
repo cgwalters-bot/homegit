@@ -48,6 +48,7 @@ const ALL_KEYS = [
   "approval:https://github.com/cgwalters-forge/q/pull/5 https://github.com/cgwalters-forge/q/pull/5#pullrequestreview-5",
   "approval:https://github.com/cgwalters-forge/r/pull/3 https://github.com/cgwalters-forge/r/pull/3#pullrequestreview-3",
   "approval:https://github.com/cgwalters-forge/r/pull/4 https://github.com/cgwalters-forge/r/pull/4#pullrequestreview-4",
+  "patch-ready:https://github.com/cgwalters-forge/tracker/issues/60:4242",
   "answer-unapplied:https://github.com/cgwalters-forge/tracker/issues/50 https://github.com/cgwalters-forge/tracker/issues/50#issuecomment-1",
   "budget:https://github.com/cgwalters-forge/tracker/issues/1",
   "lead-orphan:https://github.com/cgwalters-forge/tracker/issues/2",
@@ -96,15 +97,17 @@ test("capacity: lanes against the target, paced by the week's capacity", () => {
     }
   }
   const [free] = rec.capacity(obs({ items: oneFree }));
-  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1 \(bot-pace assign ITEM, or bot-runs dispatch\); 2 P0 wait on a human$/);
+  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1 via bot-runs dispatch \(a devspace run, the default for implementation and test work; bot-pace assign only for a local worker that does GitHub I\/O, or where a remote run is impossible\); 2 P0 wait on a human$/);
   assert.equal(free.detail[0], "P0 https://github.com/cgwalters-forge/tracker/issues/30 image-builder analysis (osbuild/image-builder, budget 5M by P0)");
   const a = rec.capacity(obs({ items: oneFree.filter((it) => !/^PVTI_c/.test(it.id)) }))[0];
   assert.match(a.do, /no Todo candidates: triage the backlog or file upstream work; 2 P0 wait on a human$/);
   // A lane's shortfall with the total at the target is only noted.
   // [case, changes, the Observed line's agents part]
   const noted = [
-    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target)"],
-    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2)"],
+    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote, 3 local (drifting local: dispatch via bot-runs))"],
+    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 1 remote, 2 local (drifting local: dispatch via bot-runs))"],
+    ["mostly remote", { items: setItem(setItem(read("board.json"), "PVTI_h1", { lead: undefined, run: "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/6" }), "PVTI_o1", { status: "Draft" }) },
+      "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 2 remote, 1 local)"],
   ];
   for (const [name, changes, want] of noted) {
     assert.ok(rec.render(rec.observed(obs(changes)), []).startsWith(`Observed: ${want}; budgets `), name);
@@ -331,7 +334,23 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
     ["approval", "closed-not-done", "drive", "health", "heartbeat", "lead-orphan"]);
   // The rules that didn't run keep theirs too.
   assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: null, sweep: {}, questions: [], contentStates: {} }, ["capacity", "drive"])].sort(),
-    ["answer-unapplied", "closed-not-done", "heartbeat", "lead-orphan", "stale-lead"]);
+    ["answer-unapplied", "closed-not-done", "heartbeat", "lead-orphan", "patch-ready", "stale-lead"]);
+});
+
+test("patch-ready: a Draft item whose Why names a run's patch is reported until the switch is on", () => {
+  const [a] = rec.patchReady(obs());
+  assert.equal(a.url, "https://github.com/cgwalters-forge/tracker/issues/60");
+  assert.match(a.do, /^devspace run 4242's patch is ready, but bot-runs apply isn't run unattended until cgwalters-bot\/homegit#82 merges/);
+  assert.equal(rec.APPLY_UNATTENDED, false, "the switch stays off until homegit#82 merges");
+  // With the switch on: a Sonnet worker applies it.
+  const [on] = rec.patchReady(obs({ applyUnattended: true }));
+  assert.match(on.do, /^devspace run 4242's patch is ready: dispatch a local Sonnet worker .*apply-preamble\.md/);
+  assert.equal(on.key, a.key);
+  // Applied and proposed: Why no longer says ready, or the item left Draft.
+  const board = read("board.json");
+  assert.deepEqual(rec.patchReady(obs({ items: setItem(board, "PVTI_p1", { why: "Draft PR https://github.com/cgwalters-forge/r/pull/9" }) })), []);
+  assert.deepEqual(rec.patchReady(obs({ items: setItem(board, "PVTI_p1", { status: "Todo" }) })), []);
+  assert.deepEqual(rec.patchReady(obs({ items: undefined })), []);
 });
 
 test("stale-lead: Lead coordinator ends with In Progress; other Leads stay", () => {
@@ -374,7 +393,7 @@ function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) 
 
 test("bot-reconcile: the report, and --json", () => {
   const out = cli([]);
-  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(13\):\n/);
+  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote, 3 local \(drifting local: dispatch via bot-runs\)\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(14\):\n/);
   assert.doesNotMatch(out, /^. capacity /m);
   const j = JSON.parse(cli(["--json"]));
   assert.deepEqual(j.actions.map((a) => a.key), ALL_KEYS);

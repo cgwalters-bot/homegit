@@ -28,6 +28,9 @@
    "workflow": "manual", "content": {"type": "Issue", "url": "https://github.com/cgwalters-forge/tracker/issues/160"}},
   {"id": "PVTI_r7", "title": "a fork PR waiting on the operator's review", "status": "Draft", "priority": "P0", "org": "o", "reviewers": ["cgwalters"],
    "why": "Ready for your review (requested 10-01)", "content": {"type": "PullRequest", "url": "https://github.com/cgwalters-forge/r/pull/7"}},
+  {"id": "PVTI_p1", "title": "a run's patch", "status": "Draft", "org": "o",
+   "why": "Agent run https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/4242 succeeded with a patch (812 bytes): ready for bot-runs apply 4242 --slug SLUG --message FILE, then bot-pr fork-pr",
+   "content": {"type": "Issue", "url": "https://github.com/cgwalters-forge/tracker/issues/60"}},
   {"id": "PVTI_d1", "title": "finished", "status": "Done", "priority": "P1", "org": "cgwalters-bot",
    "content": {"type": "Issue", "url": "https://github.com/cgwalters-forge/tracker/issues/99"}}
 ]
