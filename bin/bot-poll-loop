@@ -41,6 +41,8 @@ or, after about $(((CYCLES * FAST_S + 59) / 60)) minutes with nothing,
   <bot-reconcile's Observed line, the inputs it couldn't read, and
    its exit status if it failed>
 
+Both end with why the heartbeat wasn't refreshed, when it wasn't.
+
 It never sweeps: the bot-sweep.timer does, publishing runs under
 ${SW}. Each cycle reads the complete
 runs newer than the last it read (oldest first; on a fresh state only the
@@ -53,7 +55,11 @@ humans (news). A sweep problem (the newest status lists problems that
 the run before it had too, or no sweep completed in $((STALE_S / 60)) minutes) wakes
 it at most hourly (sweep-problem).
 
-Each cycle also runs 'bot-reconcile --state ${S}/actions.json'
+Each cycle first runs 'bot-heartbeat refresh', which republishes the
+heartbeat as last published with updated_at moved to now, while that
+publish was this session's and nobody changed it since: so the heartbeat
+stays fresh without a wake, and is stale only when the refresh can't
+keep it so. Then it runs 'bot-reconcile --state ${S}/actions.json'
 and wakes on its fired actions: those that are new, and those still
 open ${RESYNC_MIN} minutes after they last woke it (a controller's resync). So the
 same unresolved action doesn't wake it again and again.
@@ -174,6 +180,15 @@ sweep_problem() {
     echo "${why}"
 }
 
+# refresh: bot-heartbeat refresh, leaving in refreshed why it didn't
+# refresh (empty when it did, or needn't yet).
+refresh() {
+    local rc=0 out
+    out=$("${TOOLS}/bot-heartbeat" refresh 2>&1) || rc=$?
+    refreshed=""
+    test "${rc}" -eq 0 || refreshed="$(tail -n1 <<<"${out}") (exit ${rc})"
+}
+
 # reconcile: runs bot-reconcile against the actions state into
 # ${S}/reconcile.txt, adding the kinds of its fired actions to hits.
 reconcile() {
@@ -188,7 +203,12 @@ reconcile() {
 wake() {
     echo "ACTIONS (${hits# }) at ${t}: $1"
     cat "${S}/reconcile.txt"
+    heartbeat_note
     exit 0
+}
+
+heartbeat_note() {
+    test -z "${refreshed}" || echo "Heartbeat not refreshed: ${refreshed}"
 }
 
 cycle=0
@@ -211,6 +231,7 @@ while :; do
         echo "${r}" >"${S}/lastrun"
         prime=""
     done
+    refresh
     reconcile
     if why=$(sweep_problem); then
         hits="sweep-problem${hits}"
@@ -246,4 +267,5 @@ echo "QUIET: no news in this window"
 # With what bot-reconcile couldn't read, or its failure: neither wakes
 # it, but a reconcile that keeps failing shouldn't go unseen.
 grep -E '^(Observed:|  unread: |\(bot-reconcile exited )' "${S}/reconcile.txt"
+heartbeat_note
 exit 0

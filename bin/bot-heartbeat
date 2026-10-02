@@ -82,9 +82,20 @@ const MAX_AGENT_IDS = 8;
 const AGENT_ID_RE = /^[A-Za-z0-9]{1,64}$/;
 const TOKEN_KEYS = ["input", "output", "cache_read", "cache_write"];
 
+// What publish last wrote from this machine, for refresh: its input
+// (agent_ids included: it stays local), the heartbeat as published, and
+// the Claude Code session it ran in.
+const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "bot-heartbeat");
+const LAST_PUBLISH_FILE = path.join(STATE_DIR, "last-publish.json");
+const SESSION_ENV = "CLAUDE_CODE_SESSION_ID";
+// refresh leaves a heartbeat younger than this alone (the review app
+// calls it stale after 15 minutes).
+const REFRESH_MIN_AGE_MS = 5 * 60 * 1000;
+
 const EX_ERROR = 1;
 const EX_USAGE = 2;
 const EX_INVALID = 3;
+const EX_NOT_REFRESHED = 4;
 
 class Exit extends Error {
   constructor(status, message) {
@@ -95,6 +106,7 @@ class Exit extends Error {
 
 function usage() {
   return `Usage: ${PROG} publish [--dry-run] [--no-usage] < HEARTBEAT.json
+       ${PROG} refresh
        ${PROG} show [--usage]
        ${PROG} usage
        ${PROG} statusline < STATUSLINE.json
@@ -156,6 +168,17 @@ adds a "mentioned this" event to them.
               repositories' visibility)
   --no-usage  write no usage snapshot
 
+publish saves what it published, and its input, to ${LAST_PUBLISH_FILE.replace(os.homedir(), "~")}.
+
+refresh republishes that input with updated_at set to now (and
+next_wake_at, if any, moved by as much), so that the heartbeat stays
+fresh while nothing in it changed; bot-poll-loop runs it each cycle. It
+does only when the last publish ran in this Claude Code session
+(\$${SESSION_ENV}, if set) and the published heartbeat is still
+the one it wrote (the same workers and coordinator state: nobody
+published since); otherwise it changes nothing and exits ${EX_NOT_REFRESHED}. A
+heartbeat under ${REFRESH_MIN_AGE_MS / 60000} minutes old is left as it is.
+
 show prints the published heartbeat's JSON, or with --usage the usage
 snapshot's.
 
@@ -168,7 +191,7 @@ in ~/.claude/settings.json. It saves rate_limits' used_percentage and
 resets_at (and nothing else of its input) to ${RATE_LIMITS_FILE},
 and prints the model and both percentages.
 
-Exit status: 0 done, ${EX_INVALID} invalid input, ${EX_USAGE} usage, ${EX_ERROR} anything else.
+Exit status: 0 done, ${EX_INVALID} invalid input, ${EX_NOT_REFRESHED} not refreshed, ${EX_USAGE} usage, ${EX_ERROR} anything else.
 `;
 }
 
@@ -592,11 +615,11 @@ function botComment(t) {
   return null;
 }
 
-// writeComment(t, body): edit the bot's comment on T's issue in place
-// (create it the first time), unless it already says BODY. Returns what
+// writeComment(t, body, existing): edit the bot's comment on T's issue
+// in place (create it the first time), unless it already says BODY.
+// EXISTING is that comment, when the caller just read it. Returns what
 // happened, for the log.
-function writeComment(t, body) {
-  const existing = botComment(t);
+function writeComment(t, body, existing = botComment(t)) {
   if (existing && existing.body === body) return `unchanged: ${existing.html_url}`;
   // The lookup only finds BOT_LOGIN's comment: under another login,
   // every publish would create one more.
@@ -654,8 +677,15 @@ function cmdPublish(args) {
     else if (a === "--no-usage") withUsage = false;
     else throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
   }
+  publish(readInput(), { dryRun, withUsage });
+}
+
+// publish(input, {dryRun, withUsage, existing}): validates and publishes
+// INPUT (see cmdPublish), and unless dryRun saves it for refresh.
+// EXISTING is the heartbeat comment, when the caller just read it.
+function publish(input, { dryRun = false, withUsage = true, existing } = {}) {
   const nowMs = now();
-  const { hb: valid, agentIds } = validate(readInput(), nowMs);
+  const { hb: valid, agentIds } = validate(input, nowMs);
   const hb = dropPrivate(valid);
   const body = render(hb);
   let usageBody = null;
@@ -672,10 +702,54 @@ function cmdPublish(args) {
     if (usageBody !== null) process.stdout.write(`${DRY_RUN_SEPARATOR}\n${usageBody}`);
     return;
   }
-  log(`${writeComment(HEARTBEAT, body)} (${hb.workers.length} worker(s))`);
+  log(`${writeComment(HEARTBEAT, body, existing)} (${hb.workers.length} worker(s))`);
+  saveLastPublish({ ...input, updated_at: hb.updated_at }, hb);
   if (usageBody === null) return;
   assertPrivate(USAGE_REPO);
   log(`usage: ${writeComment(USAGE, usageBody)}`);
+}
+
+// saveLastPublish(input, hb): what refresh republishes. Best effort: the
+// heartbeat is out already, and without this file refresh only declines.
+function saveLastPublish(input, hb) {
+  try {
+    writeFileAtomic(LAST_PUBLISH_FILE, `${JSON.stringify({ session: process.env[SESSION_ENV] || null, input, published: hb })}\n`);
+  } catch (e) {
+    log(`cannot save the heartbeat for refresh: ${e.message}`);
+  }
+}
+
+// notRefreshed(why): refresh's refusal.
+const notRefreshed = (why) => new Exit(EX_NOT_REFRESHED, `not refreshed: ${why}`);
+
+function cmdRefresh(args) {
+  if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
+  let last;
+  try {
+    last = JSON.parse(fs.readFileSync(LAST_PUBLISH_FILE, "utf8"));
+  } catch (e) {
+    if (e.code === "ENOENT") throw notRefreshed(`nothing published from here yet (${LAST_PUBLISH_FILE})`);
+    throw new Exit(EX_ERROR, `cannot read ${LAST_PUBLISH_FILE}: ${e.message}`);
+  }
+  if (!isObject(last) || !isObject(last.input) || !isObject(last.published)) throw new Exit(EX_ERROR, `${LAST_PUBLISH_FILE} is malformed; publish again`);
+  const session = process.env[SESSION_ENV] || null;
+  if (last.session !== session) throw notRefreshed(`the last publish ran in session ${last.session || "(none)"}, not this one (${session || "none"})`);
+  const nowMs = now();
+  const age = nowMs - Date.parse(last.published.updated_at);
+  if (age < REFRESH_MIN_AGE_MS) {
+    log(`fresh: published ${Math.round(age / 60000)} min ago`);
+    return;
+  }
+  const existing = botComment(HEARTBEAT);
+  const current = existing && parseComment(existing.body);
+  if (JSON.stringify(current) !== JSON.stringify(last.published)) {
+    throw notRefreshed(`the published heartbeat is not the one this session last wrote (as of ${last.published.updated_at}): someone published since`);
+  }
+  // Move updated_at to now, and next_wake_at by as much.
+  const delta = nowMs - Date.parse(last.input.updated_at);
+  const coordinator = { ...last.input.coordinator };
+  if (coordinator.next_wake_at) coordinator.next_wake_at = iso(Date.parse(coordinator.next_wake_at) + delta);
+  publish({ ...last.input, updated_at: iso(nowMs), coordinator }, { existing });
 }
 
 function cmdShow(args) {
@@ -735,6 +809,9 @@ function main() {
     case "publish":
       needIssue();
       return cmdPublish(args);
+    case "refresh":
+      needIssue();
+      return cmdRefresh(args);
     case "show":
       needIssue();
       return cmdShow(args);
