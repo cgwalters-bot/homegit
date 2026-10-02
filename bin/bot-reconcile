@@ -1,0 +1,285 @@
+#!/usr/bin/env node
+// The coordinator's controller: compares the observed state with the
+// desired one and prints what to do about the difference. See --help;
+// the rules are in lib/reconcile.js. Node's standard library only, plus
+// bot-board, bot-heartbeat, bot-capacity and gh (through
+// bot-priority-health's REST helpers, with their ETag cache).
+"use strict";
+
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const { promisify } = require("node:util");
+
+const execFileP = promisify(execFile);
+
+const PROG = path.basename(process.argv[1] || "bot-reconcile");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const ROOT = path.join(BIN_DIR, "..");
+const rec = require(path.join(ROOT, "lib", "reconcile.js"));
+const pace = require(path.join(ROOT, "lib", "pacing.js"));
+const operator = require(path.join(ROOT, "lib", "operator.js"));
+
+const tool = (name) => process.env[`BOT_RECONCILE_${name.replace(/^bot-/, "").toUpperCase()}`] || path.join(BIN_DIR, name);
+const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+const SWEEP_DIR = path.join(STATE_HOME, "bot-sweep");
+// bot-watch's last-seen state of the coordinator's sweep.
+const WATCH_STATE = path.join(STATE_HOME, "bot-watch", "watch.json");
+const ACTIVITY_FILE = path.join(process.env.BOT_OPERATOR_ACTIVITY_STATE || path.join(STATE_HOME, "bot-operator-activity"), "repos.json");
+const POLICY_DIR = process.env.UPSTREAM_POLICY_DIR || path.join(ROOT, "upstream-policy");
+const TOPIC_SKILL = path.join(ROOT, "dotfiles", ".agents", "skills", "topic-lead", "SKILL.md");
+const STATE_VERSION = 1;
+// The inputs each rule reads; only those of the rules run are read.
+const RULE_INPUTS = {
+  capacity: ["items", "capacity", "activity"],
+  heartbeat: ["items", "heartbeat"],
+  "lead-orphan": ["items", "heartbeat"],
+  drive: ["sweep"],
+  "answer-unapplied": ["questions"],
+  "closed-not-done": ["items", "contentStates"],
+};
+const MAX_BUFFER = 256 << 20;
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+function usage() {
+  const rules = Object.keys(rec.RULES).join(", ");
+  return `Usage: ${PROG} [--json] [--apply] [--state FILE [--resync MIN]] [--rule NAME]...
+       [--board-file F] [--sweep-dir D] [--heartbeat-file F] [--capacity-file F]
+       [--questions-file F] [--activity-file F] [--watch-state F] [--now TIME]
+
+Reconciles like a Kubernetes controller: reads the observed state, compares
+it with the desired one, and prints the actions that would close the gap,
+each with a stable key, a kind, the item's URL and what to do. It changes
+nothing itself, except with --apply (see closed-not-done). Run it on each
+wake, do the actions, then run it again to confirm they converged
+("Actions: none").
+
+Observed: the board (bot-board list), the latest complete bot-sweep run
+(${SWEEP_DIR.replace(os.homedir(), "~")}), the heartbeat (bot-heartbeat show),
+the week's capacity (bot-capacity --json), and the question issues of
+${operator.loadOrExit(PROG).tracker_repo} answered in the last ${rec.ANSWER_WINDOW_MS / 3600e3}h, and bot-watch's last-seen
+state of the board's issues and PRs (${WATCH_STATE.replace(os.homedir(), "~")}).
+Only the inputs of the rules run are read.
+
+Rules (${rules}):
+  capacity          pacing.agents work agents busy (In Progress with a Lead
+                    or Run), pacing.harness_agents of them on the harness,
+                    the rest upstream; a lane under its target gets the top
+                    Todo candidates (by priority, spread over repositories,
+                    toward the operator's recent activity; not topic
+                    sessions', asks, manual items, or bot text for a
+                    human-text repository). The targets shrink with the
+                    week's capacity: half, P0 only, at bot-capacity's P0-only
+                    mark; none once it is used up. A busy task whose Actual
+                    tokens passed its Budget tokens is a 'budget' action.
+  heartbeat         the heartbeat is fresh (${rec.HEARTBEAT_MAX_AGE_MS / 60e3} min, or until its next
+                    wake) and lists the busy items' workers and no others;
+                    for a drift it prints the heartbeat to publish.
+  lead-orphan       each of the coordinator's busy items (Lead not a topic
+                    of the topic-lead skill) has a worker in the heartbeat,
+                    each worker a busy item; In Progress items with neither
+                    Lead nor Run are nobody's.
+  drive             the latest sweep's P0 drive blockers that need the
+                    coordinator, its P0 health lines, and approved fork
+                    PRs its promotions didn't take, carried over as they are.
+  answer-unapplied  a question the operator answered whose Unblocks items
+                    are still open and untouched since the answer.
+  closed-not-done   an item whose own issue or PR is closed or merged is
+                    Done, once none of its Branch PRs is open (or unknown).
+                    A PR closed unmerged needs a human: listed, but not
+                    carried out, and not at all when its item is Needs
+                    human (bot-watch's question to the operator). The one
+                    rule --apply carries out: 'bot-board set ITEM --status
+                    Done --news ...' for each; bot-watch --apply runs it.
+
+With --state FILE it remembers the actions across runs, and marks with '*'
+(--json: "fired") the ones that are new, or still there ${rec.RESYNC_MS / 3600e3}h (--resync) after
+they last fired; an action that is gone is forgotten. An input that can't
+be read is listed as such, its rules' earlier actions are kept as they
+were, and the exit status is 1.
+
+The --*-file options read an input from a file instead (tests); --now
+sets the time.
+`;
+}
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function parseArgs(argv) {
+  const opts = { json: false, apply: false, rules: [], resync: rec.RESYNC_MS };
+  const values = ["state", "resync", "rule", "board-file", "sweep-dir", "heartbeat-file", "capacity-file", "questions-file", "activity-file", "watch-state", "now"];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-h" || a === "--help") throw new Exit(0, null);
+    if (a === "--json" || a === "--apply") {
+      opts[a.slice(2)] = true;
+      continue;
+    }
+    const name = a.replace(/^--/, "");
+    if (!a.startsWith("--") || !values.includes(name)) throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${a} needs a value`);
+    const v = argv[++i];
+    if (name === "rule") {
+      if (!(v in rec.RULES)) throw new Exit(EX_USAGE, `unknown rule '${v}'; rules: ${Object.keys(rec.RULES).join(", ")}`);
+      opts.rules.push(v);
+    } else if (name === "resync") {
+      if (!(Number(v) > 0)) throw new Exit(EX_USAGE, `--resync takes minutes, not '${v}'`);
+      opts.resync = Number(v) * 60e3;
+    } else opts[name] = v;
+  }
+  if (!opts.rules.length) opts.rules = Object.keys(rec.RULES);
+  opts.now = opts.now ? Date.parse(opts.now) : Date.now();
+  if (Number.isNaN(opts.now)) throw new Exit(EX_USAGE, "--now: not a time");
+  return opts;
+}
+
+const readJsonFile = (f) => JSON.parse(fs.readFileSync(f, "utf8"));
+const runJson = async (cmd, args) => JSON.parse((await execFileP(cmd, args, { maxBuffer: MAX_BUFFER })).stdout);
+const firstLine = (e) => String((e.stderr && e.stderr.trim()) || e.message).split("\n").pop();
+
+// latestSweep(dir): {run, ended_at, watch, inbox} of the last complete
+// bot-sweep run.
+function latestSweep(dir) {
+  const st = readJsonFile(path.join(dir, "status.json"));
+  const last = st.last_complete;
+  if (!last || !last.run) throw new Error(`no complete sweep in ${dir} yet`);
+  const read = (name) => {
+    try {
+      return fs.readFileSync(path.join(dir, "runs", last.run, `${name}.txt`), "utf8");
+    } catch (e) {
+      if (e.code === "ENOENT") return "";
+      throw e;
+    }
+  };
+  return { run: last.run, ended_at: last.ended_at, watch: read("watch"), inbox: read("inbox") };
+}
+
+// questions(config, now): the tracker's question issues updated in the
+// window, each with the operator's answer (their first comment) and the
+// state of the items it unblocks, for the answers in the window.
+async function questions(config, now) {
+  const { restGet, pages, pool } = require(path.join(BIN_DIR, "bot-priority-health"));
+  // Since the start of the day, so that the listing's ETag holds all day.
+  const since = new Date(now - rec.ANSWER_WINDOW_MS);
+  since.setUTCHours(0, 0, 0, 0);
+  const issues = await pages(`repos/${config.tracker_repo}/issues?labels=question&state=all&since=${since.toISOString()}`);
+  const out = await pool(issues.filter((i) => !i.pull_request && i.comments > 0), async (i) => {
+    const answer = (await pages(`repos/${config.tracker_repo}/issues/${i.number}/comments`))
+      .find((c) => c.user && c.user.login === config.operator.login);
+    if (!answer || now - Date.parse(answer.created_at) > rec.ANSWER_WINDOW_MS) return null;
+    const urls = rec.unblocks(i.body);
+    const unblocks = await pool(urls, async (url) => {
+      const m = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/(?:issues|pull)\/(\d+)/.exec(url);
+      const it = m && (await restGet(`repos/${m[1]}/issues/${m[2]}`));
+      return { url, state: it ? it.state : "gone", updated_at: it ? it.updated_at : null };
+    });
+    return { url: i.html_url, answer: { at: answer.created_at, url: answer.html_url, text: String(answer.body || "").trim().split("\n")[0] }, unblocks };
+  });
+  return out.filter(Boolean);
+}
+
+// contentStates(file): {URL: state} of bot-watch's last-seen state.
+function contentStates(file) {
+  const w = readJsonFile(file);
+  return Object.fromEntries(Object.entries(w.items || {}).map(([url, v]) => [url, v && v.state]));
+}
+
+// observe(opts): the observed state the rules run need, and the inputs
+// that couldn't be read.
+async function observe(opts) {
+  const config = operator.loadOrExit(PROG);
+  const errors = [];
+  const obs = { now: opts.now, config, activity: {} };
+  const needed = new Set(opts.rules.flatMap((r) => RULE_INPUTS[r]));
+  const get = async (key, what, fn) => {
+    if (!needed.has(key)) return;
+    try {
+      obs[key] = await fn();
+    } catch (e) {
+      errors.push(`${what}: ${firstLine(e)}`);
+    }
+  };
+  const fromFile = (opt, fn) => (opts[opt] ? () => readJsonFile(opts[opt]) : fn);
+  await Promise.all([
+    get("items", "the board", fromFile("board-file", () => runJson(tool("bot-board"), ["list", "--json"]))),
+    get("sweep", "the latest sweep", () => latestSweep(opts["sweep-dir"] || SWEEP_DIR)),
+    get("heartbeat", "the heartbeat", fromFile("heartbeat-file", () => runJson(tool("bot-heartbeat"), ["show"]))),
+    get("capacity", "the week's capacity", fromFile("capacity-file", () => runJson(tool("bot-capacity"), ["--json"]))),
+    get("questions", "the answered questions", fromFile("questions-file", () => questions(config, opts.now))),
+    get("contentStates", "bot-watch's last-seen state", () => contentStates(opts["watch-state"] || WATCH_STATE)),
+    get("activity", "the operator's activity", () => pace.readActivity(opts["activity-file"] || ACTIVITY_FILE, opts.now)),
+  ]);
+  obs.activity = obs.activity || {};
+  obs.verdicts = pace.readVerdicts(POLICY_DIR);
+  try {
+    obs.topics = rec.topics(fs.readFileSync(TOPIC_SKILL, "utf8"));
+  } catch (e) {
+    errors.push(`the topics (${TOPIC_SKILL}): ${e.message}`);
+    obs.topics = [];
+  }
+  return { obs, errors };
+}
+
+function readState(file) {
+  try {
+    const s = readJsonFile(file);
+    return s && s.version === STATE_VERSION ? s.actions || {} : {};
+  } catch (e) {
+    if (e.code === "ENOENT") return {};
+    throw new Exit(EX_ERROR, `cannot read ${file}: ${e.message}`);
+  }
+}
+
+function writeState(file, actions, now) {
+  fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, `${JSON.stringify({ version: STATE_VERSION, updated_at: new Date(now).toISOString(), actions })}\n`);
+  fs.renameSync(tmp, file);
+}
+
+// apply(actions, errors): carries out the actions that have an `apply`,
+// recording the result in each.
+async function apply(actions, errors) {
+  for (const a of actions.filter((x) => x.apply)) {
+    try {
+      await execFileP(tool("bot-board"), ["set", a.apply.id, "--status", a.apply.status, "--news", a.apply.news], { maxBuffer: MAX_BUFFER });
+      a.applied = "done";
+    } catch (e) {
+      a.applied = `failed: ${firstLine(e)}`;
+      errors.push(`applying ${a.key}: ${firstLine(e)}`);
+    }
+  }
+}
+
+async function main(argv) {
+  const opts = parseArgs(argv);
+  const { obs, errors } = await observe(opts);
+  let actions = rec.reconcile(obs, opts.rules).map((a) => ({ ...a, fired: null }));
+  if (opts.apply) await apply(actions, errors);
+  if (opts.state) {
+    const r = rec.edge(readState(opts.state), actions, opts.now, opts.resync, rec.unreadKinds(obs, opts.rules));
+    actions = r.actions;
+    writeState(opts.state, r.state, opts.now);
+  }
+  const o = rec.observed(obs);
+  if (opts.json) process.stdout.write(`${JSON.stringify({ observed: o, errors, actions, fired: actions.filter((a) => a.fired).length }, null, 2)}\n`);
+  else process.stdout.write(rec.render(o, actions, errors));
+  return errors.length ? EX_ERROR : 0;
+}
+
+main(process.argv.slice(2)).then((code) => process.exit(code), (e) => {
+  if (e instanceof Exit) {
+    if (e.status === 0) process.stdout.write(usage());
+    else process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  }
+  process.stderr.write(`${PROG}: error: ${e.stack || e.message}\n`);
+  process.exit(EX_ERROR);
+});

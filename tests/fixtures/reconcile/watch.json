@@ -1,0 +1,5 @@
+{"version": 1, "swept_at": "2026-10-02T11:40:00Z", "items": {
+  "https://github.com/cgwalters-forge/tracker/issues/1": {"updated_at": "2026-10-02T10:00:00Z", "state": "open", "edge_ids": []},
+  "https://github.com/cgwalters-forge/tracker/issues/99": {"updated_at": "2026-10-01T10:00:00Z", "state": "closed", "edge_ids": []},
+  "https://github.com/bootc-dev/bootc/pull/30": {"updated_at": "2026-10-01T10:00:00Z", "state": "closed", "head_sha": "abc", "edge_ids": []}
+}}
