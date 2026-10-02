@@ -124,7 +124,8 @@ test("heartbeat: fresh, and listing the busy workers only", () => {
   const agreeing = { ...hb, workers: [hb.workers[0], { name: "o1", item_url: "https://github.com/cgwalters-forge/tracker/issues/2", started_at: hb.updated_at, status: "working" }] };
   // [case, heartbeat, heartbeat action keys]
   const cases = [
-    ["drift: a worker on a Done item, a busy item without one", hb, ["heartbeat:drift"]],
+    ["drift: a busy item without a worker", hb, ["heartbeat:drift"]],
+    ["only a worker on a Done item: lead-orphan's, not a drift", { ...agreeing, workers: [...agreeing.workers, hb.workers[1]] }, []],
     ["in agreement", agreeing, []],
     ["old, its next wake long past", { ...at(30, -10), workers: agreeing.workers }, ["heartbeat:stale"]],
     ["old, but its next wake is ahead", { ...at(30, 10), workers: agreeing.workers }, []],
@@ -134,9 +135,6 @@ test("heartbeat: fresh, and listing the busy workers only", () => {
     ["unread", undefined, []],
   ];
   for (const [name, heartbeat, want] of cases) assert.deepEqual(keys(rec.heartbeat(obs({ heartbeat }))), want, name);
-  // The heartbeat to publish drops the finished worker and keeps the rest as published.
-  const publish = JSON.parse(/<<<'(.*)'$/.exec(rec.heartbeat(obs())[0].detail[0])[1]);
-  assert.deepEqual(publish, { updated_at: "2026-10-02T12:00:00.000Z", coordinator: hb.coordinator, workers: [hb.workers[0]] });
 });
 
 test("lead-orphan: every busy item has a worker, every worker a busy item", () => {

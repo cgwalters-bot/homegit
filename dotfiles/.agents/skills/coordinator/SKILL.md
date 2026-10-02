@@ -276,11 +276,11 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   while the total is under the target too: a lane short of its share
   while the other runs over is only noted in the Observed line. A busy task
   past its Budget tokens is a **budget** action.
-- **heartbeat:** the heartbeat is fresh and lists exactly the busy
-  items' workers; for a drift it prints the `bot-heartbeat publish`
-  input without the finished workers. `bot-poll-loop` keeps an unchanged
-  heartbeat fresh itself, so a stale one means its refresh failed: its
-  report ends with why.
+- **heartbeat:** the heartbeat is fresh and lists a worker for each
+  busy item. `bot-poll-loop` keeps an unchanged heartbeat fresh itself,
+  and drops the workers whose item went Done or closed, so a stale one
+  means its refresh failed (its report ends with why), and a drift is a
+  busy item with no worker.
 - **lead-orphan:** each of your busy items (Lead `coordinator`, or any
   Lead not in the topic-lead skill's table) has a worker in the
   heartbeat, and each worker there a busy item; an In Progress item with
@@ -770,7 +770,11 @@ it fresh: each `bot-poll-loop` cycle runs `bot-heartbeat refresh`, which
 republishes your last publish with `updated_at` (and `next_wake_at`)
 moved to now, as long as that publish ran in this Claude Code session and
 nobody published since; when it can't, the loop's report ends with
-"Heartbeat not refreshed: WHY".
+"Heartbeat not refreshed: WHY". Before that, `bot-heartbeat prune`
+republishes it the same way without the workers whose item is Done on
+the board or closed, so there is no need to publish just to drop a
+finished worker either; it never adds one, and keeps one whose item it
+can't read.
 
 ```bash
 jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{

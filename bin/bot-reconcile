@@ -84,8 +84,9 @@ Rules (${rules}):
                     mark; none once it is used up. A busy task whose Actual
                     tokens passed its Budget tokens is a 'budget' action.
   heartbeat         the heartbeat is fresh (${rec.HEARTBEAT_MAX_AGE_MS / 60e3} min, or until its next
-                    wake) and lists the busy items' workers and no others;
-                    for a drift it prints the heartbeat to publish.
+                    wake) and lists a worker for each busy item
+                    (bot-poll-loop drops the workers of Done items
+                    itself, with bot-heartbeat prune).
   lead-orphan       each of the coordinator's busy items (Lead not a topic
                     of the topic-lead skill) has a worker in the heartbeat,
                     each worker a busy item; In Progress items with neither
