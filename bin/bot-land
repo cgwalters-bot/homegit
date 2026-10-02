@@ -43,7 +43,7 @@ class Exit extends Error {
 }
 
 function usage() {
-  return `Usage: ${PROG} [--title TITLE] [--body BODY] [--repo OWNER/REPO]
+  return `Usage: ${PROG} [--title TITLE] [--body BODY] [--repo OWNER/REPO] [--base BRANCH]
                 [--no-auto [--no-review]] [--no-wait] [--timeout MINUTES]
 
 Lands the current branch of this worktree on one of the bot's own
@@ -54,10 +54,10 @@ up to date with main, rebase-merged:
 
   1. runs 'bot-git check ${REMOTE}/BASE..HEAD';
   2. pushes the branch to ${REMOTE} (with a lease, so a rebase can re-push);
-  3. opens a pull request into the default branch BASE, or reuses the
-     open one for this branch. TITLE defaults to the subject of a single
-     commit (it is required for more); BODY to a list of the commits'
-     subjects, plus '${AI_TRAILER}';
+  3. opens a pull request into BASE, or reuses the open one for this
+     branch, whatever its base (and retargets it to --base, if given).
+     TITLE defaults to the subject of a single commit (it is required for
+     more); BODY to a list of the commits' subjects, plus '${AI_TRAILER}';
   4. enables auto-merge by rebase, unless --no-auto, for a pull request
      that waits for ${OPERATOR_S} approval (a truly critical harness
      change: who can authorize actions, wider credential exposure or token
@@ -78,6 +78,19 @@ up to date with main, rebase-merged:
      fast-forwards the shared clone this worktree belongs to, if that has
      BASE checked out and is clean.
 
+BASE is --base, else the base of the open pull request for this branch,
+else the repository's default branch. --base stacks this branch on
+another unmerged one (its parent): the pull request then holds only this
+branch's commits. Such a pull request needs --no-auto: auto-merge would
+merge it into the parent branch, not the default branch, folding it into
+the parent's pull request after that one's review, and leaving it
+nothing to land on its own. Once the parent's pull request has merged, or
+the parent branch is gone (deleted on merge), ${PROG} retargets the pull
+request to the default branch, rebases the branch onto it with bot-git,
+dropping the parent's commits (those up to the fork point with the
+parent, as ${REMOTE}/PARENT or the pull request last saw it), and goes on
+as for any other.
+
 --repo defaults to the OWNER/REPO of ${REMOTE}'s URL. --timeout (default
 ${DEFAULT_TIMEOUT_MIN}) bounds the wait.
 
@@ -88,7 +101,7 @@ ${EX_USAGE} usage, ${EX_ERROR} anything else.
 }
 
 function parseArgs(argv) {
-  const opts = { title: null, body: null, repo: null, auto: true, review: true, wait: true, timeout: DEFAULT_TIMEOUT_MIN };
+  const opts = { title: null, body: null, repo: null, base: null, auto: true, review: true, wait: true, timeout: DEFAULT_TIMEOUT_MIN };
   const value = (i, name) => {
     if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
     return argv[i + 1];
@@ -108,6 +121,9 @@ function parseArgs(argv) {
         break;
       case "--repo":
         opts.repo = value(i++, a);
+        break;
+      case "--base":
+        opts.base = value(i++, a);
         break;
       case "--no-auto":
         opts.auto = false;
@@ -165,13 +181,28 @@ function push(branch) {
   git(["push", "--quiet", "--force-with-lease", "--set-upstream", REMOTE, `HEAD:refs/heads/${branch}`], `push ${branch} to ${REMOTE}`);
 }
 
-// openPull(repo, owner, branch, base, opts): the open pull request of
-// BRANCH into BASE, opened now if there is none.
-function openPull(repo, owner, branch, base, opts) {
-  const open = ghJSON([`repos/${repo}/pulls?state=open&base=${encodeURIComponent(base)}&head=${encodeURIComponent(`${owner}:${branch}`)}`], "list pull requests");
-  if (Array.isArray(open) && open.length > 0) {
-    log(`reusing ${open[0].html_url}`);
-    return open[0];
+// findPull(repo, owner, branch): the open pull request of BRANCH, into
+// any base, or null.
+function findPull(repo, owner, branch) {
+  const open = ghJSON([`repos/${repo}/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`], "list pull requests");
+  return Array.isArray(open) && open.length > 0 ? open[0] : null;
+}
+
+// retarget(repo, pr, base): point PR at BASE.
+function retarget(repo, pr, base) {
+  run("gh", ["api", "--silent", "-X", "PATCH", `repos/${repo}/pulls/${pr.number}`, "-f", `base=${base}`], `retarget ${pr.html_url} to ${base}`);
+  log(`retargeted ${pr.html_url} from ${pr.base.ref} to ${base}`);
+  pr.base = { ...pr.base, ref: base };
+}
+
+// openPull(repo, branch, base, existing, opts): EXISTING (BRANCH's open
+// pull request, retargeted to BASE if it has another), or a pull request
+// of BRANCH into BASE opened now.
+function openPull(repo, branch, base, existing, opts) {
+  if (existing) {
+    log(`reusing ${existing.html_url} (into ${existing.base.ref})`);
+    if (existing.base.ref !== base) retarget(repo, existing, base);
+    return existing;
   }
   const subjects = git(["log", "--reverse", "--format=%s", `${REMOTE}/${base}..HEAD`], "list the commits").split("\n");
   let title = opts.title;
@@ -271,6 +302,51 @@ function checkFailed(repo, sha, names) {
   return null;
 }
 
+const resolves = (rev) => {
+  try {
+    execFileSync("git", ["rev-parse", "--verify", "--quiet", `${rev}^{commit}`], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// parentLanded(repo, owner, parent): why the stacked-on branch PARENT is
+// done with ("merged in URL", "gone from REMOTE"), or null while it
+// isn't: it still exists and has no merged pull request without an open one.
+function parentLanded(repo, owner, parent) {
+  try {
+    execFileSync("git", ["ls-remote", "--exit-code", "--heads", REMOTE, parent], { stdio: "ignore" });
+  } catch (e) {
+    if (e.status === 2) return `gone from ${REMOTE}`;
+    throw new Exit(EX_ERROR, `cannot read ${REMOTE}'s ${parent}: ${String(e.stderr || e.message).trim()}`);
+  }
+  const pulls = ghJSON([`repos/${repo}/pulls?state=all&head=${encodeURIComponent(`${owner}:${parent}`)}`], `list the pull requests of ${parent}`) || [];
+  if (pulls.some((p) => p.state === "open")) return null;
+  const merged = pulls.find((p) => p.merged_at);
+  return merged ? `merged in ${merged.html_url}` : null;
+}
+
+// rebaseOffParent(parent, prBaseSha, base): rebase HEAD onto
+// REMOTE/BASE with bot-git, dropping the commits it shares with the
+// landed PARENT: those up to its fork point with REMOTE/PARENT (still
+// there unless pruned), else with the base the pull request last had
+// (PR_BASE_SHA). Without either, a plain rebase drops them only when
+// the merge kept their patches.
+function rebaseOffParent(parent, prBaseSha, base) {
+  git(["fetch", "--quiet", REMOTE, base], `fetch ${REMOTE}/${base}`);
+  const tip = [`${REMOTE}/${parent}`, prBaseSha].find((r) => r && resolves(r));
+  const forkPoint = tip && git(["merge-base", tip, "HEAD"], `find the fork point with ${parent}`);
+  const args = forkPoint ? ["rebase", "--onto", `${REMOTE}/${base}`, forkPoint] : ["rebase", `${REMOTE}/${base}`];
+  try {
+    execFileSync(BOT_GIT, args, { stdio: ["ignore", "pipe", "pipe"] });
+  } catch (e) {
+    execFileSync("git", ["rebase", "--abort"], { stdio: "ignore" });
+    throw new Exit(EX_FAILED, `the branch doesn't rebase cleanly off ${parent} onto ${REMOTE}/${base}; rebase it by hand: ${String(e.stderr || e.message).trim()}`);
+  }
+  log(`rebased off ${parent} onto ${REMOTE}/${base}${forkPoint ? "" : " (no fork point known: dropped only the commits whose patches ${base} has)"}`);
+}
+
 // rebaseIfBehind(branch, base): rebase HEAD onto REMOTE/BASE with
 // bot-git and push it again, unless it already has REMOTE/BASE (GitHub
 // can take a while to see a push).
@@ -314,8 +390,23 @@ function main() {
   const owner = repo.split("/")[0];
   const branch = git(["symbolic-ref", "--quiet", "--short", "HEAD"], "read the current branch (detached HEAD?)");
   const info = ghJSON([`repos/${repo}`], `read ${repo}`);
-  const base = info.default_branch;
-  if (branch === base) throw new Exit(EX_USAGE, `on ${base} itself: commit on a topic branch (bot/<slug>)`);
+  const defaultBranch = info.default_branch;
+  if (branch === defaultBranch || branch === opts.base) throw new Exit(EX_USAGE, `on ${branch} itself: commit on a topic branch (bot/<slug>)`);
+  const existing = findPull(repo, owner, branch);
+  let base = opts.base || (existing ? existing.base.ref : defaultBranch);
+  if (base !== defaultBranch) {
+    const landed = parentLanded(repo, owner, base);
+    if (landed) {
+      log(`${base} is ${landed}: retargeting to ${defaultBranch}`);
+      rebaseOffParent(base, existing && existing.base.ref === base ? existing.base.sha : null, defaultBranch);
+      base = defaultBranch;
+    } else if (opts.auto) {
+      throw new Exit(
+        EX_USAGE,
+        `stacked on ${base}${opts.base ? "" : ` (the base of ${existing.html_url})`}, so not enabling auto-merge, which would merge it into ${base} rather than ${defaultBranch}: pass --no-auto`,
+      );
+    }
+  }
   git(["fetch", "--quiet", REMOTE, base], `fetch ${REMOTE}/${base}`);
   const ahead = git(["rev-list", "--count", `${REMOTE}/${base}..HEAD`], "count the commits");
   if (ahead === "0") throw new Exit(EX_USAGE, `${branch} has no commits over ${REMOTE}/${base}`);
@@ -325,7 +416,7 @@ function main() {
     throw new Exit(EX_ERROR, `bot-git check failed; fix the commits first`);
   }
   push(branch);
-  const pr = openPull(repo, owner, branch, base, opts);
+  const pr = openPull(repo, branch, base, existing, opts);
   if (!opts.auto) {
     trackOnBoard(pr);
     if (opts.review) requestReview(repo, pr, git(["rev-parse", "HEAD"], "read HEAD"));

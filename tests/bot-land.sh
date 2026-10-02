@@ -60,6 +60,7 @@ fail() {
 # one repeating; a poll whose answer is merged runs on-merge first),
 # rules.json (the rules of main), checks-NAME.json (the runs of check
 # NAME, none if missing), reviews.json (the reviews of pull request 5),
+# parent.json (the pull requests of bot/parent, the branch stacked on),
 # body (the body of the pull request opened) and calls (every call);
 # requesting a review fails when request-fails exists.
 mkdir -p "${WORK}/bin"
@@ -69,8 +70,10 @@ set -euo pipefail
 printf '%s\n' "$*" >>"${FAKE_GH}/calls"
 case "$*" in
     "api repos/acme/proj") echo '{"default_branch": "main"}' ;;
-    "api repos/acme/proj/pulls?state=open&base=main&head=acme%3Abot%2Ftopic") cat "${FAKE_GH}/open.json" ;;
-    "api -X POST repos/acme/proj/pulls -f title="*" -f head=bot/topic -f base=main -F body=@-")
+    "api repos/acme/proj/pulls?state=open&head=acme%3Abot%2Ftopic") cat "${FAKE_GH}/open.json" ;;
+    "api repos/acme/proj/pulls?state=all&head=acme%3Abot%2Fparent") cat "${FAKE_GH}/parent.json" ;;
+    "api --silent -X PATCH repos/acme/proj/pulls/5 -f base="*) ;;
+    "api -X POST repos/acme/proj/pulls -f title="*" -f head=bot/topic -f base="*" -F body=@-")
         cat >"${FAKE_GH}/body"
         echo '{"number": 5, "html_url": "https://github.com/acme/proj/pull/5"}' ;;
     "pr merge 5 --repo acme/proj --auto --rebase") ;;
@@ -115,6 +118,7 @@ setup() {
     mkdir -p "${FAKE_GH}/polls"
     echo '[]' >"${FAKE_GH}/open.json"
     echo '[]' >"${FAKE_GH}/reviews.json"
+    echo '[]' >"${FAKE_GH}/parent.json"
     # Like homegit's: the required-checks gate, besides other rules.
     jq -n '[{type: "pull_request"}, {type: "required_status_checks",
         parameters: {required_status_checks: [{context: "required-checks", integration_id: 15368}]}}]' >"${FAKE_GH}/rules.json"
@@ -150,7 +154,7 @@ poll 1 open
 poll 2 merged
 run "merged" 0 "fast-forwarded ${WORK}/shared" --timeout 1
 test "$(cat "${FAKE_GH}/body")" = $'- topic: Change 1\n\nGenerated-by: AI' || fail "body: $(cat "${FAKE_GH}/body")"
-called "title=topic: Change 1" || fail "title: $(cat "${FAKE_GH}/calls")"
+called "title=topic: Change 1 -f head=bot/topic -f base=main -F" || fail "title: $(cat "${FAKE_GH}/calls")"
 called "pr merge 5 --repo acme/proj --auto --rebase" || fail "no auto-merge"
 test "$(git -C "${WORK}/shared" rev-parse main)" = "$(git -C "${WORKTREE}" rev-parse HEAD)" || fail "shared clone not fast-forwarded"
 test "$(git --git-dir="${WORK}/origin.git" rev-parse "${BRANCH}")" = "$(git -C "${WORKTREE}" rev-parse HEAD)" || fail "branch not pushed"
@@ -210,11 +214,12 @@ poll 1 merged
 run "merged, off the board" 0 "merged ${URL}"
 test ! -e "${FAKE_GH}/board" || fail "auto-merge: board calls: $(cat "${FAKE_GH}/board")"
 
-# open_pr [LOGIN]: pull request 5 is already open for the branch, with
-# LOGIN's review requested.
+# open_pr [LOGIN [BASE [BASE_SHA]]]: pull request 5 is already open for
+# the branch, into BASE (default main), with LOGIN's review requested.
 open_pr() {
-    jq -n --arg url "${URL}" --arg r "${1:-}" \
-        '[{number: 5, html_url: $url, requested_reviewers: [$r | select(. != "") | {login: .}]}]' >"${FAKE_GH}/open.json"
+    jq -n --arg url "${URL}" --arg r "${1:-}" --arg base "${2:-main}" --arg sha "${3:-${OLD}}" \
+        '[{number: 5, html_url: $url, base: {ref: $base, sha: $sha},
+           requested_reviewers: [$r | select(. != "") | {login: .}]}]' >"${FAKE_GH}/open.json"
 }
 # reviewed STATE@SHA...: cgwalters' reviews of pull request 5, oldest
 # first (SHA "head" is the worktree's HEAD), plus one by someone else.
@@ -291,16 +296,101 @@ unreviewed
 approved CHANGES_REQUESTED@${OLD} APPROVED@head
 EOF
 
+# stack: the branch stacked on bot/parent, pushed to origin, whose one
+# commit adds the file parent; prints that commit.
+readonly PARENT=bot/parent
+stack() {
+    setup 0
+    echo 1 >"${WORKTREE}/parent"
+    git -C "${WORKTREE}" add parent
+    (cd "${WORKTREE}" && "${BOT_GIT}" commit -q -m "parent: Add it" -m "Generated-by: AI")
+    git -C "${WORKTREE}" push -q origin "HEAD:${PARENT}"
+    git -C "${WORKTREE}" fetch -q origin
+    commit "topic: Change 1"
+    git -C "${WORKTREE}" rev-parse HEAD~
+}
+# parent_pr STATE: bot/parent's pull request 4 is open or merged.
+parent_pr() {
+    jq -n --arg s "$1" '[{state: (if $s == "open" then "open" else "closed" end),
+        merged_at: (if $s == "merged" then "2026-10-01T00:00:00Z" else null end),
+        html_url: "https://github.com/acme/proj/pull/4"}]' >"${FAKE_GH}/parent.json"
+}
+
+# Stacked on an unmerged branch: into it (one commit over it, so no
+# --title needed), never auto-merged; an open pull request is reused
+# whatever its base, or retargeted to --base.
+while read -r name status pattern parent pr want args; do
+    stack >/dev/null
+    test "${parent}" = none || parent_pr "${parent}"
+    test "${pr}" = none || open_pr "" "${pr}"
+    test "${args}" != - || args=
+    # shellcheck disable=SC2086 # several arguments, or none
+    run "stacked, ${name}" "${status}" "${pattern}" ${args}
+    test "${want}" = - || grep -qE -- "${want}" "${FAKE_GH}/calls" || fail "stacked, ${name}: no '${want}' in: $(cat "${FAKE_GH}/calls")"
+    if test "${pr}" = none && test "${status}" = 0; then
+        called "POST repos/acme/proj/pulls -f" || fail "stacked, ${name}: not opened"
+    else
+        ! called "POST repos/acme/proj/pulls -f" || fail "stacked, ${name}: opened another"
+    fi
+    case "${want}" in *PATCH*) ;; *) ! called "PATCH" || fail "stacked, ${name}: retargeted" ;; esac
+    ! called "pr merge" || fail "stacked, ${name}: enabled auto-merge"
+done <<EOF
+opened 0 requested.cgwalters..review open none title=topic:.Change.1.-f.head=bot/topic.-f.base=bot/parent.-F --base ${PARENT} --no-auto
+opened-no-parent-pr 0 requested.cgwalters..review none none base=bot/parent.-F --base ${PARENT} --no-auto
+auto-refused ${EX_USAGE} stacked.on.bot/parent,.so.not.enabling.auto-merge.*pass.--no-auto open none - --base ${PARENT}
+reused 0 reusing.${URL}.\(into.bot/parent\) open ${PARENT} - --no-auto
+reused-auto-refused ${EX_USAGE} stacked.on.bot/parent.\(the.base.of.${URL}\) open ${PARENT} - -
+retargeted-to-base 0 retargeted.${URL}.from.bot/parent.to.main open ${PARENT} PATCH.repos/acme/proj/pulls/5.-f.base=main --base main --no-auto
+EOF
+
+# Once the parent merged (its commit fixed on the way) or its branch is
+# gone, retargeted to main, rebased without the parent's commit (from
+# the fork point with origin/bot/parent, or with the pull request's base
+# when that ref was pruned too), and auto-merged as usual.
+while read -r name landed pr args; do
+    PARENT_COMMIT=$(stack)
+    echo "1 fixed" >"${WORK}/shared/parent"
+    git -C "${WORK}/shared" add parent
+    git -C "${WORK}/shared" commit -q -m "parent: Add it"
+    git -C "${WORK}/shared" push -q origin main
+    MERGED=$(git -C "${WORK}/shared" rev-parse HEAD)
+    case "${landed}" in
+        merged) parent_pr merged; pattern="bot/parent is merged in https://github.com/acme/proj/pull/4: retargeting to main" ;;
+        gone | pruned) git --git-dir="${WORK}/origin.git" branch -q -D "${PARENT}"; pattern="bot/parent is gone from origin: retargeting to main" ;;
+    esac
+    test "${landed}" != pruned || git -C "${WORKTREE}" update-ref -d "refs/remotes/origin/${PARENT}"
+    test "${pr}" = none || open_pr "" "${PARENT}" "${PARENT_COMMIT}"
+    poll 1 merged
+    # shellcheck disable=SC2086 # several arguments, or none
+    run "landed, ${name}" 0 "${pattern}" ${args}
+    if test "${pr}" = none; then
+        called "-f head=bot/topic -f base=main -F" || fail "landed, ${name}: not opened into main"
+    else
+        called "PATCH repos/acme/proj/pulls/5 -f base=main" || fail "landed, ${name}: not retargeted"
+    fi
+    called "pr merge 5 --repo acme/proj --auto --rebase" || fail "landed, ${name}: no auto-merge"
+    git --git-dir="${WORK}/origin.git" merge-base --is-ancestor "${MERGED}" "${BRANCH}" || fail "landed, ${name}: not rebased onto main"
+    test "$(git --git-dir="${WORK}/origin.git" rev-list --count "${MERGED}..${BRANCH}")" = 1 || fail "landed, ${name}: the parent's commit wasn't dropped"
+    ! git --git-dir="${WORK}/origin.git" merge-base --is-ancestor "${PARENT_COMMIT}" "${BRANCH}" || fail "landed, ${name}: still on the parent"
+done <<EOF
+merged merged ${PARENT}
+gone gone ${PARENT}
+pruned pruned ${PARENT}
+explicit-base merged none --base ${PARENT}
+EOF
+
 # Refusals: several commits without a title, main itself, nothing to land.
 setup 2
 run "no title" "${EX_USAGE}" "2 commits: pass --title"
 setup
 git -C "${WORK}/shared" checkout -q --detach && git -C "${WORKTREE}" checkout -q main
 run "on main" "${EX_USAGE}" "on main itself"
+setup
+run "on the base" "${EX_USAGE}" "on bot/topic itself" --base "${BRANCH}"
 setup 0
 run "empty" "${EX_USAGE}" "has no commits over origin/main"
 run "usage" "${EX_USAGE}" "unexpected argument" --bogus
 run "--no-review with auto-merge" "${EX_USAGE}" "--no-review goes with --no-auto" --no-review
 
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: bot-land opens or reuses the pull request, auto-merges and waits, rebases when main moves, stops on failures, fast-forwards the shared clone, and requests cgwalters' review"
+echo "ok: bot-land opens or reuses the pull request, auto-merges and waits, rebases when main moves, stops on failures, fast-forwards the shared clone, requests cgwalters' review, and stacks on and retargets off a parent branch"

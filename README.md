@@ -289,7 +289,9 @@ bypass, and blocks force-pushes and deleting main. They only allow
 rebase merges, to keep the commits as written, with auto-merge on and
 branches deleted on merge. `bot-land` lands a branch: it pushes it,
 opens the pull request, enables auto-merge and waits, rebasing when main
-moved on. A rebase merge re-commits the commits unsigned, with the
+moved on. With `--base PARENT` (and `--no-auto`) it stacks a branch on
+another unmerged one, and once the parent merged it retargets the pull
+request to main, dropping the parent's commits. A rebase merge re-commits the commits unsigned, with the
 merging account (the bot) as committer. Here the `ci` workflow
 (`.github/workflows/ci.yml`) runs shellcheck, `node --check`, the
 crates' checks and every `tests/*.sh` in parallel jobs, and the ruleset
