@@ -48,8 +48,10 @@ mkdir -p "${WORK}/bin" "${FAKE_GH}/rest" "${FAKE_GH}/opened" "${WORK}/hooks"
 # comments default to none, and POSTs to them add one by the bot. POST
 # .../pulls opens an upstream PR (listed by GET .../pulls, filtered by
 # head if given, and read with its commits by GET .../pulls/N), unless $FAKE_GH/fail-open exists, which it
-# removes; its reviews default to none. PATCH .../pulls/N closes a fork
-# PR. Anything else fails. Every
+# removes; its reviews default to none (an upstream PR made up here may
+# have a state and merged_at, which GET .../pulls filters by state on).
+# PATCH .../pulls/N closes a fork PR. PUT .../actions/permissions does
+# nothing. Anything else fails. Every
 # call is logged to $FAKE_GH/calls.
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -132,7 +134,11 @@ case "${method} ${path}" in
     GET\ repos/acme/*/pulls)
         repo=${path#repos/}; repo=${repo%/pulls}
         json=$(find "${store}/opened" -name '*.json' -exec cat {} + 2>/dev/null |
-            jq -s --arg repo "${repo}" --arg head "$(field head)" '[.[] | select(.repo == $repo and ($head == "" or .head == $head)) | {html_url, head: {sha: .head_sha}}]') ;;
+            jq -s --arg repo "${repo}" --arg head "$(field head)" --arg state "$(field state)" '
+                [.[] | select(.repo == $repo and ($head == "" or .head == $head))
+                 | {html_url, head: {sha: .head_sha}, state: (.state // "open"), merged_at: (.merged_at // null)}
+                 | select($state == "" or $state == "all" or .state == $state)]') ;;
+    PUT\ repos/*/actions/permissions) ;;
     GET\ repos/acme/*/pulls/*/reviews)
         json=$(cat "${store}/rest/${path}.json" 2>/dev/null || echo '[]') ;;
     GET\ repos/acme/*/pulls/*/commits)
@@ -367,7 +373,9 @@ jq -n --arg a "${F1}" --arg s "${F2}" --arg u "https://github.com/cgwalters-forg
     [{user: {login: "cgwalters-bot"}, created_at: "2026-09-25T12:00:00Z", html_url: "https://github.com/cgwalters-forge/proj/pull/8#c0",
       body: "Signed off 1 commit(s)\n\n<!-- bot-pr signoff approved=\($a) signed=\($s) approval=\($u) review=800 -->"}]' \
     >"${FAKE_GH}/repos_cgwalters-forge_proj_issues_8_comments.json"
-echo '{"parent": {"full_name": "acme/proj"}, "source": {"full_name": "acme/proj"}}' | fixture repos/cgwalters-forge/proj
+echo '{"full_name": "cgwalters-forge/proj", "default_branch": "main", "parent": {"full_name": "acme/proj"}, "source": {"full_name": "acme/proj"}}' |
+    fixture repos/cgwalters-forge/proj
+echo '{"workflows": []}' | fixture repos/cgwalters-forge/proj/actions/workflows
 echo '{"parent": {"full_name": "acme/nodco"}, "source": {"full_name": "acme/nodco"}}' | fixture repos/cgwalters-forge/nodco
 jq -n '[{type: "required_status_checks", parameters: {required_status_checks: [{context: "DCO"}, {context: "ci"}]}}]' |
     fixture repos/acme/proj/rules/branches/main
@@ -785,5 +793,89 @@ signoff_refused "signoff, not promoted" "no PR in ${APP} says 'bot-pr promote' o
 upstream_pr 91 someone bot/unpromoted
 signoff_refused "signoff, not the bot's PR" "was opened by someone, not cgwalters-bot" https://github.com/acme/dcoapp/pull/91
 
+# --- Stacked fork PRs: fork-pr stacks on another open fork PR's branch,
+# and promote waits until that one is merged upstream ---
+readonly ITEM=PVTI_stacked
+new_branch bot/parent
+SP1=$(commit_as bot parent "parent")
+git -C "${SRC}" switch -q -c bot/child
+SC1=$(commit_as bot child "child")
+new_branch bot/random
+commit_as bot random "random" >/dev/null
+git -C "${SRC}" push -q forge bot/parent bot/random
+fork_pr proj 20 bot/parent "${SP1}"
+printf 'Builds on the parent.\n\n%s\n' "${TRAILER}" >"${WORK}/stacked-body"
+# fork_pr_run NAME EXPECTED BASE: fork-pr of bot/child onto BASE, output
+# in $OUT (without run's failing hooks: fork-pr pushes with the user's
+# git, as it runs in the worker's clone).
+fork_pr_run() {
+    local status=0
+    OUT=$("${BOT_PR}" fork-pr --repo acme/proj --base "$3" --branch bot/child --item "${ITEM}" --title "Child" \
+        --body-file "${WORK}/stacked-body" --from "${SRC}" 2>&1) || status=$?
+    if test "$2" = ok && test "${status}" -ne 0 || test "$2" = fail && test "${status}" -eq 0; then
+        fail "$1: exit status ${status}, expected $2; output:"$'\n'"${OUT}"
+        return 1
+    fi
+}
+REFS_BEFORE=$(all_refs)
+if fork_pr_run "random fork-only base" fail bot/random; then
+    expect "random fork-only base" "acme/proj has no branch 'bot/random', and no open fork PR in ${FORGE} is from it; to stack on another fork PR, pass its branch as --base"
+fi
+test "$(all_refs)" = "${REFS_BEFORE}" || fail "random fork-only base: the remotes changed"
+if fork_pr_run "stacked base" ok bot/parent; then
+    expect "stacked base" "Stacking on ${URL}/proj/pull/20 \(bot/parent\); upstream base main"
+fi
+child=$(find "${FAKE_GH}/opened" -name '*.json' -exec cat {} + | jq -sc --arg f "${FORGE}" '[.[] | select(.repo == $f and .head == "bot/child")] | first')
+test "$(jq -r '"\(.repo) \(.base)"' <<<"${child}")" = "${FORGE} bot/parent" || fail "stacked base: not opened into bot/parent: ${child}"
+# shellcheck disable=SC2016 # literal backticks
+for want in '- Upstream: `acme/proj`, base `main`' "- Stacked on: ${URL}/proj/pull/20;" "- Board item: \`${ITEM}\`"; do
+    jq -r .body <<<"${child}" | grep -qF -- "${want}" || fail "stacked base: no '${want}' in: $(jq -r .body <<<"${child}")"
+done
+test "$(remote_ref "${FORGE}" bot/child)" = "${SC1}" || fail "stacked base: bot/child not pushed"
+# As GitHub would show it: #21, approved at its head.
+fork_pr proj 21 bot/child "${SC1}"
+jq --argjson c "${child}" '.body = $c.body | .base.ref = "bot/parent"' "${FAKE_GH}/rest/repos/${FORGE}/pulls/21.json" >"${WORK}/pr21"
+mv "${WORK}/pr21" "${FAKE_GH}/rest/repos/${FORGE}/pulls/21.json"
+
+# STATE|EXPECT: how far #20 got (each step on top of the last), and
+# promote #21's refusal, or 'ok'.
+while IFS='|' read -r state want; do
+    case "${state}" in
+        open) ;;
+        dropped) remote_ref "${FORGE}" bot/parent >"${FAKE_GH}/closed_repos_${FORGE//\//_}_pulls_20" ;;
+        promoted) jq -n '{repo: "acme/proj", html_url: "https://github.com/acme/proj/pull/80", head: "cgwalters-forge:bot/parent", base: "main"}' \
+            >"${FAKE_GH}/opened/80.json" ;;
+        merged)
+            jq '.state = "closed" | .merged_at = "2026-09-26T00:00:00Z"' "${FAKE_GH}/opened/80.json" >"${WORK}/80" &&
+                mv "${WORK}/80" "${FAKE_GH}/opened/80.json"
+            # Rebase-merged: the parent's patch, as a new commit.
+            git -C "${SRC}" switch -q -c merged "$(git -C "${REMOTES}/acme/proj" rev-parse main)"
+            git -C "${SRC}" -c core.hooksPath=/dev/null -c commit.gpgSign=false cherry-pick "${SP1}" >/dev/null
+            git -C "${SRC}" push -q up HEAD:main ;;
+    esac
+    REFS_BEFORE=$(all_refs)
+    if test "${want}" = ok; then
+        run "stacked, parent ${state}" ok promote "${URL}/proj/pull/21" || continue
+        up=$(opened bot/child)
+        test "$(jq -r .base <<<"${up}")" = main || fail "stacked, parent ${state}: no upstream PR into main: ${up}"
+        head=$(remote_ref "${FORGE}" bot/child)
+        expect "stacked, parent ${state}" "is merged upstream as https://github.com/acme/proj/pull/80"
+        # The rebased head is in the fork, on top of upstream's main.
+        test "$(git -C "${REMOTES}/${FORGE}" rev-list --count "$(remote_ref acme/proj main)..${head}")" = 1 ||
+            fail "stacked, parent ${state}: the parent's commit wasn't dropped"
+        jq -r .body <<<"${up}" | grep -q 'bot-meta\|Stacked on' && fail "stacked, parent ${state}: the bot-meta section went upstream"
+    else
+        if run "stacked, parent ${state}" fail promote "${URL}/proj/pull/21"; then
+            expect "stacked, parent ${state}" "not promoting ${URL}/proj/pull/21: it is stacked on ${URL}/proj/pull/20, ${want}"
+        fi
+        test "$(all_refs)" = "${REFS_BEFORE}" || fail "stacked, parent ${state}: the remotes changed"
+    fi
+done <<'EOF'
+open|which is not promoted yet
+dropped|which was closed without being merged upstream
+promoted|whose upstream PR https://github.com/acme/proj/pull/80 is not merged yet
+merged|ok
+EOF
+
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: promote passes the policy gate only with a current bot-ok record, signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases; signoff signs off promoted PRs only on that approval or cgwalters' upstream approval of the current head, with the same refusals"
+echo "ok: promote passes the policy gate only with a current bot-ok record, signs off on approval where DCO is required or runs, keeps the approval, normalizes the bot's old name, skips no-DCO and signed PRs, refuses others' commits and stale heads, and leases, and waits for a stacked PR's parent to merge; fork-pr stacks only on an open fork PR; signoff signs off promoted PRs only on that approval or cgwalters' upstream approval of the current head, with the same refusals"

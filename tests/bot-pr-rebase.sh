@@ -44,7 +44,9 @@ mkdir -p "${WORK}/bin" "${FAKE_GH}/rest"
 # repositories in $REMOTES; reviews and comments default to none, and
 # anything else from a fixture. POST .../merge-upstream syncs a fork's
 # main with acme/proj's, and POSTed issue comments are kept in
-# $FAKE_GH/comments. Anything else fails. Every call is logged to
+# $FAKE_GH/comments. A list of PRs comes from a fixture (by default none),
+# filtered by head label, and a PATCH of a PR is logged to
+# $FAKE_GH/patches. Anything else fails. Every call is logged to
 # $FAKE_GH/calls.
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
@@ -124,7 +126,11 @@ case "${method} ${path}" in
         printf '%s %s\n' "${path}" "$(printf '%s' "$(field body)" | jq -Rsc .)" >>"${store}/comments"
         json='{}' ;;
     GET\ repos/*/actions/runs) json='{"workflow_runs": []}' ;;
-    GET\ repos/*/pulls) json='[]' ;;
+    GET\ repos/*/pulls)
+        json=$(jq -c --arg h "$(field head)" '[.[] | select($h == "" or .head.label == $h)]' "${store}/rest/${path}.json" 2>/dev/null || echo '[]') ;;
+    PATCH\ repos/*/pulls/*)
+        printf '%s base=%s\n' "${path}" "$(field base)" >>"${store}/patches"
+        json='{}' ;;
     GET\ *)
         test -e "${store}/rest/${path}.json" || notfound
         json=$(cat "${store}/rest/${path}.json") ;;
@@ -433,8 +439,85 @@ check_cases <<EOF
 merge queue undecided|${U}/24||cannot tell whether acme/proj takes conflict-free rebases.*--force-merge-queue skips that|
 EOF
 
+# --- Stacked fork PRs (see 'bot-pr fork-pr'): rebased onto the branch
+# of the fork PR they are stacked on, after a force-push of that one, and
+# onto upstream's main once it is merged there ---
+# stacked N PARENT_N BRANCH PARENT_BRANCH: fork PR #N from BRANCH into
+# PARENT_BRANCH, stacked on #PARENT_N.
+stacked() {
+    pr "${F}" "$1" "${F}" "$3"
+    jq --arg p "https://github.com/${F}/pull/$2" --arg b "$4" \
+        '.base.ref = $b | .body |= sub("<!-- /bot-meta -->"; "- Stacked on: \($p); promote waits\n<!-- /bot-meta -->")' \
+        "${FAKE_GH}/rest/repos/${F}/pulls/$1.json" >"${WORK}/pr.json"
+    mv "${WORK}/pr.json" "${FAKE_GH}/rest/repos/${F}/pulls/$1.json"
+}
+# NAME: bot/NAME off bot/PARENT, one commit, pushed to the fork.
+stack_branch() {
+    git -C "${SRC}" switch -q -C "bot/$1" "$(git -C "${REMOTES}/${F}" rev-parse "bot/$2")"
+    commit_as bot "$1" "$1"$'\n\n'"${AI}"
+    git -C "${SRC}" push -q -f "file://${REMOTES}/${F}" "HEAD:refs/heads/bot/$1"
+}
+# #30 <- #31: #30 is force-pushed (rebased onto the new main).
+git -C "${SRC}" switch -q -C bot/sparent "${BASE}"
+commit_as bot sparent "sparent"$'\n\n'"${AI}"
+git -C "${SRC}" push -q "file://${REMOTES}/${F}" HEAD:refs/heads/bot/sparent
+pr "${F}" 30 "${F}" bot/sparent
+stack_branch schild sparent
+stacked 31 30 bot/schild bot/sparent
+git -C "${SRC}" switch -q bot/sparent
+git -C "${SRC}" -c core.hooksPath=/dev/null -c commit.gpgSign=false rebase -q "${MAIN}"
+git -C "${SRC}" push -q -f "file://${REMOTES}/${F}" HEAD:refs/heads/bot/sparent
+# #33 (closed, never merged) <- #32.
+git -C "${SRC}" switch -q -C bot/dparent "${BASE}"
+commit_as bot dparent "dparent"$'\n\n'"${AI}"
+git -C "${SRC}" push -q "file://${REMOTES}/${F}" HEAD:refs/heads/bot/dparent
+pr "${F}" 33 "${F}" bot/dparent
+jq '.state = "closed"' "${FAKE_GH}/rest/repos/${F}/pulls/33.json" >"${WORK}/pr.json" && mv "${WORK}/pr.json" "${FAKE_GH}/rest/repos/${F}/pulls/33.json"
+stack_branch dchild dparent
+stacked 32 33 bot/dchild bot/dparent
+# #35 (merged upstream as acme/proj#90: #9's change, in MAIN) <- #34.
+git -C "${SRC}" switch -q -C bot/mparent "${BASE}"
+commit_as bot upstreamed "mparent"$'\n\n'"${AI}" same
+git -C "${SRC}" push -q "file://${REMOTES}/${F}" HEAD:refs/heads/bot/mparent
+pr "${F}" 35 "${F}" bot/mparent
+jq '.state = "closed"' "${FAKE_GH}/rest/repos/${F}/pulls/35.json" >"${WORK}/pr.json" && mv "${WORK}/pr.json" "${FAKE_GH}/rest/repos/${F}/pulls/35.json"
+jq -n '[{html_url: "https://github.com/acme/proj/pull/90", state: "closed", merged_at: "2026-09-26T00:00:00Z",
+         head: {label: "cgwalters-forge:bot/mparent"}}]' | fixture repos/acme/proj/pulls
+stack_branch mchild mparent
+stacked 34 35 bot/mchild bot/mparent
+
+# NAME|N|ONTO|EXPECT: rebase fork PR #N; EXPECT is 'rebased' (its own
+# commit, alone on top of ONTO, a branch of the fork, and with
+# 'retarget', its base set to main) or a REGEX of the refusal.
+while IFS='|' read -r name n onto expect; do
+    ref=$(jq -r .head.ref "${FAKE_GH}/rest/repos/${F}/pulls/${n}.json")
+    before=$(git -C "${REMOTES}/${F}" rev-parse "${ref}")
+    : >"${FAKE_GH}/patches"
+    status=0
+    out=$("${BOT_PR}" rebase "https://github.com/${F}/pull/${n}" 2>&1) || status=$?
+    after=$(git -C "${REMOTES}/${F}" rev-parse "${ref}")
+    if [[ "${expect}" == rebased* ]]; then
+        test "${status}" -eq 0 || { fail "${name}: exit status ${status}: ${out}"; continue; }
+        test "$(git -C "${REMOTES}/${F}" rev-parse "${after}~1")" = "$(git -C "${REMOTES}/${F}" rev-parse "${onto}")" ||
+            fail "${name}: not alone on top of ${onto}: ${out}"
+        test "$(git -C "${REMOTES}/${F}" log -1 --format=%B "${after}")" = "$(git -C "${REMOTES}/${F}" log -1 --format=%B "${before}")" ||
+            fail "${name}: its own commit changed"
+        want=""
+        test "${expect}" = rebased || want="repos/${F}/pulls/${n} base=main"
+        test "$(cat "${FAKE_GH}/patches")" = "${want}" || fail "${name}: PATCHes '$(cat "${FAKE_GH}/patches")', expected '${want}'"
+    else
+        test "${status}" -ne 0 || fail "${name}: not refused: ${out}"
+        grep -qE -- "${expect}" <<<"${out}" || fail "${name}: output lacks '${expect}': ${out}"
+        test "${after}" = "${before}" || fail "${name}: pushed anyway"
+    fi
+done <<EOF
+stacked, parent force-pushed|31|bot/sparent|rebased
+stacked, parent dropped|32||stacked on https://github.com/${F}/pull/33, which was closed without being merged upstream
+stacked, parent merged upstream|34|main|rebased retarget
+EOF
+
 out=$("${BOT_PR}" rebase https://github.com/acme/proj/issues/1 2>&1) && fail "an issue URL: not refused: ${out}"
 grep -q 'expected a PR URL' <<<"${out}" || fail "an issue URL: ${out}"
 
 test "${failures}" -eq 0 || { echo "${failures} checks failed" 1>&2; exit 1; }
-echo "ok: bot-pr rebase rebases the bot's own PRs, keeps cgwalters' sign-off, and refuses conflicts and others' work"
+echo "ok: bot-pr rebase rebases the bot's own PRs, keeps cgwalters' sign-off, follows stacked fork PRs' parents, and refuses conflicts and others' work"

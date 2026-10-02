@@ -224,7 +224,9 @@ bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \
 Run it in the clone that has the branch. It creates the forge's fork
 if needed (`bot-pr fork-of OWNER/REPO` prints it), turns off its CI
 (`bot-pr fork-setup FORK-NAME` redoes just that),
-syncs the fork's copy of the base with upstream,
+syncs the fork's copy of the base with upstream (or, for a base that
+is another open fork PR's `bot/...` branch, stacks the new PR on that
+one; see `workstream`),
 pushes the branch there, opens the PR inside the fork, and
 appends a bot-meta section with the upstream target, the board item and
 review instructions. Write the title
