@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# The coordinator's wait for news: reads the bot-sweep runs and the
+# operator's approvals, runs bot-reconcile, and exits when there is
+# something to do. See --help. (crates/bot-poll is the Rust poller this
+# may replace; this is the loop the coordinator runs today.)
+set -u
+
+BIN=$(dirname "$(readlink -f "$0")")
+readonly BIN
+# shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
+source "${BIN}/operator.sh"
+
+# Where the tools are (tests substitute fakes), the loop's state, and
+# the sweeps it reads.
+TOOLS=${BOT_POLL_LOOP_BIN_DIR:-${BIN}}
+readonly TOOLS
+readonly S=${BOT_POLL_LOOP_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/bot-coordinator/poll}
+readonly SW=${BOT_POLL_LOOP_SWEEP_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bot-sweep}
+# A sweep problem wakes at most this often; no completed sweep for this
+# long is one.
+readonly STALE_S=$((30 * 60)) SP_EVERY_S=3600
+# Cycles of FAST_S seconds after the first look (about 9 minutes), and
+# how long an unresolved action waits before it wakes again.
+readonly CYCLES=${BOT_POLL_LOOP_CYCLES:-3} FAST_S=${BOT_POLL_LOOP_FAST_S:-180}
+readonly RESYNC_MIN=${BOT_POLL_LOOP_RESYNC_MIN:-120}
+readonly KEYS="approved outstanding rebase forgerev health ask drive"
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0")
+
+Waits for something for the coordinator to do, and exits saying what:
+
+  ACTIONS (KINDS) at HHMM: WHERE
+  <bot-reconcile's report: the observed state and every open action,
+   the new ones marked '*'>
+
+or, after about $(((CYCLES * FAST_S + 59) / 60)) minutes with nothing,
+
+  QUIET: no news in this window
+  <bot-reconcile's Observed line, the inputs it couldn't read, and
+   its exit status if it failed>
+
+It never sweeps: the bot-sweep.timer does, publishing runs under
+${SW}. Each cycle reads the complete
+runs newer than the last it read (oldest first; on a fresh state only the
+newest, which primes the seen-sets) and wakes on what is new in them:
+the operator's activity on fork PRs (forge-review), requests and answers
+from bot-notify (notify), approved fork PRs (approval), outstanding
+reviews (review), rebase needs (rebase), new P0 drive blockers
+(drive-P0), priority health lines (health, health-P0) and item news by
+humans (news). A sweep problem (the newest status lists problems that
+the run before it had too, or no sweep completed in $((STALE_S / 60)) minutes) wakes
+it at most hourly (sweep-problem).
+
+Each cycle also runs 'bot-reconcile --state ${S}/actions.json'
+and wakes on its fired actions: those that are new, and those still
+open ${RESYNC_MIN} minutes after they last woke it (a controller's resync). So the
+same unresolved action doesn't wake it again and again.
+
+Between cycles, every ${FAST_S}s, one call reads ${OP_OPERATOR_LOGIN}'s events feed: a
+new approval runs bot-signoff-due --apply and bot-promote-due --apply
+at once, and wakes it (approval, fast) if either signed off or promoted
+something (or refused to), or the PR is one the bot tracks: in
+${OP_FORGE_ORG} or ${OP_BOT_LOGIN}'s own, on the board (or in an item's
+Branch), or opened by ${OP_BOT_LOGIN}.
+
+The seen-sets and the actions state live in ${S}.
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    "") ;;
+    *) echo "error: $(basename "$0") takes no arguments (see --help)" 1>&2; exit 2 ;;
+esac
+
+mkdir -p "${S}" || exit 1
+for k in ${KEYS} evapprove; do touch "${S}/${k}-now" "${S}/${k}-seen"; done
+
+# events: the operator's approving reviews in their public events feed.
+events() {
+    gh api "users/${OP_OPERATOR_LOGIN}/events?per_page=50" \
+        --jq '.[]|select(.type=="PullRequestReviewEvent" and .payload.review.state=="approved")|.payload.review.html_url' 2>/dev/null | sort -u
+}
+events >>"${S}/evapprove-seen"
+sort -u "${S}/evapprove-seen" -o "${S}/evapprove-seen"
+
+# tracked REVIEW_URL...: prints those of the approvals that are of PRs
+# the bot tracks: in the forge org or the bot's own account, on the board
+# (as an item or in one's Branch), or opened by the bot (the events feed
+# doesn't say who, so that is one read per approval).
+tracked() {
+    local board u pr owner
+    board=$("${TOOLS}/bot-board" list --json 2>/dev/null |
+        jq -r '.[] | (.content.url // empty), ((.branch // "") | split(" ")[] | select(. != ""))' 2>/dev/null)
+    for u in "$@"; do
+        pr=${u%%#*}
+        [[ "${pr}" =~ ^https://github\.com/([^/]+)/([^/]+)/pull/([0-9]+)$ ]] || continue
+        owner=${BASH_REMATCH[1]}
+        if test "${owner,,}" = "${OP_FORGE_ORG,,}" || test "${owner,,}" = "${OP_BOT_LOGIN,,}" || grep -qixF "${pr}" <<<"${board}" ||
+            test "$(gh api "repos/${owner}/${BASH_REMATCH[2]}/pulls/${BASH_REMATCH[3]}" --jq .user.login 2>/dev/null)" = "${OP_BOT_LOGIN}"; then
+            echo "${u}"
+        fi
+    done
+}
+
+# runs: the complete runs, renamed out of .ID.partial and with bot-watch's
+# closing line.
+runs() {
+    local d
+    for d in "${SW}"/runs/[0-9]*; do
+        test -f "${d}/watch.txt" && grep -qE '^Swept [0-9]+ URLs' "${d}/watch.txt" && echo "${d##*/}"
+    done | sort
+}
+
+# process DIR: applies the seen-sets to one run's outputs, adding the
+# kinds of what's new to hits; with prime set, marks them seen instead.
+process() {
+    local d=$1 hit="" new_health cut k
+    grep -oE '^[^[:space:]]+[[:space:]]+\[APPROVED[^]]*\]' "${d}/inbox.txt" 2>/dev/null | sort -u >"${S}/approved-now"
+    awk '/^https:/{pr=$1} /^  20[0-9][0-9]-/{print pr" "$1" "$2" "$3}' "${d}/inbox.txt" 2>/dev/null | sort -u >"${S}/forgerev-now"
+    grep -oE '"url":"[^"]+"' "${d}/notify.txt" 2>/dev/null | sort -u >"${S}/ask-now"
+    sed -n '/^Outstanding reviews by /,/^[^ ]/p' "${d}/watch.txt" | grep -oE '^    [^[:space:]].* at [^[:space:]]+' | sort -u >"${S}/outstanding-now"
+    sed -n '/^Needs rebase/,/^[^ ]/p' "${d}/watch.txt" | grep -oE '^    [^[:space:]]+#[0-9]+' | sort -u >"${S}/rebase-now"
+    sed -n '/^P0 drive/,/^$/p' "${d}/watch.txt" | grep -oE '^  [^[:space:]]+ https://[^[:space:]]+ [0-9a-f]+' |
+        grep -vE '^  (mergeable|ci-pending)' | sort -u >"${S}/drive-now"
+    sed -n '/^Priority health:/,/^$/p' "${d}/watch.txt" | grep -oE '^  P[0-9] [^[:space:]]+ [^[:space:]]+ [0-9a-f]+' | sort -u >"${S}/health-now"
+    if test -n "${prime}"; then
+        for k in approved outstanding rebase health ask drive; do cp "${S}/${k}-now" "${S}/${k}-seen"; done
+        # Their recent reviews stay news: only those older than 6h are seen.
+        cut=$(date -u -d '6 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+        awk -v c="${cut}" '$2 < c' "${S}/forgerev-now" >"${S}/forgerev-seen"
+        return 0
+    fi
+    test -n "$(comm -13 "${S}/forgerev-seen" "${S}/forgerev-now")" && hit="${hit} forge-review"
+    test -n "$(comm -13 "${S}/ask-seen" "${S}/ask-now")" && hit="${hit} notify"
+    test -n "$(comm -13 "${S}/approved-seen" "${S}/approved-now")" && hit="${hit} approval"
+    test -n "$(comm -13 "${S}/outstanding-seen" "${S}/outstanding-now")" && hit="${hit} review"
+    test -n "$(comm -13 "${S}/rebase-seen" "${S}/rebase-now")" && hit="${hit} rebase"
+    test -n "$(comm -13 "${S}/drive-seen" "${S}/drive-now")" && hit="${hit} drive-P0"
+    sed '/^Priority health:/,/^$/d; /^Sign-offs/,/^$/d; /^Needs rebase/,/^[^ ]/d; /^Outstanding reviews/,/^[^ ]/d' "${d}/watch.txt" |
+        grep -E '^    [^[:space:]]' | grep -qvE "by @[^[:space:]]+\[bot\]|by @${OP_BOT_LOGIN}|CI passing again|^    https?://" && hit="${hit} news"
+    new_health=$(comm -13 "${S}/health-seen" "${S}/health-now")
+    test -n "${new_health}" && hit="${hit} health"
+    grep -q '^  P0 ' <<<"${new_health}" && hit="${hit} health-P0"
+    for k in approved outstanding rebase forgerev health ask drive; do sort -u "${S}/${k}-seen" "${S}/${k}-now" -o "${S}/${k}-seen"; done
+    hits="${hits}${hit}"
+    return 0
+}
+
+# sweep_problem: prints why the sweeps need a look, at most hourly: the
+# newest sweep's problems, if the run before it had a failing step too
+# (a GitHub 5xx on one URL is retried by the next sweep), or no sweep
+# completed in STALE_S.
+sweep_problem() {
+    local why="" age now f=${SW}/status.json prev
+    now=$(date +%s)
+    if test ! -f "${f}"; then
+        why="no status.json yet"
+    else
+        age=$((now - $(date -d "$(jq -r '.ended_at // empty' "${f}")" +%s 2>/dev/null || echo 0)))
+        if jq -e '.problems|length>0' "${f}" >/dev/null 2>&1; then
+            prev=$(find "${SW}/runs" -mindepth 1 -maxdepth 1 -name '[0-9]*' -printf '%f\n' 2>/dev/null | sort | tail -n2 | head -n1)
+            if test -n "${prev}" && jq -e 'to_entries|any(.value != 0)' "${SW}/runs/${prev}/status.json" >/dev/null 2>&1; then
+                why="$(jq -r '.problems|join("; ")' "${f}" | cut -c1-300)"
+            fi
+        fi
+        test "${age}" -gt "${STALE_S}" && why="${why:+${why}; }no sweep completed in $((age / 60)) min"
+    fi
+    test -z "${why}" && return 1
+    test $((now - $(cat "${S}/sp-last" 2>/dev/null || echo 0))) -lt "${SP_EVERY_S}" && return 1
+    echo "${now}" >"${S}/sp-last"
+    echo "${why}"
+}
+
+# reconcile: runs bot-reconcile against the actions state into
+# ${S}/reconcile.txt, adding the kinds of its fired actions to hits.
+reconcile() {
+    local kinds
+    "${TOOLS}/bot-reconcile" --state "${S}/actions.json" --resync "${RESYNC_MIN}" >"${S}/reconcile.txt" 2>&1 ||
+        echo "(bot-reconcile exited $?)" >>"${S}/reconcile.txt"
+    kinds=$(grep -oE '^\* [a-z-]+' "${S}/reconcile.txt" | cut -c3- | sort -u | tr '\n' ' ')
+    test -z "${kinds}" || hits="${hits} actions: ${kinds% }"
+}
+
+# wake WHERE: prints the wake line and the reconcile report, and exits.
+wake() {
+    echo "ACTIONS (${hits# }) at ${t}: $1"
+    cat "${S}/reconcile.txt"
+    exit 0
+}
+
+cycle=0
+while :; do
+    t=$(date +%H%M)
+    hits=""
+    prime=""
+    test -e "${S}/primed" || prime=1
+    last=$(cat "${S}/lastrun" 2>/dev/null)
+    all=$(runs)
+    if test -n "${prime}"; then
+        # A fresh state: only the newest run primes the seen-sets.
+        new=$(printf '%s\n' "${all}" | tail -n1)
+        test -n "${new}" && touch "${S}/primed"
+    else
+        new=$(printf '%s\n' "${all}" | awk -v l="${last}" 'NF && $0 > l')
+    fi
+    for r in ${new}; do
+        process "${SW}/runs/${r}"
+        echo "${r}" >"${S}/lastrun"
+        prime=""
+    done
+    reconcile
+    if why=$(sweep_problem); then
+        hits="sweep-problem${hits}"
+        wake "${why}"
+    fi
+    test -n "${hits}" && wake "see ${SW}/runs/$(cat "${S}/lastrun" 2>/dev/null)/{watch,notify,inbox}.txt"
+    test "${cycle}" -ge "${CYCLES}" && break
+    cycle=$((cycle + 1))
+    # The fast path: their approvals through the events feed (one call),
+    # acted on at once.
+    sleep "${FAST_S}"
+    t=$(date +%H%M)
+    events >"${S}/evapprove-now"
+    new_ev=$(comm -13 "${S}/evapprove-seen" "${S}/evapprove-now")
+    sort -u "${S}/evapprove-seen" "${S}/evapprove-now" -o "${S}/evapprove-seen"
+    if test -n "${new_ev}"; then
+        # Cheap and idempotent, so run on any approval; but wake only when
+        # they did something, or the approval is of a PR the bot tracks
+        # (not, say, someone else's PR the operator approved).
+        "${TOOLS}/bot-signoff-due" --apply >"${S}/signoff-${t}.txt" 2>"${S}/signoff-${t}.err"
+        "${TOOLS}/bot-promote-due" --apply >"${S}/promote-${t}.txt" 2>"${S}/promote-${t}.err"
+        # shellcheck disable=SC2086 # one URL per word
+        mine=$(tracked ${new_ev})
+        did=$(grep -hE '^(Signed off|Sign-off refused|Promoted|Promotion refused): ' "${S}/signoff-${t}.txt" "${S}/promote-${t}.txt")
+        if test -n "${mine}${did}"; then
+            reconcile
+            hits="approval, fast${hits}"
+            wake "$(tr '\n' ' ' <<<"${mine:-${new_ev}}"); see ${S}/signoff-${t}.txt ${S}/promote-${t}.txt"
+        fi
+    fi
+done
+echo "QUIET: no news in this window"
+# With what bot-reconcile couldn't read, or its failure: neither wakes
+# it, but a reconcile that keeps failing shouldn't go unseen.
+grep -E '^(Observed:|  unread: |\(bot-reconcile exited )' "${S}/reconcile.txt"
+exit 0
