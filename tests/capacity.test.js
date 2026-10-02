@@ -172,6 +172,32 @@ test("bot-actuals sets Actual tokens on Done items without one; --dry-run only p
   assert.match(run(["--dry-run", "--all"]), /Actual tokens = 5 on PVTI_b/);
 });
 
+test("bot-actuals plan: which items each mode sets", () => {
+  const { plan } = require(path.join(BIN, "bot-actuals"));
+  const busy = { status: "In Progress", lead: "coordinator" };
+  // [item fields, attributed sum, set in modes done/all/open]
+  const cases = [
+    [{ status: "Done" }, 500e3, [true, true, true]],
+    [{ status: "Done", "actual tokens": 400e3 }, 450e3, [false, true, false]],
+    [{ status: "Done", "actual tokens": 400e3 }, 600e3, [false, true, true]],
+    [{ status: "Done", "actual tokens": 600e3 }, 500e3, [false, true, false]],
+    [busy, 50e3, [false, false, true]],
+    [{ ...busy, "actual tokens": 1e6 }, 1.05e6, [false, false, false]],
+    [{ ...busy, "actual tokens": 1e6 }, 1.2e6, [false, false, true]],
+    [{ status: "In Progress", run: "https://github.com/o/r/actions/runs/1" }, 10, [false, false, true]],
+    [{ status: "In Progress" }, 1e6, [false, false, false]],
+    [{ status: "Todo" }, 1e6, [false, false, false]],
+    [{ status: "Done" }, 0, [false, false, false]],
+  ];
+  cases.forEach(([fields, sum, want], i) => {
+    const item = { id: `PVTI_${i}`, title: `t${i}`, ...fields };
+    const tasks = sum ? [{ item: item.id, fresh_tokens: sum }] : [];
+    ["done", "all", "open"].forEach((mode, m) => {
+      assert.deepEqual(plan([item], tasks, mode), want[m] ? [{ id: item.id, title: item.title, tokens: sum }] : [], `case ${i} ${mode}`);
+    });
+  });
+});
+
 test("bot-capacity reads the statusline file and reports the projection", () => {
   const rate = path.join(TMP, "rate-limits.json");
   const base = { ...process.env, BOT_CAPACITY_COST: fakeCost, BOT_CAPACITY_BOARD: fakeBoard, BOT_CAPACITY_RATE_FILE: rate, BOT_CAPACITY_NOW: new Date(NOW).toISOString() };
