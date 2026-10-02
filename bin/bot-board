@@ -47,7 +47,7 @@ readonly NEWS_MAX=200
 readonly NEWS_DATE_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}: '
 # Number fields, which only --field sets (the field list doesn't tell a
 # number field from a text one).
-readonly NUMBER_FIELDS=("Actual tokens")
+readonly NUMBER_FIELDS=("Actual tokens" "Budget tokens")
 # The Org field says which organization an item's work targets, so the
 # board can be filtered to the bot's own infrastructure (the forge org's
 # and the bot's options) or to work going outbound. A fork owned by one
@@ -254,7 +254,8 @@ Commands:
                               separate several with spaces. --field sets
                               any other text or single-select field, such
                               as another board's (--field Area docs), or
-                              the number field Actual tokens.
+                              the number fields Actual tokens and Budget
+                              tokens.
                               --status '${QUESTION_STATUS}' is refused unless
                               the item is a question (or review or
                               chore ask) or a PR, or has one in its
@@ -273,9 +274,11 @@ Commands:
                               match its item's Priority and Org ('P0',
                               '${TARGET_LABEL_PREFIX}bootc-dev'); 'set', 'issue',
                               'question' and 'fill-org' keep them in sync
-  field-ensure NAME           Add the text field NAME to the board unless it
-                              has one (bot-runs keeps an item's agent run
-                              in a 'Run' field)
+  field-ensure [--number] NAME
+                              Add the text (--number: number) field NAME
+                              to the board unless it has one (bot-runs
+                              keeps an item's agent run in a 'Run' field,
+                              bot-pace its token budget in 'Budget tokens')
   state-get [--track] NAME    Print the JSON state kept in the archived
                               draft item '${STATE_PREFIX}NAME' ({} if it
                               doesn't exist yet). --track records it as
@@ -1554,7 +1557,12 @@ cmd_labels() {
 # --- Fields ----------------------------------------------------------------
 
 cmd_field_ensure() {
-    { test $# -eq 1 && test -n "$1"; } || fatal "usage: $(basename "$0") field-ensure NAME"
+    local type=TEXT
+    if test "${1:-}" = --number; then
+        type=NUMBER
+        shift
+    fi
+    { test $# -eq 1 && test -n "$1"; } || fatal "usage: $(basename "$0") field-ensure [--number] NAME"
     local name=$1
     load_fields
     has_field "${name}" && return 0
@@ -1562,10 +1570,10 @@ cmd_field_ensure() {
     refresh=true FIELDS_JSON=
     load_fields
     has_field "${name}" && return 0
-    ghq project field-create "${NUMBER}" --owner "${OWNER}" --name "${name}" --data-type TEXT >/dev/null ||
-        fail_after $? "creating the text field '${name}' on ${BOARD_URL} failed (gh needs the project scope)"
+    ghq project field-create "${NUMBER}" --owner "${OWNER}" --name "${name}" --data-type "${type}" >/dev/null ||
+        fail_after $? "creating the ${type,,} field '${name}' on ${BOARD_URL} failed (gh needs the project scope)"
     rm -f "${BOARD_CACHE}/fields.json"
-    echo "Created the text field '${name}' on ${BOARD_URL}" 1>&2
+    echo "Created the ${type,,} field '${name}' on ${BOARD_URL}" 1>&2
 }
 
 # --- State items -----------------------------------------------------------
