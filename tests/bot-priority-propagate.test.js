@@ -119,21 +119,36 @@ test("a sub-issue that is also in Branch is raised as a Branch child", () => {
   assert.deepEqual(r.out.map((c) => [c.action, c.url, c.from, c.to]), [["raised", issueUrl(2), "P2", "P0"]]);
 });
 
-test("a child missing from the board is added with the parent's Theme", () => {
+test("a child missing from the board is added with the parent's Theme, unless it is a Branch PR", () => {
   const r = exec(() => {
     subs(1, [[2]]);
     api(2);
     api(9);
-  }, [item(1, { priority: "P0", theme: "devspace", branch: prUrl(9) })], "--apply");
+  }, [item(1, { priority: "P0", theme: "devspace", branch: `${prUrl(8)} ${issueUrl(9)}` })], "--apply");
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(r.out.map((c) => [c.action, c.url, c.to, c.theme]), [
-    ["added", prUrl(9), "P0", "devspace"], ["added", issueUrl(2), "P0", "devspace"],
+    ["added", issueUrl(9), "P0", "devspace"], ["added", issueUrl(2), "P0", "devspace"],
   ]);
   assert.deepEqual(r.calls, [
-    `add --priority P0 ${prUrl(9)}`, "set PVTI_new_9 --field Theme devspace",
+    `add --priority P0 ${issueUrl(9)}`, "set PVTI_new_9 --field Theme devspace",
     `add --priority P0 ${issueUrl(2)}`, "set PVTI_new_2 --field Theme devspace",
   ]);
 });
+
+// A P0 parent's Branch holds PR 7 (or issue 7); the case adds item 7 to the
+// board as it says, and the expected change (or none).
+for (const [name, child, expected] of [
+  ["a Branch PR not on the board is not added (the parent records it)", null, []],
+  ["a Branch PR on the board as itself is raised", item(7, { type: "PullRequest", priority: "P2", status: "Draft" }), [["raised", prUrl(7)]]],
+  ["a Branch PR twin with only a Priority is raised, not duplicated", item(7, { type: "PullRequest", priority: "P1" }), [["raised", prUrl(7)]]],
+]) {
+  test(name, () => {
+    const r = exec(() => api(7), [item(1, { priority: "P0", branch: prUrl(7) }), ...(child ? [child] : [])], "--apply");
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.out.map((c) => [c.action, c.url]), expected);
+    assert.ok(!r.calls.some((c) => c.startsWith("add ")), r.calls.join("\n"));
+  });
+}
 
 test("Done on the board, and closed or merged on GitHub, are skipped", () => {
   const r = exec(() => {
@@ -186,4 +201,57 @@ test("a failing bot-board is reported, and the others go on", () => {
   }, [item(1, { priority: "P0", branch: `${issueUrl(2)} ${issueUrl(3)}` }), item(2, { priority: "P2" }), item(3, { priority: "P2" })], "--apply");
   assert.equal(r.status, 1);
   assert.match(r.stderr, /boom/);
+});
+
+// --dedupe: each case is a board (item 1 an open tracker parent whose
+// Branch records PR 7 unless the case says otherwise) and the expected
+// [action, url, fields] lines; it reads nothing from GitHub.
+const parent = (f = {}) => item(1, { status: "In Progress", priority: "P0", branch: prUrl(7), ...f });
+const pr7 = (f = {}) => item(7, { type: "PullRequest", ...f });
+for (const [name, board, expected] of [
+  ["a twin with only a Priority is archived", [parent(), pr7({ priority: "P0" })], [["archived", prUrl(7), []]]],
+  ["a twin with Org and Theme too is archived", [parent(), pr7({ priority: "P1", org: "bootc-dev", theme: "x", labels: [] })],
+    [["archived", prUrl(7), []]]],
+  ["a PR item with its own Status is kept", [parent(), pr7({ priority: "P0", status: "Draft" })], [["kept", prUrl(7), ["status"]]]],
+  ["a PR item with a Why or Lead is kept", [parent(), pr7({ why: "w", lead: "wfc", news: "" })], [["kept", prUrl(7), ["lead", "why"]]]],
+  ["a PR in only a Done item's Branch is no twin", [parent({ status: "Done" }), pr7({ priority: "P0" })], []],
+  ["a Done PR item is left alone", [parent(), pr7({ status: "Done" })], []],
+  ["a PR item in no Branch is no twin", [parent({ branch: "" }), pr7({ priority: "P0" })], []],
+  ["an issue item in a Branch is no twin", [parent({ branch: issueUrl(7) }), item(7, { priority: "P0" })], []],
+  ["an item's own URL in its Branch is no twin", [pr7({ priority: "P0", branch: prUrl(7) })], []],
+]) {
+  test(`--dedupe: ${name}`, () => {
+    const r = exec(() => {}, board, "--dedupe", "--apply");
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.out.map((t) => [t.action, t.url, t.fields]), expected);
+    const archived = r.out.filter((t) => t.action === "archived");
+    assert.deepEqual(r.calls, archived.map((t) => `archive ${t.id}`));
+    for (const t of archived) assert.equal(t.line, `archived ${t.url} (in Branch of ${issueUrl(1)})`);
+  });
+}
+
+test("--dedupe plans only by default and with --dry-run, and lists kept twins", () => {
+  for (const args of [["--dry-run"], []]) {
+    const r = exec(() => {}, [parent({ branch: `${prUrl(7)} ${prUrl(8)}` }), pr7({ priority: "P0" }),
+      item(8, { type: "PullRequest", status: "Draft", why: "w" })], "--dedupe", ...args);
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(r.out.map((t) => [t.action, t.result]), [["archived", "planned"], ["kept", "planned"]]);
+    assert.equal(r.out[1].line, `kept ${prUrl(8)}: has status, why (in Branch of ${issueUrl(1)})`);
+    assert.deepEqual(r.calls, []);
+  }
+});
+
+test("--dedupe reports a failed archive and goes on", () => {
+  const saved = fs.readFileSync(FAKE_BOT_BOARD, "utf8");
+  fs.writeFileSync(FAKE_BOT_BOARD, saved.replace(
+    'if (args[0] === "add")', 'if (args[1] === "PVTI_P7") { process.stderr.write("boom\\n"); process.exit(1); }\nif (args[0] === "add")'));
+  try {
+    const r = exec(() => {}, [parent({ branch: `${prUrl(7)} ${prUrl(8)}` }), pr7({ priority: "P0" }),
+      item(8, { type: "PullRequest", priority: "P0" })], "--dedupe", "--apply");
+    assert.equal(r.status, 1);
+    assert.match(r.stderr, /boom/);
+    assert.deepEqual(r.calls, ["archive PVTI_P7", "archive PVTI_P8"]);
+  } finally {
+    fs.writeFileSync(FAKE_BOT_BOARD, saved);
+  }
 });

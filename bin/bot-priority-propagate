@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // Priority follows structure: raises the Branch items of the Workstream
-// board's P0 (then P1) items to that priority, and adds the Branch items
-// and new sub-issues that are not on the board. Sub-issues already on the
+// board's P0 (then P1) items to that priority, and adds the Branch issues
+// and new sub-issues that are not on the board (never a Branch PR: the
+// parent's Branch is where it lives). Sub-issues already on the
 // board keep their priority: the operator sets those deliberately.
 // bot-watch runs it on every sweep and lists
-// what it did as its "Priority propagation" section. See --help.
+// what it did as its "Priority propagation" section. --dedupe archives
+// the PR items it used to add. See --help.
 // Node's standard library only, plus gh (through bot-priority-health's
 // REST helpers, with their ETag cache) and bot-board.
 "use strict";
@@ -27,12 +29,17 @@ const RANK_UNSET = 99;
 const DONE_STATUS = "Done";
 const THEME_FIELD = "Theme";
 const PER_PAGE = 100;
+// Fields of a board item that a script sets by itself (fill-org, and this
+// tool's Priority and Theme), and keys bot-board list copies from the
+// issue or PR: an item with nothing else holds no data of its own.
+const AUTO_FIELDS = new Set(["priority", "org", "theme"]);
+const CONTENT_KEYS = new Set(["id", "content", "title", "repository", "labels", "reviewers", "assignees", "linked pull requests", "milestone"]);
 const EX_ERROR = 1;
 const EX_USAGE = 2;
 const ISSUE_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(issues|pull)\/([0-9]+)(?:[/#?]|$)/i;
 
 function usage() {
-  return `Usage: ${PROG} [--apply | --dry-run] [--board-file FILE] [--json]
+  return `Usage: ${PROG} [--dedupe] [--apply | --dry-run] [--board-file FILE] [--json]
 
 Priority follows structure. For every open item (not ${DONE_STATUS}) of the Workstream
 board at ${PRIORITIES.join(", then ")} (one pass each, so a P0 parent's children are settled
@@ -44,12 +51,17 @@ first), its children get its priority if theirs is lower or unset
     those not yet on the board.
 
 A Branch child on the board is raised (and gets the parent's ${THEME_FIELD} if it
-has none); a child that is not on the board is added at that priority, with
-the parent's ${THEME_FIELD}. A sub-issue already on the board is NEVER touched,
+has none); a child that is not on the board is added at that priority,
+with the parent's ${THEME_FIELD}, unless it is a PR in Branch. Such a PR (a fork
+or upstream PR) lives in its item's Branch (see bot-pr fork-pr), not as an
+item of its own, and the review app ranks it by that item's priority; so a
+Branch PR is only raised, when it is on the board as itself (bot-land adds
+the bot's own PRs). A sub-issue already on the board is NEVER touched,
 whatever its priority: sub-issues are often deliberately lower than their
-epic (a P2 follow-up under a P0 epic stays P2). Children that are ${DONE_STATUS} on the board, or closed or merged on
-GitHub, are left alone. A raised child is a parent in its turn, in
-the pass of its new priority. Of several parents, the most urgent wins.
+epic (a P2 follow-up under a P0 epic stays P2). Children that are
+${DONE_STATUS} on the board, or closed or merged on GitHub, are left alone. A
+raised child is a parent in its turn, in the pass of its new priority. Of
+several parents, the most urgent wins.
 
 One line per change:
 
@@ -60,12 +72,27 @@ With --apply, the changes are made through bot-board, a line starting
 "FAILED" for one that was refused; with --dry-run, or neither, the lines
 are only what would change. Idempotent: a later run finds nothing.
 
+With --dedupe, it instead archives (bot-board archive) the twins earlier
+versions added: PR items whose PR is in the Branch of another open
+item (not ${DONE_STATUS}), and that have no data of their own: no field set
+but ${[...AUTO_FIELDS].join(", ")}. One line each; an open twin with data of its own
+(a Status, Why, Lead...) is listed as kept, for a human to look at:
+
+  archived URL (in Branch of PARENT-URL)
+  kept URL: has status, why (in Branch of PARENT-URL)
+
+It reads only the board, and is idempotent too: archived items aren't
+listed.
+
 Options:
+  --dedupe            archive the twin items instead (see above)
   --apply             make the changes
   --dry-run           report only (the default)
   --board-file FILE   the board as 'bot-board list --json' prints it
   --json              print a JSON array of {action, url, parent, from, to,
-                      theme, result, line}, result being planned, applied or failed
+                      theme, result, line}, result being planned, applied or failed;
+                      with --dedupe, of {action (archived or kept), url, id,
+                      parent, fields, result, line}
   -h, --help          show this help
 
 Exits 1 if a change failed or a parent's children could not be read, and
@@ -74,7 +101,7 @@ ${EX_RATELIMIT} if GitHub is rate limiting the bot.
 }
 
 function parseArgs(argv) {
-  const opts = { apply: false, boardFile: null, json: false };
+  const opts = { apply: false, boardFile: null, json: false, dedupe: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -84,6 +111,7 @@ function parseArgs(argv) {
         process.exit(0);
       case "--apply": opts.apply = true; break;
       case "--dry-run": opts.apply = false; break;
+      case "--dedupe": opts.dedupe = true; break;
       case "--json": opts.json = true; break;
       case "--board-file":
         if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `--board-file needs a value\n\n${usage()}`);
@@ -154,6 +182,7 @@ async function plan(board, children, isOpen) {
         let item = items.get(child.key);
         if (item && item.status === DONE_STATUS) continue;
         if (item && child.sub) continue; // on the board: keeps its priority
+        if (!item && !child.sub && !child.isIssue) continue; // lives in the parent's Branch
         if (!(await isOpen(child))) continue;
         let change = null;
         if (!item) {
@@ -176,6 +205,69 @@ async function plan(board, children, isOpen) {
     }
   }
   return changes;
+}
+
+// ownData(item): the board fields an item has beyond AUTO_FIELDS, as
+// bot-board list --json names them.
+function ownData(item) {
+  return Object.keys(item).filter((k) => {
+    if (AUTO_FIELDS.has(k) || CONTENT_KEYS.has(k)) return false;
+    const v = item[k];
+    return v !== null && v !== undefined && v !== "" && !(Array.isArray(v) && v.length === 0);
+  }).sort();
+}
+
+// dedupe(board): the twins, as [{action, url, id, parent, fields}] in
+// board order: archived for one without data of its own, kept otherwise.
+// A twin is a PR item whose PR is in the Branch of another open item
+// (an issue there is still added as an item); a Done one is left out (no
+// view shows it).
+function dedupe(board) {
+  const recordedIn = new Map(); // key -> the first open item recording it in Branch
+  for (const it of board) {
+    if (it.status === DONE_STATUS) continue;
+    const own = parseUrl(it.content && it.content.url);
+    for (const word of (it.branch || "").split(/\s+/)) {
+      const u = parseUrl(word);
+      if (u && (!own || u.key !== own.key) && !recordedIn.has(u.key)) recordedIn.set(u.key, own ? own.url : it.id);
+    }
+  }
+  const out = [];
+  for (const it of board) {
+    const u = parseUrl(it.content && it.content.url);
+    if (!u || u.isIssue || !recordedIn.has(u.key) || it.status === DONE_STATUS) continue;
+    const fields = ownData(it);
+    out.push({ action: fields.length ? "kept" : "archived", url: u.url, id: it.id, parent: recordedIn.get(u.key), fields });
+  }
+  return out;
+}
+
+function describeTwin(t, result) {
+  const where = `(in Branch of ${t.parent})`;
+  if (t.action === "kept") return `kept ${t.url}: has ${t.fields.join(", ")} ${where}`;
+  return `${result === "failed" ? "FAILED " : ""}archived ${t.url} ${where}`;
+}
+
+async function runDedupe(board, opts) {
+  let failed = 0;
+  const results = [];
+  for (const t of dedupe(board)) {
+    let result = t.action === "kept" || !opts.apply ? "planned" : "applied";
+    if (result === "applied") {
+      try {
+        await bb(["archive", t.id]);
+      } catch (e) {
+        if (e instanceof Exit) throw e;
+        warn(e.message);
+        result = "failed";
+        failed++;
+      }
+    }
+    results.push({ ...t, result, line: describeTwin(t, result) });
+  }
+  if (opts.json) process.stdout.write(`${JSON.stringify(results)}\n`);
+  else process.stdout.write(results.length ? results.map((r) => `${r.line}\n`).join("") : "Dedupe: no twin items\n");
+  if (failed) throw new Exit(EX_ERROR, `${failed} archive(s) failed`);
 }
 
 function describe(c, result) {
@@ -206,6 +298,7 @@ async function applyChange(c) {
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const board = await loadBoard(opts.boardFile, null);
+  if (opts.dedupe) return runDedupe(board, opts);
   let failedReads = 0;
   const state = new Map();
   const childrenOf = async (parent) => {
@@ -271,5 +364,5 @@ if (require.main === module) {
     process.exit(e.status);
   });
 } else {
-  module.exports = { plan, parseUrl };
+  module.exports = { plan, parseUrl, dedupe };
 }
