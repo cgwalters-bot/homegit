@@ -76,7 +76,9 @@ Rules (${rules}):
                     toward the operator's recent activity; not topic
                     sessions', asks, manual items, or bot text for a
                     human-text repository; an umbrella, see lead-orphan,
-                    isn't busy). The targets shrink with the
+                    isn't busy), but only while the total is under its
+                    target: a lane short while the other runs over is only
+                    noted in the Observed line. The targets shrink with the
                     week's capacity: half, P0 only, at bot-capacity's P0-only
                     mark; none once it is used up. A busy task whose Actual
                     tokens passed its Budget tokens is a 'budget' action.

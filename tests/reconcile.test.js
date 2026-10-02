@@ -49,7 +49,6 @@ const ALL_KEYS = [
   "approval:https://github.com/cgwalters-forge/r/pull/3 https://github.com/cgwalters-forge/r/pull/3#pullrequestreview-3",
   "approval:https://github.com/cgwalters-forge/r/pull/4 https://github.com/cgwalters-forge/r/pull/4#pullrequestreview-4",
   "answer-unapplied:https://github.com/cgwalters-forge/tracker/issues/50 https://github.com/cgwalters-forge/tracker/issues/50#issuecomment-1",
-  "capacity:upstream",
   "budget:https://github.com/cgwalters-forge/tracker/issues/1",
   "lead-orphan:https://github.com/cgwalters-forge/tracker/issues/2",
   "lead-orphan:https://github.com/cgwalters-forge/tracker/issues/4",
@@ -67,16 +66,23 @@ test("topics come from the topic-lead skill's table", () => {
 });
 
 test("capacity: lanes against the target, paced by the week's capacity", () => {
-  const upstreamIdle = setItem(read("board.json"), "PVTI_u1", { status: "Done" });
+  // The fixture world is at the target: 4 of 4 busy, harness 3 of 2, upstream 1 of 2.
+  const board = read("board.json");
+  // One harness agent less: 3 of 4 busy, one upstream slot free.
+  const oneFree = setItem(board, "PVTI_o1", { status: "Draft" });
+  // Under the P0-only target (1 and 1): harness 1 of 1 (the topic's), upstream idle.
+  const upstreamIdle = setItem(setItem(oneFree, "PVTI_h1", { status: "Draft" }), "PVTI_u1", { status: "Done" });
+  const p0 = { capacity: { dispatch: { scope: "p0" } } };
   // [case, changes, capacity action keys, the upstream candidates]
   const cases = [
-    ["one upstream slot free", {}, ["capacity:upstream"], ["PVTI_c4", "PVTI_c2", "PVTI_c1"]],
-    ["unknown capacity is no limit", { capacity: undefined }, ["capacity:upstream"], ["PVTI_c4", "PVTI_c2", "PVTI_c1"]],
-    // Half the target (1 and 1), P0 only: the run fills upstream.
-    ["P0 only: half the target", { capacity: { dispatch: { scope: "p0" } } }, [], null],
-    ["P0 only, upstream idle", { capacity: { dispatch: { scope: "p0" } }, items: upstreamIdle }, ["capacity:upstream"], ["PVTI_c4"]],
+    ["the total at the target: a lane under its share gets nothing", {}, [], null],
+    ["the total over it (the epic busy too)", { children: {} }, [], null],
+    ["one upstream slot free", { items: oneFree }, ["capacity:upstream"], ["PVTI_c4", "PVTI_c2", "PVTI_c1"]],
+    ["unknown capacity is no limit", { items: oneFree, capacity: undefined }, ["capacity:upstream"], ["PVTI_c4", "PVTI_c2", "PVTI_c1"]],
+    ["P0 only: half the target, which the total is over", { ...p0, items: oneFree }, [], null],
+    ["P0 only, upstream idle", { ...p0, items: upstreamIdle }, ["capacity:upstream"], ["PVTI_c4"]],
     ["the week is used up", { capacity: { dispatch: { scope: "none" } }, items: upstreamIdle }, [], null],
-    ["no candidates", { items: read("board.json").filter((it) => !/^PVTI_c/.test(it.id)) }, ["capacity:upstream"], []],
+    ["no candidates", { items: oneFree.filter((it) => !/^PVTI_c/.test(it.id)) }, ["capacity:upstream"], []],
     ["a bigger harness share", { config: operator.resolve({ pacing: { agents: 6, harness_agents: 5 } }) }, ["capacity:harness"], null],
   ];
   for (const [name, changes, want, candidates] of cases) {
@@ -89,8 +95,20 @@ test("capacity: lanes against the target, paced by the week's capacity", () => {
       assert.equal(actions[0].detail.length, candidates.length, name);
     }
   }
-  const a = rec.capacity(obs({ items: read("board.json").filter((it) => !/^PVTI_c/.test(it.id)) }))[0];
+  const [free] = rec.capacity(obs({ items: oneFree }));
+  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1 \(bot-pace assign ITEM, or bot-runs dispatch\); 2 P0 wait on a human$/);
+  assert.equal(free.detail[0], "P0 https://github.com/cgwalters-forge/tracker/issues/30 image-builder analysis (osbuild/image-builder, budget 5M by P0)");
+  const a = rec.capacity(obs({ items: oneFree.filter((it) => !/^PVTI_c/.test(it.id)) }))[0];
   assert.match(a.do, /no Todo candidates: triage the backlog or file upstream work; 2 P0 wait on a human$/);
+  // A lane's shortfall with the total at the target is only noted.
+  // [case, changes, the Observed line's agents part]
+  const noted = [
+    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target)"],
+    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2)"],
+  ];
+  for (const [name, changes, want] of noted) {
+    assert.ok(rec.render(rec.observed(obs(changes)), []).startsWith(`Observed: ${want}; budgets `), name);
+  }
 });
 
 test("capacity: a task over its budget, unless the budget was raised", () => {
@@ -333,8 +351,8 @@ function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) 
 
 test("bot-reconcile: the report, and --json", () => {
   const out = cli([]);
-  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(14\):\n/);
-  assert.match(out, /^ {2}capacity https:\/\/github\.com\/cgwalters-forge\/tracker\/issues\/30: upstream 1 of 2 busy: dispatch up to 1 .*\n {4}P0 https:\/\/github\.com\/cgwalters-forge\/tracker\/issues\/30 image-builder analysis \(osbuild\/image-builder, budget 5M by P0\)$/m);
+  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(13\):\n/);
+  assert.doesNotMatch(out, /^. capacity /m);
   const j = JSON.parse(cli(["--json"]));
   assert.deepEqual(j.actions.map((a) => a.key), ALL_KEYS);
   assert.deepEqual(j.errors, []);

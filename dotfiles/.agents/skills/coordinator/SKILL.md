@@ -247,7 +247,9 @@ with a stable key, a kind, the item's URL and what to do. It changes
 nothing itself. Its rules (`bot-reconcile --help` has the details):
 
 - **capacity:** the work agents busy per lane against the target (see
-  "Capacity"); a lane under it gets its top Todo candidates. A busy task
+  "Capacity"); a lane under it gets its top Todo candidates, but only
+  while the total is under the target too: a lane short of its share
+  while the other runs over is only noted in the Observed line. A busy task
   past its Budget tokens is a **budget** action.
 - **heartbeat:** the heartbeat is fresh and lists exactly the busy
   items' workers; for a drift it prints the `bot-heartbeat publish`
