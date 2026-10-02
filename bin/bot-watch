@@ -136,9 +136,10 @@ stay the same until the problem is fixed or the PR's head moves.
 
 Then comes "Priority propagation" ('bot-priority-propagate', see its
 --help): priority follows structure, so with --apply the Branch items of
-the P0 (then P1) items are raised to their priority, and those and new
-sub-issues are added to the board (sub-issues already on the board keep
-their priority), and each change is listed as a line. It is
+the P0 (then P1) items are raised to their priority, Branch issues and
+new sub-issues missing from the board are added (never a Branch PR: it
+lives in its item's Branch; sub-issues already on the board keep their
+priority), and each change is listed as a line. It is
 bookkeeping: bot-poll doesn't wake for it.
 
 Next comes the "P0 drive" of 'bot-drive' (see its --help): one line
