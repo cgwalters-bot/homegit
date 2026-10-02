@@ -1,0 +1,5 @@
+[
+  {"id": "PVTI_x9", "title": "someone else's draft, a stable gate", "status": "In Review", "priority": "P0", "owner": "others",
+   "next": "Stable gate. 2026-10-01: author draft, CI red, idle since 09-21; waits on the author (CI, DCO)",
+   "content": {"type": "PullRequest", "url": "https://github.com/o/r/pull/9"}}
+]

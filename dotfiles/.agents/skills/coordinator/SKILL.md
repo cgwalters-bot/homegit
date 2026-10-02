@@ -258,7 +258,12 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   neither Lead nor Run is nobody's.
 - **drive:** the latest sweep's P0 drive blockers that need you, its P0
   health lines, and approved fork PRs its promotions didn't take, carried
-  over as they are.
+  over as they are. A health line whose PR waits on a human with an ask
+  under 7 days old stays quiet: the operator's review requested on it, or,
+  on someone else's PR, a dated "waits on the author" note (e.g.
+  "2026-10-02: ... waits on the author") in its item's Why or Next, on
+  this board or the epic's. An older or undated ask fires again, as a
+  nudge. On the bot's own PR an ask quiets only staleness.
 - **answer-unapplied:** a question the operator answered whose Unblocks
   items are still open and untouched since the answer.
 - **closed-not-done:** an item whose own issue or PR is closed or merged

@@ -24,6 +24,8 @@
    "content": {"type": "Issue", "url": "https://github.com/cgwalters-forge/workflow-compiler/issues/4"}},
   {"id": "PVTI_w1", "title": "P0 waiting on the operator", "status": "Needs human", "priority": "P0", "org": "bootc-dev",
    "content": {"type": "PullRequest", "url": "https://github.com/bootc-dev/bootc/pull/30"}},
+  {"id": "PVTI_r7", "title": "a fork PR waiting on the operator's review", "status": "Draft", "priority": "P0", "org": "o", "reviewers": ["cgwalters"],
+   "why": "Ready for your review (requested 10-01)", "content": {"type": "PullRequest", "url": "https://github.com/cgwalters-forge/r/pull/7"}},
   {"id": "PVTI_d1", "title": "finished", "status": "Done", "priority": "P1", "org": "cgwalters-bot",
    "content": {"type": "Issue", "url": "https://github.com/cgwalters-forge/tracker/issues/99"}}
 ]

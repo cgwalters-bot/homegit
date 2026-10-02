@@ -31,11 +31,12 @@ const POLICY_DIR = process.env.UPSTREAM_POLICY_DIR || path.join(ROOT, "upstream-
 const TOPIC_SKILL = path.join(ROOT, "dotfiles", ".agents", "skills", "topic-lead", "SKILL.md");
 const STATE_VERSION = 1;
 // The inputs each rule reads; only those of the rules run are read.
+// prs follows from the sweep.
 const RULE_INPUTS = {
   capacity: ["items", "capacity", "activity"],
   heartbeat: ["items", "heartbeat"],
   "lead-orphan": ["items", "heartbeat"],
-  drive: ["sweep"],
+  drive: ["sweep", "prs", "items", "epicItems"],
   "answer-unapplied": ["questions"],
   "closed-not-done": ["items", "contentStates"],
 };
@@ -46,7 +47,8 @@ const EX_USAGE = 2;
 function usage() {
   const rules = Object.keys(rec.RULES).join(", ");
   return `Usage: ${PROG} [--json] [--apply] [--state FILE [--resync MIN]] [--rule NAME]...
-       [--board-file F] [--sweep-dir D] [--heartbeat-file F] [--capacity-file F]
+       [--board-file F] [--epic-board-file F] [--sweep-dir D] [--prs-file F]
+       [--heartbeat-file F] [--capacity-file F]
        [--questions-file F] [--activity-file F] [--watch-state F] [--now TIME]
 
 Reconciles like a Kubernetes controller: reads the observed state, compares
@@ -56,12 +58,14 @@ nothing itself, except with --apply (see closed-not-done). Run it on each
 wake, do the actions, then run it again to confirm they converged
 ("Actions: none").
 
-Observed: the board (bot-board list), the latest complete bot-sweep run
-(${SWEEP_DIR.replace(os.homedir(), "~")}), the heartbeat (bot-heartbeat show),
-the week's capacity (bot-capacity --json), and the question issues of
-${operator.loadOrExit(PROG).tracker_repo} answered in the last ${rec.ANSWER_WINDOW_MS / 3600e3}h, and bot-watch's last-seen
-state of the board's issues and PRs (${WATCH_STATE.replace(os.homedir(), "~")}).
-Only the inputs of the rules run are read.
+Observed: the board (bot-board list) and the P0 epic's, the latest
+complete bot-sweep run
+(${SWEEP_DIR.replace(os.homedir(), "~")}) and the PRs of its P0 health lines (their
+author, and when ${operator.loadOrExit(PROG).operator.login}'s review was requested), the heartbeat
+(bot-heartbeat show), the week's capacity (bot-capacity --json), and the
+question issues of ${operator.loadOrExit(PROG).tracker_repo} answered in the last ${rec.ANSWER_WINDOW_MS / 3600e3}h, and
+bot-watch's last-seen state of the board's issues and PRs
+(${WATCH_STATE.replace(os.homedir(), "~")}). Only the inputs of the rules run are read.
 
 Rules (${rules}):
   capacity          pacing.agents work agents busy (In Progress with a Lead
@@ -84,6 +88,12 @@ Rules (${rules}):
   drive             the latest sweep's P0 drive blockers that need the
                     coordinator, its P0 health lines, and approved fork
                     PRs its promotions didn't take, carried over as they are.
+                    A health line is left out while its PR waits on a human
+                    with an ask under ${rec.ASK_MAX_AGE_MS / 864e5} days old: the operator's review
+                    requested, or, on someone else's PR, a dated "waits on
+                    the author" note in a board item's Why or Next (on the
+                    bot's own PR, only for staleness); an older ask fires as
+                    a nudge.
   answer-unapplied  a question the operator answered whose Unblocks items
                     are still open and untouched since the answer.
   closed-not-done   an item whose own issue or PR is closed or merged is
@@ -114,7 +124,8 @@ class Exit extends Error {
 
 function parseArgs(argv) {
   const opts = { json: false, apply: false, rules: [], resync: rec.RESYNC_MS };
-  const values = ["state", "resync", "rule", "board-file", "sweep-dir", "heartbeat-file", "capacity-file", "questions-file", "activity-file", "watch-state", "now"];
+  const values = ["state", "resync", "rule", "board-file", "epic-board-file", "sweep-dir", "prs-file", "heartbeat-file", "capacity-file",
+    "questions-file", "activity-file", "watch-state", "now"];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") throw new Exit(0, null);
@@ -185,6 +196,31 @@ async function questions(config, now) {
   return out.filter(Boolean);
 }
 
+// prs(config, sweep): {URL: {author, requested, requested_at}} of the
+// PRs of the sweep's P0 health lines: requested is whether the
+// operator's review is requested on it, requested_at when it last was.
+async function prs(config, sweep) {
+  const { restGet, pages, pool, PR_URL_RE } = require(path.join(BIN_DIR, "bot-priority-health"));
+  const login = config.operator.login.toLowerCase();
+  const urls = [...new Set(rec.healthLines(sweep).map((h) => h.url))];
+  const out = await pool(urls, async (url) => {
+    const m = PR_URL_RE.exec(url);
+    if (!m) return null;
+    const repo = `${m[2]}/${m[3]}`;
+    const pr = await restGet(`repos/${repo}/pulls/${m[4]}`);
+    if (!pr) return null;
+    const requested = (pr.requested_reviewers || []).some((u) => u.login.toLowerCase() === login);
+    let at = null;
+    if (requested) {
+      for (const e of await pages(`repos/${repo}/issues/${m[4]}/events`)) {
+        if (e.event === "review_requested" && e.requested_reviewer && e.requested_reviewer.login.toLowerCase() === login && !(at >= e.created_at)) at = e.created_at;
+      }
+    }
+    return [url, { author: pr.user && pr.user.login, requested, requested_at: at }];
+  });
+  return Object.fromEntries(out.filter(Boolean));
+}
+
 // contentStates(file): {URL: state} of bot-watch's last-seen state.
 function contentStates(file) {
   const w = readJsonFile(file);
@@ -224,6 +260,13 @@ async function observe(opts) {
     errors.push(`the topics (${TOPIC_SKILL}): ${e.message}`);
     obs.topics = [];
   }
+  // These follow from the inputs above; without those, they stay unread
+  // and the rules act as without them.
+  const epic = Object.keys(config.board.epics)[0];
+  await Promise.all([
+    epic && get("epicItems", `the ${epic} board`, fromFile("epic-board-file", () => runJson(tool("bot-board"), ["--project", epic, "list", "--json"]))),
+    obs.sweep && get("prs", "the P0 health PRs", fromFile("prs-file", () => prs(config, obs.sweep))),
+  ]);
   return { obs, errors };
 }
 
