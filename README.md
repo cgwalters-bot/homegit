@@ -333,7 +333,11 @@ For `human-text`, I retitle the fork PR, rewrite its body and reword
 the commits myself, push them myself, and approve with a `/promote
 --human-text` line; promote checks that GitHub shows me as the pusher
 of the approved head and the last editor of the title and body, and
-adds nothing to the body. Or I open the upstream PR myself.
+adds nothing to the body. Or I open the upstream PR myself. The one
+exception is a thread where I summon the bot (an @-mention with an
+ask, or a review request): that is my consent for it to answer there
+itself, as a reply or a `COMMENT` review, never as a tracker question
+or a gist for me to post.
 `tests/upstream-policy.sh` tests the check offline.
 
 Open decision: a project whose policy files say nothing about AI is

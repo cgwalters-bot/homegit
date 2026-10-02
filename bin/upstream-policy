@@ -35,7 +35,7 @@ const STATE_DIR = path.join(
 // Verdicts from the loosest to the strictest.
 const VERDICTS = {
   "bot-ok": "the bot may write the code and the text, with the AI trailer",
-  "human-text": `code by the bot is fine, but the PR title and body, commit messages and comments must be ${OPERATOR.possessive(OWNER_LOGIN)} own`,
+  "human-text": `code by the bot is fine, but the PR title and body, commit messages and comments must be ${OPERATOR.possessive(OWNER_LOGIN)} own, except an answer on a thread where ${OWNER_LOGIN} summoned the bot`,
   "human-only": "no AI-generated contributions at all",
   "no-go": "the bot does not contribute here",
 };
