@@ -283,7 +283,10 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   on someone else's PR, a dated "waits on the author" note (e.g.
   "2026-10-02: ... waits on the author") in its item's Why or Next, on
   this board or the epic's. An older or undated ask fires again, as a
-  nudge. On the bot's own PR an ask quiets only staleness.
+  nudge. On the bot's own PR an ask quiets only staleness. When the
+  sweep's P0 drive or priority health step failed, the last run's actions
+  of that kind carry over as still open (the Observed line names the
+  step), so they neither drop out nor wake you again once it recovers.
 - **answer-unapplied:** a question the operator answered whose Unblocks
   items are still open and untouched since the answer.
 - **closed-not-done:** an item whose own issue or PR is closed or merged

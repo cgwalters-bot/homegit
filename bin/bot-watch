@@ -1176,9 +1176,10 @@ test "${rc}" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
 # With PRs that could not be read (status 1), it still lists the others.
 if ! health=$(jq -ce 'arrays' "${scratch}/health.json" 2>/dev/null); then
     health='[]'
-    health_failed=true
+    test "${rc}" -ne 0 || rc="invalid output"
 fi
-if test "${rc}" -ne 0; then
+# (bot-reconcile recognizes the failure by this warning: keep the wording.)
+if test "${rc}" != 0; then
     warn "the priority health sweep failed (status ${rc}); its section is incomplete"
     health_failed=true
 fi
@@ -1190,7 +1191,8 @@ fi
 # sections, with a warning and a nonzero exit; so does a rate limit,
 # which is the search's (as for the PRs off the board above).
 # (bot-poll recognizes an incomplete section by that warning, as for
-# the health and outstanding-review sections: keep the wording.)
+# the health and outstanding-review sections, and bot-reconcile a failed
+# P0 drive step: keep the wording.)
 due_step() {
     local out rc
     # Waited for above.
