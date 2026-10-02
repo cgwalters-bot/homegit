@@ -30,6 +30,8 @@ Skills are [Agent Skills](https://agentskills.io) in `~/.agents/skills/<name>/SK
 
 Write clean, idiomatic code. Avoid lots of duplicate code; e.g. in unit tests, "data driven" tests can be much more concise and understandable. Ensure robust error handling with informative, user-helpful messages, and proactively handle edge cases. Adhere to established style conventions like `rustfmt`, and use constants for "magic" strings or numbers.
 
+Put a blank line between the functions, impls and other items you add, even where the surrounding code packs them together: `rustfmt` keeps blank lines but never inserts them (its `blank_lines_lower_bound` option is unstable), so nothing else will.
+
 - **Avoid AI slop**: DO NOT do things like generate random new toplevel markdown files. Tracking your work should go in a mixture of the git commit log or documentation for existing code.
 - **Clean Commit History**: Strive for a clean, readable git history. Separate logical changes into distinct commits, each with a clear message. Where applicable, try to create "prep" commits that could be merged separately. Before declaring a commit task done, run `git diff HEAD~1..HEAD` to verify no unintended files or hunks were staged.
 - **Integration**: Try to ensure your changes "fit in". Prefer to fix/extend existing docs or code instead of generating new.
