@@ -1,0 +1,9 @@
+{
+  "html_url": "https://github.com/acme/widget/pull/7",
+  "title": "Teach the widget context",
+  "state": "open",
+  "draft": false,
+  "body": "The complete PR body.",
+  "head": {"ref": "bot/context", "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "repo": {"full_name": "fork/widget"}},
+  "base": {"ref": "main", "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "repo": {"full_name": "acme/widget"}}
+}
