@@ -29,7 +29,7 @@ exit "\${FAKE_${envName}_EXIT:-0}"
 }
 fs.mkdirSync(BIN);
 for (const [name, env] of [["bot-watch", "WATCH"], ["bot-notify", "NOTIFY"], ["bot-pr", "INBOX"],
-  ["bot-tmt-number", "GC"], ["git", "GIT"]]) fake(name, env);
+  ["bot-tmt-number", "GC"], ["bot-actuals", "ACTUALS"], ["git", "GIT"]]) fake(name, env);
 
 // Whether PID is gone (or a zombie) within a few seconds: a killed
 // orphan is reaped by init, which may take a moment.
@@ -72,12 +72,12 @@ test("a clean sweep publishes its outputs and a complete status", () => {
   assert.deepEqual(s.last_complete.run, s.run);
   assert.match(s.run, /^[0-9]{8}-[0-9]{6}-[0-9]{3}$/);
   assert.ok(s.duration_s >= 0 && s.ended_at >= s.started_at);
-  assert.deepEqual(Object.keys(s.steps).sort(), ["git", "inbox", "notify", "tmt-gc", "watch"]);
+  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "git", "inbox", "notify", "tmt-gc", "watch"]);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-notify.txt"), "utf8"), "notify says\n");
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-inbox.txt"), "utf8"), "inbox says\n");
   // The run, in bot-poll's layout.
-  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0 });
+  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0 });
   assert.equal(fs.readFileSync(path.join(r.stateDir, "runs", s.run, "watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.ok(!fs.existsSync(path.join(r.stateDir, "running.json")));
   assert.deepEqual(fs.readdirSync(path.join(r.stateDir, "runs")), [s.run]);
@@ -164,6 +164,7 @@ test("a stopped sweep kills its steps, skips the rest and says so", async () => 
   assert.equal(st.problems[0], "the sweep was stopped (got SIGTERM)");
   assert.equal(st.steps.watch.signal, "SIGTERM");
   assert.equal(st.steps["tmt-gc"], undefined);
+  assert.equal(st.steps.actuals, undefined);
   assert.equal(st.complete, false);
   assert.ok(!fs.existsSync(path.join(dir, "running.json")));
   assert.ok(gone(Number(fs.readFileSync(pidFile, "utf8"))));

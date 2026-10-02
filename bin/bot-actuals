@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Write the inference tokens a Done board item took to its "Actual tokens"
+// Write the inference tokens a board item took to its "Actual tokens"
 // field. See --help. Node's standard library only, plus bot-cost and
 // bot-board.
 "use strict";
@@ -8,6 +8,7 @@ const { execFileSync } = require("node:child_process");
 const path = require("node:path");
 
 const cap = require(path.join(__dirname, "..", "lib", "capacity.js"));
+const pace = require(path.join(__dirname, "..", "lib", "pacing.js"));
 
 const PROG = path.basename(process.argv[1] || "bot-actuals");
 const COST = process.env.BOT_ACTUALS_COST || path.join(__dirname, "bot-cost");
@@ -15,18 +16,27 @@ const BOARD = process.env.BOT_ACTUALS_BOARD || path.join(__dirname, "bot-board")
 const DEFAULT_SINCE = "30d";
 const ACTUAL_FIELD = "Actual tokens";
 const DONE_STATUS = "Done";
+// With --open, a value already set is raised once the sum passed it by
+// this much (and this share of it), so a busy task's spend shows without
+// a board write per sweep.
+const RAISE_MIN = 100e3;
+const RAISE_SHARE = 0.1;
 const MAX_BUFFER = 256 * 1024 * 1024;
 const EX_USAGE = 2;
 
 function usage() {
-  return `Usage: ${PROG} [--since AGE] [--all] [--dry-run] [--json]
+  return `Usage: ${PROG} [--since AGE] [--all | --open] [--dry-run] [--json]
 
 Sums the fresh inference tokens (input, output and cache writes, not
 cache reads) of the transcripts whose worker prompt names a board item
 on an "Item: URL-or-PVTI_ID" line (bot-cost's tasks), and sets the sum
 as "${ACTUAL_FIELD}" on that item if its Status is ${DONE_STATUS} and the field is
 empty (--all: also overwrite). Items match by id, by issue or PR URL, or
-by a PR URL in Branch. Use --dry-run first: it prints what would be set.
+by a PR URL in Branch. --open also sets it on the busy items (In Progress
+with a Lead or Run, whose Budget tokens it is weighed against), and raises
+a value already set, there and on Done items, once the sum passed it by
+${RAISE_MIN / 1e3}k tokens and ${RAISE_SHARE * 100}% (never lowering one): bot-sweep runs that.
+Use --dry-run first: it prints what would be set.
 AGE is as for bot-cost (default ${DEFAULT_SINCE}); a task older than that is not
 counted, so run it before the transcripts age out of the window.
 `;
@@ -34,16 +44,26 @@ counted, so run it before the transcripts age out of the window.
 
 const run = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "inherit"] });
 
-// plan(items, tasks, all): [{id, title, tokens}] of the Done items to set.
-function plan(items, tasks, all) {
+// plan(items, tasks, mode): [{id, title, tokens}] of the items to set:
+// mode "done" the Done items with no value, "all" every Done item, and
+// "open" the Done and busy ones with no value or a value the sum passed
+// (see RAISE_MIN).
+function plan(items, tasks, mode = "done") {
   const sums = cap.attribute(tasks, items);
+  const wanted = (it) => {
+    const had = pace.num(it["actual tokens"]);
+    if (mode === "all") return it.status === DONE_STATUS;
+    if (mode === "done") return it.status === DONE_STATUS && had === null;
+    if (it.status !== DONE_STATUS && !pace.isActive(it)) return false;
+    return had === null || sums[it.id] - had >= Math.max(RAISE_MIN, had * RAISE_SHARE);
+  };
   return items
-    .filter((it) => it.status === DONE_STATUS && sums[it.id] > 0 && (all || it["actual tokens"] == null))
+    .filter((it) => sums[it.id] > 0 && wanted(it))
     .map((it) => ({ id: it.id, title: it.title, tokens: Math.round(sums[it.id]) }));
 }
 
 function main(argv) {
-  let since = DEFAULT_SINCE, all = false, dry = false, json = false;
+  let since = DEFAULT_SINCE, mode = "done", dry = false, json = false;
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
       case "-h": case "--help": process.stdout.write(usage()); return 0;
@@ -51,7 +71,8 @@ function main(argv) {
         since = argv[++i];
         if (!since) { process.stderr.write(`${PROG}: --since needs a value\n`); return EX_USAGE; }
         break;
-      case "--all": all = true; break;
+      case "--all": mode = "all"; break;
+      case "--open": mode = "open"; break;
       case "--dry-run": dry = true; break;
       case "--json": json = true; break;
       default: process.stderr.write(`${PROG}: unexpected argument '${argv[i]}'\n\n${usage()}`); return EX_USAGE;
@@ -59,7 +80,7 @@ function main(argv) {
   }
   const tasks = JSON.parse(run(COST, ["--since", since, "--no-compute", "--tasks", "0", "--json"])).tasks;
   const items = JSON.parse(run(BOARD, ["list", "--json"]));
-  const todo = plan(items, tasks, all);
+  const todo = plan(items, tasks, mode);
   if (json) process.stdout.write(`${JSON.stringify(todo, null, 2)}\n`);
   for (const t of todo) {
     if (!json) process.stdout.write(`${dry ? "would set" : "set"} ${ACTUAL_FIELD} = ${t.tokens} on ${t.id} (${t.title})\n`);

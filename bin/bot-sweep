@@ -33,7 +33,11 @@ const PHASES = [
     { name: "notify", tool: "bot-notify", args: [], timeoutMin: 5 },
     { name: "inbox", tool: "bot-pr", args: ["inbox", "--dry-run"], timeoutMin: 10 },
   ],
-  [{ name: "tmt-gc", tool: "bot-tmt-number", args: ["--gc"], timeoutMin: 2 }],
+  [
+    { name: "tmt-gc", tool: "bot-tmt-number", args: ["--gc"], timeoutMin: 2 },
+    // The tokens spent on busy and Done items, once bot-watch moved them.
+    { name: "actuals", tool: "bot-actuals", args: ["--open"], timeoutMin: 3 },
+  ],
 ];
 // The steps whose output bot-poll reads for news: published as
 // latest-NAME.txt too.
@@ -80,10 +84,11 @@ never killed halfway by a poll's timeout:
   bot-watch --apply --exclude-lead '*'   \\
   bot-notify                              > at once
   bot-pr inbox --dry-run                 /
-  bot-tmt-number --gc
+  bot-tmt-number --gc                    \ at once
+  bot-actuals --open                     /
 
 Each step has a timeout (git 2, bot-watch 20, bot-notify 5, inbox 10,
-gc 2 minutes) and runs in its own process group, all of which is killed
+gc 2, actuals 3 minutes) and runs in its own process group, all of which is killed
 when it times out, so no orphan keeps holding bot-watch's lock. A step
 that finds another run holding its lock is retried ${LOCK_RETRIES} times.
 
