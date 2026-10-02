@@ -138,14 +138,16 @@ bot-watch --apply --exclude-lead '*'
 bot-notify
 bot-pr inbox --dry-run
 bot-tmt-number --gc
+bot-actuals --open
+bot-board fill-org   # Org for items the project's auto-add put on the board
 ```
 
 with a timeout each, killing a step's whole process group when it times
 out (so no orphan keeps holding bot-watch's lock), and publishes each
 completed sweep under `~/.local/state/bot-sweep/`: `runs/ID/NAME.txt`
 (kept 2 days), `latest-{watch,notify,inbox}.txt`, and `status.json`
-(start, end, duration, each step's exit status, the problems, and the
-last complete sweep). (`--exclude-lead '*'` leaves the items led by a
+(start, end, duration, each step's exit status, the problems, the
+last complete sweep, and the items fill-org gave an Org). (`--exclude-lead '*'` leaves the items led by a
 topic session to it; see "Topic sessions" below.) Never run `bot-watch
 --apply` yourself: it would race the timer's sweep for its lock (and
 consume its news). `systemctl --user status bot-sweep.timer
