@@ -1,0 +1,24 @@
+Priority health:
+  P0 conflict https://github.com/o/r/pull/1 aaaaaaaaaaaa: conflicts with main
+  P0 stale https://github.com/o/r/pull/2 bbbbbbbbbbbb: no activity since 2026-09-21T15:53:15Z
+  P1 ci-failing https://github.com/o/r/pull/3 cccccccccccc: tests
+
+P0 drive:
+  conflict https://github.com/o/r/pull/1 aaaaaaaaaaaa: conflicts with main; rebase refused: unanswered review
+  review https://github.com/o/r/pull/4 dddddddddddd: waiting on you: no approval yet; waiting on review
+  ci-pending https://github.com/o/r/pull/5 eeeeeeeeeeee: still running: build; none yet
+  behind https://github.com/o/r/pull/6 ffffffffffff: behind main, which must be up to date; rebased -> 999999999999
+
+Promotions:
+  Promoted: https://github.com/cgwalters-forge/r/pull/1 -> https://github.com/o/r/pull/11
+  Not promoted: https://github.com/cgwalters-forge/r/pull/3: o/r's contribution policy record is stale; dispatch a policy check
+
+Needs your text:
+  Needs your text: https://github.com/cgwalters-forge/q/pull/2 (o/q is human-text): retitle it, then comment '/promote --human-text'
+  Needs your text: https://github.com/cgwalters-forge/q/pull/5 (o/q is human-text): retitle it, then comment '/promote --human-text'
+
+Some item  [Draft]  PVTI_x
+  o/r#1
+    comment by @alice: hello
+
+Swept 3 URLs of 2 board items: 0 failed.

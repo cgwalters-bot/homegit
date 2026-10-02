@@ -1,0 +1,13 @@
+https://github.com/cgwalters-forge/r/pull/1  [APPROVED]  promoted by the sweep
+  -> approved by https://github.com/cgwalters-forge/r/pull/1#pullrequestreview-1: bot-pr promote https://github.com/cgwalters-forge/r/pull/1
+https://github.com/cgwalters-forge/q/pull/2  [APPROVED]  waits on the operator's text
+  -> approved by https://github.com/cgwalters-forge/q/pull/2#pullrequestreview-2: bot-pr promote https://github.com/cgwalters-forge/q/pull/2
+https://github.com/cgwalters-forge/r/pull/3  [APPROVED]  stale policy record
+  -> approved by https://github.com/cgwalters-forge/r/pull/3#pullrequestreview-3: bot-pr promote https://github.com/cgwalters-forge/r/pull/3
+https://github.com/cgwalters-forge/r/pull/4  [APPROVED]  approved after the sweep's promotions
+  2026-10-02T11:41:00Z review APPROVED: https://github.com/cgwalters-forge/r/pull/4#pullrequestreview-4
+  -> approved by https://github.com/cgwalters-forge/r/pull/4#pullrequestreview-4: bot-pr promote https://github.com/cgwalters-forge/r/pull/4
+https://github.com/cgwalters-forge/q/pull/5  [APPROVED, text by cgwalters]  the operator's text is in
+  -> approved by https://github.com/cgwalters-forge/q/pull/5#pullrequestreview-5: bot-pr promote --human-text https://github.com/cgwalters-forge/q/pull/5
+https://github.com/cgwalters-forge/r/pull/6  changes requested
+  2026-10-02T11:00:00Z review CHANGES_REQUESTED: https://github.com/cgwalters-forge/r/pull/6#pullrequestreview-6

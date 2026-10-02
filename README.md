@@ -157,11 +157,24 @@ footer" in the same doc).
 
 Planning is by cost and capacity. Items carry an `Est. cost` bucket (XS to
 XL, in fresh inference tokens; see "Cost estimates" in the `workstream`
-skill) and, once Done, their `Actual tokens`, which `bot-actuals` sums from
+skill), once an agent works on them a `Budget tokens` number (`bot-pace`),
+and their `Actual tokens`, which `bot-actuals` sums from
 the transcripts of workers whose prompt has an `Item: URL` line.
 `bot-capacity` shows the week's usage, burn rate and projection (from the
 percent `bot-heartbeat statusline` saves) next to the open P0/P1
 estimates, which the coordinator uses to decide what to dispatch.
+
+The coordinator's loop is a controller: `bot-reconcile` compares the
+observed state (the board, the latest sweep, the heartbeat, the week's
+capacity, answered questions) with the desired one and prints the actions
+that close the gap, under rules in `lib/reconcile.js`: keep the operator
+config's `pacing.agents` work agents busy, split between harness and
+upstream work; keep the heartbeat in step with the board; carry over the
+sweep's P0 drive and approvals; apply answered questions; set items Done
+whose issue or PR closed (which `bot-watch --apply` does itself).
+`bot-poll-loop`
+waits on the sweeps and wakes the coordinator on news and on new (or, after
+2 hours, still open) actions.
 
 `bot-heartbeat publish` puts the coordinator's loop state and its local
 workers (names, board item links, devspaces) in one pinned comment on
