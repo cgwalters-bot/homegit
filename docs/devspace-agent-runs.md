@@ -65,7 +65,20 @@ maximum), holds small, unencrypted files at its root:
   same lines the job log shows;
 - `outcome.json`: the agent's own outcome (tests run, early-stop
   reasons); step 3 of the plan defines it along with the rest of
-  `outputs/v1`, which travels in a separate `agent-out` artifact.
+  `outputs/v1`.
+
+**`agent-out`**, with `retention-days: 30`, is uploaded only by a
+`branch` run that changed files. It holds `changes.patch`, the change as
+a binary `git diff` against the run's starting commit (new files
+included, nothing committed, at most 8 MiB), and `base.json`
+(`{repo, ref, commit}`). The runner has no credentials, so it can't push.
+The patch isn't redacted, because that would corrupt it; a
+secret-shaped string in it fails the upload instead.
+`bot-runs apply RUN --slug SLUG --message FILE` checks it again locally
+(size, base, secret-shaped strings, no `.github/`, `.git` or
+`.gitmodules` paths, no symlinks or submodules). It then commits it as
+the bot on `bot/SLUG` in a fresh clone of the target. After review,
+`bot-pr fork-pr --from DIR` opens it on the forge.
 
 **`agent-transcript`**, with `retention-days: 30`, holds one file,
 `transcript.tar.zst`: a zstd-compressed tar, public like the rest, since the
@@ -114,6 +127,7 @@ zero.
 | `failures` | array | `{kind, message}`, `kind` one of `tool_error`, `timeout`, `budget`, `validation`, `agent_exit` |
 | `tests` | array | `{command, exit_code, duration_s}` from `outcome.json` |
 | `files` | array | paths the agent changed, relative to the repository |
+| `patch` | object | branch runs that changed files: `base` (the commit the change is against), and `bytes` (of `changes.patch`) or `error` (why no change was handed back); else `null` |
 | `egress_denied` | array | `{domain, count}` from the proxy log (empty while egress is open) |
 | `outcome` | object | `status` (`Draft`, `Needs human` or `null`), `url` (the forge PR or write-up, once applied, else `null`) and `why` |
 | `redactions` | integer | how many strings the redaction pass replaced |
