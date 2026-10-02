@@ -311,7 +311,32 @@ require_cmd jq "install jq"
 require_cmd flock "install util-linux"
 
 scratch=$(mktemp -d)
-trap 'rm -rf "${scratch}"' EXIT
+# The steps run in the background (see run_pool and step_start) die
+# with the sweep, rather than run on unseen.
+trap 'kill_background; rm -rf "${scratch}"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# kill_background: stops the background jobs and their children.
+kill_background() {
+    local pid
+    for pid in $(jobs -p); do
+        pkill -TERM -P "${pid}" 2>/dev/null || true
+        kill -TERM "${pid}" 2>/dev/null || true
+    done
+}
+
+# BOT_WATCH_TIMING=1: how long each section took, on stderr, to find
+# what makes a sweep slow.
+readonly TIMING=${BOT_WATCH_TIMING:-}
+readonly STARTED=${EPOCHREALTIME}
+# timing NAME START [DETAIL]: prints how long NAME took since START (an
+# EPOCHREALTIME), with BOT_WATCH_TIMING set.
+timing() {
+    test -n "${TIMING}" || return 0
+    local end=${EPOCHREALTIME}
+    LC_ALL=C awk -v n="$1" -v s="$2" -v e="${end}" -v d="${3:-}" \
+        'BEGIN { printf "timing: %s %.1fs%s\n", n, e - s, (d == "" ? "" : " (" d ")") }' 1>&2
+}
 
 # ghapi ARGS...: 'gh api', turning rate limiting into a clear exit and a
 # 404 or 410 into EX_NOTFOUND.
@@ -350,9 +375,11 @@ rest_get() {
             etag=$(awk 'tolower($0) ~ /^etag:/ { sub(/^[^:]*:[[:space:]]*/, ""); print; exit }' "${scratch}/headers")
             if test -n "${etag}"; then
                 mkdir -p "${ETAG_DIR}"
-                cp "${scratch}/body" "${body_file}.tmp.$$"
-                mv -f "${body_file}.tmp.$$" "${body_file}"
-                printf '%s\n' "${etag}" >"${etag_file}"
+                # Jobs share $$ (and may read one resource at once).
+                cp "${scratch}/body" "${body_file}.tmp.${BASHPID}"
+                mv -f "${body_file}.tmp.${BASHPID}" "${body_file}"
+                printf '%s\n' "${etag}" >"${etag_file}.tmp.${BASHPID}"
+                mv -f "${etag_file}.tmp.${BASHPID}" "${etag_file}"
             fi
             cat "${scratch}/body"
             ;;
@@ -380,6 +407,66 @@ rest_pages() {
     done
 }
 
+# How many issues and PRs are read at once (BOT_WATCH_JOBS): each read
+# is a few REST calls in a row, so a sweep of a few hundred took over ten
+# minutes one at a time. Not many more: with the steps that run
+# meanwhile, 8 made about 1400 requests a minute, over GitHub's
+# secondary rate limit of 900 (most of them answered 304, which may
+# still count).
+readonly JOBS=${BOT_WATCH_JOBS:-3}
+
+# run_pool DIR FUNC: runs 'FUNC LINE' for each line on stdin, JOBS at a
+# time, each in the background (so that errexit holds in FUNC) with its
+# own scratch dir. Job I (from 0, in input order) has its stdout in
+# DIR/I.out and its exit status in DIR/I.rc. Once a job exits with
+# EX_RATELIMIT no more start, and DIR/ratelimited exists. Run it in the
+# background too, so that it waits only for its own jobs.
+run_pool() {
+    local dir=$1 fn=$2 i=0 running=0 line
+    mkdir -p "${dir}"
+    while IFS= read -r line; do
+        if test "${running}" -ge "${JOBS}"; then
+            wait -n || true
+            running=$((running - 1))
+        fi
+        test ! -e "${dir}/ratelimited" || break
+        pool_job "${dir}/${i}" "${fn}" "${line}" &
+        running=$((running + 1))
+        i=$((i + 1))
+    done
+    wait
+}
+
+# pool_job JOB FUNC LINE: one job of run_pool, JOB being DIR/I.
+pool_job() {
+    local rc=0
+    scratch=$1
+    mkdir -p "${scratch}"
+    "$2" "$3" >"$1.out" &
+    wait "$!" || rc=$?
+    test "${rc}" -ne "${EX_RATELIMIT}" || : >"${1%/*}/ratelimited"
+    echo "${rc}" >"$1.rc"
+}
+
+# step_start NAME CMD [ARGS...]: runs CMD in the background while the
+# sweep goes on, its stdout to ${scratch}/NAME.out, its stderr to
+# NAME.err and its exit status to NAME.rc; wait for it with
+# step_pids[NAME] in the shell that started it (not in a command
+# substitution).
+declare -A step_pids=()
+step_start() {
+    local name=$1
+    shift
+    {
+        local rc=0 t=${EPOCHREALTIME}
+        "$@" >"${scratch}/${name}.out" 2>"${scratch}/${name}.err" || rc=$?
+        timing "${name}" "${t}" 2>>"${scratch}/${name}.err"
+        echo "${rc}" >"${scratch}/${name}.rc"
+    } &
+    step_pids[${name}]=$!
+}
+
+
 # Copies of resources not read for a while (such as the comments since
 # an old updated_at) are dropped.
 if test -d "${ETAG_DIR}"; then
@@ -401,6 +488,8 @@ exec {lock_fd}>"${LOCK_DIR}/lock" || fatal "cannot open ${LOCK_DIR}/lock"
 flock -n "${lock_fd}" || fatal "another $(basename "$0") run holds ${LOCK_DIR}/lock"
 
 # --- Board and state -------------------------------------------------------
+
+t0=${EPOCHREALTIME}
 
 if test -n "${board_file}"; then
     board=$(jq -ce 'if type == "array" then . else error("not an array") end' "${board_file}") ||
@@ -471,6 +560,7 @@ test -z "${last_swept}" || bootstrap=false
 dropped=$(jq -c '.dropped // {}' <<<"${state}")
 swept_at=${now:-$(date -u +%FT%TZ)}
 nitems=$(jq '[.[].items[].id] | unique | length' <<<"${watch}")
+timing "board and state" "${t0}" "${nitems} items"
 
 # --- Sweep -----------------------------------------------------------------
 
@@ -777,42 +867,169 @@ probe() {
         '{cur: $cur, changes: ., info: $info, prev_state: $prev_state, outstanding: $outstanding, rebase: $rebase}' <<<"${changes}"
 }
 
-results='{}'
-new_seen='{}'
-failed='[]'
-gone='[]'
-new_urls='[]'
-while IFS= read -r url; do
-    test -n "${url}" || continue
-    prev=$(jq -c --arg u "${url}" '.[$u]' <<<"${seen}")
-    dropped_at=$(jq -r --arg u "${url}" '.[$u] // empty' <<<"${dropped}")
-    rc=0
-    # In the background, because in 'r=$(probe ...) || rc=$?' errexit would
-    # be off throughout probe; this way a failing step stops it.
-    probe "${url}" "${prev}" "${dropped_at}" >"${scratch}/probe.json" &
-    wait "$!" || rc=$?
-    case "${rc}" in
-        0)
-            results=$(jq -c --arg u "${url}" --slurpfile r "${scratch}/probe.json" '.[$u] = $r[0]' <<<"${results}")
-            new_seen=$(jq -c --arg u "${url}" --slurpfile r "${scratch}/probe.json" '.[$u] = $r[0].cur' <<<"${new_seen}")
-            test "${prev}" != null || new_urls=$(jq -c --arg u "${url}" '. + [$u]' <<<"${new_urls}")
-            ;;
-        "${EX_RATELIMIT}") exit "${EX_RATELIMIT}" ;;
-        "${EX_NOTFOUND}")
-            # Deleted, or the repository went private: reported once.
-            if test "$(jq -r '.state // empty' <<<"${prev}")" != gone; then
-                gone=$(jq -c --arg u "${url}" '. + [$u]' <<<"${gone}")
-            fi
-            new_seen=$(jq -c --arg u "${url}" '.[$u] = {state: "gone"}' <<<"${new_seen}")
-            ;;
-        *)
-            warn "reading ${url} failed; will retry next sweep"
-            failed=$(jq -c --arg u "${url}" '. + [$u]' <<<"${failed}")
-            # Keep its last-seen state, so that nothing is skipped.
-            test "${prev}" = null || new_seen=$(jq -c --arg u "${url}" --argjson p "${prev}" '.[$u] = $p' <<<"${new_seen}")
-            ;;
-    esac
-done < <(jq -r '.[].url' <<<"${watch}")
+# The P0 and P1 PRs that need a look, whatever changed or not: like the
+# sections below, a to-do on every sweep. It and the other steps the
+# sweep runs (bot-drive after it, bot-signoff-due, bot-promote-due,
+# bot-priority-propagate, bot-operator-activity) don't depend on what
+# the probes find, so they run in the background meanwhile; their
+# sections come where they did when they ran one by one, with their
+# warnings.
+# With --lead, only that lead's items; --exclude-lead leaves it every one.
+health_board=${board}
+test -z "${lead}" || health_board=${swept_board}
+printf '%s\n' "${health_board}" >"${scratch}/board.json"
+health_args=(--json --board-file "${scratch}/board.json")
+test -z "${now}" || health_args+=(--now "${now}")
+if test -n "${epic_board_file}"; then
+    health_args+=(--epic-board-file "${epic_board_file}")
+elif test -n "${board_file}"; then
+    echo '[]' >"${scratch}/epic-board.json"
+    health_args+=(--epic-board-file "${scratch}/epic-board.json")
+else
+    # Read once, for bot-drive too.
+    health_args+=(--write-epic-board "${scratch}/epic-board.json")
+fi
+# The sign-offs and promotions the operator's approvals allow: only
+# --apply runs them.
+due_args=(--json)
+if ${dry_run} || test -n "${board_file}"; then
+    due_args+=(--dry-run)
+elif ${apply}; then
+    due_args+=(--apply)
+fi
+# health_then_drive: bot-priority-health, then bot-drive with the P0
+# epic's board it read. The P0 PRs' blockers are level-triggered: the
+# board the health step read.
+health_then_drive() {
+    local rc=0 t=${EPOCHREALTIME}
+    "${PRIORITY_HEALTH}" "${health_args[@]}" >"${scratch}/health.json" 2>"${scratch}/health.err" || rc=$?
+    timing "bot-priority-health" "${t}" 2>>"${scratch}/health.err"
+    echo "${rc}" >"${scratch}/health.rc"
+    local drive_args=(--board-file "${scratch}/board.json")
+    test -z "${now}" || drive_args+=(--now "${now}")
+    if test -n "${epic_board_file}"; then
+        drive_args+=(--epic-board-file "${epic_board_file}")
+    elif test -s "${scratch}/epic-board.json"; then
+        drive_args+=(--epic-board-file "${scratch}/epic-board.json")
+    fi
+    "${DRIVE}" "${due_args[@]}" "${drive_args[@]}"
+}
+step_start drive health_then_drive
+step_start signoff "${SIGNOFF_DUE}" "${due_args[@]}"
+step_start promote "${PROMOTE_DUE}" "${due_args[@]}"
+# Priority follows structure: with --apply, the Branch items of the
+# P0 and P1 items are raised to their priority (sub-issues on the board
+# keep theirs; new ones are added). Over the
+# whole board, whatever --lead says. Only listed, never woken for (see
+# bot-poll, which ignores the section).
+printf '%s\n' "${board}" >"${scratch}/full-board.json"
+step_start propagate "${PRIORITY_PROPAGATE}" "${due_args[@]}" --board-file "${scratch}/full-board.json"
+# What the operator did that the bot should act on (by event, so
+# bot-poll wakes once per event however often a sweep lists it).
+step_start activity "${OPERATOR_ACTIVITY}" "${due_args[@]}" --board-file "${scratch}/board.json" ${now:+--now "${now}"}
+
+# off_board: prints the outstanding reviews and rebase candidates (see
+# pr_off_board) of the bot's open PRs other than fork PRs that the sweep
+# doesn't probe (not on the board, or not any more), as JSON lines {url,
+# items, outstanding, rebase}: one search (a page per ${PER_PAGE} PRs, fork
+# PRs included, as it can't tell them apart), which has no ETags, then
+# their reviews and CI. Fails if the search does; a PR that can't be read
+# is skipped with a warning.
+off_board() {
+    # The PRs on no item are the coordinator's safety net, not a topic's.
+    test -z "${lead}" || return 0
+    local search_q search found='' page=1 total extra url o rc
+    # Oldest first: a PR opened during the paging lands on the last page
+    # rather than shifting the others (duplicates are dropped below).
+    search_q="is:pr+is:open+author:${BOT_LOGIN}&sort=created&order=asc"
+    while :; do
+        search=$(rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}&page=${page}") ||
+            { rc=$?; warn "the search for the bot's open PRs failed (status ${rc})"; return "${rc}"; }
+        found+=$(jq -c '.items[]' <<<"${search}")$'\n'
+        total=$(jq -e '.total_count | numbers' <<<"${search}") ||
+            { warn "the search for the bot's open PRs answered without a total_count"; return 1; }
+        test $((page * PER_PAGE)) -lt "${total}" || break
+        if test "${page}" -ge "${SEARCH_MAX_PAGES}"; then
+            warn "the bot has over $((page * PER_PAGE)) open PRs; only the first $((page * PER_PAGE)) found have their reviews checked"
+            break
+        fi
+        page=$((page + 1))
+    done
+    extra=$(jq -rs --argjson swept "${board_urls}" --arg bot "${BOT_LOGIN}" --argjson forks "${FORK_OWNERS}" \
+        --arg meta "${FORK_META}" "${FORK_PR_JQ}"'
+        [.[] | select(fork_pr(.html_url | capture("^https://github\\.com/(?<o>[^/]+)/").o) | not) | .html_url
+           | select(IN($swept[]) | not)] | unique[]' <<<"${found}")
+    test -n "${extra}" || return 0
+    run_pool "${scratch}/off-board" pr_off_board <<<"${extra}" &
+    wait "$!"
+    test ! -e "${scratch}/off-board/ratelimited" || return "${EX_RATELIMIT}"
+    local i=0
+    while IFS= read -r url; do
+        rc=$(<"${scratch}/off-board/${i}.rc")
+        o=${scratch}/off-board/${i}.out
+        i=$((i + 1))
+        if test "${rc}" -ne 0; then
+            warn "reading ${url} (off the board) for outstanding reviews failed (status ${rc}); skipped"
+            continue
+        fi
+        jq -c --arg u "${url}" 'select(.outstanding != null or .rebase != null) | {url: $u, items: []} + .' "${o}"
+    done <<<"${extra}"
+}
+# off_board_job DIR: off_board, with DIR as its scratch dir.
+off_board_job() {
+    scratch=$1
+    mkdir -p "${scratch}"
+    off_board
+}
+# Also meanwhile.
+off_board_job "${scratch}/off-board-search" >"${scratch}/extra.json" 2>"${scratch}/extra.err" &
+off_board_pid=$!
+
+t0=${EPOCHREALTIME}
+# probe_job URL: a run_pool job, probing URL with what the state has.
+probe_job() {
+    local prev dropped_at
+    prev=$(jq -c --arg u "$1" '.[$u]' <<<"${seen}")
+    dropped_at=$(jq -r --arg u "$1" '.[$u] // empty' <<<"${dropped}")
+    probe "$1" "${prev}" "${dropped_at}"
+}
+run_pool "${scratch}/probe" probe_job < <(jq -r '.[].url' <<<"${watch}") &
+wait "$!"
+test ! -e "${scratch}/probe/ratelimited" || exit "${EX_RATELIMIT}"
+# Each URL's exit status, in the order of the watch records, and the
+# probes that succeeded, in the same order.
+rcs=()
+ok_files=()
+for ((i = 0; i < nurls; i++)); do
+    rcs+=("$(<"${scratch}/probe/${i}.rc")")
+    test "${rcs[i]}" -ne 0 || ok_files+=("${scratch}/probe/${i}.out")
+    if test "${rcs[i]}" -ne 0 && test "${rcs[i]}" -ne "${EX_NOTFOUND}"; then
+        warn "reading $(jq -r --argjson i "${i}" '.[$i].url' <<<"${watch}") failed; will retry next sweep"
+    fi
+done
+# Deleted, or the repository went private (EX_NOTFOUND): reported once
+# as gone. A URL that failed otherwise keeps its last-seen state, so that
+# nothing is skipped.
+{ read -r results; read -r new_seen; read -r failed; read -r gone; read -r new_urls; } < <(
+    printf '%s\n' "${rcs[@]}" | jq -sc . >"${scratch}/rcs.json"
+    cat "${ok_files[@]}" /dev/null | jq -nr --slurpfile rcs "${scratch}/rcs.json" \
+        --slurpfile watch <(printf '%s\n' "${watch}") --slurpfile seen <(printf '%s\n' "${seen}") \
+        --argjson notfound "${EX_NOTFOUND}" '
+        [inputs] as $probes | $rcs[0] as $rcs | $seen[0] as $seen | [$watch[0][].url] as $urls
+        | [range(0; $urls | length) | select($rcs[.] == 0)] as $ok
+        | (reduce range(0; $ok | length) as $k ({}; .[$urls[$ok[$k]]] = $probes[$k])) as $results
+        | (reduce range(0; $urls | length) as $i ({}; $urls[$i] as $u
+            | if $rcs[$i] == 0 then .[$u] = $results[$u].cur
+              elif $rcs[$i] == $notfound then .[$u] = {state: "gone"}
+              elif $seen[$u] != null then .[$u] = $seen[$u]
+              else . end)) as $new_seen
+        | ($results | tojson), ($new_seen | tojson),
+          ([range(0; $urls | length) | select($rcs[.] != 0 and $rcs[.] != $notfound) | $urls[.]] | tojson),
+          ([range(0; $urls | length) | select($rcs[.] == $notfound and ($seen[$urls[.]].state // "") != "gone")
+            | $urls[.]] | tojson),
+          ([$ok[] | $urls[.] | select($seen[.] == null)] | tojson)')
+test -n "${new_urls}" || fatal "internal error: collecting what the probes found failed"
+timing probe "${t0}" "${nurls} URLs"
 
 # --- Per item: changes and bookkeeping --------------------------------------
 
@@ -852,59 +1069,14 @@ outstanding=$(jq -c --slurpfile results "${scratch}/results.json" '
     $results[0] as $results
     | [.[] | select($results[.url].outstanding != null)
        | {url, items: [.items[] | {id, title}]} + $results[.url].outstanding]' <<<"${watch}")
-# off_board: prints the outstanding reviews and rebase candidates (see
-# pr_off_board) of the bot's open PRs other than fork PRs that the sweep
-# doesn't probe (not on the board, or not any more), as JSON lines {url,
-# items, outstanding, rebase}: one search (a page per ${PER_PAGE} PRs, fork
-# PRs included, as it can't tell them apart), which has no ETags, then
-# their reviews and CI. Fails if the search does; a PR that can't be read
-# is skipped with a warning.
-off_board() {
-    # The PRs on no item are the coordinator's safety net, not a topic's.
-    test -z "${lead}" || return 0
-    local search_q search found='' page=1 total extra url o rc
-    # Oldest first: a PR opened during the paging lands on the last page
-    # rather than shifting the others (duplicates are dropped below).
-    search_q="is:pr+is:open+author:${BOT_LOGIN}&sort=created&order=asc"
-    while :; do
-        search=$(rest_get "search/issues?q=${search_q}&per_page=${PER_PAGE}&page=${page}") ||
-            { rc=$?; warn "the search for the bot's open PRs failed (status ${rc})"; return "${rc}"; }
-        found+=$(jq -c '.items[]' <<<"${search}")$'\n'
-        total=$(jq -e '.total_count | numbers' <<<"${search}") ||
-            { warn "the search for the bot's open PRs answered without a total_count"; return 1; }
-        test $((page * PER_PAGE)) -lt "${total}" || break
-        if test "${page}" -ge "${SEARCH_MAX_PAGES}"; then
-            warn "the bot has over $((page * PER_PAGE)) open PRs; only the first $((page * PER_PAGE)) found have their reviews checked"
-            break
-        fi
-        page=$((page + 1))
-    done
-    extra=$(jq -rs --argjson swept "${board_urls}" --arg bot "${BOT_LOGIN}" --argjson forks "${FORK_OWNERS}" \
-        --arg meta "${FORK_META}" "${FORK_PR_JQ}"'
-        [.[] | select(fork_pr(.html_url | capture("^https://github\\.com/(?<o>[^/]+)/").o) | not) | .html_url
-           | select(IN($swept[]) | not)] | unique[]' <<<"${found}")
-    while IFS= read -r url; do
-        test -n "${url}" || continue
-        # pr_off_board checks every step itself, as errexit is off here.
-        rc=0
-        o=$(pr_off_board "${url}") || rc=$?
-        if test "${rc}" -eq "${EX_RATELIMIT}"; then
-            return "${rc}"
-        elif test "${rc}" -ne 0; then
-            warn "reading ${url} (off the board) for outstanding reviews failed (status ${rc}); skipped"
-            continue
-        fi
-        jq -c --arg u "${url}" 'select(.outstanding != null or .rebase != null) | {url: $u, items: []} + .' <<<"${o}"
-    done <<<"${extra}"
-}
 
 # The safety net doesn't depend on the board, but a failure there (even
 # the search quota running out) mustn't cost the sweep its report or
 # state: only a warning, and a nonzero exit.
 search_failed=false
+t0=${EPOCHREALTIME}
 rc=0
-off_board >"${scratch}/extra.json" 2>"${scratch}/extra.err" &
-wait "$!" || rc=$?
+wait "${off_board_pid}" || rc=$?
 case "${rc}" in
     0)
         cat "${scratch}/extra.err" 1>&2
@@ -920,6 +1092,7 @@ case "${rc}" in
         search_failed=true
         ;;
 esac
+timing "off-board PRs (after the probes)" "${t0}"
 report=$(jq -c 'map(select((.changes | length) > 0 or (.actions | length) > 0) | del(.retry))' <<<"${report}")
 
 # The bot's open PRs that need a rebase: also a to-do, listed on every
@@ -930,6 +1103,7 @@ report=$(jq -c 'map(select((.changes | length) > 0 or (.actions | length) > 0) |
 # listed again. URLs that could not be read keep what was remembered.
 # PRs with an outstanding review by REQUESTER are left out: they are a
 # worker's, and a rebase's push would look like an answer.
+t0=${EPOCHREALTIME}
 prev_rebase=$(jq -c '.rebase // {}' <<<"${state}")
 candidates=$(jq -c --slurpfile results "${scratch}/results.json" --slurpfile extra "${scratch}/extra.json" \
     --argjson search_failed "${search_failed}" '
@@ -968,27 +1142,16 @@ done < <(jq -r --argjson forks "${FORK_OWNERS}" "${REBASE_REPO_JQ}"'
 needs_rebase=$(jq -c --argjson co "${conflicts_only}" "${REBASE_REPO_JQ}"'
     map(select(.conflicts == true or ([repo, .base] | IN($co[]) | not)))' <<<"${needs_rebase}")
 
-# The P0 and P1 PRs that need a look, whatever changed or not: like the
-# sections above, a to-do on every sweep. Its failing costs only the
-# section, with a warning and a nonzero exit.
+timing "needs rebase" "${t0}"
+
+# The P0 and P1 health lines. Its failing costs only the section, with a
+# warning and a nonzero exit.
 health_failed=false
-# With --lead, only that lead's items; --exclude-lead leaves it every one.
-health_board=${board}
-test -z "${lead}" || health_board=${swept_board}
-printf '%s\n' "${health_board}" >"${scratch}/board.json"
-health_args=(--json --board-file "${scratch}/board.json")
-test -z "${now}" || health_args+=(--now "${now}")
-if test -n "${epic_board_file}"; then
-    health_args+=(--epic-board-file "${epic_board_file}")
-elif test -n "${board_file}"; then
-    echo '[]' >"${scratch}/epic-board.json"
-    health_args+=(--epic-board-file "${scratch}/epic-board.json")
-else
-    # Read once, for bot-drive too.
-    health_args+=(--write-epic-board "${scratch}/epic-board.json")
-fi
-rc=0
-"${PRIORITY_HEALTH}" "${health_args[@]}" >"${scratch}/health.json" || rc=$?
+for step in "${!step_pids[@]}"; do
+    wait "${step_pids[${step}]}" || true
+done
+cat "${scratch}/health.err" 1>&2
+rc=$(<"${scratch}/health.rc")
 # An exhausted quota is the whole sweep's problem, not just this section's.
 test "${rc}" -ne "${EX_RATELIMIT}" || exit "${EX_RATELIMIT}"
 # With PRs that could not be read (status 1), it still lists the others.
@@ -1001,25 +1164,20 @@ if test "${rc}" -ne 0; then
     health_failed=true
 fi
 
-# The sign-offs and promotions the operator's approvals allow: only
-# --apply runs them. Like the health section, a step's failing costs
-# only its sections, with a warning and a nonzero exit; so does a rate
-# limit, which is the search's (as for the PRs off the board above).
-due_args=(--json)
-if ${dry_run} || test -n "${board_file}"; then
-    due_args+=(--dry-run)
-elif ${apply}; then
-    due_args+=(--apply)
-fi
-# due_step TOOL WHAT [ARGS...]: prints the JSON array of TOOL
-# (bot-drive, bot-signoff-due or bot-promote-due), run in the sweep's
-# mode with ARGS; an empty one, with a warning naming WHAT, and fails, if
-# TOOL failed. (bot-poll recognizes an incomplete section by that
-# warning, as for the health and outstanding-review sections: keep the
-# wording.)
+# due_step NAME WHAT: prints the JSON array of the step NAME started
+# (bot-drive, bot-signoff-due, bot-promote-due, ...), run in the sweep's
+# mode; an empty one, with a warning naming WHAT, and fails, if it
+# failed. Like the health section, a step's failing costs only its
+# sections, with a warning and a nonzero exit; so does a rate limit,
+# which is the search's (as for the PRs off the board above).
+# (bot-poll recognizes an incomplete section by that warning, as for
+# the health and outstanding-review sections: keep the wording.)
 due_step() {
-    local out rc=0
-    out=$("$1" "${due_args[@]}" "${@:3}") || rc=$?
+    local out rc
+    # Waited for above.
+    cat "${scratch}/$1.err" 1>&2
+    rc=$(<"${scratch}/$1.rc")
+    out=$(<"${scratch}/$1.out")
     if ! jq -ce 'arrays' <<<"${out}" 2>/dev/null; then
         echo '[]'
         test "${rc}" -ne 0 || rc="invalid output"
@@ -1028,36 +1186,18 @@ due_step() {
     warn "looking for $2 failed (status ${rc}); its section is incomplete"
     return 1
 }
-# The P0 PRs' blockers, level-triggered: the board the health step read.
-drive_args=(--board-file "${scratch}/board.json")
-test -z "${now}" || drive_args+=(--now "${now}")
-if test -n "${epic_board_file}"; then
-    drive_args+=(--epic-board-file "${epic_board_file}")
-elif test -s "${scratch}/epic-board.json"; then
-    drive_args+=(--epic-board-file "${scratch}/epic-board.json")
-fi
 drive_failed=false
-drive=$(due_step "${DRIVE}" "P0 drive steps" "${drive_args[@]}") || drive_failed=true
+drive=$(due_step drive "P0 drive steps") || drive_failed=true
 signoff_failed=false
-signoffs=$(due_step "${SIGNOFF_DUE}" "sign-offs due") || signoff_failed=true
+signoffs=$(due_step signoff "sign-offs due") || signoff_failed=true
 # Fork PRs approved for a human-text repository only get listed, under
 # "Needs your text".
 promotion_failed=false
-promotions=$(due_step "${PROMOTE_DUE}" "promotions due") || promotion_failed=true
-# Priority follows structure: with --apply, the Branch items of the
-# P0 and P1 items are raised to their priority (sub-issues on the board
-# keep theirs; new ones are added). Over the
-# whole board, whatever --lead says. Only listed, never woken for (see
-# bot-poll, which ignores the section).
-printf '%s\n' "${board}" >"${scratch}/full-board.json"
+promotions=$(due_step promote "promotions due") || promotion_failed=true
 propagation_failed=false
-propagation=$(due_step "${PRIORITY_PROPAGATE}" "priority propagation" --board-file "${scratch}/full-board.json") ||
-    propagation_failed=true
-# What the operator did that the bot should act on (by event, so
-# bot-poll wakes once per event however often a sweep lists it).
+propagation=$(due_step propagate "priority propagation") || propagation_failed=true
 activity_failed=false
-activity=$(due_step "${OPERATOR_ACTIVITY}" "operator activity" --board-file "${scratch}/board.json" ${now:+--now "${now}"}) ||
-    activity_failed=true
+activity=$(due_step activity "operator activity") || activity_failed=true
 needs_text=$(jq -c '[.[] | select(.result == "needs-text")]' <<<"${promotions}")
 promotions=$(jq -c '[.[] | select(.result != "needs-text")]' <<<"${promotions}")
 
@@ -1086,6 +1226,7 @@ why_for() {
         | if length > $max then .[:$max - 3] + "..." else . end' <<<"[$1, $2]"
 }
 
+t0=${EPOCHREALTIME}
 napplied=0
 napply_failed=0
 while IFS= read -r entry; do
@@ -1114,7 +1255,11 @@ while IFS= read -r entry; do
         'map(if .id == $id then .actions |= map(if .allowed then .result = $r else . end) else . end)' <<<"${report}")
 done < <(${apply} && jq -c '.[] | {item: {id, why}, action: (.actions[] | select(.allowed))}' <<<"${report}")
 
+timing "board changes" "${t0}"
+
 # --- Report ----------------------------------------------------------------
+
+t0=${EPOCHREALTIME}
 
 nfailed=$(jq length <<<"${failed}")
 # URLs that left the sweep, with when they were last seen (by the last
@@ -1225,6 +1370,8 @@ else
         fatal "recording the last-seen state in ${state_file} failed; the next sweep reports these changes again"
     echo "State advanced; ${napplied} item(s) updated on the board." 1>&2
 fi
+timing "report and state" "${t0}"
+timing total "${STARTED}"
 if test "${nfailed}" -gt 0; then
     echo "${nfailed} URL(s) could not be read; they keep their last-seen state until a sweep reads them." 1>&2
     exit 1
