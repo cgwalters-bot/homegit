@@ -104,18 +104,11 @@ as in the worker preamble; they carry the Lead too (set it on the question).
 ## Merging
 
 All the safe merge rules in `coordinator` ("Own repositories take pull
-requests only", "Harness changes merge after an independent review") apply.
-These standing OKs from the operator (relayed when this skill was
-written; the coordinator skill's own-repository rules are the baseline)
-apply to a topic session as well:
-
-- cgwalters-forge/workflow-compiler: self-merge, once its CI is green and an
-  independent review of the exact head has approved it.
-- cgwalters-forge/review (the review app): the same.
-- homegit: changes that pass CI merge after an independent review subagent
-  approved the head, using `bin/bot-land`. Its exceptions (architecture,
-  security, the rules themselves) still need the operator's approval on the
-  PR.
+requests only", "Harness changes merge after an independent review") apply
+to a topic session as well: a bot pull request in a harness repository
+merges once its CI is green and an independent review of the exact head has
+approved it, unless it is truly critical as defined there, which needs the
+operator's approval on the PR.
 
 Anything else, including upstream PRs, goes through the usual `bot-pr` flow
 with the operator's own approval.

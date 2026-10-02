@@ -59,8 +59,10 @@ up to date with main, rebase-merged:
      commit (it is required for more); BODY to a list of the commits'
      subjects, plus '${AI_TRAILER}';
   4. enables auto-merge by rebase, unless --no-auto, for a pull request
-     that waits for ${OPERATOR_S} approval (architecture, security, the
-     bot's own rules, loosening an upstream-policy verdict): then it
+     that waits for ${OPERATOR_S} approval (a truly critical harness
+     change: who can authorize actions, wider credential exposure or token
+     scope, a weaker sandbox or prompt-injection boundary; or loosening an
+     upstream-policy verdict): then it
      requests their review, which puts it in their review queue, unless
      they already approved HEAD or requested changes on it, and puts it
      on the Workstream board with Status ${WAITING_STATUS}, so that

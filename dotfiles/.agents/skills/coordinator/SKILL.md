@@ -433,30 +433,38 @@ work is.
   `BOT_GIT_ALLOW_SHARED_CLONE=1`; bot-land's fast-forward of the shared
   clone needs nothing.
 - **Harness changes merge after an independent review, not after
-  the operator.** For the bot's own harness (the own repositories above,
-  cgwalters-forge/review and cgwalters-forge/tracker), a change may
-  auto-merge once a separate reviewer subagent (never the worker that
-  wrote it) has approved that exact head and its verdict is posted on
-  the pull request. For bootc-dev/cgwalters-devspace-sandbox the same
-  review counts as their approval for promote, only if that repository
-  doesn't enforce DCO (their sign-off always needs their own approval). They
-  asked for this so harness work doesn't queue behind them; they read it
-  afterwards in the review app's news pane. Exceptions, which still need
-  their approval before merging (open them with `bot-land --no-auto`,
-  which puts the pull request on the board, and request their review on
-  it: the pull request is their queue entry, never a tracker question or
-  `--review` ask):
-  - **architecture:** a new component or service, a new trust boundary,
-    or a change of direction against a design they wrote or approved;
-  - **security:** credentials and tokens, sandboxing and containment,
-    workflow `permissions:` and secrets, action or container pinning,
-    the review app's auth, CSP and approve guard, egress;
-  - **the rules themselves:** `bot-git`'s sign-off handling, the
-    upstream-policy gate, `bot-pr promote`/`signoff`, this list, and
-    anything else in AGENTS.md or these skills that loosens what the bot
-    may do without them.
-  When unsure whether a change falls under an exception, treat it as
-  one.
+  the operator.** The harness repositories are every cgwalters-bot/*
+  repository other than forks of upstream projects (so homegit and
+  praxis-credential-broker among them) and the bot's own cgwalters-forge
+  repositories: review, workflow-compiler, agentic-job,
+  harness-coordination, actions and tracker. There a bot pull request
+  merges (rebase) once its CI is green and a separate reviewer subagent
+  (never the worker that wrote it) has approved that exact head, with
+  its verdict posted on the pull request. The operator set this as one
+  standing rule ("You can auto merge most stuff to our harness for now
+  with just a subagent review unless it is truly critical"), so harness
+  work doesn't queue behind them; they read it afterwards in the review
+  app's news pane. Never merge with `--admin`, and never dismiss their
+  reviews: a pull request they marked CHANGES_REQUESTED waits for their
+  re-review once the rework addressed it. Only truly critical changes
+  still need their explicit approval before merging (open them with
+  `bot-land --no-auto`, which puts the pull request on the board, and
+  request their review on it: the pull request is their queue entry,
+  never a tracker question or `--review` ask):
+  - **authority:** anything that changes who can authorize actions: the
+    operator-trust rules, sign-off/DCO authority (`bot-git`'s sign-off
+    handling, `bot-pr promote`/`signoff`, carrying a sign-off over), the
+    upstream-policy gate, and this rule itself;
+  - **credentials:** anything that widens credential exposure or token
+    scope (narrowing it, e.g. a spend cap, is not critical);
+  - **containment:** anything that weakens the sandbox or the
+    prompt-injection boundaries (treating GitHub text as data, the review
+    app's auth, CSP and approve guard, egress limits).
+  Upstream (non-harness) repositories are unchanged: their pull requests,
+  including forge fork PRs targeting bootc-dev or another upstream (e.g.
+  cgwalters-devspace-sandbox), go through `bot-pr promote` on the
+  operator's own approval, as does anything needing their DCO sign-off,
+  and the human-text policy applies as before.
 - **Housekeeping needs no question.** Clearing local caches, removing
   finished worktrees and scratch clones, stopping idle devspaces and
   similar routine cleanup of the bot's own local state: just do it and
