@@ -330,10 +330,12 @@ work is.
   and if it's unclear, ask on the PR or issue. Its state (cursor, seen
   events, decisions) is in `~/.local/state/bot-operator-activity/`.
 - **Priority propagation.** Priority follows structure: `bot-watch
-  --apply` runs `bot-priority-propagate`, which raises the sub-issues
-  and Branch items of every open P0 (then P1) item to that priority
-  (never lowering one), and adds those not on the board, copying the
-  parent's Theme. Each change is a line under "Priority propagation",
+  --apply` runs `bot-priority-propagate`, which raises the Branch items
+  (the PRs and issues implementing it) of every open P0 (then P1) item
+  to that priority (never lowering one), and adds those not on the
+  board, and new sub-issues not yet on it, copying the parent's Theme.
+  It never follows sub-issues already on the board: the operator sets
+  those lower than their epic deliberately, so their priority stays. Each change is a line under "Priority propagation",
   which needs nothing more and never wakes you: set an epic's priority
   and its work follows on the next sweep.
 - **Sign-offs.** `bot-watch --apply` runs `bot-pr signoff` itself on
