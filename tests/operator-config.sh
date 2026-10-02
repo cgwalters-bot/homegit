@@ -175,7 +175,7 @@ expect priority-health '^Priority health: nothing to flag$'
 # --- bot-devspace: the configured runner repository and host names ---
 mkdir -p "${XDG_STATE_HOME}/bot-devspace/t1" && echo 42 >"${XDG_STATE_HOME}/bot-devspace/t1/run_id"
 run devspace-list "${BIN}/bot-devspace" list
-expect devspace-list '^t1 +42 +in_progress +jmarrero-devspace-42$'
+expect devspace-list '^t1 +42 +in_progress +jmarrero-devspace-42 +-$'
 grep -q 'repos/jmarrero-bot/jmarrero-devspace-sandbox/actions/runs/42' "${FAKE}/calls" ||
     fail "devspace-list: didn't read the run in jmarrero-bot/jmarrero-devspace-sandbox: $(cat "${FAKE}/calls")"
 
