@@ -1,0 +1,234 @@
+#!/usr/bin/env node
+// How long a devspace has before its runner goes away: the backend of
+// 'bot-devspace remaining', and of the warning (and --min-left refusal)
+// of 'bot-devspace ssh'. See --help.
+// Node's standard library only, plus ssh.
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1] || "bot-devspace-time");
+// What the devspace workflow sets in every SSH session (sshd SetEnv): its
+// soft deadline, and when the duration it counts started, in epoch seconds.
+const DEADLINE_VAR = "DEVSPACE_DEADLINE";
+const STARTED_VAR = "DEVSPACE_STARTED";
+// Below this, 'check' warns: about what saving results, pushing and
+// stopping cleanly take.
+const WARN_MINUTES = 20;
+// Files in a devspace's state directory: bot-devspace's ssh_config, and
+// the times read from the devspace, cached since they never change.
+const SSH_CONFIG_FILE = "ssh_config";
+const CACHE_FILE = "deadline.json";
+const NAME_RE = /^[a-z0-9][a-z0-9_.-]{0,62}$/;
+const EPOCH_RE = /^[0-9]{1,12}$/;
+const SSH_CONNECT_TIMEOUT_S = 8;
+const SSH_TIMEOUT_MS = 30_000;
+const MINUTE_MS = 60_000;
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} --state-root DIR COMMAND
+
+The backend of 'bot-devspace remaining' and of the check 'bot-devspace
+ssh' makes; bot-devspace passes --state-root.
+
+Commands:
+  remaining [--json] [NAME]
+      Print the time NAME (or every known devspace) has left: minutes
+      left, the deadline and when its duration started.
+  check [--min-left N] NAME
+      Warn on stderr when NAME has less than ${WARN_MINUTES} minutes left; with
+      --min-left, fail when it has less than N. When the time left can't
+      be told, only print a note.
+
+The times come from the devspace itself: its workflow sets ${DEADLINE_VAR}
+and ${STARTED_VAR} (epoch seconds) in SSH sessions. They are read once
+over SSH and cached in DIR/NAME/${CACHE_FILE}. A devspace whose workflow
+predates them has no known deadline.`;
+}
+
+// isoSeconds(ms): like GitHub's timestamps, without milliseconds.
+const isoSeconds = (ms) => new Date(ms).toISOString().replace(/\.\d{3}Z$/, "Z");
+
+// parseTimes(output): {started_at, deadline} (ISO, or null when the
+// devspace doesn't set them) from the "STARTED DEADLINE" line the probe
+// prints; throws on anything else.
+function parseTimes(output) {
+  const fields = output.trim().split(/\s+/).filter(Boolean);
+  if (fields.length === 0) return { started_at: null, deadline: null };
+  const [started, deadline] = fields.length === 1 ? [null, fields[0]] : fields;
+  if (fields.length > 2 || !EPOCH_RE.test(deadline) || (started != null && !EPOCH_RE.test(started))) {
+    throw new Exit(EX_ERROR, `unexpected ${STARTED_VAR}/${DEADLINE_VAR} on the devspace: '${output.trim()}'`);
+  }
+  return { started_at: started == null ? null : isoSeconds(Number(started) * 1000), deadline: isoSeconds(Number(deadline) * 1000) };
+}
+
+// withMinutesLeft(info, now): info with minutes_left, whole minutes
+// rounded down and never below 0, or null without a deadline.
+function withMinutesLeft(info, now) {
+  const left = info.deadline ? Math.max(0, Math.floor((Date.parse(info.deadline) - now) / MINUTE_MS)) : null;
+  return { ...info, minutes_left: left };
+}
+
+function describe(i) {
+  if (i.error) return `${i.name}: unknown (${i.error})`;
+  if (!i.deadline) return `${i.name}: unknown (the devspace doesn't set ${DEADLINE_VAR}; its workflow predates it)`;
+  const started = i.started_at ? ` (started ${i.started_at})` : "";
+  if (i.minutes_left === 0) return `${i.name}: deadline passed at ${i.deadline}${started}; the devspace is gone or about to be`;
+  return `${i.name}: ${i.minutes_left} min left, until ${i.deadline}${started}`;
+}
+
+// hostOf(sshConfig): the alias the ssh_config bot-devspace wrote defines.
+function hostOf(sshConfig) {
+  const m = /^Host\s+(\S+)\s*$/m.exec(sshConfig);
+  if (!m) throw new Exit(EX_ERROR, "its ssh_config defines no Host");
+  return m[1];
+}
+
+// probe(dir): the times the devspace's SSH sessions carry.
+function probe(dir) {
+  const config = path.join(dir, SSH_CONFIG_FILE);
+  let text;
+  try {
+    text = fs.readFileSync(config, "utf8");
+  } catch (e) {
+    throw new Exit(EX_ERROR, `cannot read ${config}: ${e.message}`);
+  }
+  const remote = `printf '%s %s\\n' "\${${STARTED_VAR}:-}" "\${${DEADLINE_VAR}:-}"`;
+  const args = ["-F", config, "-o", "BatchMode=yes", "-o", `ConnectTimeout=${SSH_CONNECT_TIMEOUT_S}`, hostOf(text), remote];
+  let out;
+  try {
+    out = execFileSync("ssh", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: SSH_TIMEOUT_MS });
+  } catch (e) {
+    const detail = String(e.stderr || e.message || "").trim().split("\n").pop();
+    throw new Exit(EX_ERROR, `cannot reach the devspace over SSH: ${detail}`);
+  }
+  return parseTimes(out);
+}
+
+// lookup(stateRoot, name): the times of NAME, from the cache or else
+// read from the devspace (and cached, since they never change).
+function lookup(stateRoot, name) {
+  if (!NAME_RE.test(name)) throw new Exit(EX_USAGE, `invalid devspace name '${name}'`);
+  const dir = path.join(stateRoot, name);
+  if (!fs.existsSync(dir)) throw new Exit(EX_ERROR, `no devspace named '${name}' (see 'bot-devspace list')`);
+  const cacheFile = path.join(dir, CACHE_FILE);
+  try {
+    const c = JSON.parse(fs.readFileSync(cacheFile, "utf8"));
+    return { name, started_at: c.started_at ?? null, deadline: c.deadline ?? null };
+  } catch {
+    // Not read yet (or unreadable): ask the devspace.
+  }
+  const times = probe(dir);
+  try {
+    fs.writeFileSync(cacheFile, `${JSON.stringify(times)}\n`);
+  } catch (e) {
+    process.stderr.write(`note: cannot cache the deadline in ${cacheFile}: ${e.message}\n`);
+  }
+  return { name, ...times };
+}
+
+const nowMs = () => (process.env.BOT_DEVSPACE_NOW ? Date.parse(process.env.BOT_DEVSPACE_NOW) : Date.now());
+
+function cmdRemaining(stateRoot, args) {
+  let json = false;
+  const names = [];
+  for (const a of args) {
+    if (a === "--json") json = true;
+    else if (a.startsWith("-")) throw new Exit(EX_USAGE, `unknown option for remaining: ${a}`);
+    else names.push(a);
+  }
+  if (names.length > 1) throw new Exit(EX_USAGE, "usage: bot-devspace remaining [--json] [NAME]");
+  const all = names.length === 0;
+  const list = all
+    ? (fs.existsSync(stateRoot) ? fs.readdirSync(stateRoot).filter((n) => fs.existsSync(path.join(stateRoot, n, SSH_CONFIG_FILE))).sort() : [])
+    : names;
+  const now = nowMs();
+  // One unreachable devspace doesn't hide the others when listing all.
+  const results = list.map((n) => {
+    try {
+      return withMinutesLeft(lookup(stateRoot, n), now);
+    } catch (e) {
+      if (!all || !(e instanceof Exit)) throw e;
+      return { name: n, started_at: null, deadline: null, minutes_left: null, error: e.message };
+    }
+  });
+  if (json) process.stdout.write(`${JSON.stringify(all ? results : results[0])}\n`);
+  else process.stdout.write(results.map((r) => `${describe(r)}\n`).join(""));
+}
+
+function cmdCheck(stateRoot, args) {
+  let minLeft = null;
+  const names = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--min-left") {
+      const v = args[++i];
+      if (!/^[0-9]+$/.test(v || "")) throw new Exit(EX_USAGE, `--min-left takes a number of minutes (got '${v ?? ""}')`);
+      minLeft = Number(v);
+    } else names.push(args[i]);
+  }
+  if (names.length !== 1) throw new Exit(EX_USAGE, "usage: check [--min-left N] NAME");
+  const name = names[0];
+  let info;
+  try {
+    info = withMinutesLeft(lookup(stateRoot, name), nowMs());
+  } catch (e) {
+    // Only a known deadline blocks the command: an unreachable devspace
+    // fails the command on its own, with a better message.
+    if (!(e instanceof Exit) || e.status === EX_USAGE) throw e;
+    process.stderr.write(`note: cannot tell how long devspace '${name}' has left: ${e.message}\n`);
+    return;
+  }
+  const left = info.minutes_left;
+  if (left == null) {
+    if (minLeft != null) process.stderr.write(`note: devspace '${name}' doesn't set ${DEADLINE_VAR}, so --min-left can't be checked\n`);
+    return;
+  }
+  if (minLeft != null && left < minLeft) {
+    throw new Exit(EX_ERROR, `refusing to start: devspace '${name}' has ${left} min left (until ${info.deadline}), and --min-left asks for ${minLeft}; start a fresh devspace`);
+  }
+  if (left < WARN_MINUTES) {
+    process.stderr.write(`warning: devspace '${name}' has ${left} min left (deadline ${info.deadline}): copy results and logs off it, push what is ready and stop it (see the devspace-time skill)\n`);
+  }
+}
+
+function main(argv) {
+  let stateRoot = null;
+  let i = 0;
+  for (; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-h" || a === "--help") {
+      process.stdout.write(`${usage()}\n`);
+      return;
+    }
+    if (a === "--state-root") stateRoot = argv[++i];
+    else break;
+  }
+  if (!stateRoot) throw new Exit(EX_USAGE, "--state-root is required (see --help)");
+  const [command, ...rest] = argv.slice(i);
+  if (command === "remaining") cmdRemaining(stateRoot, rest);
+  else if (command === "check") cmdCheck(stateRoot, rest);
+  else throw new Exit(EX_USAGE, `unknown command '${command || ""}' (see --help)`);
+}
+
+if (require.main === module) {
+  try {
+    main(process.argv.slice(2));
+  } catch (e) {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${e.status === EX_USAGE ? PROG : "error"}: ${e.message}\n`);
+    process.exit(e.status);
+  }
+} else {
+  module.exports = { parseTimes, withMinutesLeft, describe, hostOf, WARN_MINUTES };
+}

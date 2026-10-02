@@ -124,6 +124,10 @@ bot-devspace ssh "$NAME" "tail -n 20 ~/test.log"
 `nohup sh -c '...' > ~/test.log 2>&1 &` works too. Use the project's own
 entry points (Justfile, Makefile, CI workflow steps) so the run matches CI.
 
+The runner is killed when its `--duration` runs out, with everything on
+it. Check `bot-devspace remaining NAME` before a long step and while
+polling, and follow `devspace-time` for what to do when time runs short.
+
 When one devspace tests several branches, give each branch its own checkout
 and its own `CARGO_TARGET_DIR`, and don't share container build caches
 between them (e.g. `BUILDAH_LAYERS=false`, or a distinct image tag per

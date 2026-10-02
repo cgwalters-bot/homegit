@@ -63,6 +63,9 @@ readonly PROVISION_PACKAGES=(
 # bootc's .github/actions/install-tmt. Keep them in sync with those.
 readonly BCVK_VERSION=0.19.0
 readonly TMT_VERSION=1.78.0
+# Reads and checks the time a devspace has left; next to this script.
+BIN_DIR=$(dirname "$(realpath "$0")")
+readonly TIME_HELPER=${BIN_DIR}/bot-devspace-time
 
 usage() {
     cat <<EOF
@@ -85,7 +88,15 @@ Commands:
                      unless --keep-on-failure is given.
   provision NAME     Check the baseline dev toolchain is installed (on legacy
                      ${LEGACY_SSH_USER} devspaces: install it; idempotent)
-  ssh NAME [CMD...]  Run CMD on the devspace, or an interactive shell
+  ssh [--min-left N] NAME [CMD...]
+                     Run CMD on the devspace, or an interactive shell. Warns
+                     when less than 20 minutes are left; with --min-left,
+                     refuses to run when less than N minutes are left.
+  remaining [--json] [NAME]
+                     Print the minutes NAME (or each devspace) has left
+                     before its runner goes away, the deadline and the
+                     start, from the DEVSPACE_DEADLINE and DEVSPACE_STARTED
+                     its workflow sets in SSH sessions
   ssh-config NAME    Print the path of an ssh_config defining Host ${ALIAS_PREFIX}NAME,
                      for use with 'ssh -F' and GIT_SSH_COMMAND="ssh -F <path>"
   list               List known devspaces with their live run status
@@ -480,12 +491,23 @@ EOF
     fi
 }
 
+time_helper() {
+    "${TIME_HELPER}" --state-root "${STATE_ROOT}" "$@"
+}
+
 cmd_ssh() {
-    test $# -ge 1 || fatal "usage: $(basename "$0") ssh NAME [CMD...]"
+    local min_left=()
+    case "${1:-}" in
+        --min-left) test $# -ge 2 || fatal "--min-left requires an argument"; min_left=(--min-left "$2"); shift 2 ;;
+        --min-left=*) min_left=(--min-left "${1#--min-left=}"); shift ;;
+    esac
+    test $# -ge 1 || fatal "usage: $(basename "$0") ssh [--min-left N] NAME [CMD...]"
     local name=$1
     shift
     validate_name "${name}"
     run_id_of "${name}" >/dev/null
+    # Warns, or with --min-left refuses, when the runner is about to go.
+    time_helper check "${min_left[@]}" "${name}" || exit 1
     exec ssh -F "$(state_dir "${name}")/ssh_config" "${ALIAS_PREFIX}${name}" "$@"
 }
 
@@ -563,7 +585,7 @@ command=$1
 shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
-    start|provision|ssh|ssh-config|list|stop) ;;
+    start|provision|ssh|ssh-config|list|stop|remaining) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
 require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
@@ -576,4 +598,5 @@ case "${command}" in
     ssh-config) cmd_ssh_config "$@" ;;
     list) cmd_list "$@" ;;
     stop) cmd_stop "$@" ;;
+    remaining) time_helper remaining "$@" ;;
 esac

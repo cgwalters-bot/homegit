@@ -8,6 +8,7 @@ Rules:
 - **Skills:** read and follow these skills, in `dotfiles/.agents/skills/`:
   - `workstream/SKILL.md`, for Workflow semantics and board usage;
   - `devspace-work/SKILL.md`, for the edit-locally, build and test on a devspace, push-from-local loop;
+  - `devspace-time/SKILL.md`, to check the time a devspace has left (`bot-devspace remaining`) and save, push and stop before it is killed;
   - `upstream-pr/SKILL.md`, for commit and contribution rules;
   - `commit-review/SKILL.md`, to self-review before pushing.
 - **Tools:** use `bin/bot-devspace`, `bin/bot-board`, `bin/bot-pace`, `bin/bot-pr`, `bin/bot-git` and `bin/bot-land` from the checkout, by absolute path.

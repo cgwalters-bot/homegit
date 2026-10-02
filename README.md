@@ -29,7 +29,8 @@ opencode, Codex, Gemini CLI and Cursor look; Claude Code reads only
 `bot-feedback` (surfacing reactions on the bot's work), `bot-notify`
 (routing mentions of and requests to the bot),
 `upstream-pr` (how to contribute as the bot, with `bot-pr`), `devspace-work` (building
-and testing on a remote runner), `coordinator` (running a top-level
+and testing on a remote runner), `devspace-time` (finishing before that runner's
+time limit), `coordinator` (running a top-level
 session that polls, dispatches worker and reviewer subagents, and writes
 the morning brief; the preambles it briefs them with live next to it),
 `topic-lead` (a session of its own for one topic, which owns the board items
@@ -130,7 +131,10 @@ tested branch to the forge fork from the local machine. No credentials are
 ever copied to a devspace, and the SSH user can't reach the runner's
 own (see the `devspace-work` skill); `tests/bot-devspace.sh` tests which
 user `bot-devspace` picks. `bot-devspace stop` cancels the runner, since
-they're billed while they run.
+they're billed while they run. A runner is also killed when its duration
+runs out, so `bot-devspace remaining` tells an agent how long it has
+(`bin/bot-devspace-time` computes it), and `bot-devspace ssh` warns when
+little is left.
 
 The next step moves the agents themselves onto devspaces: an `agent.yml`
 workflow runs an agent on one board item, with its condensed transcript
