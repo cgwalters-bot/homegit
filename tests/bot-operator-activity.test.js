@@ -136,6 +136,16 @@ test("only in-scope events not handled elsewhere are classified; act and ask are
   assert.equal(review.context.board_item.title, "fix the lint");
   const reply = classified().find((d) => d.event.url === THREAD_COMMENT);
   assert.equal(reply.context.bot_last_comment.body, "Option one or two?");
+  // Every event of theirs counts as activity in its repository, in scope
+  // or not (bot-reconcile reads it); someone else's doesn't.
+  const repos = JSON.parse(fs.readFileSync(path.join(WORK, "state", "repos.json"), "utf8"));
+  assert.deepEqual(Object.fromEntries(Object.entries(repos).map(([r, ev]) => [r, Object.keys(ev).sort()])), {
+    "someone/else": ["comment:101"],
+    "cgwalters-forge/bootc": ["review:201", "review:501"],
+    "bootc-dev/bootc": ["comment:301"],
+    "containers/composefs-rs": ["comment:401"],
+    "cgwalters-forge/private": ["comment:500"],
+  });
 });
 
 test("the cursor and the decisions survive a restart", () => {
