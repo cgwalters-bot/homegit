@@ -48,6 +48,14 @@ readonly NEWS_DATE_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}: '
 # Number fields, which only --field sets (the field list doesn't tell a
 # number field from a text one).
 readonly NUMBER_FIELDS=("Actual tokens" "Budget tokens")
+# 'bot-pace assign' claims an item for one of the coordinator's workers
+# with Status ACTIVE_STATUS and Lead COORDINATOR_LEAD. That claim ends
+# when the item leaves ACTIVE_STATUS, so 'set --status' clears that Lead
+# with it; any other Lead is a topic session's, which owns its items in
+# every status, and stays.
+readonly LEAD_FIELD=Lead
+readonly ACTIVE_STATUS='In Progress'
+readonly COORDINATOR_LEAD=coordinator
 # The Org field says which organization an item's work targets, so the
 # board can be filtered to the bot's own infrastructure (the forge org's
 # and the bot's options) or to work going outbound. A fork owned by one
@@ -267,6 +275,10 @@ Commands:
                               the ask is what he acts on. 'question' sets
                               it itself.
                               An empty value clears a text field.
+                              A --status other than '${ACTIVE_STATUS}' also
+                              clears Lead '${COORDINATOR_LEAD}' (a worker's
+                              claim, from bot-pace assign) unless --field
+                              ${LEAD_FIELD} is given; other Leads stay.
   fill-org [--all] [--dry-run]
                               Set Org on items that have none (--all:
                               also correct every other item), from the
@@ -1291,6 +1303,13 @@ news_line() {
     printf '%s\n' "${text}"
 }
 
+# current_lead ID: the item's Lead in the (REST, quota-free) listing, or
+# nothing if it has none or isn't listed yet.
+current_lead() {
+    load_items
+    jq -r --arg id "$1" --arg f "${LEAD_FIELD,,}" 'first(.items[] | select(.id == $id) | .[$f] // empty) // empty' <<<"${ITEMS_JSON}"
+}
+
 cmd_set() {
     test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT] [--news TEXT] [--branch URL] [--gist URL] [--field NAME VALUE]..."
     local item=$1
@@ -1298,6 +1317,7 @@ cmd_set() {
     test $# -gt 0 || fatal "nothing to set; valid options: ${SET_OPTIONS[*]}"
     # Resolve and validate everything before changing anything.
     local field_ids=() args=() names=() field field_id option value label_args=() needs_human=false new_branch="" branch_given=false
+    local new_status="" lead_given=false
     load_fields
     while test $# -gt 0; do
         case "$1" in
@@ -1320,6 +1340,7 @@ cmd_set() {
                 names+=("${field} = ${value}")
                 test "${field}" != Status || test "${value}" != "${QUESTION_STATUS}" || needs_human=true
                 test "${field}" != Branch || { new_branch=${value}; branch_given=true; }
+                test "${field}" != Status || new_status=${value}
                 case "${field}" in Priority|Org) label_args+=("--${field,,}" "${value}") ;; esac
                 shift 2
                 ;;
@@ -1339,6 +1360,7 @@ cmd_set() {
                     if test -n "$3"; then args+=("--text=$3"); else args+=(--clear); fi
                 fi
                 names+=("$2 = $3")
+                test "$2" != "${LEAD_FIELD}" || lead_given=true
                 shift 3
                 ;;
             *) fatal "unknown option for set: '$1'; valid options: ${SET_OPTIONS[*]} --field" ;;
@@ -1356,6 +1378,19 @@ cmd_set() {
         test -n "${id}" || fatal "'${item}' is not on the board (${BOARD_URL}); if it was just added, use its PVTI_ id"
     fi
     ! ${needs_human} || test -n "${SKIP_ASK_CHECK:-}" || ! is_workstream || check_ask "${id}" "${item_url}" "${new_branch}" "${branch_given}"
+    if test -n "${new_status}" && test "${new_status}" != "${ACTIVE_STATUS}" && ! ${lead_given} &&
+        has_field "${LEAD_FIELD}"; then
+        local lead
+        lead=$(current_lead "${id}") || {
+            echo "warning: couldn't read the Lead of ${id}, so a Lead '${COORDINATOR_LEAD}' (if any) stays; bot-reconcile's stale-lead rule clears it later" 1>&2
+            lead=
+        }
+        if test "${lead}" = "${COORDINATOR_LEAD}"; then
+            field_ids+=("$(field_json "${LEAD_FIELD}" | jq -r .id)")
+            args+=(--clear)
+            names+=("${LEAD_FIELD} = (cleared: no longer ${ACTIVE_STATUS})")
+        fi
+    fi
     project=$(project_id) || fail_after $? "cannot look up the project id"
     # Don't start a batch of edits that the quota can't finish.
     remaining=$(gh api rate_limit --jq .resources.graphql.remaining 2>/dev/null) || remaining=
