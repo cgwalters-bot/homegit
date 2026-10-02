@@ -24,11 +24,29 @@ readonly SUMMARY_ARTIFACT=agent-run
 readonly TRANSCRIPT_ARTIFACT=agent-transcript
 # A branch run's change: changes.patch and base.json.
 readonly OUT_ARTIFACT=agent-out
+# The job of agent.yml that runs the agent as runner-sandbox and uploads
+# OUT_ARTIFACT; apply takes a change only from it.
+readonly AGENT_JOB=Agent
 readonly MAX_PATCH_BYTES=$((8 << 20))
-# Paths a run's change may never touch: CI and git's own files.
-readonly PROTECTED_PATH_RE='^(\.github/|\.gitmodules$)|(^|/)\.git(/|$)'
-# Secret-shaped strings (GitHub, Anthropic, AWS tokens; private keys).
-readonly SECRET_RE='gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+readonly MAX_BASE_JSON_BYTES=4096
+readonly MAX_PATCH_FILES=100
+readonly REPO_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+readonly BASE_RE='^[A-Za-z0-9_][A-Za-z0-9_./-]*$'
+# The paths a run's change may touch: relative, of plain characters (no
+# spaces, quotes or control characters; . and .. components are refused
+# separately).
+readonly APPLY_PATH_RE='^[A-Za-z0-9_.+@=,][A-Za-z0-9_.+@=,-]*(/[A-Za-z0-9_.+@=,][A-Za-z0-9_.+@=,-]*)*$'
+# Paths it may never touch: git's own files (.git, .gitmodules,
+# .gitattributes, .github/ and the like), CI and hook configuration, and
+# files editors or shells run on their own.
+readonly PROTECTED_PATH_RE='(^|/)\.git|(^|/)\.husky/|^\.pre-commit-config\.ya?ml$|^\.?lefthook\.ya?ml$|^\.circleci/|^\.travis\.yml$|^\.tekton/|^\.packit\.ya?ml$|^\.envrc$|^\.vscode/|(^|/)CODEOWNERS$'
+# Secret-shaped strings (GitHub, GitLab, Anthropic, AWS, Google, Slack
+# tokens; private keys).
+readonly SECRET_RE='gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[abprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+# The trailer naming the run an applied change came from.
+readonly RUN_TRAILER=Agent-run
+# The push URL of an applied clone's origin: apply never pushes.
+readonly NO_PUSH_URL=no-push://bot-runs-apply-never-pushes
 # The AI trailer of the bot's commits (shared AGENTS.md).
 readonly AI_TRAILER='Generated-by: AI'
 # The files of the summary artifact that are kept; anything else in it is
@@ -141,15 +159,22 @@ Commands:
   diff RUN1 RUN2
       Compare two runs: result, duration, turns, tokens, AIC, tool
       calls, failures, files touched, tests and outcome.
-  apply RUN --slug SLUG --message FILE [--dir DIR] [--source GIT_URL]
+  apply RUN --repo OWNER/REPO --slug SLUG --message FILE [--base REF]
+        [--dir DIR] [--source GIT_URL]
       Turn a successful branch run's change (its agent-out artifact) into
       a local commit on bot/SLUG, as the bot, with FILE as the message
-      (the AI trailer is added). The change is checked again first: size,
-      base commit, secret-shaped strings, and no .github/, .git or
-      .gitmodules paths, symlinks or submodules. DIR (default
-      ${CACHE_DIR}/apply/RUN-SLUG) is a fresh clone of GIT_URL
-      (default: the run's target on GitHub). Nothing is pushed: after
-      review, bot-pr fork-pr --from DIR opens it on the forge.
+      (the AI trailer and an ${RUN_TRAILER} trailer naming the run are
+      added). Everything from the runner is checked again first: the run
+      is a dispatch of ${RUNS_WORKFLOW} from ${RUNS_REF} for OWNER/REPO (and REF), the
+      artifact is the one its ${AGENT_JOB} job uploaded, within size and
+      file-count caps, its base commit is on the base branch, and it has
+      no secret-shaped strings, binaries, symlinks, submodules, mode
+      changes, or paths outside plain relative ones or under .git*, CI
+      or hook configuration. DIR (default ${CACHE_DIR}/apply/RUN-SLUG)
+      is a fresh clone of GIT_URL (default: OWNER/REPO on GitHub) with
+      hooks off; on a refusal it is removed. Nothing is pushed, and
+      origin there has no push URL: after review, bot-pr fork-pr --from
+      DIR opens it on the forge.
   stats [--since AGE] [--limit N] [--by agent|model|repo|item|result]
       Aggregate the finished runs (the last ${DEFAULT_STATS_SINCE}, at most ${DEFAULT_STATS_LIMIT} by
       default): success rate, failures by kind, duration, tokens and
@@ -1205,25 +1230,141 @@ cmd_stats() {
 
 # --- apply -------------------------------------------------------------------
 
-# apply_paths DIR: the paths the staged change in DIR touches, one per
-# line as "NEWMODE PATH" (000000 for a deletion), from git itself.
-apply_paths() {
-    git -C "$1" diff --cached --raw -z --no-renames --no-abbrev HEAD |
-        awk 'BEGIN { RS = "\0" } NR % 2 == 1 { split($0, f, " "); mode = f[2]; next } { print mode " " $0 }'
+# fetch_run_json ID: run ID as GitHub gives it.
+fetch_run_json() {
+    local rc=0
+    rest_get "repos/${RUNS_REPO}/actions/runs/$1" || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -ne "${EX_NOTFOUND}" || fatal "run $1 not found in ${RUNS_REPO}"
+    test "${rc}" -eq 0 || fatal "reading run $1 failed"
+}
+
+# Checks that a run object (input) is a dispatch of the agent workflow
+# from RUNS_REF in RUNS_REPO; prints why not, or nothing.
+readonly RUN_ORIGIN_JQ='
+    if (.repository.full_name // "") != $repo then "is in \(.repository.full_name // "?"), not \($repo)"
+    elif (.head_repository.id // null) != (.repository.id // "") then "ran code from another repository than \($repo)"
+    elif .path != $path then "ran \(.path // "?"), not \($path)"
+    elif .event != "workflow_dispatch" then "was triggered by \(.event // "?"), not a dispatch"
+    elif .head_branch != $ref then "ran the workflow from \(.head_branch // "?"), not \($ref)"
+    elif ((.head_sha // "") | test("^[0-9a-f]{40}$") | not) then "has no valid head_sha"
+    else empty end'
+
+# Checks the jobs of a run attempt (input): exactly one, the agent job,
+# successful, of that run and head; prints why not, or nothing.
+readonly AGENT_JOB_JQ='
+    if (.jobs | length) != 1 then "has \(.jobs | length) jobs, not just \($name)"
+    else .jobs[0] |
+        if .name != $name then "has job \(.name | tostring), not \($name)"
+        elif .run_id != $run or .head_sha != $sha then "has a job of another run or head"
+        elif .conclusion != "success" then "job \($name) is \(.conclusion // .status), not success"
+        else empty end end'
+
+# apply_artifact RUN_JSON ATTEMPT DIR: finds, checks and unpacks the
+# agent-out artifact of the run's attempt into DIR, refusing one that
+# isn't exactly what the agent job of that run uploaded.
+apply_artifact() {
+    local run=$1 attempt=$2 dir=$3 id sha body jobs art why rc=0
+    read -r id sha < <(jq -r '"\(.id) \(.head_sha)"' <<<"${run}")
+    jobs=$(rest_get "repos/${RUNS_REPO}/actions/runs/${id}/attempts/${attempt}/jobs?per_page=${PER_PAGE}") || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || fatal "listing the jobs of run ${id} failed"
+    why=$(jq -r --arg name "${AGENT_JOB}" --argjson run "${id}" --arg sha "${sha}" "${AGENT_JOB_JQ}" <<<"${jobs}")
+    test -z "${why}" || fatal "run ${id} ${why}; its change is taken only from the ${AGENT_JOB} job"
+
+    body=$(rest_get "repos/${RUNS_REPO}/actions/runs/${id}/artifacts?per_page=${PER_PAGE}") || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || fatal "listing the artifacts of run ${id} failed"
+    # The job's window: an artifact made outside it came from elsewhere
+    # (another attempt, or a later upload).
+    art=$(jq -c --arg n "${OUT_ARTIFACT}" --argjson job "$(jq -c '.jobs[0] | {started_at, completed_at}' <<<"${jobs}")" \
+        '[.artifacts[] | select(.name == $n)] as $a
+        | if ($a | length) == 0 then null
+          elif ($a | length) > 1 then {error: "has \($a | length) \($n) artifacts"}
+          else $a[0] | . + {in_job: ((.created_at // "") >= $job.started_at and (.created_at // "") <= $job.completed_at)} end' <<<"${body}")
+    test "${art}" != null ||
+        fatal "run ${id} has no ${OUT_ARTIFACT} artifact: it changed no files, or its change was dropped ('$(basename "$0") show ${id}' says why)"
+    why=$(jq -r --argjson run "${run}" --argjson max "$((MAX_PATCH_BYTES + MAX_BASE_JSON_BYTES))" '
+        if .error then .error
+        elif .expired != false then "has an expired artifact (since \(.expires_at // "?"), kept 30 days)"
+        elif .workflow_run.id != $run.id or .workflow_run.head_sha != $run.head_sha
+            or .workflow_run.repository_id != $run.repository.id then "has an artifact of another run or head"
+        elif (.in_job | not) then "has an artifact made outside its agent job"
+        elif (.size_in_bytes // ($max + 1)) > $max then "has an artifact of \(.size_in_bytes // "?") bytes, over \($max)"
+        else empty end' <<<"${art}")
+    test -z "${why}" || fatal "run ${id} ${why}"
+
+    ghapi "repos/${RUNS_REPO}/actions/artifacts/$(jq -r .id <<<"${art}")/zip" >"${scratch}/out.zip" || rc=$?
+    test "${rc}" -eq 0 || fatal "downloading the ${OUT_ARTIFACT} artifact of run ${id} failed"
+    # Exactly the two regular files, at the root, within the size caps,
+    # before anything is unpacked.
+    why=$(unzip -Z "${scratch}/out.zip" 2>/dev/null | awk -v max="${MAX_PATCH_BYTES}" -v jmax="${MAX_BASE_JSON_BYTES}" '
+        NF < 9 || $1 ~ /^(Archive|Zip)/ || $0 ~ /^[0-9]+ files?,/ { next }
+        { n++; name = $NF; size = $4 }
+        substr($1, 1, 1) != "-" { print "a non-regular file " name; next }
+        name == "changes.patch" { p++; if (size > max) print "a patch of " size " bytes, over " max; next }
+        name == "base.json" { b++; if (size > jmax) print "a base.json of " size " bytes"; next }
+        { print "an unexpected file " name }
+        END { if (p != 1 || b != 1 || n != 2) print "not exactly changes.patch and base.json" }')
+    test -z "${why}" || fatal "the ${OUT_ARTIFACT} artifact of run ${id} has ${why}"
+    unzip -q "${scratch}/out.zip" changes.patch base.json -d "${dir}" ||
+        fatal "unpacking the ${OUT_ARTIFACT} artifact of run ${id} failed"
+    # Again, as unpacked: the sizes in a zip's directory are its own say.
+    if test "$(stat -c %s "${dir}/changes.patch")" -gt "${MAX_PATCH_BYTES}" ||
+        test "$(stat -c %s "${dir}/base.json")" -gt "${MAX_BASE_JSON_BYTES}"; then
+        fatal "the ${OUT_ARTIFACT} artifact of run ${id} unpacks over its size caps"
+    fi
+}
+
+# agit DIR ARGS...: git in the clone apply makes, with no system or
+# global configuration (so no filters, hooks or fsmonitor of the
+# caller's), and no hooks at all.
+agit() {
+    local dir=$1
+    shift
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+        git -C "${dir}" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
+# apply_refusals DIR: why the staged change in DIR may not be committed,
+# one line per path, from git's own view of it (not from parsing the
+# patch): path shape and protected paths, symlinks, submodules, modes,
+# binaries.
+apply_refusals() {
+    agit "$1" diff --cached --numstat -z --no-renames HEAD >"${scratch}/numstat"
+    agit "$1" diff --cached --raw -z --no-renames --no-abbrev HEAD >"${scratch}/raw"
+    # ENVIRON: awk -v would process the regexes' backslashes.
+    PATH_RE=${APPLY_PATH_RE} DENY_RE=${PROTECTED_PATH_RE} awk '
+        BEGIN { RS = "\0" }
+        FILENAME == ARGV[1] { if (substr($0, 1, 4) == "-\t-\t") bin[substr($0, 5)] = 1; next }
+        !inpath { split($0, f, " "); old = substr(f[1], 2); new = f[2]; st = f[5]; inpath = 1; next }
+        {
+            inpath = 0; p = $0; why = ""
+            if (p !~ ENVIRON["PATH_RE"] || p ~ /(^|\/)\.\.?(\/|$)/) why = "not a plain relative path"
+            else if (p ~ ENVIRON["DENY_RE"]) why = "protected path"
+            else if (old ~ /^1[26]0000$/ || new ~ /^1[26]0000$/) why = "symlink or submodule"
+            else if (st == "A" && new != "100644") why = "new file mode " new
+            else if (st == "M" && old != new) why = "mode change " old " to " new
+            else if (st != "A" && st != "M" && st != "D") why = "change of type " st
+            else if (p in bin) why = "binary"
+            if (why != "") { gsub(/[^[:print:]]/, "?", p); print "  " p " (" why ")" }
+        }' "${scratch}/numstat" "${scratch}/raw"
 }
 
 cmd_apply() {
-    local run_id="" slug="" dir="" source="" message_file="" json=false
-    local meta rec art rc=0 repo base ref commit item workflow result conclusion branch paths bad head files
+    local run_id="" slug="" dir="" source="" message_file="" json=false want_repo="" want_base=""
+    local run meta attempt run_url why rec item repo base workflow result summary_run ref commit branch files nfiles head
     while test $# -gt 0; do
         case "$1" in
-            --slug|--dir|--source|--message)
+            --slug|--dir|--source|--message|--repo|--base)
                 test $# -ge 2 || fatal "$1 requires a value"
                 case "$1" in
                     --slug) slug=$2 ;;
                     --dir) dir=${2%/} ;;
                     --source) source=$2 ;;
                     --message) message_file=$2 ;;
+                    --repo) want_repo=$2 ;;
+                    --base) want_base=$2 ;;
                 esac
                 shift 2
                 ;;
@@ -1234,93 +1375,112 @@ cmd_apply() {
         esac
     done
     test -n "${run_id}" || fatal "apply requires a RUN"
+    [[ "${want_repo}" =~ ${REPO_RE} ]] || fatal "--repo OWNER/REPO is required: the repository the run's change must be for"
+    test -z "${want_base}" || [[ "${want_base}" =~ ${BASE_RE} ]] || fatal "--base must be a branch name, not ${want_base}"
     [[ "${slug}" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || fatal "--slug must be a branch slug like fix-typo (the branch is bot/SLUG)"
     test -n "${message_file}" || fatal "--message FILE is required: the commit message, why first (see upstream-pr/SKILL.md)"
     test -r "${message_file}" || fatal "cannot read ${message_file}"
     grep -q '[^[:space:]]' "${message_file}" || fatal "the commit message in ${message_file} is empty"
     ! grep -qi '^Signed-off-by:' "${message_file}" ||
         fatal "the commit message has a Signed-off-by; only the operator's own approval adds one (bot-pr promote)"
+    ! grep -qi "^${RUN_TRAILER}:" "${message_file}" ||
+        fatal "the commit message has an ${RUN_TRAILER} trailer; apply adds the run's own"
     branch=bot/${slug}
 
-    meta=$(fetch_run "${run_id}")
-    read -r conclusion < <(jq -r '.conclusion // .status' <<<"${meta}")
-    test "${conclusion}" = success ||
-        fatal "run ${run_id} is ${conclusion}, not success; only a successful run's change is applied"
+    # The run: a successful dispatch of the agent workflow, for the
+    # declared repository.
+    run=$(fetch_run_json "${run_id}")
+    meta=$(jq -c "${RUN_META}" <<<"${run}")
+    test "$(jq -r '.conclusion // .status' <<<"${meta}")" = success ||
+        fatal "run ${run_id} is $(jq -r '.conclusion // .status' <<<"${meta}"), not success; only a successful run's change is applied"
+    why=$(jq -r --arg repo "${RUNS_REPO}" --arg path ".github/workflows/${RUNS_WORKFLOW}" --arg ref "${RUNS_REF}" \
+        "${RUN_ORIGIN_JQ}" <<<"${run}")
+    test -z "${why}" || fatal "run ${run_id} ${why}; only dispatches of ${RUNS_WORKFLOW} from ${RUNS_REF} are applied"
+    test "$(jqlib -r '{run: .} | title_parts | .repo // ""' <<<"${meta}")" = "${want_repo}" ||
+        fatal "run ${run_id} was dispatched for $(jqlib -r '{run: .} | title_parts | .repo // "?"' <<<"${meta}"), not ${want_repo}"
+    attempt=$(jq -r .attempt <<<"${meta}")
+    run_url=$(jq -r '"\(.url)/attempts/\(.attempt)"' <<<"${meta}")
+
+    # Its summary: one field at a time, so that an empty one can't shift
+    # the others.
     rec=$(load_record "${meta}")
     test "$(jq -r '.source == "artifact" and .summary != null' <<<"${rec}")" = true ||
         fatal "run ${run_id} has no summary.json (its ${SUMMARY_ARTIFACT} artifact expired or is missing)"
-    read -r item repo base workflow result < <(jq -r '.summary | "\(.item // "") \(.repo // "") \(.base // "") \(.workflow // "") \(.result // "")"' <<<"${rec}")
+    summary_field() { jq -r --arg f "$1" '.summary[$f] // "" | tostring' <<<"${rec}"; }
+    item=$(summary_field item) repo=$(summary_field repo) base=$(summary_field base)
+    workflow=$(summary_field workflow) result=$(summary_field result) summary_run=$(summary_field run_id)
+    test "${summary_run}" = "${run_id}" || fatal "run ${run_id}'s summary is of run ${summary_run:-?}"
     test "${result}" = success || fatal "run ${run_id}'s agent result is ${result:-unknown}, not success"
     test "${workflow}" = branch || fatal "run ${run_id} is a ${workflow:-?} run; only branch runs hand back a change"
-    [[ "${repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fatal "run ${run_id}'s summary has no valid repo"
+    test "${repo}" = "${want_repo}" || fatal "run ${run_id}'s summary names ${repo:-no repository}, not ${want_repo}"
+    [[ "${base}" =~ ${BASE_RE} ]] || fatal "run ${run_id}'s summary has no valid base"
+    test -z "${want_base}" || test "${base}" = "${want_base}" ||
+        fatal "run ${run_id}'s base is ${base}, not ${want_base}"
 
-    art=$(latest_artifact "${meta}" "${OUT_ARTIFACT}") || rc=$?
-    pass_ratelimit "${rc}"
-    test "${rc}" -eq 0 || fatal "listing the artifacts of run ${run_id} failed"
-    test -n "${art}" ||
-        fatal "run ${run_id} has no ${OUT_ARTIFACT} artifact: it changed no files, or its change was dropped ('$(basename "$0") show ${run_id}' says why)"
-    test "$(jq -r .expired <<<"${art}")" = false ||
-        fatal "the ${OUT_ARTIFACT} artifact of run ${run_id} expired on $(jq -r '.expires_at // "?"' <<<"${art}") (kept 30 days)"
+    # Its change, as uploaded by its agent job, checked again here: the
+    # runner's own checks ran where the agent did.
     mkdir "${scratch}/out"
-    download_artifact "$(jq -r .id <<<"${art}")" "${scratch}/out" || rc=$?
-    test "${rc}" -eq 0 || fatal "downloading the ${OUT_ARTIFACT} artifact of run ${run_id} failed"
-    for f in changes.patch base.json; do
-        if ! test -f "${scratch}/out/${f}" || test -L "${scratch}/out/${f}"; then
-            fatal "the ${OUT_ARTIFACT} artifact of run ${run_id} has no ${f}"
-        fi
-    done
-
-    # Everything from the run is checked again here: the runner's own
-    # checks ran where the agent did.
-    test "$(stat -c %s "${scratch}/out/changes.patch")" -le "${MAX_PATCH_BYTES}" ||
-        fatal "run ${run_id}'s change is over ${MAX_PATCH_BYTES} bytes"
-    read -r ref commit < <(jq -r --arg r "${repo}" 'if .repo == $r then "\(.ref) \(.commit)" else "repo-mismatch -" end' "${scratch}/out/base.json")
-    test "${ref}" != repo-mismatch || fatal "run ${run_id}'s base.json names another repository than its summary (${repo})"
+    apply_artifact "${run}" "${attempt}" "${scratch}/out"
+    read -r ref commit < <(jq -r --arg r "${want_repo}" 'if .repo == $r then "\(.ref) \(.commit)" else "repo-mismatch -" end' "${scratch}/out/base.json")
+    test "${ref}" != repo-mismatch || fatal "run ${run_id}'s base.json names another repository than ${want_repo}"
     [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || fatal "run ${run_id}'s base.json has no valid commit"
     test "${ref}" = "${base}" || fatal "run ${run_id}'s base.json ref (${ref}) differs from its summary's base (${base})"
     if grep -qaE -- "${SECRET_RE}" "${scratch}/out/changes.patch"; then
         fatal "run ${run_id}'s change holds a secret-shaped string; not applying it"
     fi
+    nfiles=$(grep -c '^diff --git ' "${scratch}/out/changes.patch" || true)
+    test "${nfiles}" -le "${MAX_PATCH_FILES}" || fatal "run ${run_id}'s change touches ${nfiles} files, over ${MAX_PATCH_FILES}"
 
+    # A fresh clone, its base commit on the declared base branch (never
+    # fetched by id: GitHub serves forks' commits that way too).
     test -n "${dir}" || dir=${CACHE_DIR}/apply/${run_id}-${slug}
     ! test -e "${dir}" || fatal "${dir} already exists; remove it or pass --dir"
-    test -n "${source}" || source=https://github.com/${repo}
+    test -n "${source}" || source=https://github.com/${want_repo}
     mkdir -p "$(dirname "${dir}")"
-    git clone -q --no-checkout "${source}" "${dir}" || fatal "cloning ${source} failed"
-    # No hooks, filters or fsmonitor of the target's: only git itself
-    # touches the change.
-    git -C "${dir}" config core.hooksPath /dev/null
-    git -C "${dir}" cat-file -e "${commit}^{commit}" 2>/dev/null ||
-        git -C "${dir}" fetch -q origin "${commit}" || fatal "${source} has no commit ${commit}"
-    git -C "${dir}" checkout -q -b "${branch}" "${commit}" || fatal "checking out ${commit} failed"
-    git -C "${dir}" apply --index --binary --whitespace=nowarn "${scratch}/out/changes.patch" ||
-        fatal "run ${run_id}'s change doesn't apply to ${commit}; ${dir} is left as it was"
-    paths=$(apply_paths "${dir}")
-    test -n "${paths}" || fatal "run ${run_id}'s change is empty"
-    # ENVIRON: awk -v would process the regex's backslashes.
-    bad=$(RE=${PROTECTED_PATH_RE} awk '{ mode = $1; p = substr($0, 8) }
-        p ~ ENVIRON["RE"] { print "  " p " (protected path)"; next }
-        mode == "120000" || mode == "160000" { print "  " p " (symlink or submodule)" }' <<<"${paths}")
-    test -z "${bad}" || fatal "run ${run_id}'s change touches what a run may not change; review it in ${dir}:
-${bad}"
+    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+        git -c core.hooksPath=/dev/null clone -q --no-checkout --template= --single-branch --branch "${base}" -- "${source}" "${dir}" ||
+        fatal "cloning ${base} of ${source} failed"
+    # Kept in the clone for whatever runs git there next (bot-pr fork-pr
+    # pushes to an explicit URL); origin is never a push target.
+    agit "${dir}" config core.hooksPath /dev/null
+    agit "${dir}" config core.fsmonitor false
+    agit "${dir}" config remote.origin.pushurl "${NO_PUSH_URL}"
+    refuse() { rm -rf "${dir}"; fatal "$@"; }
+    agit "${dir}" merge-base --is-ancestor "${commit}" "refs/remotes/origin/${base}" 2>/dev/null ||
+        refuse "run ${run_id}'s base commit ${commit} is not on ${base} of ${source}"
+    agit "${dir}" checkout -q -b "${branch}" "${commit}" || refuse "checking out ${commit} failed"
+    agit "${dir}" apply --index --whitespace=nowarn "${scratch}/out/changes.patch" ||
+        refuse "run ${run_id}'s change doesn't apply to ${commit}"
+    files=$(agit "${dir}" diff --cached --name-only -z --no-renames HEAD | tr -cd '\0' | wc -c)
+    test "${files}" -gt 0 || refuse "run ${run_id}'s change is empty"
+    test "${files}" -le "${MAX_PATCH_FILES}" || refuse "run ${run_id}'s change touches ${files} files, over ${MAX_PATCH_FILES}"
+    why=$(apply_refusals "${dir}")
+    test -z "${why}" || refuse "run ${run_id}'s change touches what a run may not change:
+${why}"
+    agit "${dir}" diff --cached HEAD >"${scratch}/staged.diff"
+    ! grep -qaE -- "${SECRET_RE}" "${scratch}/staged.diff" ||
+        refuse "run ${run_id}'s change holds a secret-shaped string; not applying it"
 
     cp "${message_file}" "${scratch}/message"
     grep -q '^Generated-by: ' "${scratch}/message" || printf '\n%s\n' "${AI_TRAILER}" >>"${scratch}/message"
     GIT_AUTHOR_NAME=${OP_BOT_GIT_NAME} GIT_AUTHOR_EMAIL=${OP_BOT_GIT_EMAIL} \
         GIT_COMMITTER_NAME=${OP_BOT_GIT_NAME} GIT_COMMITTER_EMAIL=${OP_BOT_GIT_EMAIL} \
-        git -C "${dir}" commit -q --no-verify -F "${scratch}/message" || fatal "committing the change failed"
-    head=$(git -C "${dir}" rev-parse HEAD)
-    files=$(cut -c8- <<<"${paths}" | jq -Rsc 'split("\n") | map(select(. != ""))')
+        agit "${dir}" commit -q --no-verify -F "${scratch}/message" \
+        --trailer "${RUN_TRAILER}: ${run_url}" || refuse "committing the change failed"
+    head=$(agit "${dir}" rev-parse HEAD)
+    files=$(agit "${dir}" diff --name-only -z HEAD^ HEAD | jq -Rsc 'split("\u0000") | map(select(. != ""))')
     if ${json}; then
-        jq -n --argjson run "${run_id}" --arg repo "${repo}" --arg base "${base}" --arg commit "${commit}" \
-            --arg branch "${branch}" --arg dir "${dir}" --arg head "${head}" --arg item "${item}" --argjson files "${files}" \
-            '{run_id: $run, repo: $repo, base: $base, base_commit: $commit, branch: $branch, dir: $dir, head: $head, item: $item, files: $files}'
+        jq -n --argjson run "${run_id}" --arg url "${run_url}" --arg sha "$(jq -r .head_sha <<<"${run}")" \
+            --arg repo "${want_repo}" --arg base "${base}" --arg commit "${commit}" --arg branch "${branch}" \
+            --arg dir "${dir}" --arg head "${head}" --arg item "${item}" --argjson files "${files}" \
+            '{run_id: $run, run_url: $url, workflow_sha: $sha, repo: $repo, base: $base, base_commit: $commit,
+              branch: $branch, dir: $dir, head: $head, item: $item, files: $files}'
         return 0
     fi
-    printf 'Applied run %s to %s@%s as %s in %s (%s file(s)), commit %s.\n' \
-        "${run_id}" "${repo}" "${commit:0:12}" "${branch}" "${dir}" "$(jq length <<<"${files}")" "${head:0:12}"
+    printf 'Applied run %s to %s@%s as %s in %s (%s file(s)), commit %s. Nothing was pushed.\n' \
+        "${run_id}" "${want_repo}" "${commit:0:12}" "${branch}" "${dir}" "$(jq length <<<"${files}")" "${head:0:12}"
     printf 'Review it (commit-review), then open it on the forge:\n  bot-pr fork-pr --repo %s --base %s --branch %s --item %s --from %s --title TITLE --body-file FILE\n' \
-        "${repo}" "${base}" "${branch}" "${item:-ITEM}" "${dir}"
+        "${want_repo}" "${base}" "${branch}" "${item:-ITEM}" "${dir}"
 }
 
 # --- main ---------------------------------------------------------------------

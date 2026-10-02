@@ -96,6 +96,13 @@ reply() { # reply JSON: with ETags and --jq, like gh
 }
 repo=bootc-dev/cgwalters-devspace-sandbox
 runs=${store}/runs.json
+# Every run is a dispatch of agent.yml from main at this commit, in a
+# repository with id 1; $FAKE_GH/filter-NAME.jq, if any, is applied to the
+# reply NAME (run, jobs, artifacts), to fake another one.
+head_sha=$(printf 'a%.0s' $(seq 40))
+filtered() { # filtered NAME: stdin through filter-NAME.jq
+    if test -e "${store}/filter-$1.jq"; then jq -c -f "${store}/filter-$1.jq"; else cat; fi
+}
 # $FAKE_GH/rate-limited limits every call, rate-limited-search searches.
 if test "${path}" = rate_limit; then
     echo "2026-09-25T12:00:00Z"
@@ -127,15 +134,21 @@ case "${method} ${path%%\?*}" in
                 elif test -d "${store}/artifacts/${id}/${a}"; then
                     jq -nc --argjson n "${n}" --arg a "${a}" --arg c "${created}" '{id: $n, name: $a, expired: false, created_at: $c, expires_at: "2026-12-19T10:45:00Z"}'
                 fi
-            done | jq -sc '{total_count: length, artifacts: .}')"
+            done | jq -sc --argjson id "${id}" --arg sha "${head_sha}" '{total_count: length,
+                artifacts: map(. + {size_in_bytes: 1000, workflow_run: {id: $id, head_sha: $sha, repository_id: 1}})}' | filtered artifacts)"
         ;;
     "GET repos/${repo}/actions/runs/"*/jobs)
         id=${path#repos/"${repo}"/actions/runs/}
-        reply "$(jq -nc --argjson id "${id%%/*}" '{total_count: 1, jobs: [{id: $id, name: "agent"}]}')"
+        id=${id%%/*}
+        reply "$(jq -c --argjson id "${id}" --arg sha "${head_sha}" '.workflow_runs[] | select(.id == $id)
+            | {total_count: 1, jobs: [{id: $id, name: "Agent", run_id: $id, head_sha: $sha, status, conclusion,
+                started_at: .run_started_at, completed_at: .updated_at}]}' "${runs}" | filtered jobs)"
         ;;
     "GET repos/${repo}/actions/runs/"*)
         id=${path#repos/"${repo}"/actions/runs/}
-        body=$(jq -c --argjson id "${id}" '.workflow_runs[] | select(.id == $id)' "${runs}")
+        body=$(jq -c --argjson id "${id}" --arg sha "${head_sha}" --arg repo "${repo}" '.workflow_runs[] | select(.id == $id)
+            | {path: ".github/workflows/agent.yml", event: "workflow_dispatch", head_branch: "bot/agent-run-praxis", head_sha: $sha,
+               repository: {id: 1, full_name: $repo}, head_repository: {id: 1, full_name: $repo}} + .' "${runs}" | filtered run)
         test -n "${body}" || fail_http 404 "Not Found"
         reply "${body}"
         ;;
@@ -514,9 +527,10 @@ test_transcript_link() {
 
 # --- apply -------------------------------------------------------------------
 
-# make_change RUN [EDIT]: a target repository in $WORK/target (made once)
-# and RUN's agent-out artifact holding the diff that the shell code EDIT
-# (default: editing src/lib.rs) makes in it. Prints the base commit.
+# make_change RUN [EDIT]: a target repository in $WORK/target (made once,
+# with a commit on a side branch too) and RUN's agent-out artifact
+# holding the diff that the shell code EDIT (default: editing src/lib.rs)
+# makes in it. Prints the base commit.
 make_change() {
     local target=${WORK}/target out=${FAKE_GH}/artifacts/$1/agent-out commit
     if ! test -d "${target}"; then
@@ -525,6 +539,9 @@ make_change() {
         echo 'pub fn f() {}' >"${target}/src/lib.rs"
         git -C "${target}" add -A
         git -C "${target}" -c user.name=t -c user.email=t@example.com commit -q -m init
+        git -C "${target}" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m side
+        git -C "${target}" branch -q side
+        git -C "${target}" reset -q --hard HEAD^
     fi
     commit=$(git -C "${target}" rev-parse HEAD)
     (cd "${target}" && eval "${2:-echo 'pub fn g() {}' >>src/lib.rs}" && git add -A -N &&
@@ -538,49 +555,124 @@ make_change() {
     echo "${commit}"
 }
 
+# put_patch TEXT: replaces run 1001's change with TEXT, for patches git
+# diff wouldn't write.
+put_patch() {
+    mkdir -p "${FAKE_GH}/artifacts/1001/agent-out"
+    printf '%s\n' "$1" >"${FAKE_GH}/artifacts/1001/agent-out/changes.patch"
+}
+
+# set_json FILE FILTER: FILE through jq FILTER.
+set_json() {
+    jq -c "$2" "$1" >"$1.new" && mv "$1.new" "$1"
+}
+
+apply_run() { # apply_run RUN [ARGS...]: bot-runs apply of RUN to the fake target
+    local run=$1
+    shift
+    "${BOT_RUNS}" apply "${run}" --repo composefs/composefs-rs --slug fsck-sb --message "${WORK}/message" \
+        --source "${WORK}/target" "$@"
+}
+
 test_apply() {
     local commit out dir bot
     bot=$("${TESTS}/../bin/bot-operator" --json | jq -r '"\(.bot.git_name) <\(.bot.git_email)>"')
     commit=$(make_change 1001)
-    out=$("${BOT_RUNS}" apply 1001 --slug fsck-sb --message "${WORK}/message" --source "${WORK}/target" --json)
+    # No hook of the caller's runs.
+    mkdir -p "${WORK}/hooks"
+    for h in post-checkout pre-commit commit-msg post-commit; do
+        printf '#!/bin/sh\ntouch %s/hook-ran\n' "${WORK}" >"${WORK}/hooks/${h}"
+        chmod +x "${WORK}/hooks/${h}"
+    done
+    git config --global core.hooksPath "${WORK}/hooks"
+    out=$(apply_run 1001 --base main --json)
     dir=${XDG_CACHE_HOME}/bot-runs/apply/1001-fsck-sb
     expect_json "$(jq -c 'del(.head)' <<<"${out}")" "$(jq -nc --arg c "${commit}" --arg d "${dir}" '{run_id: 1001,
+        run_url: "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1001/attempts/1",
+        workflow_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         repo: "composefs/composefs-rs", base: "main", base_commit: $c, branch: "bot/fsck-sb", dir: $d,
         item: "PVTI_item1", files: ["src/lib.rs"]}')" "apply --json"
+    test ! -e "${WORK}/hook-ran" || fail "apply ran a hook"
     expect_eq "$(git -C "${dir}" rev-parse HEAD^)" "${commit}" "parent"
     expect_eq "$(git -C "${dir}" rev-parse --abbrev-ref HEAD)" bot/fsck-sb "branch"
     expect_eq "$(git -C "${dir}" log -1 --format='%an <%ae>|%cn <%ce>')" "${bot}|${bot}" "identity"
     expect_eq "$(git -C "${dir}" log -1 --format='%(trailers:key=Generated-by,valueonly)' | head -n1)" AI "AI trailer"
+    expect_eq "$(git -C "${dir}" log -1 --format='%(trailers:key=Agent-run,valueonly)' | head -n1)" \
+        https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1001/attempts/1 "run trailer"
     expect_eq "$(git -C "${dir}" show HEAD:src/lib.rs | tail -n1)" 'pub fn g() {}' "applied content"
     test -z "$(git -C "${dir}" status --porcelain)" || fail "apply left changes uncommitted"
+    # Its origin can't be pushed to, by accident or otherwise.
+    git -C "${dir}" -c core.hooksPath=/dev/null push -q origin HEAD 2>/dev/null && fail "pushed to origin"
     # Never over an existing directory.
-    out=$("${BOT_RUNS}" apply 1001 --slug fsck-sb --message "${WORK}/message" --source "${WORK}/target" 2>&1) &&
-        fail "applied over an existing directory"
+    out=$(apply_run 1001 2>&1) && fail "applied over an existing directory"
     expect_lines "${out}" "already exists"
 }
 
-# Each refusal: RUN, the change's EDIT (or - for none), extra setup,
-# and the expected error.
+# Each refusal: RUN, the declared repository, the change's EDIT (- for
+# none), extra setup (in which $OUT is run 1001's agent-out), and the
+# expected error. Nothing is left behind.
+# shellcheck disable=SC2034 # OUT and sha are for the setups' eval
 test_apply_refused() {
-    local run edit setup want out
-    while IFS='|' read -r run edit setup want; do
-        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${FAKE_GH}/artifacts/${run}/agent-out"
+    local run repo edit setup want out OUT=${FAKE_GH}/artifacts/1001/agent-out sha
+    while IFS='|' read -r run repo edit setup want; do
+        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${FAKE_GH}/artifacts/${run}/agent-out" "${FAKE_GH}"/filter-*.jq
+        cp "${FIXTURES}/expired.txt" "${FAKE_GH}/expired.txt"
+        cp "${FIXTURES}/artifacts/1001/agent-run/summary.json" "${FAKE_GH}/artifacts/1001/agent-run/summary.json"
+        rm -rf "${XDG_STATE_HOME}/bot-runs"
         echo 'A subject' >"${WORK}/message"
         test "${edit}" = - || make_change "${run}" "${edit}" >/dev/null
+        sha=$(git -C "${WORK}/target" rev-parse HEAD)
         eval "${setup}"
-        out=$("${BOT_RUNS}" apply "${run}" --slug s --message "${WORK}/message" --source "${WORK}/target" 2>&1) &&
+        out=$("${BOT_RUNS}" apply "${run}" --repo "${repo}" --slug s --message "${WORK}/message" --source "${WORK}/target" 2>&1) &&
             fail "applied run ${run} (${want})"
         expect_lines "${out}" "${want}"
+        test ! -e "${XDG_CACHE_HOME}/bot-runs/apply/${run}-s" || fail "left a clone behind (${want})"
     done <<'EOF'
-1001|mkdir -p .github/workflows && echo x >.github/workflows/ci.yml|:|\.github/workflows/ci\.yml \(protected path\)
-1001|echo x >.gitmodules|:|\.gitmodules \(protected path\)
-1001|ln -s /etc/passwd leak|:|leak \(symlink or submodule\)
-1001|echo "t=ghp_$(printf 'a%.0s' $(seq 36))" >>src/lib.rs|:|secret-shaped string
-1001|echo x >>src/lib.rs|jq '.repo = "other/repo"' "${FAKE_GH}/artifacts/1001/agent-out/base.json" >"${WORK}/b" && mv "${WORK}/b" "${FAKE_GH}/artifacts/1001/agent-out/base.json"|another repository
-1001|echo x >>src/lib.rs|printf 'x\n\nSigned-off-by: A <a@b>\n' >"${WORK}/message"|has a Signed-off-by
-1001|-|:|has no agent-out artifact
-1002|echo x >>src/lib.rs|:|agent result is failure, not success
-1004|echo x >>src/lib.rs|:|run 1004 is failure, not success
+1001|composefs/composefs-rs|mkdir -p .github/workflows && echo x >.github/workflows/ci.yml|:|\.github/workflows/ci\.yml \(protected path\)
+1001|composefs/composefs-rs|echo x >.gitmodules|:|\.gitmodules \(protected path\)
+1001|composefs/composefs-rs|echo '* filter=x' >.gitattributes|:|\.gitattributes \(protected path\)
+1001|composefs/composefs-rs|mkdir -p src/.githooks && echo x >src/.githooks/pre-commit|:|src/\.githooks/pre-commit \(protected path\)
+1001|composefs/composefs-rs|mkdir .husky && echo x >.husky/pre-commit|:|\.husky/pre-commit \(protected path\)
+1001|composefs/composefs-rs|echo 'repos: []' >.pre-commit-config.yaml|:|\.pre-commit-config\.yaml \(protected path\)
+1001|composefs/composefs-rs|ln -s /etc/passwd leak|:|leak \(symlink or submodule\)
+1001|composefs/composefs-rs|-|put_patch "$(printf 'diff --git a/sub b/sub\nnew file mode 160000\nindex 0000000..%s\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit %s' "${sha}" "${sha}")"; jq -nc --arg c "${sha}" '{repo: "composefs/composefs-rs", ref: "main", commit: $c}' >"${OUT}/base.json"|sub \(symlink or submodule\)
+1001|composefs/composefs-rs|chmod +x src/lib.rs|:|src/lib\.rs \(mode change 100644 to 100755\)
+1001|composefs/composefs-rs|echo x >run.sh && chmod +x run.sh|:|run\.sh \(new file mode 100755\)
+1001|composefs/composefs-rs|printf '\0\1\2' >blob.bin|:|blob\.bin \(binary\)
+1001|composefs/composefs-rs|echo x >'a b'|:|a b \(not a plain relative path\)
+1001|composefs/composefs-rs|echo x >-rf|:|-rf \(not a plain relative path\)
+1001|composefs/composefs-rs|echo x >x|put_patch "$(sed 's,\([ab]\)/x,\1/../x,g' "${WORK}/changes.patch")"|doesn't apply
+1001|composefs/composefs-rs|for i in $(seq 101); do echo "${i}" >"f${i}"; done|:|touches 101 files, over 100
+1001|composefs/composefs-rs|echo "t=ghp_$(printf 'a%.0s' $(seq 36))" >>src/lib.rs|:|secret-shaped string
+1001|composefs/composefs-rs|echo "k=AIza$(printf 'b%.0s' $(seq 35))" >>src/lib.rs|:|secret-shaped string
+1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${OUT}/base.json" '.repo = "other/repo"'|base\.json names another repository
+1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${OUT}/base.json" '.ref = "release"'|base\.json ref \(release\) differs
+1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${OUT}/base.json" ".commit = \"$(git -C "${WORK}/target" rev-parse side)\""|is not on main of
+1001|other/repo|echo x >>src/lib.rs|:|dispatched for composefs/composefs-rs, not other/repo
+1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" '.repo = "other/repo"'|summary names other/repo, not composefs/composefs-rs
+1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" '.run_id = 999'|summary is of run 999
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.event = "push"' >"${FAKE_GH}/filter-run.jq"|triggered by push, not a dispatch
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.head_branch = "evil"' >"${FAKE_GH}/filter-run.jq"|ran the workflow from evil, not bot/agent-run-praxis
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.path = ".github/workflows/other.yml"' >"${FAKE_GH}/filter-run.jq"|ran \.github/workflows/other\.yml
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.head_repository.id = 9' >"${FAKE_GH}/filter-run.jq"|ran code from another repository
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.repository.full_name = "x/y"' >"${FAKE_GH}/filter-run.jq"|is in x/y, not bootc-dev/cgwalters-devspace-sandbox
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs += [.jobs[0] + {name: "Other"}]' >"${FAKE_GH}/filter-jobs.jq"|has 2 jobs, not just Agent
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs[0].name = "Other"' >"${FAKE_GH}/filter-jobs.jq"|has job Other, not Agent
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs[0].head_sha = "b"' >"${FAKE_GH}/filter-jobs.jq"|job of another run or head
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts[-1].workflow_run.head_sha = "b"' >"${FAKE_GH}/filter-artifacts.jq"|artifact of another run or head
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts[-1].workflow_run.id = 1002' >"${FAKE_GH}/filter-artifacts.jq"|artifact of another run or head
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts[-1].created_at = "2026-09-20T11:00:00Z"' >"${FAKE_GH}/filter-artifacts.jq"|artifact made outside its agent job
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts += [.artifacts[-1]]' >"${FAKE_GH}/filter-artifacts.jq"|has 2 agent-out artifacts
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts[-1].size_in_bytes = 99999999' >"${FAKE_GH}/filter-artifacts.jq"|artifact of 99999999 bytes
+1001|composefs/composefs-rs|echo x >>src/lib.rs|head -c $((9 << 20)) /dev/zero >"${OUT}/changes.patch"|patch of 9437184 bytes, over 8388608
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo x >"${OUT}/extra"|unexpected file extra
+1001|composefs/composefs-rs|echo x >>src/lib.rs|ln -s base.json "${OUT}/link"|non-regular file link
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '1001 agent-out' >>"${FAKE_GH}/expired.txt"|expired artifact
+1001|composefs/composefs-rs|echo x >>src/lib.rs|printf 'x\n\nSigned-off-by: A <a@b>\n' >"${WORK}/message"|has a Signed-off-by
+1001|composefs/composefs-rs|echo x >>src/lib.rs|printf 'x\n\nAgent-run: https://example.com\n' >"${WORK}/message"|has an Agent-run trailer
+1001|composefs/composefs-rs|-|:|has no agent-out artifact
+1002|composefs/composefs-rs|echo x >>src/lib.rs|:|agent result is failure, not success
+1004|containers/composefs|echo x >>src/lib.rs|:|run 1004 is failure, not success
 EOF
 }
 
