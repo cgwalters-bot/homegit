@@ -273,6 +273,9 @@ Commands:
                               match its item's Priority and Org ('P0',
                               '${TARGET_LABEL_PREFIX}bootc-dev'); 'set', 'issue',
                               'question' and 'fill-org' keep them in sync
+  field-ensure NAME           Add the text field NAME to the board unless it
+                              has one (bot-runs keeps an item's agent run
+                              in a 'Run' field)
   state-get [--track] NAME    Print the JSON state kept in the archived
                               draft item '${STATE_PREFIX}NAME' ({} if it
                               doesn't exist yet). --track records it as
@@ -1548,6 +1551,23 @@ cmd_labels() {
     echo "${n} tracker issue(s) $(${dry_run} && echo "would be synced" || echo synced)" 1>&2
 }
 
+# --- Fields ----------------------------------------------------------------
+
+cmd_field_ensure() {
+    { test $# -eq 1 && test -n "$1"; } || fatal "usage: $(basename "$0") field-ensure NAME"
+    local name=$1
+    load_fields
+    has_field "${name}" && return 0
+    # The cached field list may predate it.
+    refresh=true FIELDS_JSON=
+    load_fields
+    has_field "${name}" && return 0
+    ghq project field-create "${NUMBER}" --owner "${OWNER}" --name "${name}" --data-type TEXT >/dev/null ||
+        fail_after $? "creating the text field '${name}' on ${BOARD_URL} failed (gh needs the project scope)"
+    rm -f "${BOARD_CACHE}/fields.json"
+    echo "Created the text field '${name}' on ${BOARD_URL}" 1>&2
+}
+
 # --- State items -----------------------------------------------------------
 
 # gqlq QUERY [ARGS...]: a GraphQL call through ghq; prints .data.
@@ -1825,6 +1845,7 @@ case "${command}" in
     list|show|add|draft|set|issue|resolve) ;;
     question) workstream_only "${command}" ;;
     fill-org) command=fill_org ;;
+    field-ensure) command=field_ensure ;;
     labels) workstream_only "${command}" ;;
     state-get) workstream_only "${command}"; command=state_get ;;
     state-put) workstream_only "${command}"; command=state_put ;;
