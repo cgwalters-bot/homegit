@@ -643,11 +643,15 @@ test_dispatch() {
     printf 'Fix the fsck bug.\n' >"${WORK}/brief.md"
     out=$("${BOT_RUNS}" dispatch --item PVTI_item1 --repo composefs/composefs-rs --cores 16 --budget 250 "${WORK}/brief.md")
     expect_eq "${out}" "Dispatched run 1006: https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006" "dispatch output"
-    expect_json "$(cat "${FAKE_GH}/dispatch-body.json")" '{"ref": "main", "return_run_details": true, "inputs": {
+    expect_json "$(jq -c '.inputs.brief = null' "${FAKE_GH}/dispatch-body.json")" '{"ref": "main", "return_run_details": true, "inputs": {
         "item": "PVTI_item1", "repo": "composefs/composefs-rs", "base": "main", "agent": "claude", "model": "",
-        "cores": "16", "timeout": "120", "budget": "250", "workflow": "branch", "brief": "Fix the fsck bug."}}' "dispatch request"
+        "cores": "16", "timeout": "120", "budget": "250", "workflow": "branch", "brief": null}}' "dispatch request"
+    # The runner brief, the run's target, then the task.
+    jq -e --rawfile p "${TESTS}/../dotfiles/.agents/skills/coordinator/runner-preamble.md" \
+        '.inputs.brief == $p + "\n---\n\nThis run: a `branch` run on composefs/composefs-rs at `main`.\n\nThe task:\n\nFix the fsck bug."' \
+        "${FAKE_GH}/dispatch-body.json" >/dev/null || fail "dispatch brief: $(jq .inputs.brief "${FAKE_GH}/dispatch-body.json")"
     out=$(echo "Write up the bisect." | "${BOT_RUNS}" dispatch --json --item PVTI_item2 --repo bootc-dev/bootc \
-        --agent opencode --model gpt-5-codex --workflow analysis --timeout 330 -)
+        --agent opencode --model gpt-5-codex --workflow analysis --timeout 330 --no-preamble -)
     expect_json "${out}" '{"run_id": 1006, "url": "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006",
         "api_url": "https://api.github.com/repos/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006"}' "dispatch --json"
     expect_json "$(jq -c '.inputs | {agent, model, workflow, timeout, brief}' "${FAKE_GH}/dispatch-body.json")" \
@@ -680,19 +684,25 @@ test_dispatch_invalid() {
         "BRIEF=${WORK}/missing.md|cannot read"
         "--repo private-org/secret|private-org/secret is not public (private)"
         "--repo gone/away|cannot confirm that gone/away is public"
+        "PREAMBLE=${WORK}/missing.md|cannot read the runner brief"
     )
     local c args want brief out
     for c in "${cases[@]}"; do
         want=${c#*|}
         brief=${WORK}/brief.md
         args=()
+        local preamble=""
         if [[ "${c%%|*}" == BRIEF=* ]]; then
             brief=${c%%|*}
             brief=${brief#BRIEF=}
+        elif [[ "${c%%|*}" == PREAMBLE=* ]]; then
+            preamble=${c%%|*}
+            preamble=${preamble#PREAMBLE=}
         else
             read -ra args <<<"${c%%|*}"
         fi
-        out=$("${BOT_RUNS}" dispatch "${ok[@]}" "${args[@]}" "${brief}" 2>&1) && fail "dispatched with ${c%%|*}"
+        out=$(BOT_RUNS_PREAMBLE=${preamble:-${BOT_RUNS_PREAMBLE:-}} "${BOT_RUNS}" dispatch "${ok[@]}" "${args[@]}" "${brief}" 2>&1) &&
+            fail "dispatched with ${c%%|*}"
         grep -qF -- "${want}" <<<"${out}" || fail "${c%%|*}: expected '${want}', got: ${out}"
     done
     test ! -e "${FAKE_GH}/dispatch-body.json" || fail "an invalid dispatch was sent"

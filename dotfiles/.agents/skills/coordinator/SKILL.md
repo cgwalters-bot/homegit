@@ -69,6 +69,10 @@ to this one, by path in the homegit checkout
 - `reviewer-preamble.md` for a reviewer;
 - `policy-check.md` for a policy check (see "Promote" below).
 
+A worker dispatched to a devspace runner (`bin/bot-runs dispatch`) gets
+`runner-preamble.md` instead: `bot-runs` puts it before the brief
+itself, so the brief holds only the task.
+
 Then comes the task itself: the board item or ask, the repository and
 base branch, the worker's scratch dir (e.g. a per-task directory under
 the session scratchpad), and anything specific. When the task needs a
