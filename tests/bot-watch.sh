@@ -757,7 +757,9 @@ cp "${WORK}/search.json.orig" "${REST}/search/issues.json"
 # needs a human: whose item is Needs human (bot-watch's question) it
 # stays, another is only listed. The open issue stays, and so does the
 # issue last seen closed whose read failed: it may have been reopened. A
-# --board-file sweep only says what --apply would do.
+# --board-file sweep only says what --apply would do. Of the two Draft
+# items still led, Lead coordinator (a worker's claim) is cleared, a
+# topic's Lead stays.
 readonly CD_ISSUE=${GH}/example/cd/issues/1 CD_MERGED=${GH}/example/cd/pull/2 CD_CLOSED=${GH}/example/cd/pull/3
 readonly CD_REOPENED=${GH}/example/cd/issues/4 CD_ASK=${GH}/example/cd/pull/5
 readonly CD_HEAD=cccc000000000000000000000000000000000001
@@ -781,7 +783,9 @@ jq -n --arg i "${CD_ISSUE}" --arg m "${CD_MERGED}" --arg c "${CD_CLOSED}" --arg 
     {id: "PVTI_cd3", title: "Closed", status: "Needs human", content: {type: "PullRequest", url: $c}},
     {id: "PVTI_cd4", title: "Open", status: "Draft", content: {type: "Issue", url: $open}},
     {id: "PVTI_cd5", title: "Reopened", status: "Todo", content: {type: "Issue", url: $r}},
-    {id: "PVTI_cd6", title: "Closed unmerged", status: "In Review", content: {type: "PullRequest", url: $a}}]' >"${WORK}/cd-board.json"
+    {id: "PVTI_cd6", title: "Closed unmerged", status: "In Review", content: {type: "PullRequest", url: $a}},
+    {id: "PVTI_cd7", title: "Claimed", status: "Draft", lead: "coordinator", content: {type: "Issue", url: $open}},
+    {id: "PVTI_cd8", title: "Topic", status: "Draft", lead: "wfc", content: {type: "Issue", url: $open}}]' >"${WORK}/cd-board.json"
 for mode in --json --dry-run; do
     jq -c --arg r "${CD_REOPENED}" '.items[$r] = {updated_at: "2026-09-20T00:00:00Z", state: "closed", edge_ids: []}' <<<"${EARLIER}" >"${WORK}/cd.state"
     rc=0
@@ -797,6 +801,10 @@ jq -e --arg i "${CD_ISSUE}" --arg m "${CD_MERGED}" --arg a "${CD_ASK}" \
     '(.closed_done | map([.url, .id, .applied])) == [[$i, "PVTI_cd1", null], [$m, "PVTI_cd2", null], [$a, null, null]]
     and (.closed_done_failed | not)' "${WORK}/cd--json" >/dev/null ||
     fail "cd: closed, set Done: $(jq -c '{closed_done, closed_done_failed}' "${WORK}/cd--json")"
+jq -e --arg open "${ISSUE}" '(.stale_lead | map([.url, .id, .applied])) == [[$open, "PVTI_cd7", null]] and (.stale_lead_failed | not)' \
+    "${WORK}/cd--json" >/dev/null || fail "cd: stale Lead: $(jq -c '{stale_lead, stale_lead_failed}' "${WORK}/cd--json")"
+[[ "$(<"${WORK}/cd--dry-run")" == *$'Stale Lead cleared:\n  '"${ISSUE}"$': Lead coordinator, but it is Draft: clear its Lead (--apply would do it)\n\n'* ]] ||
+    fail "cd: the text report lacks the stale Lead section: $(cat "${WORK}/cd--dry-run")"
 [[ "$(<"${WORK}/cd--dry-run")" == *$'Closed, set Done:\n  '"${CD_ISSUE}"$': its issue closed, but it is Draft: set it Done (--apply would do it)\n  '"${CD_MERGED}"$': its PR merged, but it is In Review: set it Done (--apply would do it)\n  '"${CD_ASK}"$': its PR closed unmerged, but it is In Review: ask the operator whether to drop it (Done) or redo it (Needs human), or set it Done if it is clear (a human decides)\n\n'* ]] ||
     fail "cd: the text report lacks the section: $(cat "${WORK}/cd--dry-run")"
 

@@ -553,7 +553,12 @@ bot-pace assign "$ITEM"
 ```
 
 The board status and Lead are the claim: an item In Progress with no
-Lead (or Run) is nobody's, and `bot-reconcile` asks about it. Don't assign yourself or comment on the
+Lead (or Run) is nobody's, and `bot-reconcile` asks about it. The claim
+ends when the item leaves In Progress: any `bot-board set --status`
+(`bot-pr promote`, `bot-runs reconcile` and bot-watch's bookkeeping go
+through it) clears Lead `coordinator` in the same write, and
+`bot-reconcile`'s stale-lead rule clears any left over. A topic's Lead
+stays in every status. Don't assign yourself or comment on the
 upstream issue: the bot usually lacks triage access, and while the output
 is an unsubmitted branch or a private write-up there is nothing for
 maintainers to see yet. Claiming upstream is for the `pr` workflow, and

@@ -290,13 +290,16 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
 - **answer-unapplied:** a question the operator answered whose Unblocks
   items are still open and untouched since the answer.
 - **closed-not-done:** an item whose own issue or PR is closed or merged
-  is Done, once none of its Branch PRs is open. The one rule safe to
-  carry out unattended: each `bot-watch --apply` sweep runs it with
+  is Done, once none of its Branch PRs is open. Safe to carry out
+  unattended: each `bot-watch --apply` sweep runs it with
   `--apply` on the state it found, and lists what it set under "Closed,
   set Done", so it rarely reaches you. A PR closed unmerged is never set
   Done unattended: its item is listed for you to ask the operator (Needs
   human, as bot-watch does) or set Done when that's clear, and isn't
   listed once it is Needs human, bot-watch's question.
+- **stale-lead:** an item that isn't In Progress still has Lead
+  `coordinator`, a finished worker's claim. The same sweep step clears
+  it (under "Stale Lead cleared"); a topic's Lead is never touched.
 
 `bot-poll-loop` runs it with `--state`, so an action wakes you when it is
 new, and again only if it is still open 2 hours after it last did. On a
@@ -324,7 +327,10 @@ with Lead set, and a finished item is Done. There is no session messaging.
   sets it), never a worker's name: the sweep's `--exclude-lead '*'` leaves
   out any other Lead, so the items would lose their news and bookkeeping,
   and `bot-reconcile` would take the name for a topic's. Which worker is
-  on an item is the heartbeat's to say.
+  on an item is the heartbeat's to say. That Lead ends with In Progress:
+  `bot-board set --status` to anything else clears it, and the sweep's
+  stale-lead rule (`bot-watch --apply`) clears any left over; a topic's
+  Lead stays.
 - **The deterministic tools stay shared.** The P0 drive, auto sign-off and
   promotion (and the priority health lines) run for every item, led or not:
   they derive their step from state and need no judgment. Don't redo

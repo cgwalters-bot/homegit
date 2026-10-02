@@ -40,6 +40,7 @@ const RULE_INPUTS = {
   drive: ["sweep", "prs", "items", "epicItems"],
   "answer-unapplied": ["questions"],
   "closed-not-done": ["items", "contentStates"],
+  "stale-lead": ["items"],
 };
 const MAX_BUFFER = 256 << 20;
 const EX_ERROR = 1;
@@ -55,7 +56,7 @@ function usage() {
 Reconciles like a Kubernetes controller: reads the observed state, compares
 it with the desired one, and prints the actions that would close the gap,
 each with a stable key, a kind, the item's URL and what to do. It changes
-nothing itself, except with --apply (see closed-not-done). Run it on each
+nothing itself, except with --apply (see closed-not-done and stale-lead). Run it on each
 wake, do the actions, then run it again to confirm they converged
 ("Actions: none").
 
@@ -110,9 +111,13 @@ Rules (${rules}):
                     Done, once none of its Branch PRs is open (or unknown).
                     A PR closed unmerged needs a human: listed, but not
                     carried out, and not at all when its item is Needs
-                    human (bot-watch's question to the operator). The one
-                    rule --apply carries out: 'bot-board set ITEM --status
-                    Done --news ...' for each; bot-watch --apply runs it.
+                    human (bot-watch's question to the operator). --apply
+                    carries it out: 'bot-board set ITEM --status Done
+                    --news ...' for each; bot-watch --apply runs it.
+  stale-lead        an item that isn't In Progress has no Lead coordinator
+                    (a worker's claim, which ends there; a topic's Lead
+                    stays). --apply clears it ('bot-board set ITEM --field
+                    Lead ""'); bot-watch --apply runs it.
 
 With --state FILE it remembers the actions across runs, and marks with '*'
 (--json: "fired") the ones that are new, or still there ${rec.RESYNC_MS / 3600e3}h (--resync) after
@@ -318,7 +323,7 @@ function writeState(file, actions, now) {
 async function apply(actions, errors) {
   for (const a of actions.filter((x) => x.apply)) {
     try {
-      await execFileP(tool("bot-board"), ["set", a.apply.id, "--status", a.apply.status, "--news", a.apply.news], { maxBuffer: MAX_BUFFER });
+      await execFileP(tool("bot-board"), ["set", a.apply.id, ...a.apply.set], { maxBuffer: MAX_BUFFER });
       a.applied = "done";
     } catch (e) {
       a.applied = `failed: ${firstLine(e)}`;

@@ -215,6 +215,10 @@ human, so it is only listed, and not at all when its item is Needs human
 (the question below). With --apply it sets the others Done (with News);
 with --dry-run (or --board-file) it says it would.
 
+Then "Stale Lead cleared" (the same call's 'stale-lead' rule): an item
+that left In Progress loses Lead coordinator, a worker's claim; a topic
+session's Lead stays. --apply clears it, --dry-run says it would.
+
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
 lists (fork PRs included) is open: with one of its other PRs (upstream
@@ -1290,7 +1294,7 @@ t0=${EPOCHREALTIME}
 closed_failed=false
 jq --slurpfile results "${scratch}/results.json" \
     '{items: (with_entries(select(.value.state == "gone")) + ($results[0] | map_values(.cur)))}' <<<"${new_seen}" >"${scratch}/seen.json"
-closed_args=(--rule closed-not-done --json --watch-state "${scratch}/seen.json")
+closed_args=(--rule closed-not-done --rule stale-lead --json --watch-state "${scratch}/seen.json")
 if test -n "${board_file}"; then
     closed_args+=(--board-file "${board_file}")
 elif ${apply} && ! ${dry_run}; then
@@ -1301,15 +1305,20 @@ rc=0
 cat "${scratch}/closed.err" 1>&2
 closed_dry=false
 if test -n "${board_file}" || ${dry_run}; then closed_dry=true; fi
-if ! closed=$(jq -c --argjson would "${closed_dry}" '[.actions[] | {url, id: .apply.id, applied: (.applied // null),
-        line: "\(.url): \(.do) (\(if .applied then .applied elif .apply == null then "a human decides"
+# closed_lines KIND: the actions of that rule, for the report.
+closed_lines() {
+    jq -c --arg kind "$1" --argjson would "${closed_dry}" '[.actions[] | select(.kind == $kind) | {url, id: .apply.id, applied: (.applied // null),
+        line: "\(.url // .apply.id): \(.do) (\(if .applied then .applied elif .apply == null then "a human decides"
                 elif $would then "--apply would do it" else "with --apply" end))"}]' \
-        "${scratch}/closed.json" 2>/dev/null); then
+        "${scratch}/closed.json" 2>/dev/null
+}
+if ! closed=$(closed_lines closed-not-done) || ! stale_lead=$(closed_lines stale-lead); then
     closed='[]'
+    stale_lead='[]'
     test "${rc}" -ne 0 || rc="invalid output"
 fi
 if test "${rc}" != 0; then
-    warn "looking for closed items to set Done failed (status ${rc}); its section is incomplete"
+    warn "looking for closed items to set Done and stale Leads to clear failed (status ${rc}); their sections are incomplete"
     closed_failed=true
 fi
 timing "closed, set Done" "${t0}"
@@ -1354,12 +1363,13 @@ if ${json}; then
         --slurpfile propagation <(printf '%s\n' "${propagation}") --argjson propagation_failed "${propagation_failed}" \
         --slurpfile runs <(printf '%s\n' "${runs}") --argjson runs_failed "${runs_failed}" \
         --slurpfile closed <(printf '%s\n' "${closed}") --argjson closed_failed "${closed_failed}" \
+        --slurpfile stale_lead <(printf '%s\n' "${stale_lead}") \
         '$new[0] as $new | $failed[0] as $failed | $gone[0] as $gone
          | $outstanding[0] as $outstanding | $needs_rebase[0] as $needs_rebase
          | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], p0_drive: $drive[0], signoffs: $signoffs[0], promotions: $promotions[0], priority_propagation: $propagation[0],
-          devspace_runs: $runs[0], operator_activity: $activity[0], needs_text: $needs_text[0], closed_done: $closed[0], items: ., outstanding_reviews: $outstanding,
+          devspace_runs: $runs[0], operator_activity: $activity[0], needs_text: $needs_text[0], closed_done: $closed[0], stale_lead: $stale_lead[0], items: ., outstanding_reviews: $outstanding,
           needs_rebase: $needs_rebase, new_urls: $new, failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed,
-          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, operator_activity_failed: $activity_failed, devspace_runs_failed: $runs_failed, priority_propagation_failed: $propagation_failed, closed_done_failed: $closed_failed, state_advanced: $advance}' <<<"${report}"
+          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, operator_activity_failed: $activity_failed, devspace_runs_failed: $runs_failed, priority_propagation_failed: $propagation_failed, closed_done_failed: $closed_failed, stale_lead_failed: $closed_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news. The P0 and P1
     # health lines come first of all.
@@ -1372,6 +1382,7 @@ else
     jq -r 'if length == 0 then empty else "Devspace runs:", (.[] | "  \(.line)"), "" end' <<<"${runs}"
     jq -r 'if length == 0 then empty else "Operator activity:", (.[] | "  \(.line)"), "" end' <<<"${activity}"
     jq -r 'if length == 0 then empty else "Closed, set Done:", (.[] | "  \(.line)"), "" end' <<<"${closed}"
+    jq -r 'if length == 0 then empty else "Stale Lead cleared:", (.[] | "  \(.line)"), "" end' <<<"${stale_lead}"
     jq -r --arg req "${REQUESTER}" "${REPO_REF_JQ}"'
         if length == 0 then empty else
             "Outstanding reviews by \($req):",
