@@ -681,7 +681,7 @@ test_dispatch() {
     out=$("${BOT_RUNS}" dispatch --item PVTI_item1 --repo composefs/composefs-rs --cores 16 --budget 250 "${WORK}/brief.md")
     expect_eq "${out}" "Dispatched run 1006: https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006" "dispatch output"
     expect_json "$(jq -c '.inputs.brief = null' "${FAKE_GH}/dispatch-body.json")" '{"ref": "bot/agent-run-praxis", "return_run_details": true, "inputs": {
-        "item": "PVTI_item1", "repo": "composefs/composefs-rs", "base": "main", "agent": "opencode", "model": "",
+        "item": "PVTI_item1", "repo": "composefs/composefs-rs", "base": "main", "agent": "opencode", "model": "praxis/gpt-6.1-sol",
         "cores": "16", "timeout": "120", "budget": "250", "workflow": "branch", "brief": null}}' "dispatch request"
     # The runner brief, the run's target, then the task.
     jq -e --rawfile p "${TESTS}/../dotfiles/.agents/skills/coordinator/runner-preamble.md" \
@@ -701,6 +701,10 @@ pace budget PVTI_item1
 field-ensure Run
 set PVTI_item2 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 4 cores)
 pace budget PVTI_item2" "board calls"
+    # The default model is opencode's only: --model overrides it, and the
+    # fake agent has none.
+    out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs --agent fake "${WORK}/brief.md")
+    expect_eq "$(jq -r .inputs.model <<<"$(sed 1d <<<"${out}")")" "" "fake agent's model"
     # --dry-run sends nothing.
     : >"${FAKE_GH}/calls"
     : >"${FAKE_GH}/board-calls"

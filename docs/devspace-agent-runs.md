@@ -29,7 +29,7 @@ so no polling is needed to find the run. The inputs are all strings:
 | `repo`     | the target repository, `OWNER/REPO` |
 | `base`     | its base ref |
 | `agent`    | `opencode`, `fake` (scripted, no inference) or `claude` (once the broker holds its credential) |
-| `model`    | the model name, empty for the agent's default |
+| `model`    | the model, as `provider/model` for opencode (`bot-runs dispatch` sends `praxis/gpt-6.1-sol`, GPT-6.1 Sol through the broker, unless `--model` or `BOT_RUNS_MODEL` says otherwise); empty for the agent's own default |
 | `cores`    | `4`, `16` or `64` |
 | `timeout`  | minutes, at most 330 |
 | `budget`   | the spend cap in AIC (1 AIC = $0.01) |
