@@ -33,7 +33,6 @@ so no polling is needed to find the run. The inputs are all strings:
 | `cores`    | `4`, `16` or `64` |
 | `timeout`  | minutes, at most 330 |
 | `budget`   | the spend cap in AIC (1 AIC = $0.01) |
-| `max_tokens` | optional: a token cap for inference through the praxis broker, which can only lower the broker's per-run cap; empty (the default) keeps it |
 | `workflow` | `branch` or `analysis` |
 | `brief`    | the task text: `bot-runs dispatch` sends the runner-side worker brief (`dotfiles/.agents/skills/coordinator/runner-preamble.md`), the run's target, then the given brief, unless `--no-preamble` |
 
@@ -135,7 +134,7 @@ zero.
 | `turns` | integer | model turns |
 | `tokens` | object | `input`, `output`, `cache_read`, `cache_write`: integers |
 | `tokens_source` | string | where `tokens` come from: `praxis` (the broker's record of the run), `proxy` (the job's inference proxy log) or `unverified` (the agent's own report); `null` with no counts |
-| `praxis` | object | for runs through the praxis broker, its usage record's numbers, else `null`: `schema` (`praxis-run-usage/v1`), `state` (`active`, `finished` or `expired`), `max_tokens` (the run's cap), `requests`, `refused` (by a cap), `estimated` (charged without reported usage), and `tokens` with `input` (uncached), `cache_read`, `output`, `reasoning` (within `output`) and `total` (what the cap counts): integers |
+| `praxis` | object | for runs registered with the praxis broker, its usage record's numbers, else `null`: `schema` (`praxis-run-usage/v2`), `state` (`active`, `finished` or `expired`), `requests` (metered), `unmetered` (successful responses whose usage never arrived; the cap keeps their reservation), and `tokens` with `input` (uncached), `cache_read`, `output`, `reasoning` (within `output`) and `total` (what the broker's per-run cap counts): integers |
 | `aic` | number | estimated cost in AIC |
 | `aic_budget` | number | the dispatched budget |
 | `aic_pricing` | string | `api` (billed), `api-equivalent` (a subscription run priced at API rates), `subscription` (no per-token price; the praxis broker caps tokens instead) or `mock` |
