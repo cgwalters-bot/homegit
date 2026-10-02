@@ -164,9 +164,14 @@ so parents show how far along they are.
 ## Cost estimates
 
 Planning is by cost and capacity: every item moved to Todo, and every
-item dispatched without one, gets an **Est. cost** bucket, and when it
-goes Done its **Actual tokens** are filled in (`bot-actuals`, run by the
-coordinator). "Tokens" are fresh ones: input, output and cache writes,
+item dispatched without one, gets an **Est. cost** bucket. Once an agent
+works on it, it has a **Budget tokens** number: the upper bound of its
+Est. cost bucket, or without one of its priority's bucket in the operator
+config's `pacing.budgets` (`bot-pace assign` and `bot-pace budget` set it,
+and so does `bot-runs dispatch`). Its **Actual tokens** are filled in
+while it is busy and once it is Done (`bot-actuals --open`, which each
+bot-sweep runs), and `bot-reconcile` flags a busy item that spent more than
+its budget. "Tokens" are fresh ones: input, output and cache writes,
 not cache reads (re-reading context is 90% of the raw count, grows with a
 session's length, and costs a tenth as much). Set it with
 `bot-board set "$ITEM" --field "Est. cost" "S (<1M tok)"`; a worker that
@@ -510,14 +515,17 @@ that in the Why field and set Needs human rather than silently skipping it.
 
 **1. Claim.** Listings are cached for a minute and other agents may be
 working the board, so re-read the item first and skip it if it is no
-longer Todo or someone else took it. Then set In Progress:
+longer Todo or someone else took it. Then claim it, which sets In
+Progress, Lead `coordinator` and its budget (an item the coordinator
+assigned to you is claimed already):
 
 ```bash
 bot-board --refresh show "$ITEM"
-bot-board set "$ITEM" --status "In Progress"
+bot-pace assign "$ITEM"
 ```
 
-The board status is the claim. Don't assign yourself or comment on the
+The board status and Lead are the claim: an item In Progress with no
+Lead (or Run) is nobody's, and `bot-reconcile` asks about it. Don't assign yourself or comment on the
 upstream issue: the bot usually lacks triage access, and while the output
 is an unsubmitted branch or a private write-up there is nothing for
 maintainers to see yet. Claiming upstream is for the `pr` workflow, and
