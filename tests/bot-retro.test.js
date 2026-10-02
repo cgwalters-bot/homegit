@@ -106,9 +106,41 @@ test("a scan finds each planted problem, and none in the clean agent", () => {
   assert.deepEqual(agentsOf(summary, "exit_101"), ["run-2001/main"]);
   assert.equal(summary.sources.runs.missing_transcripts, 1);
   assert.deepEqual(summary.reviews.verdicts, { approve: 0, changes: 1, none: 0 });
+  // Its "**Verdict: CHANGES.**" is a verdict, but not the required line.
+  assert.equal(summary.reviews.without_verdict_line, 1);
   assert.deepEqual(summary.reviews.items[0].findings.map((f) => f.category), ["correctness", "tests", "claims"]);
   assert.ok(summary.proposals.length > 0 && summary.proposals.length <= 5);
   assert.equal(summary.proposals[0].kind, summary.signals[0].kind);
+});
+
+test("reviewOf reads the required Verdict line, else a verdict anywhere", () => {
+  // [final text, verdict, whether it starts with the required line]
+  const cases = [
+    ["Verdict: APPROVE\n\nNo findings.", "approve", true],
+    ["Verdict: CHANGES\nMinor fixes.\n\n1. **Wrong exit status**", "changes", true],
+    ["\n  Verdict: APPROVE  \n", "approve", true],
+    ["**Verdict: CHANGES.** Two things to fix.", "changes", false],
+    ["Verdict: approve", "approve", false],
+    ["Looks fine.\n\nVerdict: APPROVE", "approve", false],
+    ["## Verdict: ship as-is", "approve", false],
+    ["Verdict: minor fixes", "changes", false],
+    ["Verdict: needs rework", "changes", false],
+    ["All good, nothing to add.", null, false],
+  ];
+  for (const [finalText, verdict, line] of cases) {
+    const r = retro.reviewOf({ id: "r", description: "Review PR 1", finalText });
+    assert.equal(r.verdict, verdict, JSON.stringify(finalText));
+    assert.equal(r.verdict_line, line, JSON.stringify(finalText));
+  }
+  assert.equal(retro.reviewOf({ id: "w", description: "Implement X", finalText: "Verdict: APPROVE" }), null);
+});
+
+test("the reviewer preamble's Verdict lines are the ones bot-retro requires", () => {
+  const preamble = fs.readFileSync(path.join(__dirname, "..", "dotfiles", ".agents", "skills", "coordinator", "reviewer-preamble.md"), "utf8");
+  const lines = preamble.split("\n").filter((l) => l.startsWith("Verdict: "));
+  const verdicts = lines.map((l) => retro.reviewOf({ id: "r", description: "Review", finalText: l }));
+  assert.ok(verdicts.every((r) => r.verdict_line), `not all accepted: ${lines}`);
+  assert.deepEqual(verdicts.map((r) => r.verdict).sort(), ["approve", "changes"]);
 });
 
 test("the window and source switches limit what is read", () => {

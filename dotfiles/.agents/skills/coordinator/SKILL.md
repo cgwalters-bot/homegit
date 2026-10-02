@@ -701,8 +701,9 @@ cost when an item is far off (two buckets), and correct the table in
 - **Review every result.** When a worker reports back, start an
   independent reviewer subagent on its branch or gist, and send the
   findings to the same worker (resuming it, so it keeps its context) to
-  fix. Repeat until the reviewer says it can ship before pointing
-  the operator at it. For a forge PR, the reviewer also posts a review
+  fix. Repeat until the reviewer's report starts with `Verdict: APPROVE`
+  (see `reviewer-preamble.md`; a report without that line is no
+  approval) before pointing the operator at it. For a forge PR, the reviewer also posts a review
   guide (`bin/bot-review-guide`, see `reviewer-preamble.md`): the
   hotspots to read closely and what to skim, which the review app
   (<https://cgwalters-forge.github.io/review/>) walks and tints in the

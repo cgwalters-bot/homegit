@@ -525,7 +525,11 @@ function scanCommand(agent, cmd, cwd, sig, out) {
 // --- reviewer verdicts ---------------------------------------------------------
 
 const REVIEWER_RE = /^(security |code |independent )?re-?review|^review\b/i;
-const VERDICT_RE = /verdict:?\**:?\s*\**\s*(approve[d]?|changes(?: requested| needed)?|request(?:ed)? changes|needs[ -]work|reject(?:ed)?|block(?:ed)?)/i;
+// The first line reviewer-preamble.md requires of a reviewer's report.
+const VERDICT_LINE_RE = /^Verdict: (APPROVE|CHANGES)$/;
+// A verdict anywhere in the text, for reports that lack that line
+// (including the older preamble's ship as-is / minor fixes / needs rework).
+const VERDICT_RE = /verdict:?\**:?\s*\**\s*(approve[d]?|changes(?: requested| needed)?|request(?:ed)? changes|needs[ -](?:work|rework)|minor fixes|ship(?: it| as[- ]is)?|reject(?:ed)?|block(?:ed)?)/i;
 const FINDING_RE = /^\s*\d+\.\s+\*\*([^*]{3,160})\*\*/gm;
 const FINDING_CATEGORIES = [
   ["security", /secur|inject|token|secret|spoof|trust|permission|credential|leak|bypass|forged?\b/i],
@@ -546,14 +550,16 @@ function categorizeFinding(title) {
 
 function reviewOf(agent) {
   if (!agent.description || !REVIEWER_RE.test(agent.description) || !agent.finalText) return null;
-  const v = VERDICT_RE.exec(agent.finalText);
+  const first = agent.finalText.trim().split("\n", 1)[0].trim();
+  const line = VERDICT_LINE_RE.exec(first);
+  const v = line || VERDICT_RE.exec(agent.finalText);
   let verdict = v ? v[1].toLowerCase() : null;
-  if (verdict) verdict = /approve/.test(verdict) ? "approve" : "changes";
+  if (verdict) verdict = /approve|ship/.test(verdict) ? "approve" : "changes";
   const findings = [...agent.finalText.matchAll(FINDING_RE)]
     .map((m) => m[1].replace(/[:.]\s*$/, "").trim())
     .filter((t) => !/^(verdict|findings|what i ran|commit hygiene)\b/i.test(t))
     .map((t) => ({ title: quote(t, 100), category: categorizeFinding(t) }));
-  return { agent: agent.id, description: agent.description, verdict, findings };
+  return { agent: agent.id, description: agent.description, verdict, verdict_line: Boolean(line), findings };
 }
 
 // --- sources --------------------------------------------------------------------
@@ -752,7 +758,7 @@ function summarize(opts, window, out) {
       graphql_calls: Object.values(out.graphql).reduce((n, c) => n + c, 0),
     },
     signals: kinds,
-    reviews: { verdicts, finding_categories: findingCats, items: reviews },
+    reviews: { verdicts, without_verdict_line: reviews.filter((r) => !r.verdict_line).length, finding_categories: findingCats, items: reviews },
     manual_steps: manual,
     runs: out.runs,
     agents: out.agents.filter((a) => a.errors > 0 || out.signals.some((s) => s.agent === a.id && s.category !== "error"))
@@ -821,7 +827,7 @@ function render(summary, narrative) {
   const r = summary.reviews;
   if (r.items.length) {
     L.push("## Reviewer findings", "");
-    L.push(`${r.items.length} review(s): ${r.verdicts.approve} approve, ${r.verdicts.changes} changes, ${r.verdicts.none} without an explicit verdict. Findings by category: ${Object.entries(r.finding_categories).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c} ${n}`).join(", ") || "none"}.`, "");
+    L.push(`${r.items.length} review(s): ${r.verdicts.approve} approve, ${r.verdicts.changes} changes, ${r.verdicts.none} without an explicit verdict; ${r.without_verdict_line} not starting with the required 'Verdict: APPROVE' or 'Verdict: CHANGES' line. Findings by category: ${Object.entries(r.finding_categories).sort((a, b) => b[1] - a[1]).map(([c, n]) => `${c} ${n}`).join(", ") || "none"}.`, "");
     for (const it of r.items.filter((i) => i.findings.length)) {
       L.push(`- ${quote(it.description, 80)} (${it.verdict || "no verdict"}): ${it.findings.slice(0, 4).map((f) => `${f.title} [${f.category}]`).join("; ")}`);
     }
