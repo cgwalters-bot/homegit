@@ -750,5 +750,55 @@ jq -e --arg u "${PD}" --arg t "${PD_TEXT}" '(.promotions | map([.url, .result, .
     fail "pd: the text report lacks the sections: $(cat "${WORK}/pd--dry-run")"
 cp "${WORK}/search.json.orig" "${REST}/search/issues.json"
 
+# --- Closed, set Done ---
+# Items whose own issue or PR closed or merged with no sweep seeing it
+# happen (a bot-land PR merged between sweeps) are Done whatever their
+# Status: the closed issue and the merged PR are. A PR closed unmerged
+# needs a human: whose item is Needs human (bot-watch's question) it
+# stays, another is only listed. The open issue stays, and so does the
+# issue last seen closed whose read failed: it may have been reopened. A
+# --board-file sweep only says what --apply would do.
+readonly CD_ISSUE=${GH}/example/cd/issues/1 CD_MERGED=${GH}/example/cd/pull/2 CD_CLOSED=${GH}/example/cd/pull/3
+readonly CD_REOPENED=${GH}/example/cd/issues/4 CD_ASK=${GH}/example/cd/pull/5
+readonly CD_HEAD=cccc000000000000000000000000000000000001
+put repos/example/cd/issues/1 '{"state": "closed", "title": "Fixed", "updated_at": "2026-09-25T10:00:00Z",
+    "created_at": "2026-09-01T10:00:00Z", "user": {"login": "someone"}}'
+: | comments repos/example/cd/issues/1
+mkdir -p "${REST}/repos/example/cd/issues"
+printf '502 Bad Gateway\nHTTP 502: Bad Gateway\n' >"${REST}/repos/example/cd/issues/4.fail"
+for n in 2 3 5; do
+    pr example/cd "${n}" "${CD_HEAD}" 2026-09-25T11:00:00Z
+    jq --argjson merged "$(test "${n}" = 2 && echo true || echo false)" '.state = "closed" | .merged = $merged' \
+        "${REST}/repos/example/cd/pulls/${n}.json" >"${WORK}/cd.json" && mv "${WORK}/cd.json" "${REST}/repos/example/cd/pulls/${n}.json"
+    : | reviews "repos/example/cd/pulls/${n}"
+    : | comments "repos/example/cd/issues/${n}"
+    : | comments "repos/example/cd/pulls/${n}"
+done
+commit example/cd "${CD_HEAD}" 2026-09-25T10:30:00Z
+jq -n --arg i "${CD_ISSUE}" --arg m "${CD_MERGED}" --arg c "${CD_CLOSED}" --arg open "${ISSUE}" --arg r "${CD_REOPENED}" --arg a "${CD_ASK}" '[
+    {id: "PVTI_cd1", title: "Fixed", status: "Draft", content: {type: "Issue", url: $i}},
+    {id: "PVTI_cd2", title: "Merged", status: "In Review", content: {type: "PullRequest", url: $m}},
+    {id: "PVTI_cd3", title: "Closed", status: "Needs human", content: {type: "PullRequest", url: $c}},
+    {id: "PVTI_cd4", title: "Open", status: "Draft", content: {type: "Issue", url: $open}},
+    {id: "PVTI_cd5", title: "Reopened", status: "Todo", content: {type: "Issue", url: $r}},
+    {id: "PVTI_cd6", title: "Closed unmerged", status: "In Review", content: {type: "PullRequest", url: $a}}]' >"${WORK}/cd-board.json"
+for mode in --json --dry-run; do
+    jq -c --arg r "${CD_REOPENED}" '.items[$r] = {updated_at: "2026-09-20T00:00:00Z", state: "closed", edge_ids: []}' <<<"${EARLIER}" >"${WORK}/cd.state"
+    rc=0
+    "${BOT_WATCH}" --apply "${mode}" --now 2026-09-25T18:00:00Z --board-file "${WORK}/cd-board.json" \
+        --state-file "${WORK}/cd.state" >"${WORK}/cd${mode}" 2>"${WORK}/cd.err" || rc=$?
+    # The failed read is the only failure.
+    if test "${rc}" != 1 || ! grep -q '^1 URL(s) could not be read' "${WORK}/cd.err"; then
+        cat "${WORK}/cd.err" 1>&2
+        fail "cd ${mode}: sweep exited ${rc}"
+    fi
+done
+jq -e --arg i "${CD_ISSUE}" --arg m "${CD_MERGED}" --arg a "${CD_ASK}" \
+    '(.closed_done | map([.url, .id, .applied])) == [[$i, "PVTI_cd1", null], [$m, "PVTI_cd2", null], [$a, null, null]]
+    and (.closed_done_failed | not)' "${WORK}/cd--json" >/dev/null ||
+    fail "cd: closed, set Done: $(jq -c '{closed_done, closed_done_failed}' "${WORK}/cd--json")"
+[[ "$(<"${WORK}/cd--dry-run")" == *$'Closed, set Done:\n  '"${CD_ISSUE}"$': its issue closed, but it is Draft: set it Done (--apply would do it)\n  '"${CD_MERGED}"$': its PR merged, but it is In Review: set it Done (--apply would do it)\n  '"${CD_ASK}"$': its PR closed unmerged, but it is In Review: ask the operator whether to drop it (Done) or redo it (Needs human), or set it Done if it is clear (a human decides)\n\n'* ]] ||
+    fail "cd: the text report lacks the section: $(cat "${WORK}/cd--dry-run")"
+
 test "${failures}" -eq 0 || { echo "${failures} failure(s)" 1>&2; exit 1; }
-echo "ok: bot-watch first-sight news, outstanding reviews, PRs that need a rebase, priority health, sign-offs and promotions as expected"
+echo "ok: bot-watch first-sight news, outstanding reviews, PRs that need a rebase, priority health, sign-offs, promotions and closed items as expected"
