@@ -1,0 +1,10 @@
+{
+  "https://github.com/cgwalters-forge/tracker/issues/160": [
+    {"url": "https://github.com/cgwalters-forge/tracker/issues/99", "state": "closed"},
+    {"url": "https://github.com/cgwalters-forge/tracker/issues/1", "state": "open"}
+  ],
+  "https://github.com/cgwalters-forge/tracker/issues/2": [
+    {"url": "https://github.com/cgwalters-forge/tracker/issues/21", "state": "open"},
+    {"url": "https://github.com/cgwalters-forge/tracker/issues/99", "state": "closed"}
+  ]
+}

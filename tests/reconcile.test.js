@@ -30,7 +30,7 @@ const run = path.join(FIX, "sweep", "runs", "20261002-114000-000");
 function obs(changes = {}) {
   return {
     now: NOW, config: operator.resolve({}), items: read("board.json"), heartbeat: read("heartbeat.json"), capacity: read("capacity.json"),
-    questions: read("questions.json"), epicItems: read("epic-board.json"), prs: read("prs.json"), contentStates: Object.fromEntries(Object.entries(read("watch.json").items).map(([u, v]) => [u, v.state])),
+    questions: read("questions.json"), epicItems: read("epic-board.json"), prs: read("prs.json"), children: read("children.json"), contentStates: Object.fromEntries(Object.entries(read("watch.json").items).map(([u, v]) => [u, v.state])),
     verdicts: pace.readVerdicts(path.join(FIX, "upstream-policy")), activity: {}, topics: ["wfc"],
     sweep: { run: "20261002-114000-000", ended_at: "2026-10-02T11:43:00Z",
       watch: fs.readFileSync(path.join(run, "watch.txt"), "utf8"), inbox: fs.readFileSync(path.join(run, "inbox.txt"), "utf8") },
@@ -137,6 +137,33 @@ test("lead-orphan: every busy item has a worker, every worker a busy item", () =
   for (const [name, changes, want] of cases) assert.deepEqual(keys(rec.leadOrphan(obs(changes))), want, name);
   const n1 = rec.leadOrphan(obs({ heartbeat: onN1 })).find((a) => a.url.endsWith("/issues/4"));
   assert.equal(n1.do, "worker n1 is on it but it has no Lead: bot-pace assign PVTI_n1");
+});
+
+test("umbrellas: an In Progress item busy through its children needs no worker, and isn't an agent", () => {
+  const E1 = "https://github.com/cgwalters-forge/tracker/issues/160";
+  const child = (status, state = "open") => ({ items: setItem(read("board.json"), "PVTI_h1", { status }),
+    children: { [E1]: [{ url: "https://github.com/cgwalters-forge/tracker/issues/1", state }] } });
+  // [case, changes, whether tracker#160 is an umbrella]
+  const cases = [
+    ["a child In Progress", {}, true],
+    ["a child Draft", child("Draft"), true],
+    ["a child In Review", child("In Review"), true],
+    ["a child Needs human", child("Needs human"), false],
+    ["a child Todo", child("Todo"), false],
+    ["a child closed, its item not Done yet", child("In Progress", "closed"), false],
+    ["a child not on the board", { children: { [E1]: [{ url: "https://github.com/o/r/issues/404", state: "open" }] } }, false],
+    ["no children", { children: {} }, false],
+    ["sub-issues unread", { children: undefined }, false],
+  ];
+  for (const [name, changes, umbrella] of cases) {
+    const o = obs(changes);
+    assert.deepEqual(rec.umbrellaItems(o).map((it) => it.id), umbrella ? ["PVTI_e1"] : [], name);
+    assert.equal(keys(rec.leadOrphan(o)).includes(`lead-orphan:${E1}`), !umbrella, `${name}: lead-orphan`);
+    assert.equal(rec.heartbeat(o).some((a) => a.key === "heartbeat:drift" && /2 busy item/.test(a.do)), !umbrella, `${name}: heartbeat`);
+    // The fixture's busy agents: h1, t1, o1, u1, plus the epic unless it is an umbrella (and h1 unless it left In Progress).
+    const busy = 4 - (o.items.find((it) => it.id === "PVTI_h1").status === "In Progress" ? 0 : 1) + (umbrella ? 0 : 1);
+    assert.equal(rec.observed(o).busy, busy, `${name}: busy agents`);
+  }
 });
 
 test("health: a P0 PR waiting on a human with a current ask is left alone, an old ask is nudged", () => {
@@ -296,7 +323,7 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
 function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) {
   const r = spawnSync(TOOL, [
     "--board-file", path.join(FIX, "board.json"), "--epic-board-file", path.join(FIX, "epic-board.json"), "--sweep-dir", path.join(FIX, "sweep"),
-    "--prs-file", path.join(FIX, "prs.json"), "--heartbeat-file", path.join(FIX, "heartbeat.json"),
+    "--prs-file", path.join(FIX, "prs.json"), "--heartbeat-file", path.join(FIX, "heartbeat.json"), "--children-file", path.join(FIX, "children.json"),
     "--capacity-file", path.join(FIX, "capacity.json"), "--questions-file", path.join(FIX, "questions.json"),
     "--activity-file", path.join(TMP, "no-activity.json"), "--watch-state", path.join(FIX, "watch.json"), "--now", now, ...args,
   ], { encoding: "utf8", env: { ...process.env, HOME: TMP, XDG_STATE_HOME: path.join(TMP, "state-home"), BOT_OPERATOR_CONFIG: path.join(FIX, "operator.json"), UPSTREAM_POLICY_DIR: path.join(FIX, "upstream-policy"), ...env } });
