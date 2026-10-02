@@ -1468,8 +1468,14 @@ cmd_fill_org() {
             *) fatal "unknown argument for fill-org: $1 (see --help)" ;;
         esac
     done
-    load_fields
+    # The listing is REST (and ETag-cached): with nothing to set, as on
+    # most of bot-sweep's runs, fill-org spends no GraphQL quota at all.
     load_items
+    if ! ${all} && jq -e 'all(.items[]; .org != null)' <<<"${ITEMS_JSON}" >/dev/null; then
+        echo "0 item(s) to update" 1>&2
+        return 0
+    fi
+    load_fields
     local field item id org current title updates=() leftovers=()
     field=$(field_json Org | jq -r .id)
     while IFS= read -r item; do

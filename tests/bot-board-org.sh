@@ -33,6 +33,9 @@ cat >"${WORK}/bin/gh" <<'EOF'
 set -euo pipefail
 store=${FAKE_GH:?}
 case "$1 $2" in
+    "project field-list"|"project view"|"api graphql") echo "$1 $2" >>"${store}/graphql-calls" ;;
+esac
+case "$1 $2" in
     "project field-list") cat "${store}/fields.json" ;;
     "api -i") exec "${FAKE_BOARD_REST:?}" "${store}/items.json" "$3" ;;
     "project view") echo PVT_fake ;;
@@ -126,6 +129,19 @@ for want in "POST labels" "POST issues/5/labels" "POST issues/6/labels" "POST is
 done
 test "$(grep -c '/labels$' "${FAKE_GH}/labels")" -eq 3 || fail "label calls for non-tracker items: $(cat "${FAKE_GH}/labels")"
 echo "all ${#CASES[@]} fill-org cases passed, tracker labels synced"
+
+# With every item's Org set (as on most of bot-sweep's runs), fill-org
+# reads only the REST listing: no GraphQL at all, and no edits.
+jq '.items |= map(.org //= "other")' "${FAKE_GH}/items.json" >"${WORK}/all-org.json"
+cp "${FAKE_GH}/items.json" "${WORK}/some-org.json"
+mv "${WORK}/all-org.json" "${FAKE_GH}/items.json"
+rm -rf "${XDG_CACHE_HOME}/bot-board" "${FAKE_GH}/graphql-calls" "${FAKE_GH}/mutations"
+out=$("${BIN}/bot-board" fill-org 2>&1) || fail "fill-org with nothing to set: ${out}"
+test "${out}" = "0 item(s) to update" || fail "fill-org with nothing to set printed: ${out}"
+test ! -e "${FAKE_GH}/graphql-calls" || fail "fill-org with nothing to set made GraphQL calls: $(cat "${FAKE_GH}/graphql-calls")"
+mv "${WORK}/some-org.json" "${FAKE_GH}/items.json"
+rm -rf "${XDG_CACHE_HOME}/bot-board"
+echo "fill-org with nothing to set spends no GraphQL"
 
 # list --field NAME=VALUE: items 0 and 1 are led by wfc, 2 by coordinator,
 # the rest by nobody.
