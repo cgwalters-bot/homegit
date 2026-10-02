@@ -30,7 +30,7 @@ const run = path.join(FIX, "sweep", "runs", "20261002-114000-000");
 function obs(changes = {}) {
   return {
     now: NOW, config: operator.resolve({}), items: read("board.json"), heartbeat: read("heartbeat.json"), capacity: read("capacity.json"),
-    questions: read("questions.json"), contentStates: Object.fromEntries(Object.entries(read("watch.json").items).map(([u, v]) => [u, v.state])),
+    questions: read("questions.json"), epicItems: read("epic-board.json"), prs: read("prs.json"), contentStates: Object.fromEntries(Object.entries(read("watch.json").items).map(([u, v]) => [u, v.state])),
     verdicts: pace.readVerdicts(path.join(FIX, "upstream-policy")), activity: {}, topics: ["wfc"],
     sweep: { run: "20261002-114000-000", ended_at: "2026-10-02T11:43:00Z",
       watch: fs.readFileSync(path.join(run, "watch.txt"), "utf8"), inbox: fs.readFileSync(path.join(run, "inbox.txt"), "utf8") },
@@ -42,6 +42,8 @@ const setItem = (items, id, fields) => items.map((it) => (it.id === id ? { ...it
 
 const ALL_KEYS = [
   "drive:conflict https://github.com/o/r/pull/1 aaaaaaaaaaaa",
+  "health:P0 ci-failing https://github.com/cgwalters-forge/r/pull/7 777777777777",
+  "health:P0 stale https://github.com/cgwalters-forge/r/pull/8 888888888888",
   "health:P0 stale https://github.com/o/r/pull/2 bbbbbbbbbbbb",
   "approval:https://github.com/cgwalters-forge/q/pull/5 https://github.com/cgwalters-forge/q/pull/5#pullrequestreview-5",
   "approval:https://github.com/cgwalters-forge/r/pull/3 https://github.com/cgwalters-forge/r/pull/3#pullrequestreview-3",
@@ -88,7 +90,7 @@ test("capacity: lanes against the target, paced by the week's capacity", () => {
     }
   }
   const a = rec.capacity(obs({ items: read("board.json").filter((it) => !/^PVTI_c/.test(it.id)) }))[0];
-  assert.match(a.do, /no Todo candidates: triage the backlog or file upstream work; 1 P0 wait on a human$/);
+  assert.match(a.do, /no Todo candidates: triage the backlog or file upstream work; 2 P0 wait on a human$/);
 });
 
 test("capacity: a task over its budget, unless the budget was raised", () => {
@@ -135,6 +137,55 @@ test("lead-orphan: every busy item has a worker, every worker a busy item", () =
   for (const [name, changes, want] of cases) assert.deepEqual(keys(rec.leadOrphan(obs(changes))), want, name);
   const n1 = rec.leadOrphan(obs({ heartbeat: onN1 })).find((a) => a.url.endsWith("/issues/4"));
   assert.equal(n1.do, "worker n1 is on it but it has no Lead: bot-pace assign PVTI_n1");
+});
+
+test("health: a P0 PR waiting on a human with a current ask is left alone, an old ask is nudged", () => {
+  const OWN = "https://github.com/cgwalters-forge/r/pull/7";
+  const OTHERS = "https://github.com/o/r/pull/9";
+  const pr = (url, fields) => ({ prs: { ...read("prs.json"), [url]: { ...read("prs.json")[url], ...fields } } });
+  const note = (text, field = "next") => ({ epicItems: [{ ...read("epic-board.json")[0], next: undefined, [field]: text }] });
+  const healthOf = (o, url) => rec.drive(o).filter((a) => a.kind === "health" && a.url === url).map((a) => `${a.key.split(" ")[1]} ${/nudge/.test(a.do) ? "nudge" : "fires"}`);
+  // [case, changes, PR, its health actions]
+  const cases = [
+    ["the bot's PR, review requested yesterday: stale is silent, red CI is the bot's", {}, OWN, ["ci-failing fires"]],
+    ["review requested 8 days ago", pr(OWN, { requested_at: "2026-09-24T11:00:00Z" }), OWN, ["ci-failing fires", "stale nudge"]],
+    ["review requested, undated", pr(OWN, { requested_at: null }), OWN, ["ci-failing fires", "stale nudge"]],
+    ["no review requested", pr(OWN, { requested: false }), OWN, ["ci-failing fires", "stale fires"]],
+    ["the PR unread", { prs: undefined }, OWN, ["ci-failing fires", "stale fires"]],
+    ["an author note on the bot's own PR counts for nothing", { ...pr(OWN, { requested: false }), epicItems: [{ ...read("epic-board.json")[0], content: { type: "PullRequest", url: OWN } }] },
+      OWN, ["ci-failing fires", "stale fires"]],
+    ["someone else's PR, a waiting-on-author note from yesterday", {}, OTHERS, []],
+    ["the note 9 days old", note("2026-09-23: waiting on the author"), OTHERS, ["ci-failing nudge", "stale nudge"]],
+    ["the note dated by month and day, in Why", note("waits on the author since 09-30", "why"), OTHERS, []],
+    ["the note dated far in the future", note("2099-01-01: waits on the author"), OTHERS, ["ci-failing nudge", "stale nudge"]],
+    ["the note dated 10-30, still ahead", note("waits on the author until 10-30"), OTHERS, ["ci-failing nudge", "stale nudge"]],
+    ["the review requested in the future", pr(OWN, { requested_at: "2099-01-01T00:00:00Z" }), OWN, ["ci-failing fires", "stale nudge"]],
+    ["the note undated", note("waits on the author"), OTHERS, ["ci-failing nudge", "stale nudge"]],
+    ["a dated Next that isn't a waiting note", note("2026-10-01: rebased"), OTHERS, ["ci-failing fires", "stale fires"]],
+    ["the note on the Workstream item whose Branch it is", { epicItems: [], items: [...read("board.json"),
+      { id: "PVTI_b9", status: "Draft", branch: OTHERS, why: "waits for the author (10-01)", content: { type: "Issue", url: "https://github.com/t/t/issues/9" } }] }, OTHERS, []],
+    ["no note, but the operator's review requested yesterday", { ...note(undefined), ...pr(OTHERS, { requested: true, requested_at: "2026-10-01T09:00:00Z" }) }, OTHERS, []],
+    ["no ask at all", note(undefined), OTHERS, ["ci-failing fires", "stale fires"]],
+  ];
+  for (const [name, changes, url, want] of cases) assert.deepEqual(healthOf(obs(changes), url), want, name);
+  const nudge = rec.drive(obs(pr(OWN, { requested_at: "2026-09-24T11:00:00Z" }))).find((a) => a.key.startsWith("health:P0 stale https://github.com/cgwalters-forge/r/pull/7"));
+  assert.equal(nudge.do, "P0 stale: waits on cgwalters's review, since 2026-09-24, with no ask under 7 days old: nudge, and date the ask, or find out why and fix it");
+});
+
+test("noteDate: the latest date in a note", () => {
+  // [text, the date (null: none)]
+  const cases = [
+    ["2026-10-02: author draft, idle since 09-21", "2026-10-02"],
+    ["requested 10-01, again 09-30", "2026-10-01"],
+    // A month and day still ahead this year are last year's.
+    ["since 12-24", "2025-12-24"],
+    ["F44, x86-64, #2248", null],
+    ["", null],
+  ];
+  for (const [text, want] of cases) {
+    const t = rec.noteDate(text, NOW);
+    assert.equal(Number.isNaN(t) ? null : new Date(t).toISOString().slice(0, 10), want, text);
+  }
 });
 
 test("drive: the sweep's P0 drive and health lines and approvals, carried over", () => {
@@ -244,7 +295,8 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
 
 function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) {
   const r = spawnSync(TOOL, [
-    "--board-file", path.join(FIX, "board.json"), "--sweep-dir", path.join(FIX, "sweep"), "--heartbeat-file", path.join(FIX, "heartbeat.json"),
+    "--board-file", path.join(FIX, "board.json"), "--epic-board-file", path.join(FIX, "epic-board.json"), "--sweep-dir", path.join(FIX, "sweep"),
+    "--prs-file", path.join(FIX, "prs.json"), "--heartbeat-file", path.join(FIX, "heartbeat.json"),
     "--capacity-file", path.join(FIX, "capacity.json"), "--questions-file", path.join(FIX, "questions.json"),
     "--activity-file", path.join(TMP, "no-activity.json"), "--watch-state", path.join(FIX, "watch.json"), "--now", now, ...args,
   ], { encoding: "utf8", env: { ...process.env, HOME: TMP, XDG_STATE_HOME: path.join(TMP, "state-home"), BOT_OPERATOR_CONFIG: path.join(FIX, "operator.json"), UPSTREAM_POLICY_DIR: path.join(FIX, "upstream-policy"), ...env } });
@@ -254,14 +306,14 @@ function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) 
 
 test("bot-reconcile: the report, and --json", () => {
   const out = cli([]);
-  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(12\):\n/);
+  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(14\):\n/);
   assert.match(out, /^ {2}capacity https:\/\/github\.com\/cgwalters-forge\/tracker\/issues\/30: upstream 1 of 2 busy: dispatch up to 1 .*\n {4}P0 https:\/\/github\.com\/cgwalters-forge\/tracker\/issues\/30 image-builder analysis \(osbuild\/image-builder, budget 5M by P0\)$/m);
   const j = JSON.parse(cli(["--json"]));
   assert.deepEqual(j.actions.map((a) => a.key), ALL_KEYS);
   assert.deepEqual(j.errors, []);
   assert.equal(j.observed.lanes.upstream.busy, 1);
   assert.deepEqual(JSON.parse(cli(["--json", "--rule", "drive", "--rule", "answer-unapplied"])).actions.map((a) => a.kind),
-    ["drive", "health", "approval", "approval", "approval", "answer-unapplied"]);
+    ["drive", "health", "health", "health", "approval", "approval", "approval", "answer-unapplied"]);
 });
 
 test("bot-reconcile --state: fires once, then on resync; an unread input keeps its actions", () => {

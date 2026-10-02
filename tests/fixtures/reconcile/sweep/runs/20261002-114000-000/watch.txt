@@ -1,6 +1,11 @@
 Priority health:
   P0 conflict https://github.com/o/r/pull/1 aaaaaaaaaaaa: conflicts with main
   P0 stale https://github.com/o/r/pull/2 bbbbbbbbbbbb: no activity since 2026-09-21T15:53:15Z
+  P0 ci-failing https://github.com/cgwalters-forge/r/pull/7 777777777777: tests
+  P0 stale https://github.com/cgwalters-forge/r/pull/7 777777777777: no activity since 2026-09-30T14:40:31Z
+  P0 stale https://github.com/cgwalters-forge/r/pull/8 888888888888: no activity since 2026-09-20T10:00:00Z
+  P0 ci-failing https://github.com/o/r/pull/9 999999999999: required-checks
+  P0 stale https://github.com/o/r/pull/9 999999999999: no activity since 2026-09-21T15:53:15Z
   P1 ci-failing https://github.com/o/r/pull/3 cccccccccccc: tests
 
 P0 drive:

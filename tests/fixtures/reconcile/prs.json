@@ -1,0 +1,6 @@
+{
+  "https://github.com/o/r/pull/2": {"author": "alice", "requested": false, "requested_at": null},
+  "https://github.com/cgwalters-forge/r/pull/7": {"author": "cgwalters-bot", "requested": true, "requested_at": "2026-10-01T09:00:00Z"},
+  "https://github.com/cgwalters-forge/r/pull/8": {"author": "cgwalters-bot", "requested": true, "requested_at": "2026-09-20T10:00:00Z"},
+  "https://github.com/o/r/pull/9": {"author": "bob", "requested": false, "requested_at": null}
+}
