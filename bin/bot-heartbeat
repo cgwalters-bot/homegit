@@ -91,6 +91,8 @@ const SESSION_ENV = "CLAUDE_CODE_SESSION_ID";
 // refresh leaves a heartbeat younger than this alone (the review app
 // calls it stale after 15 minutes).
 const REFRESH_MIN_AGE_MS = 5 * 60 * 1000;
+// The board Status of a finished item, whose worker prune drops.
+const DONE_STATUS = "Done";
 
 const EX_ERROR = 1;
 const EX_USAGE = 2;
@@ -107,6 +109,7 @@ class Exit extends Error {
 function usage() {
   return `Usage: ${PROG} publish [--dry-run] [--no-usage] < HEARTBEAT.json
        ${PROG} refresh
+       ${PROG} prune [--dry-run] [--board-file F]
        ${PROG} show [--usage]
        ${PROG} usage
        ${PROG} statusline < STATUSLINE.json
@@ -179,6 +182,14 @@ the one it wrote (the same workers and coordinator state: nobody
 published since); otherwise it changes nothing and exits ${EX_NOT_REFRESHED}. A
 heartbeat under ${REFRESH_MIN_AGE_MS / 60000} minutes old is left as it is.
 
+prune republishes that input the same way, under the same conditions,
+without the workers whose item is ${DONE_STATUS} on the board (as an item or in
+one's Branch) or closed on GitHub, whatever its age; with none of those
+it publishes nothing. It never adds a worker, and keeps one whose item
+it can't read. bot-poll-loop runs it each cycle before refresh. With
+--dry-run it only says whom it would drop; --board-file reads the
+board's items from F (bot-board list --json) instead of bot-board.
+
 show prints the published heartbeat's JSON, or with --usage the usage
 snapshot's.
 
@@ -191,7 +202,7 @@ in ~/.claude/settings.json. It saves rate_limits' used_percentage and
 resets_at (and nothing else of its input) to ${RATE_LIMITS_FILE},
 and prints the model and both percentages.
 
-Exit status: 0 done, ${EX_INVALID} invalid input, ${EX_NOT_REFRESHED} not refreshed, ${EX_USAGE} usage, ${EX_ERROR} anything else.
+Exit status: 0 done, ${EX_INVALID} invalid input, ${EX_NOT_REFRESHED} not refreshed (or pruned), ${EX_USAGE} usage, ${EX_ERROR} anything else.
 `;
 }
 
@@ -722,8 +733,10 @@ function saveLastPublish(input, hb) {
 // notRefreshed(why): refresh's refusal.
 const notRefreshed = (why) => new Exit(EX_NOT_REFRESHED, `not refreshed: ${why}`);
 
-function cmdRefresh(args) {
-  if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
+// ownLastPublish(): what this session last published, for refresh and
+// prune; they decline (notRefreshed) when another session published
+// last, or nothing was published from here.
+function ownLastPublish() {
   let last;
   try {
     last = JSON.parse(fs.readFileSync(LAST_PUBLISH_FILE, "utf8"));
@@ -734,22 +747,90 @@ function cmdRefresh(args) {
   if (!isObject(last) || !isObject(last.input) || !isObject(last.published)) throw new Exit(EX_ERROR, `${LAST_PUBLISH_FILE} is malformed; publish again`);
   const session = process.env[SESSION_ENV] || null;
   if (last.session !== session) throw notRefreshed(`the last publish ran in session ${last.session || "(none)"}, not this one (${session || "none"})`);
+  return last;
+}
+
+// republish(last, nowMs, workers): publishes LAST's input again with
+// updated_at moved to now (and next_wake_at by as much) and WORKERS (by
+// default its own), if the published heartbeat is still the one LAST
+// wrote: nobody published since.
+function republish(last, nowMs, workers = last.input.workers) {
+  const existing = botComment(HEARTBEAT);
+  const current = existing && parseComment(existing.body);
+  if (JSON.stringify(current) !== JSON.stringify(last.published)) {
+    throw notRefreshed(`the published heartbeat is not the one this session last wrote (as of ${last.published.updated_at}): someone published since`);
+  }
+  const delta = nowMs - Date.parse(last.input.updated_at);
+  const coordinator = { ...last.input.coordinator };
+  if (coordinator.next_wake_at) coordinator.next_wake_at = iso(Date.parse(coordinator.next_wake_at) + delta);
+  publish({ ...last.input, updated_at: iso(nowMs), coordinator, workers }, { existing });
+}
+
+function cmdRefresh(args) {
+  if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
+  const last = ownLastPublish();
   const nowMs = now();
   const age = nowMs - Date.parse(last.published.updated_at);
   if (age < REFRESH_MIN_AGE_MS) {
     log(`fresh: published ${Math.round(age / 60000)} min ago`);
     return;
   }
-  const existing = botComment(HEARTBEAT);
-  const current = existing && parseComment(existing.body);
-  if (JSON.stringify(current) !== JSON.stringify(last.published)) {
-    throw notRefreshed(`the published heartbeat is not the one this session last wrote (as of ${last.published.updated_at}): someone published since`);
+  republish(last, nowMs);
+}
+
+// boardItems(file): the board's items (bot-board list --json, or FILE).
+function boardItems(file) {
+  if (file) return JSON.parse(fs.readFileSync(file, "utf8"));
+  const out = execFileSync(path.join(__dirname, "bot-board"), ["list", "--json"], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 64 * 1024 * 1024 });
+  return JSON.parse(out);
+}
+
+// finishedWorkers(workers, boardFile): {name: why} of the WORKERS whose
+// item is Done on the board (as an item, or in one's Branch) or closed
+// on GitHub. One whose item can't be read is not finished: prune only
+// ever drops a worker it knows is done. An unreadable board leaves the
+// GitHub state alone to decide.
+function finishedWorkers(workers, boardFile) {
+  const { boardKeys, normalizeItem } = require(path.join(__dirname, "..", "lib", "capacity.js"));
+  const done = new Set();
+  try {
+    for (const it of boardItems(boardFile)) if (it.status === DONE_STATUS) for (const k of boardKeys(it)) done.add(k);
+  } catch (e) {
+    log(`cannot read the board, so only closed items count: ${String(e.stderr || e.message).trim().split("\n")[0]}`);
   }
-  // Move updated_at to now, and next_wake_at by as much.
-  const delta = nowMs - Date.parse(last.input.updated_at);
-  const coordinator = { ...last.input.coordinator };
-  if (coordinator.next_wake_at) coordinator.next_wake_at = iso(Date.parse(coordinator.next_wake_at) + delta);
-  publish({ ...last.input, updated_at: iso(nowMs), coordinator }, { existing });
+  const out = {};
+  for (const w of workers) {
+    if (done.has(normalizeItem(w.item_url))) {
+      out[w.name] = DONE_STATUS;
+      continue;
+    }
+    const m = ITEM_URL_RE.exec(w.item_url);
+    if (!m) continue;
+    try {
+      if (gh(["api", `repos/${m[1]}/${m[2]}/issues/${m[4]}`, "--jq", ".state"], `read ${w.item_url}`).trim() === "closed") out[w.name] = "closed";
+    } catch (e) {
+      log(`keeping worker ${w.name}: ${e.message}`);
+    }
+  }
+  return out;
+}
+
+function cmdPrune(args) {
+  let dryRun = false;
+  let boardFile = null;
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--dry-run") dryRun = true;
+    else if (args[i] === "--board-file" && i + 1 < args.length) boardFile = args[++i];
+    else throw new Exit(EX_USAGE, `unexpected argument '${args[i]}'\n\n${usage()}`);
+  }
+  const last = ownLastPublish();
+  const workers = Array.isArray(last.input.workers) ? last.input.workers : [];
+  const finished = finishedWorkers(workers, boardFile);
+  const names = Object.keys(finished);
+  if (!names.length) return;
+  log(`${dryRun ? "would drop" : "dropping"} ${names.map((n) => `${n} (${finished[n]})`).join(", ")}`);
+  if (dryRun) return;
+  republish(last, now(), workers.filter((w) => !(w.name in finished)));
 }
 
 function cmdShow(args) {
@@ -812,6 +893,9 @@ function main() {
     case "refresh":
       needIssue();
       return cmdRefresh(args);
+    case "prune":
+      needIssue();
+      return cmdPrune(args);
     case "show":
       needIssue();
       return cmdShow(args);
