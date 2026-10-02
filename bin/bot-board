@@ -255,6 +255,12 @@ Commands:
                               any other text or single-select field, such
                               as another board's (--field Area docs), or
                               the number field Actual tokens.
+                              --status '${QUESTION_STATUS}' is refused unless
+                              the item is a question (or review or
+                              chore ask) or a PR, or has one in its
+                              Branch, with ${OPERATOR}'s review requested:
+                              the ask is what he acts on. 'question' sets
+                              it itself.
                               An empty value clears a text field.
   fill-org [--all] [--dry-run]
                               Set Org on items that have none (--all:
@@ -810,6 +816,64 @@ is_tracker() { # is_tracker OWNER/REPO
     test "${1,,}" = "${TRACKER_REPO,,}"
 }
 
+# Needs human means the operator has something to do. A tracker issue is
+# that when it is a question (or review or chore ask); a PR when their
+# review is requested on it. Any other item has to point at one such PR
+# in its Branch, where the review app finds the ask: workers kept
+# setting an item Needs human with the real ask on its PR, leaving
+# nothing for the operator to act on.
+# SKIP_ASK_CHECK=1 bypasses it, for the callers that put the ask in the
+# item's Why themselves (question, bot-watch's closed PRs).
+
+# review_requested PR_URL: succeeds if the operator's review is requested
+# on that PR.
+review_requested() {
+    local ref reviewers
+    ref=$(issue_ref "$1") || exit
+    reviewers=$(ghq api "repos/${ref% *}/pulls/${ref#* }" --jq '[.requested_reviewers[].login] | join(" ")') ||
+        fail_after $? "reading ${1} failed"
+    [[ " ${reviewers,,} " == *" ${OPERATOR,,} "* ]]
+}
+
+# check_ask ITEM_ID URL BRANCH: fatal unless the item is a real ask (see
+# above); BRANCH is the Branch field it will have, or empty for the
+# current one.
+check_ask() {
+    local id=$1 url=$2 branch=$3 branch_given=${4:-false} ref repo number labels found word
+    if test -z "${url}"; then
+        url=$(gqlq 'query($id: ID!) { node(id: $id) { ... on ProjectV2Item {
+            content { ... on Issue { url } ... on PullRequest { url } } } } }' -f id="${id}" |
+            jq -r '.node.content.url // empty') || url=
+    fi
+    test -n "${url}" || fatal "cannot look up the URL of ${id} to check that it has an ask for ${OPERATOR}; its status is unchanged"
+    ref=$(issue_ref "${url}") || exit
+    repo=${ref% *}
+    number=${ref#* }
+    if [[ "${url}" == */pull/* ]]; then
+        ! review_requested "${url}" || return 0
+        fatal "${url} is a PR without a review requested from ${OPERATOR}, so '${QUESTION_STATUS}' has no ask behind it: request it (gh api -X POST repos/${repo}/pulls/${number}/requested_reviewers -f 'reviewers[]=${OPERATOR}'; bot-land --no-auto does it for the bot's own repositories), or put the action in its Why and leave the status"
+    fi
+    if is_tracker "${repo}"; then
+        labels=$(ghq api "repos/${repo}/issues/${number}" --jq '[.labels[].name] | join(" ")') ||
+            fail_after $? "reading ${url} failed"
+        for word in "${ASK_LABELS[@]}"; do
+            [[ " ${labels} " != *" ${word} "* ]] || return 0
+        done
+    fi
+    if ! ${branch_given}; then
+        found=$(lookup_item "${url}") || exit
+        branch=$(jq -r '.branch // empty' <<<"${found:-{\}}")
+    fi
+    for word in ${branch}; do
+        [[ "${word}" == https://github.com/*/pull/* ]] || continue
+        ! review_requested "${word%%[#?]*}" || return 0
+    done
+    if [[ "${branch}" == *github.com/*/pull/* ]]; then
+        fatal "${url} is not a question, and no PR in its Branch has a review requested from ${OPERATOR}, so '${QUESTION_STATUS}' has no ask behind it: set it on the PR's item instead, with ${OPERATOR}'s review requested on the PR (gh api -X POST repos/OWNER/REPO/pulls/N/requested_reviewers -f 'reviewers[]=${OPERATOR}')"
+    fi
+    fatal "${url} is not a question and has no PR in its Branch, so '${QUESTION_STATUS}' has no ask behind it: ask with '$(basename "$0") question ${url} \"QUESTION\" --option ...', which sets it"
+}
+
 # open_issue TITLE BODY [JQ_EXTRA]: opens an issue in TRACKER_REPO (with
 # the fields of the JSON object JQ_EXTRA added) and prints its REST JSON.
 open_issue() {
@@ -1126,12 +1190,12 @@ cmd_question() {
     fields+=(--why "${why}")
     test -z "${priority}" || fields+=(--priority "${priority}")
     # In subshells, so that a failed edit still prints the question's id.
-    (ITEM_URL_HINT=${url} cmd_set "${id}" "${fields[@]}" >/dev/null) ||
+    (SKIP_ASK_CHECK=1 ITEM_URL_HINT=${url} cmd_set "${id}" "${fields[@]}" >/dev/null) ||
         echo "warning: setting up the question's item ${id} failed; set: ${fields[*]}" 1>&2
     if test -n "${blocked_item}"; then
         local blocked_id
         blocked_id=$(jq -r .id <<<"${blocked_item}")
-        (cmd_set "${blocked_id}" --status "${QUESTION_STATUS}" >/dev/null) ||
+        (SKIP_ASK_CHECK=1 cmd_set "${blocked_id}" --status "${QUESTION_STATUS}" >/dev/null) ||
             echo "warning: setting ${blocked_id} (${blocked_url}) to ${QUESTION_STATUS} failed; do it by hand" 1>&2
     fi
     echo "on the board as ${id}" 1>&2
@@ -1210,7 +1274,7 @@ cmd_set() {
     shift
     test $# -gt 0 || fatal "nothing to set; valid options: ${SET_OPTIONS[*]}"
     # Resolve and validate everything before changing anything.
-    local field_ids=() args=() names=() field field_id option value label_args=()
+    local field_ids=() args=() names=() field field_id option value label_args=() needs_human=false new_branch="" branch_given=false
     load_fields
     while test $# -gt 0; do
         case "$1" in
@@ -1231,6 +1295,8 @@ cmd_set() {
                     args+=("--single-select-option-id=${option}")
                 fi
                 names+=("${field} = ${value}")
+                test "${field}" != Status || test "${value}" != "${QUESTION_STATUS}" || needs_human=true
+                test "${field}" != Branch || { new_branch=${value}; branch_given=true; }
                 case "${field}" in Priority|Org) label_args+=("--${field,,}" "${value}") ;; esac
                 shift 2
                 ;;
@@ -1266,6 +1332,7 @@ cmd_set() {
         id=$(lookup_item "${item_url}" | jq -r '.id // empty') || exit
         test -n "${id}" || fatal "'${item}' is not on the board (${BOARD_URL}); if it was just added, use its PVTI_ id"
     fi
+    ! ${needs_human} || test -n "${SKIP_ASK_CHECK:-}" || ! is_workstream || check_ask "${id}" "${item_url}" "${new_branch}" "${branch_given}"
     project=$(project_id) || fail_after $? "cannot look up the project id"
     # Don't start a batch of edits that the quota can't finish.
     remaining=$(gh api rate_limit --jq .resources.graphql.remaining 2>/dev/null) || remaining=

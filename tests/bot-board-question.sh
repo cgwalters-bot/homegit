@@ -54,7 +54,8 @@ case "$1 $2" in
         filter=$(arg --jq "$@")
         if grep -q 'items(first: 100, query' <<<"$*"; then
             jq '{data: {board: {projectV2: {items: {pageInfo: {hasNextPage: false}, nodes: [.items[]
-                | {id, content, priority: (if .priority then {name: .priority} else null end),
+                | {id, content, branch: (if .branch then {text: .branch} else null end),
+                   priority: (if .priority then {name: .priority} else null end),
                    org: (if .org then {name: .org} else null end)}]}}}}}' "${store}/items.json"
         else
             id=$(printf '%s\n' "$@" | sed -n 's/^id=//p')
@@ -111,12 +112,17 @@ mkdir -p "${FAKE_GH}/api"
 echo '{"labels": [{"name": "question"}, {"name": "P1"}]}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_42"
 echo '{"labels": [{"name": "enhancement"}]}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_43"
 echo '[{"name": "question"}, {"name": "P1"}]' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_labels"
+for n in 5 44 45; do echo '{"labels": []}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_${n}"; done
+# Pull requests 9 and 10: no review requested.
+for n in 9 10; do echo '{"requested_reviewers": [{"login": "someone"}]}' >"${FAKE_GH}/api/repos_bootc-dev_bootc_pulls_${n}"; done
 jq -n --arg t "${TRACKER}" '{items: [
     {id: "PVTI_parent", title: "composefs-rs: design a stable varlink API v1", status: "In Progress",
      priority: "P0", org: "composefs", content: {type: "Issue", url: "\($t)/issues/5", body: ""}},
     {id: "PVTI_pr", title: "UKI Addons Support", status: "In Review", priority: "P1",
      content: {type: "PullRequest", url: "https://github.com/bootc-dev/bootc/pull/9"}},
     {id: "PVTI_q", title: "Q", status: "Needs human", content: {type: "Issue", url: "\($t)/issues/42"}},
+    {id: "PVTI_br", title: "Has a PR", status: "In Progress", branch: "https://github.com/bootc-dev/bootc/pull/10",
+     content: {type: "Issue", url: "\($t)/issues/45"}},
     {id: "PVTI_np", title: "No priority", org: "bootc-dev", content: {type: "Issue", url: "\($t)/issues/44"}}]}' \
     >"${FAKE_GH}/items.json"
 
@@ -339,6 +345,34 @@ run add --priority P2 https://github.com/bootc-dev/bootc/issues/77
 expect_log "add https://github.com/bootc-dev/bootc/issues/77"
 expect_log "edit PVTI_new F_Priority O_P2"
 echo "ok: add --priority"
+
+# --- Needs human needs an ask ----------------------------------------------
+
+# A question is its own ask.
+run set "${TRACKER}/issues/42" --status "Needs human"
+expect_log "edit PVTI_q F_Status O_Needs human"
+# An issue that is neither, by id or URL, is refused with the way out.
+for item in PVTI_np "${TRACKER}/issues/44"; do
+    ! run set "${item}" --status "Needs human" || fail "set Needs human on ${item} without an ask"
+    grep -q "has no PR in its Branch.*question" "${WORK}/err" || fail "no pointer to 'question': $(cat "${WORK}/err")"
+    test ! -s "${FAKE_GH}/log" || fail "wrote before refusing: $(cat "${FAKE_GH}/log")"
+done
+# A PR in Branch without his review requested: refused, pointing at the PR.
+! run set PVTI_br --status "Needs human" || fail "set Needs human with an unreviewed PR in Branch"
+grep -q "no PR in its Branch has a review requested" "${WORK}/err" || fail "no pointer to the PR: $(cat "${WORK}/err")"
+# The PR itself without it: refused, with the request to make.
+! run set https://github.com/bootc-dev/bootc/pull/9 --status "Needs human" || fail "set Needs human on a PR without a review request"
+grep -q "requested_reviewers" "${WORK}/err" || fail "no request to make: $(cat "${WORK}/err")"
+# With his review requested on the PR, in Branch or the item itself.
+for n in 9 10; do echo '{"requested_reviewers": [{"login": "cgwalters"}]}' >"${FAKE_GH}/api/repos_bootc-dev_bootc_pulls_${n}"; done
+run set PVTI_br --status "Needs human"
+expect_log "edit PVTI_br F_Status O_Needs human"
+run set https://github.com/bootc-dev/bootc/pull/9 --status "Needs human"
+expect_log "edit PVTI_pr F_Status O_Needs human"
+# Other statuses and the question itself are never checked.
+run set PVTI_np --status "In Progress"
+expect_log "edit PVTI_np F_Status O_In Progress"
+echo "ok: Needs human needs an ask"
 
 # --- issue -----------------------------------------------------------------
 

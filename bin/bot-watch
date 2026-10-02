@@ -1088,7 +1088,7 @@ while IFS= read -r entry; do
     if test -n "${board_file}" || ${dry_run}; then
         result=would-apply
         test -z "${board_file}" || echo "testing: would run: bot-board $(printf "%q " "${args[@]}")" 1>&2
-    elif "${BOT_BOARD}" "${args[@]}" >/dev/null; then
+    elif SKIP_ASK_CHECK=1 "${BOT_BOARD}" "${args[@]}" >/dev/null; then
         napplied=$((napplied + 1))
     else
         rc=$?
