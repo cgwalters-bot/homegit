@@ -232,6 +232,18 @@ work is.
 
 ## Acting on it
 
+- **News.** The board is the control plane, and the review app's
+  board changes feed (the ops pane) is how the operator sees it move:
+  it diffs Status, Priority and Lead against what they last saw, and
+  shows the **News** field's latest line under the item. Set News
+  (`bot-board set ITEM --news TEXT`, folded into the same `set` call as
+  the transition) when something notable happens to an item: a PR
+  merged, landed or promoted, CI going red or green on a P0/P1, a
+  blocker found or cleared, an action now waiting on them. One short
+  line, e.g. `rebased onto main; needs your approval of 075b2a2c`;
+  `--news` prefixes today's date. It replaces the previous line, so
+  don't chain; leave it alone for routine bookkeeping (a claim, a
+  re-sweep with nothing new), which the Status diff already shows.
 - **Priority health before anything else.** `bot-watch` starts every
   sweep with a "Priority health" section (from `bot-priority-health`):
   the open PRs of P0 and P1 board items, and of the Composefs Stable
