@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline tests of 'bot-board question', 'resolve' and 'issue' against a
+# Offline tests of 'bot-board question', 'resolve', 'issue' and 'archive' against a
 # fake 'gh' that serves a fixed board and records every write. No
 # network, no quota.
 #   tests/bot-board-question.sh
@@ -26,7 +26,7 @@ unset GH_TOKEN GITHUB_TOKEN
 # through fake-rest) and appends each write to $FAKE_GH/log, one line
 # each: "issue PAYLOAD" for a new issue (which becomes tracker#42, REST
 # id 900), "sub REPO#N ID", "add URL", "edit ITEM FIELD VALUE", "comment
-# REPO#N BODY", "close REPO#N".
+# REPO#N BODY", "close REPO#N", "archive ITEM".
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -47,6 +47,7 @@ case "$1 $2" in
         value=$(printf '%s\n' "$@" | sed -n 's/^--\(text\|single-select-option-id\)=//p')
         test -n "${value}" || value=$(arg --single-select-option-id "$@")
         log "edit $(arg --id "$@") $(arg --field-id "$@") ${value}" ;;
+    "project item-archive") log "archive $(arg --id "$@")" ;;
     "api rate_limit") echo 5000 ;;
     # The item lookup: the board's items with the fields it reads, all on
     # one page; and an item's content by id.
@@ -386,3 +387,16 @@ expect_log "edit PVTI_new F_Org O_bootc-dev"
 expect_log "edit PVTI_new F_Priority O_P1"
 test "${out}" = PVTI_new || fail "issue printed '${out}'"
 echo "ok: issue"
+
+# --- archive ---------------------------------------------------------------
+
+# By item id, URL or OWNER/REPO#N: each archives that item.
+for ref in PVTI_pr https://github.com/bootc-dev/bootc/pull/9 bootc-dev/bootc#9; do
+    run archive "${ref}" || fail "archive ${ref}: $(cat "${WORK}/err")"
+    expect_log "archive PVTI_pr"
+    test "${out}" = "archived PVTI_pr" || fail "archive ${ref} printed '${out}'"
+done
+if run archive bootc-dev/bootc#99; then fail "archive of an item not on the board succeeded"; fi
+grep -q "is not on the board" "${WORK}/err" || fail "archive of a missing item: $(cat "${WORK}/err")"
+test ! -s "${FAKE_GH}/log" || fail "archive of a missing item wrote: $(cat "${FAKE_GH}/log")"
+echo "ok: archive"

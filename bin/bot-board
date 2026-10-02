@@ -204,6 +204,10 @@ Commands:
                               URL's repository (a fork's upstream, for
                               forks in ${OP_FORGE_ORG}); prints the new
                               item id
+  archive ITEM                Archive an item: it leaves the board's
+                              views and listings (GitHub lists no
+                              archived items) but keeps its fields, and
+                              can be restored from the board's archive
   issue [--parent ITEM] [--org O] [--priority P] TITLE BODY
                               Open an issue in ${TRACKER_REPO} and add it
                               to the board (no Status: triage); prints
@@ -798,6 +802,19 @@ cmd_add() {
     test -n "${priority}" || return 0
     (ITEM_URL_HINT=${url} cmd_set "${id}" --priority "${priority}" >/dev/null) ||
         echo "warning: setting Priority ${priority} on ${id} failed; set it by hand" 1>&2
+}
+
+cmd_archive() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") archive ITEM"
+    local id=$1
+    if [[ "${id}" != PVTI_* ]]; then
+        load_items
+        id=$(resolve_item "${id}") || exit
+    fi
+    invalidate_items
+    ghq project item-archive "${NUMBER}" --owner "${OWNER}" --id "${id}" >/dev/null ||
+        fail_after $? "archiving ${id} failed"
+    echo "archived ${id}"
 }
 
 cmd_draft() {
@@ -1850,7 +1867,7 @@ command=$1
 shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
-    list|show|add|draft|set|issue|resolve) ;;
+    list|show|add|archive|draft|set|issue|resolve) ;;
     question) workstream_only "${command}" ;;
     fill-org) command=fill_org ;;
     field-ensure) command=field_ensure ;;
