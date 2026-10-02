@@ -304,7 +304,7 @@ test("closed-not-done: an item whose own issue or PR closed or merged is Done", 
     const actions = rec.closedNotDone({ items: [item], contentStates: { [item.content.url]: state, [fork]: forkState } });
     assert.deepEqual(actions.map((a) => a.do), want ? [want] : [], `${item.id} ${item.status} ${state}`);
     if (!want) continue;
-    assert.deepEqual(actions[0].apply, applies ? { id: item.id, status: "Done", news: `${want.split(", but")[0].replace(/^its /, "")}; set Done` } : undefined,
+    assert.deepEqual(actions[0].apply, applies ? { id: item.id, set: ["--status", "Done", "--news", `${want.split(", but")[0].replace(/^its /, "")}; set Done`] } : undefined,
       `${item.id}: apply`);
   }
   assert.deepEqual(rec.closedNotDone(obs()), [], "the fixture world: the Done item and the Needs human PR stay");
@@ -333,7 +333,32 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
     ["approval", "closed-not-done", "drive", "health", "heartbeat", "lead-orphan"]);
   // The rules that didn't run keep theirs too.
   assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: null, sweep: {}, questions: [], contentStates: {} }, ["capacity", "drive"])].sort(),
-    ["answer-unapplied", "closed-not-done", "heartbeat", "lead-orphan"]);
+    ["answer-unapplied", "closed-not-done", "heartbeat", "lead-orphan", "stale-lead"]);
+});
+
+test("stale-lead: Lead coordinator ends with In Progress; other Leads stay", () => {
+  // [status, lead, the action's do (null: none)]
+  const cases = [
+    ["Draft", "coordinator", "Lead coordinator, but it is Draft: clear its Lead"],
+    ["In Review", "coordinator", "Lead coordinator, but it is In Review: clear its Lead"],
+    ["Needs human", "coordinator", "Lead coordinator, but it is Needs human: clear its Lead"],
+    ["Todo", "coordinator", "Lead coordinator, but it is Todo: clear its Lead"],
+    ["Done", "coordinator", "Lead coordinator, but it is Done: clear its Lead"],
+    [undefined, "coordinator", "Lead coordinator, but it is untriaged: clear its Lead"],
+    ["In Progress", "coordinator", null],
+    // A topic session owns its items in every status.
+    ["Draft", "wfc", null],
+    ["Done", "wfc", null],
+    ["Draft", undefined, null],
+  ];
+  for (const [i, [status, lead, want]] of cases.entries()) {
+    const item = { id: `PVTI_${i}`, status, lead, content: { type: "Issue", url: `https://github.com/o/r/issues/${i}` } };
+    const actions = rec.staleLead({ items: [item] });
+    assert.deepEqual(actions.map((a) => a.do), want ? [want] : [], `${status} ${lead}`);
+    if (want) assert.deepEqual(actions[0].apply, { id: item.id, set: ["--field", "Lead", ""] });
+  }
+  assert.deepEqual(rec.staleLead(obs()), [], "the fixture world has none");
+  assert.deepEqual(rec.staleLead(obs({ items: undefined })), []);
 });
 
 // --- bin/bot-reconcile ------------------------------------------------------
@@ -434,12 +459,13 @@ test("bot-reconcile --state: a failed drive or health step carries its actions o
   assert.deepEqual(j.actions.filter((a) => a.kind === "drive"), []);
 });
 
-test("bot-reconcile --apply: sets closed items Done, and reads only the rule's inputs", () => {
+test("bot-reconcile --apply: sets closed items Done, clears stale Leads, and reads only the rules' inputs", () => {
   const log = path.join(TMP, "board-calls");
   const fakeBoard = path.join(TMP, "bot-board");
   fs.writeFileSync(fakeBoard, `#!/usr/bin/env bash\ntest "$2" != PVTI_fail || { echo "fake: quota" >&2; exit 75; }\necho "$*" >>${log}\n`, { mode: 0o755 });
   const board = path.join(TMP, "closed-board.json");
   fs.writeFileSync(board, JSON.stringify([
+    { id: "PVTI_lead", status: "Draft", lead: "coordinator", content: { type: "Issue", url: "https://github.com/o/r/issues/9" } },
     { id: "PVTI_m", status: "Draft", content: { type: "PullRequest", url: "https://github.com/o/r/pull/1" } },
     { id: "PVTI_fail", status: "Draft", content: { type: "Issue", url: "https://github.com/o/r/issues/2" } },
     { id: "PVTI_ask", status: "In Review", content: { type: "PullRequest", url: "https://github.com/o/r/pull/3" } },
@@ -448,7 +474,7 @@ test("bot-reconcile --apply: sets closed items Done, and reads only the rule's i
   fs.writeFileSync(watch, JSON.stringify({ items: { "https://github.com/o/r/pull/1": { state: "merged" }, "https://github.com/o/r/issues/2": { state: "closed" },
     "https://github.com/o/r/pull/3": { state: "closed" } } }));
   // No sweep, heartbeat, capacity or questions: this rule doesn't read them.
-  const r = spawnSync(TOOL, ["--rule", "closed-not-done", "--apply", "--json", "--board-file", board, "--watch-state", watch,
+  const r = spawnSync(TOOL, ["--rule", "closed-not-done", "--rule", "stale-lead", "--apply", "--json", "--board-file", board, "--watch-state", watch,
     "--sweep-dir", path.join(TMP, "nowhere"), "--heartbeat-file", path.join(TMP, "nowhere.json")],
   { encoding: "utf8", env: { ...process.env, BOT_RECONCILE_BOARD: fakeBoard, BOT_OPERATOR_CONFIG: path.join(FIX, "operator.json") } });
   assert.equal(r.status, 1, r.stderr);
@@ -456,9 +482,9 @@ test("bot-reconcile --apply: sets closed items Done, and reads only the rule's i
   // The PR closed unmerged is listed, but not applied.
   assert.deepEqual(j.actions.map((a) => [a.url, a.apply && a.apply.id, a.applied]), [
     ["https://github.com/o/r/issues/2", "PVTI_fail", "failed: fake: quota"], ["https://github.com/o/r/pull/1", "PVTI_m", "done"],
-    ["https://github.com/o/r/pull/3", undefined, undefined]]);
+    ["https://github.com/o/r/pull/3", undefined, undefined], ["https://github.com/o/r/issues/9", "PVTI_lead", "done"]]);
   assert.deepEqual(j.errors, ["applying closed-not-done:https://github.com/o/r/issues/2: fake: quota"]);
-  assert.equal(fs.readFileSync(log, "utf8"), "set PVTI_m --status Done --news PR merged; set Done\n");
+  assert.equal(fs.readFileSync(log, "utf8"), "set PVTI_m --status Done --news PR merged; set Done\nset PVTI_lead --field Lead \n");
 });
 
 test("bot-reconcile: usage errors", () => {
