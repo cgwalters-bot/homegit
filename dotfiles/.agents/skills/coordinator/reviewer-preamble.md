@@ -28,7 +28,14 @@ For an answer to the operator's summons (a reply or a review the worker is about
 
 Re-run cheap checks where feasible: cargo fmt, clippy and tests for the touched crates, and actionlint via `podman run --rm -v "$PWD":/repo:Z -w /repo docker.io/rhysd/actionlint:latest`. Anything that compiles runs on a devspace, never locally (see `dotfiles/.agents/skills/devspace-work/SKILL.md` in the homegit checkout, `~/src/github/cgwalters-bot/homegit`); stop it when done. Say what you re-ran and where.
 
-Output, per branch: a verdict (ship as-is / minor fixes / needs rework) and findings ranked by severity, each with file:line and a concrete fix.
+Output: the first line of your final report is the verdict, exactly one of
+
+```
+Verdict: APPROVE
+Verdict: CHANGES
+```
+
+with nothing else on it (no markdown, no punctuation): APPROVE means it can ship as it is, CHANGES anything less (say on the next line whether minor fixes or a rework). The coordinator merges harness changes on APPROVE only, and `bin/bot-retro` counts verdicts by this line, so a report without it counts as no verdict at all. For several branches, give the strictest verdict first, then each branch's own. Then the findings, ranked by severity, each with file:line and a concrete fix.
 
 Review guide, for every forge PR (cgwalters-forge) you review: write down where the operator should look closely and what they can skim, as a `review-guide/v1` JSON file in your scratch dir. The review app (https://cgwalters-forge.github.io/review/) walks its hotspots in order and tints them in the diff. It is advice, never a replacement for reading: flag only what you found worth a closer look (no hotspots to fill a quota, none at all is fine for a trivial PR), and write it for the head you reviewed.
 - Start from `bin/bot-review-guide context PR_URL`: the head, the commits, each file's head-side hunk ranges and which commits touch it, and a skeleton.

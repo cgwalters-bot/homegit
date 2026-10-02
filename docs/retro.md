@@ -22,7 +22,9 @@ agent reads its report and decides what to act on.
   command polled over and over, tool calls or wait loops blocking for
   over 10 minutes, idle gaps over 30 minutes, messages sent to agents the
   user had stopped.
-- **Reviewer-caught bugs**: each reviewer's verdict and its numbered
+- **Reviewer-caught bugs**: each reviewer's verdict (from the
+  `Verdict: APPROVE` or `Verdict: CHANGES` first line the reviewer
+  preamble requires, counting the reports that lack it) and its numbered
   findings, sorted into rough categories (correctness, tests, error
   handling, security, commit message, claims, docs, cleanup), so the
   categories reviewers keep catching can move into the worker checklist.
