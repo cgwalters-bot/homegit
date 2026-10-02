@@ -1,0 +1,11 @@
+# Enable with: systemctl --user enable --now bot-sweep.timer
+# (and 'loginctl enable-linger' so it runs without a login session).
+[Unit]
+Description=Run the coordinator's sweep every 10 minutes
+
+[Timer]
+OnCalendar=*:0/10
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

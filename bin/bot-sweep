@@ -1,0 +1,476 @@
+#!/usr/bin/env node
+// One full sweep for the coordinator, run by the bot-sweep.timer user
+// unit: bot-watch --apply, bot-notify and bot-pr inbox --dry-run, their
+// outputs published atomically for bot-poll --from-sweep to read. See
+// --help. Node's standard library only.
+"use strict";
+
+const { spawn, spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1] || "bot-sweep");
+const SELF = fs.realpathSync(process.argv[1] || __filename);
+// The bot-* tools next to this one (tests substitute fakes).
+const BIN_DIR = process.env.BOT_SWEEP_BIN_DIR || path.dirname(SELF);
+const REPO_DIR = path.dirname(path.dirname(SELF));
+const GIT = process.env.BOT_SWEEP_GIT || "git";
+const STATUS_VERSION = 1;
+const MINUTE_MS = 60 * 1000;
+// A sweep's steps must be done well before the unit's TimeoutStartSec
+// (25 min), so that systemd never has to kill it: in a toolbox the
+// steps run in the container's cgroup, out of the unit's reach.
+const DEADLINE_MS = 22 * MINUTE_MS;
+// Phases run in order; the steps of a phase run at once. Each step's
+// stdout and stderr go to NAME.txt in the run's directory, as bot-poll
+// reads them.
+const PHASES = [
+  [{ name: "git", cmd: GIT, args: ["-C", REPO_DIR, "pull", "-q", "--ff-only"], timeoutMin: 2 }],
+  [
+    // The coordinator's sweep: items led by a topic session are its own.
+    { name: "watch", tool: "bot-watch", args: ["--apply", "--exclude-lead", "*"], timeoutMin: 20 },
+    { name: "notify", tool: "bot-notify", args: [], timeoutMin: 5 },
+    { name: "inbox", tool: "bot-pr", args: ["inbox", "--dry-run"], timeoutMin: 10 },
+  ],
+  [{ name: "tmt-gc", tool: "bot-tmt-number", args: ["--gc"], timeoutMin: 2 }],
+];
+// The steps whose output bot-poll reads for news: published as
+// latest-NAME.txt too.
+const NEWS_STEPS = ["watch", "notify", "inbox"];
+// bot-watch's report is whole once it has this closing line.
+const SWEPT_RE = /^Swept [0-9]+ URLs/m;
+// What bot-watch, bot-notify and bot-pr print when another run holds
+// their lock: worth a retry, since bot-poll's hot cycle runs bot-notify too.
+const LOCK_HELD_RE = /another \S+ run holds \S*lock/;
+const LOCK_RETRIES = 3;
+const LOCK_RETRY_WAIT_MS = Number(process.env.BOT_SWEEP_RETRY_WAIT_MS || 30 * 1000);
+// After SIGTERM, a step's process group gets this long before SIGKILL.
+const KILL_GRACE_MS = 5 * 1000;
+// How often to check that the parent is still there (see orphanGuard).
+const PARENT_CHECK_MS = 5 * 1000;
+const PARENT_ENV = "BOT_SWEEP_PARENT_PID";
+const KEEP_DAYS = 2;
+// Test hook: every step's timeout, in seconds.
+const TIMEOUT_OVERRIDE_S = Number(process.env.BOT_SWEEP_TIMEOUT_S || 0);
+const PARTIAL_KEEP_MS = 24 * 3600 * 1000;
+const PROBLEM_TAIL = 200;
+// Run directories are named by their UTC start, which sorts, as bot-poll's.
+const RUN_ID_RE = /^[0-9]{8}-[0-9]{6}-[0-9]{3}$/;
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+const EX_TEMPFAIL = 75;
+
+class Exit extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} [--state-dir DIR]
+
+Runs one full sweep for the coordinator and publishes its results, for
+'bot-poll --from-sweep DIR' to read. The bot-sweep.timer user unit runs
+it every few minutes, outside any agent session, so that a slow sweep is
+never killed halfway by a poll's timeout:
+
+  git -C HOMEGIT pull -q --ff-only
+  bot-watch --apply --exclude-lead '*'   \\
+  bot-notify                              > at once
+  bot-pr inbox --dry-run                 /
+  bot-tmt-number --gc
+
+Each step has a timeout (git 2, bot-watch 20, bot-notify 5, inbox 10,
+gc 2 minutes) and runs in its own process group, all of which is killed
+when it times out, so no orphan keeps holding bot-watch's lock. A step
+that finds another run holding its lock is retried ${LOCK_RETRIES} times.
+
+The run goes to DIR/runs/.ID.partial, renamed to DIR/runs/ID when done
+(ID is its UTC start, YYYYMMDD-HHMMSS-mmm): NAME.txt per step (stdout and
+stderr) and status.json ({NAME: exit status, or null if killed}, as
+bot-poll reads a run). Then, each written to a temporary file and
+renamed into place:
+
+  DIR/latest-{watch,notify,inbox}.txt   the run's outputs
+  DIR/status.json                       {run, started_at, ended_at,
+                                        duration_s, steps: {NAME: {exit,
+                                        signal, timed_out, attempts,
+                                        duration_s, bytes}}, problems,
+                                        complete, last_complete}
+
+problems lists what went wrong (a step that failed, timed out or found
+its lock held; bot-watch's report empty or without its closing "Swept"
+line); complete says whether bot-watch's report is whole and bot-notify
+and inbox succeeded; last_complete is the newest complete run {run,
+ended_at}. While a sweep runs, DIR/running.json holds its pid, and
+another sweep refuses to start. Runs are kept ${KEEP_DAYS} days.
+
+DIR defaults to \${XDG_STATE_HOME:-~/.local/state}/bot-sweep.
+
+Environment:
+  BOT_SWEEP_TOOLBOX         run inside this toolbox container (re-executing
+                            there, unless already in a container)
+  BOT_SWEEP_GH_TOKEN_FILE   if GH_TOKEN is unset, the file to read it from
+                            (the existing token file; nothing is copied);
+                            a leading ~/ is the home directory
+
+Exits 0 when the run has no problems, 1 when it has, 75 when another
+sweep is running.`;
+}
+
+function parseArgs(argv) {
+  const opts = { stateDir: null };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-h" || a === "--help") {
+      process.stdout.write(`${usage()}\n`);
+      process.exit(0);
+    } else if (a === "--state-dir") {
+      if (i + 1 >= argv.length) throw new Exit(EX_USAGE, "--state-dir requires a directory");
+      opts.stateDir = argv[++i];
+    } else {
+      throw new Exit(EX_USAGE, `unknown argument: ${a} (see --help)`);
+    }
+  }
+  if (!opts.stateDir) {
+    const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+    opts.stateDir = path.join(base, "bot-sweep");
+  }
+  return opts;
+}
+
+// In a toolbox, unless already in a container: the tools (gh, rg) and
+// the environment the coordinator uses live there. 'toolbox run' passes
+// on little of the environment, so the BOT_SWEEP_* settings (never a
+// token itself, which would show in ps) and the state dir go on its
+// command line. Returns its exit status, or null to sweep here.
+function maybeReexec(opts) {
+  const box = process.env.BOT_SWEEP_TOOLBOX;
+  if (!box || fs.existsSync("/run/.containerenv")) return null;
+  const settings = Object.entries(process.env)
+    .filter(([k]) => k.startsWith("BOT_SWEEP_") && k !== "BOT_SWEEP_TOOLBOX")
+    .map(([k, v]) => `${k}=${v}`);
+  // The guard inside watches this process: the one inside keeps conmon
+  // as its parent when 'toolbox run' is killed.
+  settings.push(`${PARENT_ENV}=${process.pid}`);
+  const r = spawnSync("toolbox", ["run", "-c", box, "env", ...settings, SELF, "--state-dir", opts.stateDir],
+    { stdio: "inherit" });
+  if (r.error) throw new Exit(EX_ERROR, `cannot run 'toolbox run -c ${box}': ${r.error.message}`);
+  return r.status ?? EX_ERROR;
+}
+
+function childEnv() {
+  const env = { ...process.env };
+  // An EnvironmentFile expands no %h: take ~/ instead.
+  const file = (process.env.BOT_SWEEP_GH_TOKEN_FILE || "").replace(/^~\//, `${os.homedir()}/`);
+  if (!env.GH_TOKEN && file) {
+    try {
+      env.GH_TOKEN = fs.readFileSync(file, "utf8").trim();
+    } catch (e) {
+      throw new Exit(EX_ERROR, `cannot read the gh token from ${file}: ${e.message}`);
+    }
+    if (!env.GH_TOKEN) throw new Exit(EX_ERROR, `${file} is empty; it should hold the bot's gh token`);
+  }
+  return env;
+}
+
+function runId(d) {
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-` +
+    `${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}-${p(d.getUTCMilliseconds(), 3)}`;
+}
+
+function writeAtomic(file, text) {
+  const tmp = `${file}.tmp.${process.pid}`;
+  fs.writeFileSync(tmp, text);
+  fs.renameSync(tmp, file);
+}
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+// Takes DIR/running.json, or throws if a live sweep holds it.
+function takeRunning(file, id) {
+  const body = `${JSON.stringify({ pid: process.pid, run: id, started_at: new Date().toISOString() })}\n`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(file, body, { flag: "wx" });
+      return;
+    } catch (e) {
+      if (e.code !== "EEXIST") throw new Exit(EX_ERROR, `cannot create ${file}: ${e.message}`);
+    }
+    let held = null;
+    try {
+      held = JSON.parse(fs.readFileSync(file, "utf8"));
+    } catch {
+      // Unreadable: left by a crash mid-write, so stale.
+    }
+    if (held && Number.isInteger(held.pid) && pidAlive(held.pid)) {
+      throw new Exit(EX_TEMPFAIL, `another ${PROG} (pid ${held.pid}, run ${held.run}) is running; see ${file}`);
+    }
+    fs.rmSync(file, { force: true });
+  }
+  throw new Exit(EX_ERROR, `cannot take ${file}`);
+}
+
+// The live steps' process groups, so that a signal can kill them all,
+// and why the sweep is stopping, once it is: no step starts after that.
+const live = new Set();
+let stopping = null;
+
+function killGroup(pid, signal) {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // Already gone.
+  }
+}
+
+function killAll() {
+  for (const pid of live) killGroup(pid, "SIGTERM");
+  const pids = [...live];
+  return new Promise((resolve) => setTimeout(() => {
+    for (const pid of pids) killGroup(pid, "SIGKILL");
+    resolve();
+  }, pids.length ? KILL_GRACE_MS : 0));
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Runs one attempt of a step in its own process group, appending to
+// OUT; kills the whole group at DEADLINE (ms since the epoch).
+function attempt(cmd, args, out, env, deadline) {
+  return new Promise((resolve) => {
+    const fd = fs.openSync(out, "a");
+    let child;
+    try {
+      child = spawn(cmd, args, { stdio: ["ignore", fd, fd], env, detached: true });
+    } catch (e) {
+      fs.closeSync(fd);
+      resolve({ exit: null, signal: null, timedOut: false, error: e.message });
+      return;
+    }
+    let timedOut = false;
+    let timer = null;
+    let error = null;
+    let finished = false;
+    const finish = (code, signal) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      fs.closeSync(fd);
+      if (child.pid) {
+        live.delete(child.pid);
+        // Whatever it left behind in its group (a backgrounded job
+        // holding a lock, say) goes with it.
+        killGroup(child.pid, "SIGKILL");
+      }
+      resolve({ exit: code, signal, timedOut, error });
+    };
+    child.on("spawn", () => {
+      live.add(child.pid);
+      timer = setTimeout(() => {
+        timedOut = true;
+        killGroup(child.pid, "SIGTERM");
+        setTimeout(() => killGroup(child.pid, "SIGKILL"), KILL_GRACE_MS).unref();
+      }, Math.max(0, deadline - Date.now()));
+    });
+    child.on("error", (e) => {
+      error = e.message;
+      // It never started: no 'close' need follow.
+      if (!child.pid) finish(null, null);
+    });
+    child.on("close", finish);
+  });
+}
+
+async function runStep(step, runDir, env, sweepDeadline) {
+  const out = path.join(runDir, `${step.name}.txt`);
+  fs.writeFileSync(out, "");
+  const cmd = step.tool ? path.join(BIN_DIR, step.tool) : step.cmd;
+  const start = Date.now();
+  const timeoutMs = TIMEOUT_OVERRIDE_S ? TIMEOUT_OVERRIDE_S * 1000 : step.timeoutMin * MINUTE_MS;
+  const deadline = Math.min(start + timeoutMs, sweepDeadline);
+  let r = { exit: null, signal: null, timedOut: false, error: null };
+  let attempts = 0;
+  for (;;) {
+    if (stopping) break;
+    attempts++;
+    const before = fs.statSync(out).size;
+    r = await attempt(cmd, step.args, out, env, deadline);
+    if (r.error) fs.appendFileSync(out, `${PROG}: cannot run ${cmd}: ${r.error}\n`);
+    if (r.exit === 0 || r.timedOut || attempts > LOCK_RETRIES) break;
+    const fresh = fs.readFileSync(out, "utf8").slice(before);
+    if (!LOCK_HELD_RE.test(fresh) || Date.now() + LOCK_RETRY_WAIT_MS >= deadline) break;
+    fs.appendFileSync(out, `${PROG}: the lock is held; retrying in ${LOCK_RETRY_WAIT_MS / 1000}s\n`);
+    await sleep(LOCK_RETRY_WAIT_MS);
+  }
+  if (r.timedOut) fs.appendFileSync(out, `${PROG}: killed ${step.name} after ${Math.round((Date.now() - start) / 1000)}s\n`);
+  return {
+    exit: r.exit, signal: r.signal, timed_out: r.timedOut, attempts,
+    duration_s: Math.round((Date.now() - start) / 100) / 10, bytes: fs.statSync(out).size,
+  };
+}
+
+function lastLine(text) {
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const l = lines.length ? lines[lines.length - 1] : "";
+  return l.length > PROBLEM_TAIL ? `${l.slice(0, PROBLEM_TAIL - 3)}...` : l;
+}
+
+// What went wrong in a run, one line each, and whether bot-poll can
+// take its news as whole.
+function assess(steps, outputs) {
+  const problems = [];
+  for (const [name, s] of Object.entries(steps)) {
+    const text = outputs[name] || "";
+    if (s.timed_out) {
+      problems.push(`${name} timed out after ${s.duration_s}s`);
+    } else if (LOCK_HELD_RE.test(text) && s.exit !== 0) {
+      problems.push(`${name}: another run held its lock (${s.attempts} attempts): ${lastLine(text)}`);
+    } else if (s.exit === null) {
+      problems.push(`${name} was killed${s.signal ? ` by ${s.signal}` : ", or failed to start"}: ${lastLine(text)}`);
+    } else if (s.exit !== 0) {
+      problems.push(`${name} exited ${s.exit}: ${lastLine(text)}`);
+    }
+  }
+  const watch = outputs.watch || "";
+  if (steps.watch && !steps.watch.timed_out) {
+    if (!watch.trim()) problems.push("watch printed nothing");
+    else if (!SWEPT_RE.test(watch)) problems.push("watch's report has no closing \"Swept\" line");
+  }
+  const complete = SWEPT_RE.test(watch) && steps.notify?.exit === 0 && steps.inbox?.exit === 0;
+  return { problems, complete };
+}
+
+function readStatus(file) {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function prune(runsDir, now) {
+  let names;
+  try {
+    names = fs.readdirSync(runsDir);
+  } catch {
+    return;
+  }
+  for (const n of names) {
+    const p = path.join(runsDir, n);
+    const partial = n.startsWith(".") && n.endsWith(".partial");
+    if (!partial && !RUN_ID_RE.test(n)) continue;
+    let age;
+    try {
+      age = now - fs.statSync(p).mtimeMs;
+    } catch {
+      continue;
+    }
+    if (age > (partial ? PARTIAL_KEEP_MS : KEEP_DAYS * 24 * 3600 * 1000)) {
+      try {
+        fs.rmSync(p, { recursive: true, force: true });
+      } catch (e) {
+        process.stderr.write(`${PROG}: warning: pruning ${p} failed: ${e.message}\n`);
+      }
+    }
+  }
+}
+
+// Stops the sweep when the bot-sweep that re-executed it in a toolbox
+// ($BOT_SWEEP_PARENT_PID, in the shared pid namespace) is gone (its unit
+// stopped: this process is in the container's cgroup, out of the unit's
+// reach), or else when its parent is.
+function orphanGuard(onOrphan) {
+  const outer = Number(process.env[PARENT_ENV] || 0);
+  const parent = process.ppid;
+  const t = setInterval(() => {
+    if (outer ? !pidAlive(outer) : process.ppid !== parent) onOrphan("the unit's process exited");
+  }, PARENT_CHECK_MS);
+  t.unref();
+}
+
+async function sweep(opts) {
+  const dir = opts.stateDir;
+  const runsDir = path.join(dir, "runs");
+  fs.mkdirSync(runsDir, { recursive: true });
+  const started = new Date();
+  const id = runId(started);
+  const runningFile = path.join(dir, "running.json");
+  takeRunning(runningFile, id);
+  // On a signal, the steps are killed and the rest skipped, but what ran
+  // is published, its status saying it was stopped.
+  let killed = null;
+  const stop = (why) => {
+    if (stopping) return;
+    stopping = why;
+    process.stderr.write(`${PROG}: stopping: ${why}\n`);
+    killed = killAll();
+  };
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => stop(`got ${sig}`));
+  orphanGuard(stop);
+  try {
+    const env = childEnv();
+    const partial = path.join(runsDir, `.${id}.partial`);
+    fs.mkdirSync(partial);
+    const sweepDeadline = started.getTime() + DEADLINE_MS;
+    const steps = {};
+    for (const phase of PHASES) {
+      if (stopping) break;
+      const results = await Promise.all(phase.map((s) => runStep(s, partial, env, sweepDeadline)));
+      phase.forEach((s, i) => {
+        steps[s.name] = results[i];
+      });
+      // bot-poll's view of a run: each step's exit status, null if killed.
+      writeAtomic(path.join(partial, "status.json"),
+        `${JSON.stringify(Object.fromEntries(Object.entries(steps).map(([n, s]) => [n, s.exit])))}\n`);
+    }
+    const runDir = path.join(runsDir, id);
+    fs.renameSync(partial, runDir);
+    const outputs = {};
+    for (const n of Object.keys(steps)) outputs[n] = fs.readFileSync(path.join(runDir, `${n}.txt`), "utf8");
+    const { problems, complete } = assess(steps, outputs);
+    if (stopping) problems.unshift(`the sweep was stopped (${stopping})`);
+    const ended = new Date();
+    for (const n of NEWS_STEPS) writeAtomic(path.join(dir, `latest-${n}.txt`), outputs[n] ?? "");
+    const statusFile = path.join(dir, "status.json");
+    const prev = readStatus(statusFile);
+    const status = {
+      version: STATUS_VERSION, run: id, dir: runDir,
+      started_at: started.toISOString(), ended_at: ended.toISOString(),
+      duration_s: Math.round((ended - started) / 100) / 10,
+      steps, problems, complete,
+      last_complete: complete ? { run: id, ended_at: ended.toISOString() } : (prev?.last_complete ?? null),
+    };
+    writeAtomic(statusFile, `${JSON.stringify(status, null, 1)}\n`);
+    prune(runsDir, Date.now());
+    process.stdout.write(`${PROG}: run ${id} took ${status.duration_s}s` +
+      `${problems.length ? `; problems:\n${problems.map((p) => `  ${p}`).join("\n")}` : "; no problems"}\n`);
+    return problems.length ? EX_ERROR : 0;
+  } finally {
+    if (killed) await killed;
+    fs.rmSync(runningFile, { force: true });
+  }
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  const opts = parseArgs(argv);
+  const re = maybeReexec(opts);
+  if (re !== null) return re;
+  return sweep(opts);
+}
+
+main().then((code) => process.exit(code), (e) => {
+  process.stderr.write(`${PROG}: ${e instanceof Exit ? "" : "error: "}${e.message}\n`);
+  process.exit(e instanceof Exit ? e.code : EX_ERROR);
+});

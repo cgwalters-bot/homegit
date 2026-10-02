@@ -1,0 +1,20 @@
+# The coordinator's sweep (homegit's bin/bot-sweep, see its --help),
+# apart from any agent session: bot-poll --from-sweep reads its results.
+# Host-specific settings go in ~/.config/bot-sweep.env, e.g.
+#   BOT_SWEEP_TOOLBOX=NAME              to sweep inside that toolbox
+#   BOT_SWEEP_GH_TOKEN_FILE=~/PATH      the bot's existing gh token file
+[Unit]
+Description=Sweep the bot's board, notifications and inbox for the coordinator
+
+[Service]
+Type=oneshot
+EnvironmentFile=-%h/.config/bot-sweep.env
+# toolbox asks tput about the terminal otherwise.
+Environment=TERM=dumb
+ExecStart=%h/src/github/cgwalters-bot/homegit/bin/bot-sweep
+# bot-sweep stops its own steps by 22 minutes; this is the backstop.
+TimeoutStartSec=25min
+# Every process of the sweep goes when it ends: none may keep holding
+# bot-watch's lock.
+KillMode=control-group
+Nice=5
