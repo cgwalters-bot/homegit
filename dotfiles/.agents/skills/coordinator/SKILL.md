@@ -692,6 +692,21 @@ cost when an item is far off (two buckets), and correct the table in
   - **containment:** anything that weakens the sandbox or the
     prompt-injection boundaries (treating GitHub text as data, the review
     app's auth, CSP and approve guard, egress limits).
+  - **Devspace-sandbox remote-worker stack (standing exception to
+    "containment"):** the operator, on cgwalters-forge/tracker#282: "What I
+    mean is we are not really sandboxing the sub agents here effectively so
+    almost anything we do to sandbox the remote workers and run them
+    remotely is just better than what we have now, but obviously we're
+    aiming to de-duplicate with agentic workflows which should add a lot
+    more security down the line. But let's not obsess right now over the
+    security of our POC implementation were iterating towards improvements,
+    and obviously we will rewrite it as we go." So changes to the
+    devspace-sandbox stack that improve remote sandboxing or run work
+    remotely (egress proxy, runner-sandbox user, run tokens, toolchain,
+    homegit as input, opencode model default) merge after real testing
+    plus an independent subagent review, without the operator. Anything
+    that widens what credentials the bot holds, or who can authorize
+    actions (sign-off, operator trust), is still flagged and not merged.
   Upstream (non-harness) repositories are unchanged: their pull requests,
   including forge fork PRs targeting bootc-dev or another upstream (e.g.
   cgwalters-devspace-sandbox), go through `bot-pr promote` on the
