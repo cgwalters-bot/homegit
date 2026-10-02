@@ -139,6 +139,44 @@ lands back in Todo; look at it (`bot-runs show`/`log`) before
 dispatching it again, and never dispatch an item whose `Run` is set:
 that run still owns it.
 
+### Work that doesn't need Claude: opencode with GPT-6.1 Sol
+
+Claude usage is the scarce budget, so work that needs no Claude-specific
+judgment can run on opencode with GPT-6.1 Sol (`praxis/gpt-6.1-sol`),
+through the praxis broker's Codex subscription: small mechanical
+changes, test additions, docs, a first pass at a well-specified item.
+Reviews, policy checks, harness changes and anything security-relevant
+stay on Claude. Two shapes, both with no credential copied anywhere
+(inference goes through the broker, whose base URL opencode's
+configuration holds with a placeholder key):
+
+- **Remote:** `bot-runs dispatch` already defaults opencode runs to that
+  model (`--model` or `BOT_RUNS_MODEL` change it); see the previous
+  section. The patch it hands back waits for `bot-runs apply`'s
+  hardening (homegit#82) like any other run's.
+- **Local:** `bin/bot-opencode [--repo DIR] [--base REF] [--task NAME]
+  [--timeout MIN] BRIEF` (a file, or `-`) starts `opencode acp`, the
+  Agent Client Protocol over stdio, in a new detached worktree of the
+  repository under `~/.cache/bot-work/opencode/NAME`, sends the brief,
+  prints tool-call progress and token counts on stderr, cancels the agent
+  at the timeout (exit 124), and prints opencode's final message and the
+  diff on stdout (`--out DIR` also saves `message.md` and
+  `changes.patch`). It commits nothing: review the diff as you would a
+  builder's and commit from the worktree with `bin/bot-git`, then
+  `git worktree remove` it (or pass `--rm`). It refuses any model not on
+  the praxis provider. It runs as the bot, never with your own setup:
+  its HOME (`~/.cache/bot-work/opencode/home`) holds only homegit's
+  `dotfiles/.config/opencode` (opencode.json with the praxis provider and
+  the bot's AGENTS.md) and `dotfiles/.agents/skills`, its environment is
+  cut to PATH and the locale (no token, SSH agent or XDG/OPENCODE_*
+  override), the repository's own opencode configuration is switched off,
+  and commits carry the bot's identity from the operator config. The
+  wrapper prepends the worker rules to the brief: edit only, no commits (a
+  pre-commit hook refuses them), no GitHub, and no local builds or tests,
+  which belong on a devspace: run them yourself (see devspace-work). The
+  worktree is still not a sandbox: the agent runs as your user and shares
+  the repository's `.git`, so don't point it at what it shouldn't see.
+
 ## Polling
 
 The sweeps run apart from this session: the `bot-sweep.timer` systemd

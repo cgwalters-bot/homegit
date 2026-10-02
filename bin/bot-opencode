@@ -1,0 +1,472 @@
+#!/usr/bin/env node
+// Run one task with opencode (GPT-6.1 Sol through the praxis broker) as an
+// ACP agent subprocess in a per-task git worktree, and print its final
+// message and the diff. See --help and the coordinator skill's "Local
+// opencode workers". Node's standard library only.
+"use strict";
+
+const { spawn, spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+const readline = require("node:readline");
+
+const PROG = path.basename(process.argv[1] || "bot-opencode");
+// The Agent Client Protocol version this client speaks, and what it calls
+// itself.
+const ACP_VERSION = 1;
+const CLIENT_NAME = "bot-opencode";
+const DEFAULT_MODEL = process.env.BOT_RUNS_MODEL || "praxis/gpt-6.1-sol";
+// Inference only ever goes through the broker: a model of another provider
+// would use whatever login opencode has, so it is refused.
+const BROKER_PROVIDER = "praxis";
+const DEFAULT_TIMEOUT_MIN = 30;
+// Time the agent gets to stop after session/cancel before it is killed.
+const CANCEL_GRACE_MS = 15000;
+// Time it gets to exit on SIGTERM before SIGKILL.
+const KILL_GRACE_MS = 5000;
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+const EX_TIMEOUT = 124;
+// The longest --timeout (a day), well inside what setTimeout can count.
+const MAX_TIMEOUT_MIN = 1440;
+const WORK_ROOT = path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "bot-work", "opencode");
+// The only environment variables the agent inherits (and LC_*): no token,
+// no SSH agent, no XDG or OPENCODE_* override, nothing of the operator's
+// own setup. The wrapper uses no credential and opencode needs none (the
+// broker's key is a placeholder in its configuration).
+const INHERITED_ENV = ["PATH", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR", "USER", "LOGNAME"];
+// The agent's home: a directory of its own under WORK_ROOT (kept between
+// runs, for opencode's caches) holding only homegit's opencode
+// configuration and skills, so it never reads the operator's
+// ~/.config/opencode, ~/.config/AGENTS.md, ~/.claude or ~/.gitconfig, or
+// finds a login in ~/.local/share/opencode.
+const AGENT_HOME = path.join(WORK_ROOT, "home");
+// What the bot's own configuration is, in homegit's checkout (next to bin/).
+const BOT_DOTFILES = path.join(__dirname, "..", "dotfiles");
+const BOT_HOME_LINKS = { ".config/opencode": ".config/opencode", ".agents/skills": ".agents/skills" };
+const TASK_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+// A tool call's title is cut to this many characters in the progress lines.
+const PROGRESS_WIDTH = 100;
+// Strings that look like credentials; the agent's output is checked for
+// them before it is printed, since it may end up in a public PR.
+const SECRET_RE = /gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----/;
+
+// Put before the brief: what a local bot worker may not do. The wrapper
+// enforces the first rule too (a hook refuses commits) and keeps whatever
+// still gets committed under the bot's identity.
+const WORKER_RULES = `You are a worker run by a wrapper, in a throwaway git worktree. Rules:
+- Edit files only. Do not run git commit, git push, git rebase or any other git command that writes history, and do not use gh or touch GitHub in any way: the caller reviews the working tree and commits it.
+- Do not build, compile, install dependencies or run tests or linters here (no cargo, npm, make, podman, pytest and the like): builds and tests run on a devspace, which the caller does. Cheap read-only checks (grep, cat, git diff, a syntax check with no installs) are fine.
+- Keep the change to what the task asks.
+
+Task:
+`;
+const BOT_IDENTITY_KEYS = { name: "bot.git_name", email: "bot.git_email" };
+
+class Fatal extends Error {
+  constructor(message, status = EX_ERROR) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} [--repo DIR] [--base REF] [--task NAME] [--model MODEL]
+                    [--timeout MIN] [--out DIR] [--trace FILE] [--rm] [-q] BRIEF
+
+Run BRIEF (a file, or - for stdin) with opencode as an ACP agent
+('opencode acp' on stdio) in a new git worktree of --repo (default: the
+current directory's repository) at --base (default HEAD), and print the
+agent's final message, then the diff of everything it changed against the
+starting commit. Nothing is committed or pushed; review the diff and
+commit it yourself (bot-git), from the worktree.
+
+The agent is told to edit only: no commits (a pre-commit hook refuses
+them, and anything it commits anyway carries the bot's identity from the
+operator config, never yours), no GitHub, and no local builds or tests,
+which belong on a devspace. The diff covers its commits too.
+
+It runs as the bot, not as you: HOME is ${AGENT_HOME}, holding only
+homegit's own dotfiles/.config/opencode (its AGENTS.md and the praxis
+provider: a base URL and a placeholder key, never a login) and
+dotfiles/.agents/skills, and the environment is cut to ${INHERITED_ENV.join(" ")} and LC_*
+(no token, no SSH agent, no XDG or OPENCODE_* override). Your own
+~/.config/opencode, ~/.config/AGENTS.md, ~/.claude, ~/.gitconfig and
+opencode logins are not read.
+
+Inference goes through the praxis broker and nothing else: a model of any
+other provider is refused, and no credential is read, written or copied.
+
+  --task NAME     worktree name (default: a timestamp), under
+                  ${WORK_ROOT}/NAME
+  --model MODEL   provider/model (default ${DEFAULT_MODEL}; BOT_RUNS_MODEL)
+  --timeout MIN   cancel the agent after MIN minutes (default ${DEFAULT_TIMEOUT_MIN});
+                  exits ${EX_TIMEOUT} then, still printing the diff so far
+  --out DIR       also write message.md and changes.patch there
+  --trace FILE    write the raw ACP stream (JSON lines) to FILE
+  --rm            remove the worktree afterwards (the diff is only kept
+                  with --out)
+  -q              no progress lines on stderr
+
+The agent still runs as your user, in its own process group, with the
+repository's .git (a worktree shares it): the worktree is no sandbox. The
+result is checked for secret-shaped strings, a best-effort guard only.
+
+Progress (tool calls, tokens) goes to stderr; the result to stdout. Exit
+status: 0 done, ${EX_ERROR} error or the agent failed, ${EX_USAGE} usage, ${EX_TIMEOUT} timed out.
+`;
+}
+
+function parseArgs(argv) {
+  const opts = {
+    repo: process.cwd(), base: "HEAD", task: null, model: DEFAULT_MODEL, timeoutMin: DEFAULT_TIMEOUT_MIN,
+    out: null, trace: null, rm: false, quiet: false, brief: null,
+  };
+  const value = (i, name) => {
+    if (i + 1 >= argv.length) throw new Fatal(`${name} requires a value`, EX_USAGE);
+    return argv[i + 1];
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "-h": case "--help": process.stdout.write(usage()); process.exit(0); break;
+      case "--repo": opts.repo = path.resolve(value(i++, a)); break;
+      case "--base": opts.base = value(i++, a); break;
+      case "--task": opts.task = value(i++, a); break;
+      case "--model": opts.model = value(i++, a); break;
+      case "--timeout": {
+        const n = Number(value(i++, a));
+        if (!Number.isFinite(n) || n <= 0 || n > MAX_TIMEOUT_MIN) {
+          throw new Fatal(`--timeout must be above 0 and at most ${MAX_TIMEOUT_MIN} minutes`, EX_USAGE);
+        }
+        opts.timeoutMin = n;
+        break;
+      }
+      case "--out": opts.out = path.resolve(value(i++, a)); break;
+      case "--trace": opts.trace = path.resolve(value(i++, a)); break;
+      case "--rm": opts.rm = true; break;
+      case "-q": case "--quiet": opts.quiet = true; break;
+      default:
+        if (a !== "-" && a.startsWith("-")) throw new Fatal(`unknown option: ${a} (see --help)`, EX_USAGE);
+        if (opts.brief !== null) throw new Fatal("only one BRIEF", EX_USAGE);
+        opts.brief = a;
+    }
+  }
+  if (opts.brief === null) throw new Fatal("missing BRIEF (a file, or - for stdin)", EX_USAGE);
+  if (opts.task === null) opts.task = new Date().toISOString().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-");
+  if (!TASK_RE.test(opts.task)) throw new Fatal("--task must be letters, digits, . _ - only", EX_USAGE);
+  if (!opts.model.startsWith(`${BROKER_PROVIDER}/`)) {
+    throw new Fatal(`model ${opts.model} is not on the ${BROKER_PROVIDER} broker; inference must go through it`, EX_USAGE);
+  }
+  return opts;
+}
+
+function git(cwd, args, { input, allowFail = false } = {}) {
+  const r = spawnSync("git", args, { cwd, input, encoding: "utf8", maxBuffer: 1 << 30 });
+  if (r.status !== 0 && !allowFail) {
+    throw new Fatal(`git ${args.join(" ")} failed in ${cwd}: ${(r.stderr || "").trim()}`);
+  }
+  return r.stdout;
+}
+
+function readBrief(opts) {
+  try {
+    return fs.readFileSync(opts.brief === "-" ? 0 : opts.brief, "utf8");
+  } catch (e) {
+    throw new Fatal(`cannot read the brief ${opts.brief}: ${e.message}`, EX_USAGE);
+  }
+}
+
+// A detached worktree at the base: the shared clone's branches and working
+// tree are never touched.
+function makeWorktree(opts) {
+  const top = git(opts.repo, ["rev-parse", "--show-toplevel"]).trim();
+  const dir = path.join(WORK_ROOT, opts.task);
+  if (fs.existsSync(dir)) throw new Fatal(`${dir} exists; pick another --task or remove it`);
+  fs.mkdirSync(WORK_ROOT, { recursive: true });
+  git(top, ["worktree", "add", "--detach", dir, opts.base]);
+  return { top, dir, start: git(dir, ["rev-parse", "HEAD"]).trim() };
+}
+
+// Everything the agent changed, tracked or not, against the start commit.
+function collectDiff(wt) {
+  git(wt.dir, ["add", "-A"]);
+  const patch = git(wt.dir, ["diff", "--cached", "--binary", wt.start]);
+  const stat = git(wt.dir, ["diff", "--cached", "--stat", wt.start]);
+  return { patch, stat };
+}
+
+class Acp {
+  constructor(child, onNotification, onRequest, trace) {
+    this.child = child;
+    this.nextId = 1;
+    this.pending = new Map();
+    this.onNotification = onNotification;
+    this.onRequest = onRequest;
+    this.trace = trace;
+    this.gone = null;
+    this.closed = new Promise((resolve) => child.on("close", (code, signal) => {
+      this.gone = `opencode exited (${signal || code})`;
+      this.failPending(this.gone);
+      resolve({ code, signal });
+    }));
+    readline.createInterface({ input: child.stdout }).on("line", (line) => this.handle(line));
+    child.stdin.on("error", () => {});
+    child.on("error", (e) => {
+      this.gone = `cannot run opencode: ${e.message}`;
+      this.failPending(this.gone);
+    });
+  }
+
+  log(dir, msg) {
+    if (this.trace !== null) fs.writeSync(this.trace, `${JSON.stringify({ ts: Date.now() / 1000, dir, msg })}\n`);
+  }
+
+  handle(line) {
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch {
+      return;
+    }
+    if (msg === null || typeof msg !== "object") return;
+    this.log("recv", msg);
+    if (msg.method !== undefined && msg.id !== undefined) {
+      Promise.resolve(this.onRequest(msg.method, msg.params))
+        .then((result) => this.write({ jsonrpc: "2.0", id: msg.id, result }))
+        .catch((e) => this.write({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: String(e.message || e) } }));
+    } else if (msg.method !== undefined) {
+      this.onNotification(msg.method, msg.params);
+    } else if (this.pending.has(msg.id)) {
+      const { resolve, reject } = this.pending.get(msg.id);
+      this.pending.delete(msg.id);
+      if (msg.error) reject(new Fatal(`ACP error ${msg.error.code}: ${msg.error.message}`));
+      else resolve(msg.result);
+    }
+  }
+
+  write(msg) {
+    this.log("send", msg);
+    if (!this.gone) this.child.stdin.write(`${JSON.stringify(msg)}\n`);
+  }
+
+  request(method, params) {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      if (this.gone) return reject(new Fatal(this.gone));
+      this.pending.set(id, { resolve, reject });
+      this.write({ jsonrpc: "2.0", id, method, params });
+    });
+  }
+
+  notify(method, params) {
+    this.write({ jsonrpc: "2.0", method, params });
+  }
+
+  // Fails whatever is pending once the agent is gone.
+  failPending(why) {
+    for (const { reject } of this.pending.values()) reject(new Fatal(why));
+    this.pending.clear();
+  }
+}
+
+// The bot's git identity from the operator config, as git's environment
+// variables: the operator's own global identity must never author a bot
+// commit (bot-git check refuses it). Empty when bot-operator isn't there.
+function botIdentityEnv() {
+  const get = (key) => {
+    const r = spawnSync(path.join(__dirname, "bot-operator"), ["get", key], { encoding: "utf8" });
+    return r.status === 0 ? r.stdout.trim() : "";
+  };
+  const name = get(BOT_IDENTITY_KEYS.name);
+  const email = get(BOT_IDENTITY_KEYS.email);
+  if (!name || !email) return {};
+  return { GIT_AUTHOR_NAME: name, GIT_AUTHOR_EMAIL: email, GIT_COMMITTER_NAME: name, GIT_COMMITTER_EMAIL: email };
+}
+
+// The agent's home: symlinks to the bot's own configuration (refreshed on
+// every run, so the checkout this tool runs from is what applies).
+function makeAgentHome() {
+  for (const [link, target] of Object.entries(BOT_HOME_LINKS)) {
+    const to = path.resolve(BOT_DOTFILES, target);
+    if (!fs.existsSync(to)) throw new Fatal(`the bot's configuration ${to} is missing (is ${PROG} run from homegit's bin/?)`);
+    const from = path.join(AGENT_HOME, link);
+    fs.mkdirSync(path.dirname(from), { recursive: true });
+    fs.rmSync(from, { recursive: true, force: true });
+    fs.symlinkSync(to, from);
+  }
+  return AGENT_HOME;
+}
+
+// A hooks directory whose pre-commit refuses, telling the agent why.
+function makeNoCommitHooks() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bot-opencode-hooks-"));
+  fs.writeFileSync(path.join(dir, "pre-commit"),
+    "#!/bin/sh\necho 'bot-opencode: do not commit; leave your changes in the working tree for the caller' >&2\nexit 1\n", { mode: 0o755 });
+  return dir;
+}
+
+function modelOption(configOptions) {
+  return (configOptions || []).find((o) => o.category === "model");
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const brief = readBrief(opts);
+  if (!brief.trim()) throw new Fatal("the brief is empty", EX_USAGE);
+  const say = (s) => { if (!opts.quiet) process.stderr.write(`${s}\n`); };
+  const wt = makeWorktree(opts);
+  say(`worktree ${wt.dir} at ${wt.start.slice(0, 12)}`);
+
+  const trace = opts.trace ? fs.openSync(opts.trace, "w") : null;
+  // A process group of its own, so that what the agent's tools started goes
+  // with it, and an environment of its own (see INHERITED_ENV).
+  const inherited = Object.fromEntries(Object.entries(process.env)
+    .filter(([k]) => INHERITED_ENV.includes(k) || k.startsWith("LC_")));
+  const hooksDir = makeNoCommitHooks();
+  const child = spawn("opencode", ["acp"], {
+    cwd: wt.dir, stdio: ["pipe", "pipe", "ignore"], detached: true,
+    // Inference comes only from the praxis provider of homegit's
+    // configuration: nothing from the repository's own opencode
+    // configuration, no model list fetched from the network. SHELL is bash
+    // whatever the operator's login shell is.
+    env: {
+      ...inherited, ...botIdentityEnv(), HOME: makeAgentHome(), SHELL: "/bin/bash",
+      OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_CLAUDE_CODE: "1",
+      GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hooksDir,
+    },
+  });
+  const killGroup = (signal) => {
+    try {
+      process.kill(-child.pid, signal);
+    } catch {
+      // Already gone.
+    }
+  };
+
+  // The agent's message text, one entry per run of chunks between tool
+  // calls: the last one is its final message.
+  const segments = [];
+  let inText = false;
+  let usage = null;
+  let toolCalls = 0;
+  const seenTools = new Set();
+  const onNotification = (method, params) => {
+    if (method !== "session/update") return;
+    const u = params?.update || {};
+    switch (u.sessionUpdate) {
+      case "agent_message_chunk":
+        if (u.content?.type === "text") {
+          if (!inText) segments.push("");
+          inText = true;
+          segments[segments.length - 1] += u.content.text;
+        }
+        break;
+      case "tool_call":
+        inText = false;
+        if (!seenTools.has(u.toolCallId)) {
+          seenTools.add(u.toolCallId);
+          toolCalls++;
+          say(`  tool: ${String(u.title || u.kind || "?").replace(/\s+/g, " ").slice(0, PROGRESS_WIDTH)}`);
+        }
+        break;
+      case "usage_update":
+        usage = u;
+        break;
+      default:
+    }
+  };
+  // The user's opencode configuration already allows its tools; should
+  // opencode ask anyway, allow once (the worktree is the boundary, as for a
+  // local worker), and cancel when there is nothing to allow with.
+  const onRequest = async (method, params) => {
+    if (method === "session/request_permission") {
+      const options = params?.options || [];
+      const opt = options.find((o) => o.kind === "allow_once") || options.find((o) => o.kind === "allow_always");
+      return { outcome: opt ? { outcome: "selected", optionId: opt.optionId } : { outcome: "cancelled" } };
+    }
+    throw new Fatal(`unsupported client request ${method}`);
+  };
+  const acp = new Acp(child, onNotification, onRequest, trace);
+
+  let status = 0;
+  let stopReason = null;
+  let sid = null;
+  let timer = null;
+  const started = Date.now();
+  // The whole conversation, from initialize to the prompt's answer.
+  const converse = async () => {
+    await acp.request("initialize", { protocolVersion: ACP_VERSION, clientCapabilities: {}, clientInfo: { name: CLIENT_NAME, version: "1" } });
+    const session = await acp.request("session/new", { cwd: wt.dir, mcpServers: [] });
+    sid = session.sessionId;
+    const option = modelOption(session.configOptions);
+    if (!option) throw new Fatal("opencode offers no model option");
+    if (!(option.options || []).some((o) => o.value === opts.model)) {
+      const have = (option.options || []).map((o) => o.value).join(", ");
+      throw new Fatal(`opencode has no model ${opts.model} (it has: ${have}); is the praxis provider configured in ~/.config/opencode/opencode.json?`);
+    }
+    await acp.request("session/set_config_option", { sessionId: sid, configId: option.id, value: opts.model });
+    say(`model ${opts.model}, timeout ${opts.timeoutMin}m`);
+    return acp.request("session/prompt", { sessionId: sid, prompt: [{ type: "text", text: `${WORKER_RULES}${brief}` }] });
+  };
+  try {
+    const conversation = converse();
+    const expired = new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ timeout: true }), opts.timeoutMin * 60000);
+    });
+    const winner = await Promise.race([conversation.then((r) => ({ r })), expired]);
+    if (winner.timeout) {
+      say(`timed out after ${opts.timeoutMin}m; cancelling`);
+      if (sid !== null) acp.notify("session/cancel", { sessionId: sid });
+      const grace = new Promise((resolve) => setTimeout(resolve, CANCEL_GRACE_MS).unref());
+      await Promise.race([conversation.catch(() => null), grace]);
+      stopReason = "timeout";
+      status = EX_TIMEOUT;
+    } else {
+      stopReason = winner.r.stopReason;
+      if (stopReason !== "end_turn") status = EX_ERROR;
+      if (winner.r.usage) usage = { ...usage, ...winner.r.usage };
+    }
+  } catch (e) {
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    status = e.status || EX_ERROR;
+    stopReason = stopReason || "error";
+  } finally {
+    clearTimeout(timer);
+    killGroup("SIGTERM");
+    await Promise.race([acp.closed, new Promise((r) => setTimeout(r, KILL_GRACE_MS).unref())]);
+    killGroup("SIGKILL");
+    fs.rmSync(hooksDir, { recursive: true, force: true });
+    acp.trace = null;
+    if (trace !== null) fs.closeSync(trace);
+  }
+
+  const message = (segments[segments.length - 1] || "").trim();
+  const { patch, stat } = collectDiff(wt);
+  if (SECRET_RE.test(message) || SECRET_RE.test(patch)) {
+    throw new Fatal(`the result contains a secret-shaped string; not printed (worktree kept: ${wt.dir})`);
+  }
+  const secs = Math.round((Date.now() - started) / 1000);
+  say(`done: ${stopReason}, ${secs}s, ${toolCalls} tool calls${usage?.totalTokens ? `, ${usage.inputTokens} in / ${usage.outputTokens} out tokens` : ""}`);
+  if (opts.out) {
+    fs.mkdirSync(opts.out, { recursive: true });
+    fs.writeFileSync(path.join(opts.out, "message.md"), `${message}\n`);
+    fs.writeFileSync(path.join(opts.out, "changes.patch"), patch);
+  }
+  process.stdout.write(`${message || "(no final message)"}\n\n---- diff against ${wt.start.slice(0, 12)} (${stopReason}) ----\n`);
+  process.stdout.write(patch ? `${stat}\n${patch}` : "(no changes)\n");
+  if (opts.rm) {
+    git(wt.top, ["worktree", "remove", "--force", wt.dir], { allowFail: true });
+  } else {
+    say(`worktree kept: ${wt.dir} (changes staged, not committed; remove with git worktree remove --force)`);
+  }
+  return status;
+}
+
+// Not process.exit(): a large diff on a pipe must drain before the process
+// ends.
+main().then((status) => { process.exitCode = status; }, (e) => {
+  process.stderr.write(`${PROG}: ${e.message}\n`);
+  process.exitCode = e.status || EX_ERROR;
+});
