@@ -104,7 +104,8 @@ failure it reports as "unexplained" stay on the default model.
 A worker can also run on a devspace runner instead of in this session:
 `bot-runs dispatch --item PVTI_... --repo OWNER/REPO BRIEF` starts an
 `agent.yml` run (see docs/devspace-agent-runs.md), records it in the
-item's `Run` field and sets it In Progress. From then on the run is
+item's `Run` field, sets it In Progress and gives it its token budget
+(`bot-pace budget`). From then on the run is
 the item's source of truth: `bot-runs reconcile`, on every
 `bot-watch --apply` sweep, moves it to Draft when the run hands back a
 patch (its Why says how to `bot-runs apply` it; that isn't done
@@ -150,15 +151,23 @@ topic session to it; see "Topic sessions" below.) Never run `bot-watch
 consume its news). `systemctl --user status bot-sweep.timer
 bot-sweep` shows the schedule and the last run.
 
-To wait for news, run this in the background, with the longest timeout
-the harness allows (in Claude Code, `run_in_background` with a timeout
-of 7200000 ms):
+To wait for news, run `bin/bot-poll-loop` in the background (in Claude
+Code, `run_in_background`). It never sweeps either: each cycle it reads
+the sweep runs it hasn't read yet, applies its seen-sets to them, and runs
+`bot-reconcile` (see "Reconcile" below) against its actions state; every
+3 minutes it reads the operator's events feed, and runs
+`bot-signoff-due --apply` and `bot-promote-due --apply` at once on a new
+approval, waking you only if they did something or the PR is one the
+bot tracks (its own, a fork PR, or on the board). It exits `ACTIONS (KINDS) at HHMM: WHERE` followed by
+bot-reconcile's report when something is new (a sweep's news, a sweep
+problem at most hourly, a fast approval, or a fired action), else after
+about 9 minutes `QUIET` with the report's Observed line; start it again.
+`bot-poll-loop --help` lists the kinds. Its state is in
+`~/.local/state/bot-coordinator/poll/`.
 
-```bash
-bot-poll --from-sweep ~/.local/state/bot-sweep --max-duration 6900
-```
-
-It never sweeps: every minute it reads the newest completed sweep, and
+The Rust poller, `bot-poll --from-sweep ~/.local/state/bot-sweep
+--max-duration 6900`, is to replace it, adding hot cycles between
+sweeps; what follows describes it. It never sweeps: every minute it reads the newest completed sweep, and
 compares what it lists against what it has already reported:
 approvals, the operator's activity on fork PRs, outstanding reviews,
 rebase needs, priority health lines (a new P0 one is its own kind),
@@ -228,6 +237,47 @@ the run's file rather than rerunning it. `bot-tmt-number --gc` releases the
 bootc tmt test numbers workers reserved once their number is on main
 or in their open PR, or their PR closed.
 
+## Reconcile
+
+The loop is level-triggered, like a Kubernetes controller: `bin/bot-reconcile`
+reads the observed state (the board, the latest sweep run, the heartbeat,
+the week's capacity and the recently answered questions), compares it
+with the desired one, and prints the actions that close the gap, each
+with a stable key, a kind, the item's URL and what to do. It changes
+nothing itself. Its rules (`bot-reconcile --help` has the details):
+
+- **capacity:** the work agents busy per lane against the target (see
+  "Capacity"); a lane under it gets its top Todo candidates. A busy task
+  past its Budget tokens is a **budget** action.
+- **heartbeat:** the heartbeat is fresh and lists exactly the busy
+  items' workers; for a drift it prints the `bot-heartbeat publish`
+  input without the finished workers.
+- **lead-orphan:** each of your busy items (Lead `coordinator`, or any
+  Lead not in the topic-lead skill's table) has a worker in the
+  heartbeat, and each worker there a busy item; an In Progress item with
+  neither Lead nor Run is nobody's.
+- **drive:** the latest sweep's P0 drive blockers that need you, its P0
+  health lines, and approved fork PRs its promotions didn't take, carried
+  over as they are.
+- **answer-unapplied:** a question the operator answered whose Unblocks
+  items are still open and untouched since the answer.
+- **closed-not-done:** an item whose own issue or PR is closed or merged
+  is Done, once none of its Branch PRs is open. The one rule safe to
+  carry out unattended: each `bot-watch --apply` sweep runs it with
+  `--apply` on the state it found, and lists what it set under "Closed,
+  set Done", so it rarely reaches you. A PR closed unmerged is never set
+  Done unattended: its item is listed for you to ask the operator (Needs
+  human, as bot-watch does) or set Done when that's clear, and isn't
+  listed once it is Needs human, bot-watch's question.
+
+`bot-poll-loop` runs it with `--state`, so an action wakes you when it is
+new, and again only if it is still open 2 hours after it last did. On a
+wake, do the actions (dispatching, fixing or asking, as each says), then
+run `bot-reconcile` again to confirm they converged: what remains should
+be only what waits on someone else. An action that keeps coming back
+means the rule or the board is wrong: fix that rather than acting on it
+again.
+
 ## Topic sessions
 
 The operator may run a separate Claude session per topic (the `topic-lead`
@@ -242,6 +292,11 @@ with Lead set, and a finished item is Done. There is no session messaging.
   with `--exclude-lead '*'` already leaves those items out of the news. Items
   with no Lead are yours. `bot-notify` and `bot-pr inbox` still list
   everything: apply the same rule to what they show.
+- **Your own workers' items get Lead `coordinator`** (`bot-pace assign`
+  sets it), never a worker's name: the sweep's `--exclude-lead '*'` leaves
+  out any other Lead, so the items would lose their news and bookkeeping,
+  and `bot-reconcile` would take the name for a topic's. Which worker is
+  on an item is the heartbeat's to say.
 - **The deterministic tools stay shared.** The P0 drive, auto sign-off and
   promotion (and the priority health lines) run for every item, led or not:
   they derive their step from state and need no judgment. Don't redo
@@ -258,10 +313,40 @@ with Lead set, and a finished item is Done. There is no session messaging.
 
 ## Capacity
 
-Plan by cost and capacity, not by a count of workers (the CPU scales
-well; the weekly inference budget is what runs out). Every item you move
-to Todo or dispatch gets an **Est. cost** bucket, from the table in
-`workstream` ("Cost estimates"). Before dispatching, run `bot-capacity`:
+The operator's standing goal: "a goal for us is to always have say ~4
+agents working on tasks - we're not just saying "p0 or nothing" roughly
+split between our harness improvements and upstreams and divided across
+upstreams or tasks that cgwalters is working on overall". So keep
+`pacing.agents` work agents busy (4 by default; the operator config's
+`pacing` key, see docs/bootstrap.md), `pacing.harness_agents` of them (half)
+on the harness (items whose Org is the bot's or the forge org's) and the
+rest on upstream work. An agent is busy on an item In Progress with a
+Lead or a Run: local workers, devspace runs and topic sessions all count.
+Each lane fills from its own Todo items by priority, so harness work
+doesn't wait for P0 upstream work, and P1 and P2 work goes on while the P0
+work waits on a human. `bot-reconcile`'s capacity rule names the
+candidates: by priority, then (upstream) spread over repositories, then
+toward where the operator was active lately (`bot-operator-activity`
+keeps that), leaving out topic sessions' items, asks, manual items, and
+bot-text work for a repository whose policy keeps the bot's text out.
+Fill a free slot with `bot-pace assign ITEM` (In Progress, Lead
+`coordinator`, and its budget) before briefing the worker, or with
+`bot-runs dispatch`.
+
+Every task has a token budget, **Budget tokens** on the board: the upper
+bound of its Est. cost bucket, else its priority's bucket in
+`pacing.budgets`. Give the bucket when you know better (`bot-pace assign
+ITEM --est M`). Each sweep's `bot-actuals --open` keeps the busy items'
+Actual tokens current, and a task past its budget is a `budget` action:
+look at what the worker is doing, then stop it, or raise the budget
+(`bot-pace budget ITEM --tokens N --force`) and say why in its Why.
+
+The week's capacity scales the target. Plan by cost, not by a count of
+workers alone (the CPU scales well; the weekly inference budget is what
+runs out). Every item you move to Todo or dispatch gets an **Est. cost**
+bucket, from the table in `workstream` ("Cost estimates"). Before
+dispatching, run `bot-capacity` (bot-reconcile reads it too, and halves
+the target to P0 work only at its "P0 only" mark, and to none at 100%):
 it shows the week's usage (the `seven_day` percent that `bot-heartbeat
 statusline` saves, else `--budget` tokens, else token totals), the burn
 rate, the percent projected at the reset, and the open P0/P1 estimates
@@ -278,11 +363,10 @@ summed by bucket. Then:
 - with no percent at all ("unknown"), use the token totals and the
   operator's last word on the budget; don't guess one.
 
-After `bot-watch --apply` moves items to Done, run `bot-actuals --dry-run`
-and then `bot-actuals`: it sets Actual tokens on Done items whose workers
-carried an `Item:` line. Compare it with Est. cost when an item is far off
-(two buckets), and correct the table in `workstream` if a whole kind of
-work is.
+Each sweep runs `bot-actuals --open`: it sets Actual tokens on Done and
+busy items whose workers carried an `Item:` line. Compare it with Est.
+cost when an item is far off (two buckets), and correct the table in
+`workstream` if a whole kind of work is.
 
 ## Acting on it
 
@@ -555,13 +639,12 @@ work is.
      event). Labelling it again later is a new request. A note that
      also mentions the bot comes as a mention request too: handle both
      as this one triage.
-- **Dispatch** workers for Todo items (by priority, per `workstream`) and
-  for the operator's asks from `bot-notify`. Composefs stability comes
-  first: fill free worker slots with P0 (composefs-stable) items before
-  any P1 own-infra or backlog item, and only then P2. Scale the number of concurrent
-  workers with the load: more when the queue is deep and items are
-  independent, fewer when they share a repository or the GraphQL quota
-  is running low.
+- **Dispatch** workers for Todo items and for the operator's asks from
+  `bot-notify`, into the free slots of each lane (see "Capacity"):
+  within a lane by priority, so composefs stability (P0) comes first
+  there, but a lane whose P0 work waits on a human goes on with P1 and P2
+  rather than idling. The operator's asks come before the lane's Todo
+  items. Run fewer when the GraphQL quota is running low.
 - **Forge CI is off.** Forge forks run no workflows, so a worker's
   devspace run is the fork PR's CI: brief workers to put its results in
   the PR description, and don't wait for, or ask about, fork CI. Only a
@@ -619,16 +702,18 @@ work is.
 
 ## Loop cadence
 
-`bot-poll --from-sweep` in the background is the loop's heartbeat: it wakes the
-session on news, or after its --max-duration. Worker completions wake the session too;
-handle them as they arrive, and keep one `bot-poll` running (a second
-one refuses to start while the first holds its state dir).
+`bot-poll-loop` in the background is the loop's heartbeat: it wakes the
+session on news and new actions, or after its window. Worker completions
+wake the session too; handle them as they arrive, then run
+`bot-reconcile` to see what is left, and keep one loop running.
 
 ## Heartbeat
 
 The review app's ops view can't see the workers on this machine, so
 publish them: on each loop wake (after polling) and whenever a worker
-starts or finishes, pipe the current state to `bot-heartbeat publish`:
+starts or finishes, pipe the current state to `bot-heartbeat publish`
+(`bot-reconcile`'s heartbeat and lead-orphan rules check that it did, and
+that it agrees with the board):
 
 ```bash
 jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
