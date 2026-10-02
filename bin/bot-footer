@@ -10,6 +10,7 @@ const path = require("node:path");
 const { promisify } = require("node:util");
 
 const execFileP = promisify(execFile);
+const { normalizeItem } = require(path.join(__dirname, "..", "lib", "capacity.js"));
 
 const PROG = path.basename(process.argv[1] || "bot-footer");
 const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
@@ -17,7 +18,6 @@ const BOT_COST = process.env.BOT_FOOTER_BOT_COST || path.join(BIN_DIR, "bot-cost
 const SCHEMA = "bot-run/v1";
 const COST_SCHEMA = "bot-cost/v1";
 const DEFAULT_SINCE = "2d";
-const ITEM_RE = /^PVTI_[A-Za-z0-9_-]+$/;
 const SCRATCH_RE = /^[A-Za-z0-9._-]+$/;
 // Ids are shortened to this many characters in the human line.
 const SHORT_ID = 8;
@@ -35,7 +35,7 @@ class Exit extends Error {
 }
 
 function usage() {
-  return `Usage: ${PROG} (--item PVTI_... | --scratch NAME | --task KEY) [--since AGE]
+  return `Usage: ${PROG} (--item ITEM | --scratch NAME | --task KEY) [--since AGE]
                   [--projects DIR]... [--no-compute] [--json]
 
 Prints a footer for a PR body or comment recording the bot run that made
@@ -45,7 +45,8 @@ it: one compact human line, then the same data as JSON in an HTML comment,
   <!-- ${SCHEMA} {...} -->
 
 from '${path.basename(BOT_COST)} --json' over --since AGE (default ${DEFAULT_SINCE}). The task is a
-board item (--item), the scratch dir named in a subagent's prompt
+board item (--item: the URL or PVTI_ id on the "Item:" line of the
+prompt), the scratch dir named in a subagent's prompt
 (--scratch, bot-cost's task scratch:NAME), or any bot-cost task key
 (--task). Costs are estimates at list prices; the duration is wall time
 from the task's first to its last message. The JSON has no free text.
@@ -73,8 +74,9 @@ function parseArgs(argv) {
         process.exit(0);
       case "--item": {
         const v = value(i++, a);
-        if (!ITEM_RE.test(v)) throw new Exit(EX_USAGE, `--item takes a board item id (PVTI_...), not '${v}'`);
-        setTask(v, a);
+        const item = normalizeItem(v);
+        if (!item) throw new Exit(EX_USAGE, `--item takes a board item's issue or PR URL or its id (PVTI_...), not '${v}'`);
+        setTask(item, a);
         break;
       }
       case "--scratch": {

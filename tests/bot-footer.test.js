@@ -97,7 +97,9 @@ test("errors name close matches or how to find the task", () => {
     [["--since", "later", "--item", "PVTI_item1"], 2, /bot-cost failed: .*not an age/],
     [[], 2, /name the task with --item, --scratch or --task/],
     [["--item", "PVTI_item1", "--scratch", "x"], 2, /give one of --item, --scratch and --task/],
-    [["--item", "item1"], 2, /--item takes a board item id/],
+    [["--item", "item1"], 2, /--item takes a board item's issue or PR URL or its id/],
+    // An "Item:" line's URL is the task key as bot-cost normalizes it.
+    [["--item", "https://github.com/O/R/issues/9/"], 1, /no task https:\/\/github\.com\/o\/r\/issues\/9 in /],
     [["--bogus"], 2, /unexpected argument/],
   ];
   for (const [args, status, want] of cases) {
