@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Offline tests of how 'bot-board fill-org' derives an item's Org, of
-# 'list --field' filtering by a text field (Lead), and of 'set --news'
-# dating its one line, against
+# 'list --field' filtering by a text field (Lead), of 'set --news'
+# dating its one line, and of 'set --status' ending a worker's Lead,
+# against
 # a fake 'gh' serving a fixed board and repository lookups. No network,
 # no quota.
 #   tests/bot-board-org.sh
@@ -39,7 +40,10 @@ case "$1 $2" in
     "project field-list") cat "${store}/fields.json" ;;
     "api -i") exec "${FAKE_BOARD_REST:?}" "${store}/items.json" "$3" ;;
     "project view") echo PVT_fake ;;
-    "project item-edit") printf '%s\n' "${@: -1}" >>"${store}/edits" ;;
+    "project item-edit")
+        printf '%s\n' "${@: -1}" >>"${store}/edits"
+        printf '%s %s\n' "${@: -2:1}" "${@: -1}" >>"${store}/field-edits"
+        ;;
     "api rate_limit") echo 5000 ;;
     "api graphql") { printf '%s' "$*" | tr -s '\n ' ' '; echo; } >>"${store}/mutations"; echo '{}' ;;
     # Tracker issues have no labels yet; label writes are logged.
@@ -58,7 +62,9 @@ chmod +x "${WORK}/bin/gh"
 
 jq -n '{fields: [{id: "F_org", name: "Org", options: [
     "bootc-dev", "coreos", "osbuild", "redhat-cop", "cgwalters-forge", "cgwalters-bot", "other"
-    | {id: "O_\(.)", name: .}]}, {id: "F_lead", name: "Lead"}, {id: "F_news", name: "News"}]}' >"${FAKE_GH}/fields.json"
+    | {id: "O_\(.)", name: .}]}, {id: "F_lead", name: "Lead"}, {id: "F_news", name: "News"},
+    {id: "F_status", name: "Status", options: ["Todo", "In Progress", "Draft", "In Review", "Needs human", "Done"
+    | {id: "S_\(.)", name: .}]}]}' >"${FAKE_GH}/fields.json"
 cat >"${FAKE_GH}/sources" <<'EOF'
 cgwalters-forge/bootc bootc-dev/bootc
 cgwalters-forge/image-builder osbuild/image-builder
@@ -194,3 +200,33 @@ done
 "${BIN}/bot-board" set PVTI_0 --news $'one\ntwo' >/dev/null 2>"${WORK}/err" && fail "set --news with two lines succeeded"
 grep -q "one line" "${WORK}/err" || fail "two-line --news: $(cat "${WORK}/err")"
 echo "set --news cases passed"
+
+# set --status: leaving In Progress ends a worker's claim, Lead
+# coordinator, in the same write; a topic's Lead stays, and so does an
+# explicit --field Lead. Items 0 and 1 are led by wfc, 2 by coordinator
+# (see the list cases), 3 by nobody.
+# CASE|ITEM|ARGS (space separated)|EXPECTED field edits ('F_x VALUE', ';' between)
+readonly STATUS_CASES=(
+    "to Draft|PVTI_2|--status Draft|F_status --single-select-option-id=S_Draft;F_lead --clear"
+    "to In Review|PVTI_2|--status In_Review|F_status --single-select-option-id=S_In Review;F_lead --clear"
+    "to Todo|PVTI_2|--status Todo|F_status --single-select-option-id=S_Todo;F_lead --clear"
+    "to Done|PVTI_2|--status Done|F_status --single-select-option-id=S_Done;F_lead --clear"
+    "to Needs human|PVTI_2|--status Needs_human|F_status --single-select-option-id=S_Needs human;F_lead --clear"
+    "stays In Progress|PVTI_2|--status In_Progress|F_status --single-select-option-id=S_In Progress"
+    "explicit Lead wins|PVTI_2|--status Todo --field Lead coordinator|F_status --single-select-option-id=S_Todo;F_lead --text=coordinator"
+    "no status change|PVTI_2|--news x|F_news --text=${today}: x"
+    "topic Lead stays|PVTI_0|--status Draft|F_status --single-select-option-id=S_Draft"
+    "no Lead|PVTI_3|--status Done|F_status --single-select-option-id=S_Done"
+)
+for c in "${STATUS_CASES[@]}"; do
+    IFS='|' read -r name item args want <<<"${c}"
+    rm -f "${FAKE_GH}/field-edits"
+    read -ra argv <<<"${args}"
+    # Underscores stand for spaces within a status.
+    argv=("${argv[@]//_/ }")
+    SKIP_ASK_CHECK=1 "${BIN}/bot-board" set "${item}" "${argv[@]}" >/dev/null 2>"${WORK}/err" ||
+        fail "set ${name}: $(cat "${WORK}/err")"
+    got=$(paste -sd';' "${FAKE_GH}/field-edits")
+    test "${got}" = "${want}" || fail "set ${name}: got '${got}', want '${want}'"
+done
+echo "set --status Lead cases passed"
