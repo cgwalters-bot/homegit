@@ -300,8 +300,9 @@ if ! grep -q "reading ${UNREADABLE_PR} (off the board) for outstanding reviews f
     fail "watch: expected only a warning about ${UNREADABLE_PR}: $(cat "${WORK}/watch.err")"
 fi
 # (bot-promote-due looks for approvals of the fork PR #20 search lists,
-# which has no fixtures: 404s aren't cached.)
-if grep -v -E -e '^304 ' -e '^200 search/issues$' -e '^404 repos/bootc-dev/bootc/pulls/2700$' \
+# and bot-signoff-due for a /no-carry on #2700, which have no fixtures:
+# 404s aren't cached.)
+if grep -v -E -e '^304 ' -e '^200 search/issues$' -e '^404 repos/bootc-dev/bootc/(pulls|issues)/2700(/comments)?$' \
     -e '^404 repos/cgwalters-forge/bootc/(pulls/20/reviews|issues/20/comments)$' "${FAKE_GH}/calls" | grep -q . ||
     ! grep -q "^304 ${PR_API}/reviews$" "${FAKE_GH}/calls"; then
     fail "watch: the second sweep read unchanged resources without 304s: $(sort "${FAKE_GH}/calls" | uniq -c)"
@@ -409,9 +410,9 @@ rm "${REST}/search/issues.fail"
 # two pages (the fake answers every page alike) is read and listed once.
 # The search API stops at 1000 results, with a warning.
 cp "${REST}/search/issues.json" "${WORK}/search.json.orig"
-# sweep runs the tool twice (text and JSON), and bot-signoff-due's and
-# bot-promote-due's own searches page alike: six times the requests.
-for c in "150|12|" "5000|60|over 1000 open PRs"; do
+# sweep runs the tool twice (text and JSON), and bot-signoff-due's two
+# searches and bot-promote-due's own page alike: eight times the requests.
+for c in "150|16|" "5000|80|over 1000 open PRs"; do
     IFS='|' read -r total calls warning <<<"${c}"
     jq -c --argjson n "${total}" '.total_count = $n' "${WORK}/search.json.orig" >"${REST}/search/issues.json"
     : >"${FAKE_GH}/calls"
@@ -704,7 +705,7 @@ for mode in --json --dry-run; do
     "${BOT_WATCH}" --apply "${mode}" --now 2026-09-25T18:00:00Z --board-file "${WORK}/so-board.json" \
         --state-file "${WORK}/so.state" >"${WORK}/so${mode}" 2>"${WORK}/so.err" || { cat "${WORK}/so.err" 1>&2; fail "so ${mode}: sweep failed"; }
 done
-jq -e --arg u "${SO}" '.signoffs == [{url: $u, head: "'"${SO_HEAD}"'", result: "would-run", new_head: null, detail: "",
+jq -e --arg u "${SO}" '.signoffs == [{kind: "signoff", url: $u, head: "'"${SO_HEAD}"'", result: "would-run", new_head: null, detail: "",
     line: "Would run: bot-pr signoff \($u)"}] and (.signoffs_failed | not)' "${WORK}/so--json" >/dev/null ||
     fail "so: the sign-offs: $(jq -c . "${WORK}/so--json")"
 [[ "$(<"${WORK}/so--dry-run")" == *$'Sign-offs:\n  Would run: bot-pr signoff '"${SO}"$'\n\n'* ]] ||

@@ -67,7 +67,11 @@ to this one, by path in the homegit checkout
 - `worker-preamble.md` for a worker (implementing an item, answering an
   ask, turning Drafts into forge PRs);
 - `reviewer-preamble.md` for a reviewer;
-- `policy-check.md` for a policy check (see "Promote" below).
+- `policy-check.md` for a policy check (see "Promote" below);
+- `carry-attest.md` for the review that lets `bot-git carry-signoff`
+  keep the operator's sign-off past a change (see "Commit attribution"
+  in the shared AGENTS.md): launch it when a worker reports it couldn't,
+  never as the agent that made the change.
 
 A worker dispatched to a devspace runner (`bin/bot-runs dispatch`) gets
 `runner-preamble.md` instead: `bot-runs` puts it before the brief
@@ -491,7 +495,12 @@ cost when an item is far off (two buckets), and correct the table in
   `bot-pr signoff` refused. A refusal needs a look (a stale policy
   record, say): once its cause is fixed, run `bot-pr signoff URL` by
   hand, since the sweeps only retry a refused head after 6h. A sign-off
-  needs nothing more.
+  needs nothing more. The same section lists the operator's `/no-carry`
+  replies to a carried sign-off (`bot-pr carry-note`): `bot-pr no-carry`
+  drops it and answers on the PR (`Carried sign-off dropped: URL
+  (NEW-HEAD)`), and those commits then wait for their approval and a
+  sign-off like any other; a `No-carry refused:` line needs a look, then
+  `bot-pr no-carry URL` by hand.
 - **Promotions.** Likewise, `bot-watch --apply` runs `bot-pr promote`
   itself (with `--draft` after the operator's `/draft`) on each fork PR
   whose current head they approved, by review or `/promote` line, when
@@ -531,8 +540,10 @@ cost when an item is far off (two buckets), and correct the table in
   commits (and the operator's), keeps the operator's sign-off, and comments one line on an upstream PR. When it
   exits 10 (conflicts), or for the conflicting ones, dispatch a worker
   to resolve the conflicts, retest and push, per `upstream-pr` (on an
-  upstream PR the operator's sign-off then stays only on commits whose resolution
-  changed nothing beyond context; the others need `bot-pr signoff`). A
+  upstream PR the operator's sign-off then stays only on commits that an
+  independent `carry-attest.md` review classes as not substantively
+  different, via `bot-git carry-signoff` and a `bot-pr carry-note`
+  comment; the others, and commits new since, need `bot-pr signoff`). A
   PR the sweep listed for CI isn't listed again once rebased: if CI
   still fails, it's real, and the next "CI failing" news is work for a
   worker.

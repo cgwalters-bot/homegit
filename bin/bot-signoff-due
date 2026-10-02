@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // Finds the bot's upstream PRs that the operator approved at their current
 // head but whose DCO check fails, and with --apply runs 'bot-pr signoff'
-// on each. bot-watch runs it on every sweep. See --help.
+// on each; and those where he revoked a carried sign-off ('/no-carry'),
+// running 'bot-pr no-carry' on each. bot-watch runs it on every sweep.
+// See --help.
 // Node's standard library only, plus gh (through bot-priority-health's
 // REST helpers, with their ETag cache) and bot-pr.
 "use strict";
@@ -32,6 +34,13 @@ const PER_PAGE = 100;
 // The search API returns at most 1000 results.
 const SEARCH_MAX_PAGES = 10;
 const SHORT_SHA = 12;
+// The PRs where he may have revoked a carried sign-off: a search narrows
+// them down (its tokens are loose), and noCarryAsk decides.
+const NO_CARRY_Q = `is:pr+is:open+author:${BOT_LOGIN}+commenter:${REVIEWER}+%22no-carry%22+in:comments`;
+// As bot-pr's NO_CARRY_COMMAND, CARRY_RECORD_RE and NO_CARRY_RECORD.
+const NO_CARRY_COMMAND = "/no-carry";
+const CARRY_RECORD_RE = /<!-- bot-pr carry was=[0-9a-f]{40} head=[0-9a-f]{40} carried=[0-9a-f,]* -->/;
+const NO_CARRY_RECORD = "<!-- bot-pr no-carry";
 const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/([0-9]+)$/;
 // The heads 'bot-pr signoff' refused, or signed without changing: their
 // result is listed again instead of retrying (see lib/retry-cache.js).
@@ -65,7 +74,22 @@ Prints one line per PR:
                                      (--apply; every commit has his
                                      sign-off already, yet DCO fails)
 
-and nothing when no PR is due. A head 'bot-pr signoff' refused or left
+and nothing when no PR is due.
+
+It also finds the bot's open upstream PRs where ${REVIEWER} revoked a
+sign-off that 'bot-git carry-signoff' carried: a comment of his with a
+'${NO_CARRY_COMMAND}' line after the bot's carry comment ('bot-pr carry-note'),
+and after the bot's last answer to one. 'bot-pr no-carry URL' drops the
+carried sign-offs and answers, so once it has, the PR is no longer due.
+For those it prints, in the same way:
+
+  No-carry due: URL at HEAD (COMMENT_URL)
+  Would run: bot-pr no-carry URL
+  Carried sign-off dropped: URL (NEWHEAD)
+  No-carry answered: URL at HEAD: nothing left to drop
+  No-carry refused: URL at HEAD: WHY
+
+A head 'bot-pr signoff' refused or left
 unchanged isn't tried again for ${retry.RETRY_HOURS}h: its line is repeated from
 ${ATTEMPTS_FILE.replace(os.homedir(), "~")} (as --dry-run does too) until the head
 moves or that time is up. Once its cause is fixed, run 'bot-pr signoff
@@ -74,8 +98,9 @@ URL' by hand rather than wait.
 Options:
   --apply     run 'bot-pr signoff' on each PR that is due
   --dry-run   print what --apply would run, and change nothing
-  --json      print a JSON array of {url, head, result, new_head, detail,
-              line} (result: due, would-run, signed, refused, unchanged)
+  --json      print a JSON array of {kind, url, head, result, new_head,
+              detail, line} (kind: signoff or no-carry; result: due,
+              would-run, signed, refused, unchanged, dropped, answered)
   -h, --help  show this help
 
 Exits 1 if the search or a PR could not be read (the others are still
@@ -130,13 +155,13 @@ function isDue(owner, pr, reviews, runs, statuses) {
 // with this body is one of its fork PRs, as in bot-watch.
 const isForkPr = (owner, body) => FORK_OWNERS.includes(owner) && (body || "").includes(FORK_META);
 
-// candidates(): the URLs of the bot's open PRs that REVIEWER reviewed,
-// but for its fork PRs.
-async function candidates() {
+// candidates(q, what): the URLs of the bot's PRs the search q finds, but
+// for its fork PRs.
+async function candidates(q, what) {
   const urls = [];
   for (let page = 1; page <= SEARCH_MAX_PAGES; page++) {
-    const body = await restGet(`search/issues?q=${SEARCH_Q}&per_page=${PER_PAGE}&page=${page}`);
-    if (!body || !Array.isArray(body.items)) throw new Exit(EX_ERROR, "the search for the bot's reviewed PRs answered nothing usable");
+    const body = await restGet(`search/issues?q=${q}&per_page=${PER_PAGE}&page=${page}`);
+    if (!body || !Array.isArray(body.items)) throw new Exit(EX_ERROR, `the search for ${what} answered nothing usable`);
     for (const i of body.items) {
       const m = PR_URL_RE.exec(i.html_url || "");
       if (m && !isForkPr(m[1], i.body)) urls.push(i.html_url);
@@ -144,6 +169,34 @@ async function candidates() {
     if (page * PER_PAGE >= body.total_count || !body.items.length) break;
   }
   return [...new Set(urls)];
+}
+
+// lines(body): a comment's lines, trimmed.
+const lines = (body) => (body || "").replace(/\r/g, "").split("\n").map((l) => l.trim());
+
+// noCarryAsk(comments): the first comment by REVIEWER with a NO_CARRY_COMMAND
+// line that a carry comment of the bot's precedes, after the bot's last
+// answer to one; null if there is none. bot-pr's NO_CARRY_PENDING_JQ
+// decides the same.
+function noCarryAsk(comments) {
+  const byBot = (c) => c.user && c.user.login === BOT_LOGIN;
+  const sorted = [...comments].sort((a, b) => a.id - b.id);
+  const answered = Math.max(0, ...sorted.filter((c) => byBot(c) && (c.body || "").includes(NO_CARRY_RECORD)).map((c) => c.id));
+  const after = sorted.filter((c) => c.id > answered);
+  return after.find((c) => c.user && c.user.login === REVIEWER && lines(c.body).includes(NO_CARRY_COMMAND)
+    && after.some((b) => byBot(b) && b.id < c.id && CARRY_RECORD_RE.test(b.body || ""))) || null;
+}
+
+// checkNoCarry(url): {url, head, ask} for a PR whose carried sign-off
+// REVIEWER revoked and the bot hasn't answered, else null.
+async function checkNoCarry(url) {
+  const [, owner, name, number] = PR_URL_RE.exec(url);
+  const repo = `${owner}/${name}`;
+  const ask = noCarryAsk(await pages(`repos/${repo}/issues/${number}/comments`));
+  if (!ask) return null;
+  const pr = await restGet(`repos/${repo}/pulls/${number}`);
+  if (!pr || pr.state !== "open" || pr.user.login !== BOT_LOGIN || isForkPr(owner, pr.body)) return null;
+  return { url, head: pr.head.sha, ask: ask.html_url };
 }
 
 // check(url): {url, head} for a PR that is due, else null.
@@ -160,16 +213,19 @@ async function check(url) {
   return isDue(owner, pr, reviews, runs, (status && status.statuses) || []) ? { url, head: pr.head.sha } : null;
 }
 
-// signoff(url, head): {result, new_head, detail} of running 'bot-pr
-// signoff' on the PR at head.
-async function signoff(url, head) {
+// run(kind, url, head): {result, new_head, detail} of running 'bot-pr
+// KIND' (signoff or no-carry) on the PR at head.
+async function run(kind, url, head) {
   try {
-    const { stdout } = await execFileP(BOT_PR, ["signoff", url], { maxBuffer: 64 << 20 });
+    const { stdout } = await execFileP(BOT_PR, [kind, url], { maxBuffer: 64 << 20 });
     const newHead = stdout.trim().split("\n").pop() || "";
+    if (kind === "no-carry") {
+      return newHead === head ? { result: "answered", new_head: newHead, detail: "nothing left to drop" } : { result: "dropped", new_head: newHead, detail: "" };
+    }
     if (newHead === head) return { result: "unchanged", new_head: newHead, detail: "every commit has his sign-off already, yet DCO fails" };
     return { result: "signed", new_head: newHead, detail: "" };
   } catch (e) {
-    if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (bot-pr signoff ${url})`);
+    if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (bot-pr ${kind} ${url})`);
     const lines = (e.stderr || e.message || "").trim().split("\n").filter(Boolean);
     return { result: "refused", new_head: null, detail: (lines.pop() || `exit status ${e.code}`).replace(/^error: /, "") };
   }
@@ -177,6 +233,15 @@ async function signoff(url, head) {
 
 function line(r) {
   const at = `${r.url} at ${r.head.slice(0, SHORT_SHA)}`;
+  if (r.kind === "no-carry") {
+    switch (r.result) {
+      case "due": return `No-carry due: ${at} (${r.ask})`;
+      case "would-run": return `Would run: bot-pr no-carry ${r.url}`;
+      case "dropped": return `Carried sign-off dropped: ${r.url} (${r.new_head.slice(0, SHORT_SHA)})`;
+      case "answered": return `No-carry answered: ${at}: ${r.detail}`;
+      default: return `No-carry refused: ${at}: ${r.detail}`;
+    }
+  }
   switch (r.result) {
     case "due": return `Sign-off due: ${at}`;
     case "would-run": return `Would run: bot-pr signoff ${r.url}`;
@@ -188,11 +253,12 @@ function line(r) {
 
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
-  const urls = await candidates();
   const failed = [];
-  const due = (await pool(urls, async (url) => {
+  // dueOf(kind, urls, fn): the PRs of urls that fn finds due, as kind.
+  const dueOf = async (kind, urls, fn) => (await pool(urls, async (url) => {
     try {
-      return await check(url);
+      const d = await fn(url);
+      return d && { kind, ...d };
     } catch (e) {
       if (e instanceof Exit && e.status === EX_RATELIMIT) throw e;
       warn(`reading ${url} failed: ${e.message}`);
@@ -200,6 +266,10 @@ async function main() {
       return null;
     }
   })).filter(Boolean);
+  const due = [
+    ...await dueOf("signoff", await candidates(SEARCH_Q, "the bot's reviewed PRs"), check),
+    ...await dueOf("no-carry", await candidates(NO_CARRY_Q, `the bot's PRs with a '${NO_CARRY_COMMAND}'`), checkNoCarry),
+  ];
   // {"URL@HEAD": {result, new_head, detail, at}}: only the PRs due now
   // are kept, so a head that moved (or a PR no longer due) is forgotten.
   const tried = retry.load(ATTEMPTS_FILE, warn);
@@ -208,14 +278,14 @@ async function main() {
   let rateLimited = null;
   // One at a time: each clones and pushes.
   for (const d of due) {
-    const key = `${d.url}@${d.head}`;
+    const key = `${d.kind === "no-carry" ? "no-carry " : ""}${d.url}@${d.head}`;
     let r = { result: "due", new_head: null, detail: "" };
     const t = tried[key];
     if (retry.fresh(t)) r = t;
     else if (opts.dryRun) r = { ...r, result: "would-run" };
     else if (opts.apply) {
       try {
-        r = await signoff(d.url, d.head);
+        r = await run(d.kind, d.url, d.head);
       } catch (e) {
         // What was signed already must still be reported.
         if (!(e instanceof Exit)) throw e;
@@ -223,7 +293,7 @@ async function main() {
         break;
       }
     }
-    if (r.result === "refused" || r.result === "unchanged") attempts[key] = { at: new Date().toISOString(), ...r };
+    if (["refused", "unchanged", "answered"].includes(r.result)) attempts[key] = { at: new Date().toISOString(), ...r };
     const { at, ...shown } = r;
     results.push({ ...d, ...shown, line: line({ ...d, ...shown }) });
   }
@@ -240,5 +310,5 @@ if (require.main === module) {
     process.exit(e.status);
   });
 } else {
-  module.exports = { approvedHead, isDue };
+  module.exports = { approvedHead, isDue, noCarryAsk };
 }

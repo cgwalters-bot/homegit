@@ -23,10 +23,13 @@ use crate::gh::{Fetched, Gh, MAX_PAGES, NOT_MODIFIED, PER_PAGE};
 /// ones updated since the last.
 const NOTIFICATIONS: &str = "notifications?per_page=50";
 /// The lines of bot-signoff-due --apply's results.
-const SIGNOFF_RESULTS: [&str; 3] = [
+const SIGNOFF_RESULTS: [&str; 6] = [
     "Signed off:",
     "Sign-off refused:",
     "Sign-off changed nothing:",
+    "Carried sign-off dropped:",
+    "No-carry answered:",
+    "No-carry refused:",
 ];
 const APPROVED: &str = "APPROVED";
 /// The notification reason of a thread the bot opened.
@@ -122,7 +125,8 @@ impl Poller<'_> {
     /// often as their X-Poll-Interval allows), then the items they flag
     /// and those the operator was active on lately. Runs bot-notify when a
     /// thread asks something of the bot, and bot-signoff-due --apply when
-    /// the operator approved the head of an upstream PR of the bot's.
+    /// the operator approved the head of an upstream PR of the bot's, or
+    /// commented /no-carry there.
     /// Writes RUN/hot.txt (and the tools' outputs there) when there is
     /// news or a tool ran.
     pub fn cycle(&self, state: &mut State, run: &Path, now: i64) -> Result<Cycle> {
