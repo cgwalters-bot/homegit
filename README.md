@@ -125,11 +125,12 @@ waits for it to be reachable over the tailnet and hands out an
 ssh_config for its unprivileged `runner-sandbox` user (the workflow installs the
 toolchain: podman, gcc, Rust, bcvk, ...), so an agent edits
 locally, pushes its branch to the devspace with plain git over SSH, runs
-the project's tests there (KVM is available for VM tests), and pushes the
+the project's tests there (KVM is available for VM tests) as detached jobs
+it blocks on with `bot-devspace wait`, and pushes the
 tested branch to the forge fork from the local machine. No credentials are
 ever copied to a devspace, and the SSH user can't reach the runner's
 own (see the `devspace-work` skill); `tests/bot-devspace.sh` tests which
-user `bot-devspace` picks. `bot-devspace stop` cancels the runner, since
+user `bot-devspace` picks and how jobs end. `bot-devspace stop` cancels the runner, since
 they're billed while they run.
 
 The next step moves the agents themselves onto devspaces: an `agent.yml`
