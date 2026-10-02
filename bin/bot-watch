@@ -132,9 +132,10 @@ sign-off, or have seen no activity for too long, P0 first. Its lines
 stay the same until the problem is fixed or the PR's head moves.
 
 Then comes "Priority propagation" ('bot-priority-propagate', see its
---help): priority follows structure, so with --apply the sub-issues and
-Branch items of the P0 (then P1) items are raised to their priority, or
-added to the board, and each change is listed as a line. It is
+--help): priority follows structure, so with --apply the Branch items of
+the P0 (then P1) items are raised to their priority, and those and new
+sub-issues are added to the board (sub-issues already on the board keep
+their priority), and each change is listed as a line. It is
 bookkeeping: bot-poll doesn't wake for it.
 
 Next comes the "P0 drive" of 'bot-drive' (see its --help): one line
@@ -1033,8 +1034,9 @@ signoffs=$(due_step "${SIGNOFF_DUE}" "sign-offs due") || signoff_failed=true
 # "Needs your text".
 promotion_failed=false
 promotions=$(due_step "${PROMOTE_DUE}" "promotions due") || promotion_failed=true
-# Priority follows structure: with --apply, the sub-issues and Branch
-# items of the P0 and P1 items are raised to their priority. Over the
+# Priority follows structure: with --apply, the Branch items of the
+# P0 and P1 items are raised to their priority (sub-issues on the board
+# keep theirs; new ones are added). Over the
 # whole board, whatever --lead says. Only listed, never woken for (see
 # bot-poll, which ignores the section).
 printf '%s\n' "${board}" >"${scratch}/full-board.json"

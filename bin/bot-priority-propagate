@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-// Priority follows structure: raises the sub-issues and Branch items of
-// the Workstream board's P0 (then P1) items to that priority, and adds
-// those not on the board. bot-watch runs it on every sweep and lists
+// Priority follows structure: raises the Branch items of the Workstream
+// board's P0 (then P1) items to that priority, and adds the Branch items
+// and new sub-issues that are not on the board. Sub-issues already on the
+// board keep their priority: the operator sets those deliberately.
+// bot-watch runs it on every sweep and lists
 // what it did as its "Priority propagation" section. See --help.
 // Node's standard library only, plus gh (through bot-priority-health's
 // REST helpers, with their ETag cache) and bot-board.
@@ -37,12 +39,15 @@ board at ${PRIORITIES.join(", then ")} (one pass each, so a P0 parent's children
 first), its children get its priority if theirs is lower or unset
 (never lowered):
 
-  - its sub-issues (GitHub's sub-issues API, an issue's only);
-  - the issues and PRs in its Branch field.
+  - the issues and PRs in its Branch field, the work that implements it;
+  - its sub-issues (GitHub's sub-issues API, an issue's only), but only
+    those not yet on the board.
 
-A child on the board is raised (and gets the parent's ${THEME_FIELD} if it has
-none); one that is not on the board is added at that priority, with the
-parent's ${THEME_FIELD}. Children that are ${DONE_STATUS} on the board, or closed or merged on
+A Branch child on the board is raised (and gets the parent's ${THEME_FIELD} if it
+has none); a child that is not on the board is added at that priority, with
+the parent's ${THEME_FIELD}. A sub-issue already on the board is NEVER touched,
+whatever its priority: sub-issues are often deliberately lower than their
+epic (a P2 follow-up under a P0 epic stays P2). Children that are ${DONE_STATUS} on the board, or closed or merged on
 GitHub, are left alone. A raised child is a parent in its turn, in
 the pass of its new priority. Of several parents, the most urgent wins.
 
@@ -124,8 +129,10 @@ async function subIssues(repo, number) {
 
 // plan(board, children): the changes, as [{action, url, ...}], in
 // the order made. children(item) is the parsed children of an item, each
-// {key, url, repo, number, isIssue, state?}, state unknown for those off
-// the sub-issues API; open(child) is whether GitHub has it open.
+// {key, url, repo, number, isIssue, state?, sub?}, state unknown for those
+// off the sub-issues API, sub true for one known only as a sub-issue (not
+// in Branch): it is added if off the board, never raised; open(child) is
+// whether GitHub has it open.
 async function plan(board, children, isOpen) {
   const items = new Map(); // key -> {url, key, issue, branch, priority, status, theme, id, onBoard}
   for (const it of board) {
@@ -146,6 +153,7 @@ async function plan(board, children, isOpen) {
         if (child.key === parent.key) continue;
         let item = items.get(child.key);
         if (item && item.status === DONE_STATUS) continue;
+        if (item && child.sub) continue; // on the board: keeps its priority
         if (!(await isOpen(child))) continue;
         let change = null;
         if (!item) {
@@ -203,10 +211,14 @@ async function main() {
   const childrenOf = async (parent) => {
     const out = new Map();
     try {
-      if (parent.isIssue) for (const c of await subIssues(parent.repo, parent.number)) out.set(c.key, c);
       for (const word of parent.branch.split(/\s+/)) {
         const u = parseUrl(word);
         if (u && !out.has(u.key)) out.set(u.key, u);
+      }
+      if (parent.isIssue) {
+        for (const c of await subIssues(parent.repo, parent.number)) {
+          if (!out.has(c.key)) out.set(c.key, { ...c, sub: true });
+        }
       }
     } catch (e) {
       if (e instanceof Exit && e.status === EX_RATELIMIT) throw e;
