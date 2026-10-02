@@ -44,6 +44,9 @@ pub struct Poller<'a> {
     pub sweeper: &'a Sweeper,
     /// The state dir, where gh's responses are captured.
     pub dir: &'a Path,
+    /// With --from-sweep, bot-sweep's DIR: while a sweep runs there, an
+    /// approval's bot-signoff-due is left to its bot-watch.
+    pub sweep_dir: Option<&'a Path>,
 }
 
 fn warn(what: &str, e: &anyhow::Error) {
@@ -209,7 +212,11 @@ impl Poller<'_> {
         if tool_ran {
             fs::create_dir_all(run).with_context(|| format!("creating {}", run.display()))?;
         }
-        if signoff {
+        if signoff && self.sweep_dir.is_some_and(crate::sweep_running) {
+            eprintln!(
+                "bot-poll: an approval calls for bot-signoff-due, which the running sweep's bot-watch runs"
+            );
+        } else if signoff {
             let items = self.signoffs(run, &mut state.reported, now)?;
             if !items.is_empty() {
                 news.entry("signoff".to_string()).or_default().extend(items);

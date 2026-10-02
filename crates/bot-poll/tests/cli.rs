@@ -877,3 +877,202 @@ fn a_notification_that_asks_runs_bot_notify() {
     assert_no_hot_news(&r, 2, 2);
     assert!(r.calls.is_empty(), "{:?}", r.calls);
 }
+
+// --- --from-sweep ---------------------------------------------------------
+
+/// An RFC 3339 time `mins` minutes ago.
+fn mins_ago(mins: i64) -> String {
+    (chrono::Utc::now() - chrono::Duration::minutes(mins)).to_rfc3339()
+}
+
+impl World {
+    /// bot-sweep's DIR.
+    fn sweeps(&self) -> PathBuf {
+        self.dir.path().join("sweeps")
+    }
+
+    /// Publishes run RUN in DIR as bot-sweep does: the fixture outputs of
+    /// SET, each with exit status 0, and a status naming the run, with
+    /// PROBLEMS, complete if there are none, and its last complete run
+    /// LAST_COMPLETE (run, minutes ago).
+    fn publish(&self, run: &str, set: &str, problems: &[&str], last_complete: (&str, i64)) {
+        let dir = self.sweeps().join("runs").join(run);
+        fs::create_dir_all(&dir).unwrap();
+        for s in ["notify", "inbox", "watch"] {
+            fs::copy(
+                fixtures(set).join(format!("{s}.txt")),
+                dir.join(format!("{s}.txt")),
+            )
+            .unwrap();
+        }
+        fs::write(
+            dir.join("status.json"),
+            r#"{"git":0,"watch":0,"notify":0,"inbox":0,"tmt-gc":0}"#,
+        )
+        .unwrap();
+        let status = serde_json::json!({
+            "version": 1, "run": run, "started_at": mins_ago(3), "ended_at": mins_ago(1),
+            "duration_s": 120.0, "steps": {}, "problems": problems, "complete": problems.is_empty(),
+            "last_complete": {"run": last_complete.0, "ended_at": mins_ago(last_complete.1)},
+        });
+        fs::write(self.sweeps().join("status.json"), status.to_string()).unwrap();
+    }
+
+    fn poll_sweeps(&self, extra: &[&str]) -> Run {
+        let dir = self.sweeps();
+        let mut args = vec!["--from-sweep", dir.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        // No fixtures: a tool run by mistake prints nothing.
+        self.run(&self.dir.path().join("no-fixtures"), &args)
+    }
+}
+
+#[test]
+fn from_sweep_reports_the_sweeps_news_without_sweeping() {
+    let w = World::new();
+    w.publish(
+        "20261002-040000-000",
+        "base",
+        &[],
+        ("20261002-040000-000", 1),
+    );
+    let r = w.poll_sweeps(&["--once"]);
+    let run = assert_news(&r, BASE_KINDS);
+    assert_eq!(run, w.sweeps().join("runs/20261002-040000-000"));
+    assert!(r.calls.is_empty(), "it runs no tool: {:?}", r.calls);
+    // The hot set is rebuilt after a new sweep.
+    assert!(
+        r.gh.iter().any(|l| l.starts_with("search/issues")),
+        "{:?}",
+        r.gh
+    );
+
+    // The same sweep again: nothing new, and no rebuild.
+    let r = w.poll_sweeps(&["--once"]);
+    assert_no_news(&r);
+    assert!(r.gh.is_empty(), "{:?}", r.gh);
+
+    w.publish(
+        "20261002-041000-000",
+        "news",
+        &[],
+        ("20261002-041000-000", 1),
+    );
+    assert_news(&w.poll_sweeps(&["--once"]), NEWS_KINDS);
+    let r = w.run(&fixtures("news"), &["--summary"]);
+    assert!(
+        r.stdout.contains("\nSign-offs (signoff):\n  Signed off: "),
+        "{}",
+        r.stdout
+    );
+}
+
+#[test]
+fn from_sweep_reads_every_sweep_completed_since_the_last_check() {
+    let w = World::new();
+    w.publish(
+        "20261002-040000-000",
+        "base",
+        &[],
+        ("20261002-040000-000", 1),
+    );
+    assert_news(&w.poll_sweeps(&["--once"]), BASE_KINDS);
+    // Two sweeps complete before the next check: the first one's news
+    // (which bot-watch --apply consumed) isn't lost.
+    w.publish(
+        "20261002-041000-000",
+        "news",
+        &[],
+        ("20261002-041000-000", 1),
+    );
+    w.publish(
+        "20261002-042000-000",
+        "base",
+        &[],
+        ("20261002-042000-000", 1),
+    );
+    let r = w.poll_sweeps(&["--once"]);
+    let run = assert_news(&r, NEWS_KINDS);
+    assert_eq!(run, w.sweeps().join("runs/20261002-042000-000"));
+    // A partial run is never read.
+    fs::create_dir_all(w.sweeps().join("runs/.20261002-043000-000.partial")).unwrap();
+    assert_no_news(&w.poll_sweeps(&["--once"]));
+}
+
+#[test]
+fn from_sweep_reports_failed_and_stale_sweeps() {
+    let w = World::new();
+    // Nothing published: no status at all is news, once an hour.
+    let r = w.poll_sweeps(&["--once"]);
+    assert_news(&r, "sweep");
+    let r = w.run(&fixtures("base"), &["--summary"]);
+    assert!(
+        r.stdout
+            .contains("Sweep health (bot-sweep) (sweep):\n  no sweep results in "),
+        "{}",
+        r.stdout
+    );
+    assert_no_news(&w.poll_sweeps(&["--once"]));
+
+    // A failed sweep, the last complete one 40 minutes old: its news
+    // (what its outputs have) and the problem and the staleness.
+    w.publish(
+        "20261002-050000-000",
+        "base",
+        &["watch exited 1: error: another bot-watch run holds /s/lock"],
+        ("20261002-042000-000", 40),
+    );
+    let r = w.poll_sweeps(&["--once"]);
+    assert_news(&r, &format!("sweep, {BASE_KINDS}"));
+    let r = w.run(&fixtures("base"), &["--summary"]);
+    for want in [
+        "  sweep 20261002-050000-000: watch exited 1: error: another bot-watch run holds /s/lock (see ",
+        "  the last complete sweep, 20261002-042000-000, ended 40m ago (newest: 20261002-050000-000, ended ",
+    ] {
+        assert!(r.stdout.contains(want), "lacks {want:?}:\n{}", r.stdout);
+    }
+    // The same failure in the next sweep isn't news again (for 6 hours),
+    // nor the staleness (for an hour).
+    w.publish(
+        "20261002-051000-000",
+        "base",
+        &["watch exited 1: error: another bot-watch run holds /s/lock again"],
+        ("20261002-042000-000", 50),
+    );
+    assert_no_news(&w.poll_sweeps(&["--once"]));
+
+    // A complete sweep: healthy, and quiet.
+    w.publish(
+        "20261002-052000-000",
+        "base",
+        &[],
+        ("20261002-052000-000", 1),
+    );
+    let r = w.poll_sweeps(&["--once"]);
+    assert_no_news(&r);
+    let r = w.poll_sweeps(&["--dry-run"]);
+    assert!(r.stdout.contains("The sweeps are healthy."), "{}", r.stdout);
+
+    // Then the timer stops: the same status, aging, is news.
+    w.publish(
+        "20261002-052000-000",
+        "base",
+        &[],
+        ("20261002-052000-000", 31),
+    );
+    assert_news(&w.poll_sweeps(&["--once"]), "sweep");
+}
+
+#[test]
+fn from_sweep_conflicts_with_the_sweep_options() {
+    let w = World::new();
+    for extra in [
+        &["--lead", "x"][..],
+        &["--exclude-lead", "*"][..],
+        &["--no-wait"][..],
+    ] {
+        let r = w.poll_sweeps(extra);
+        assert_ne!(r.status, 0, "{extra:?}: {}", r.stdout);
+        assert!(r.stderr.contains("cannot be used with"), "{}", r.stderr);
+    }
+}

@@ -17,8 +17,9 @@ use std::time::{Duration, Instant, SystemTime};
 use anyhow::{Context, Result, anyhow, bail};
 use bot_poll::hot::CycleStat;
 use bot_poll::{
-    KindNews, LastNews, Output, STATE_VERSION, Source, State, evaluate, news_line, operator,
-    render_status, render_summary, status,
+    KindNews, LastNews, NewsItem, Output, STATE_VERSION, SWEEP_SET, Source, State, SweepStatus,
+    evaluate, evaluate_set, in_kind_order, news_line, operator, render_status, render_summary,
+    status, sweep_health,
 };
 use chrono::{Local, Utc};
 use clap::Parser;
@@ -39,6 +40,13 @@ const RUN_ID_FORMAT: &str = "%Y%m%d-%H%M%S-%3f";
 const LOCATOR: &str = "bot-watch";
 /// The prefix of a hot cycle's run directory, which isn't a sweep's.
 const HOT_RUN_PREFIX: &str = "hot-";
+/// How often --from-sweep looks for a newer sweep, and at its health.
+const FROM_SWEEP_CHECK: Duration = Duration::from_secs(60);
+/// bot-sweep's files in its DIR: the newest sweep's status, the one
+/// running now, and the runs.
+const SWEEP_STATUS: &str = "status.json";
+const SWEEP_RUNNING: &str = "running.json";
+const SWEEP_RUNS: &str = "runs";
 
 /// One sweep, in order: output (stdout and stderr) to NAME.txt in the
 /// run's directory. None as the tool is git.
@@ -91,6 +99,15 @@ struct Cli {
     /// ('*': every Lead but the coordinator's); may be repeated.
     #[arg(long, value_name = "LEAD")]
     exclude_lead: Vec<String>,
+    /// Sweep nothing: read the sweeps bot-sweep completes in DIR (its
+    /// systemd timer runs them), checking every minute, and report their
+    /// news, and the sweeps' own failures and staleness.
+    #[arg(
+        long,
+        value_name = "DIR",
+        conflicts_with_all = ["lead", "exclude_lead", "no_wait", "interval"]
+    )]
+    from_sweep: Option<PathBuf>,
     /// Where the runs and the seen-sets live [default:
     /// $XDG_STATE_HOME/bot-poll, or ~/.local/state/bot-poll; with --lead,
     /// bot-poll-lead-LEAD there]
@@ -183,7 +200,20 @@ been since and what its own requests cost (STATE-DIR/status.json holds
 the same). Otherwise it goes on, until --max-duration is up, when it
 prints \"No news ...\" and exits 0. Its first sweep is due an interval after the newest one
 started (at once, with --no-wait or --once), so a restart keeps the
-schedule. Only one poll runs per STATE-DIR at a time.";
+schedule. Only one poll runs per STATE-DIR at a time.
+
+With --from-sweep DIR it runs no sweep itself (nor git pull): bot-sweep,
+run by the bot-sweep.timer user unit, does, and publishes each completed
+one in DIR (see bot-sweep --help). Every minute it checks DIR/status.json
+for a sweep it hasn't evaluated, evaluates that run's outputs as above,
+and rebuilds the hot set; hot cycles go on in between (an approval's
+bot-signoff-due waits while a sweep runs: that sweep's bot-watch runs
+it). It also reports, as kind sweep, what is wrong with the sweeps: the
+newest one's problems (a step failed, timed out or found its lock held;
+bot-watch's report empty or cut short), each again every 6 hours while
+it persists, and no complete sweep for over 30 minutes (or no status at
+all), again every hour. So a quiet poll means the sweeps work. --once
+checks once, and --dry-run shows what the newest sweep would report.";
 
 fn state_dir(cli: &Cli) -> Result<PathBuf> {
     if let Some(d) = &cli.state_dir {
@@ -382,6 +412,40 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
         .with_context(|| format!("renaming {} to {}", tmp.display(), path.display()))
 }
 
+/// The outputs of the steps that finished in run directory `run`, by
+/// its status.json ({STEP: exit status, null if killed}).
+fn read_run_dir(run: &Path) -> BTreeMap<Source, Output> {
+    let status: BTreeMap<String, Option<i32>> = fs::read_to_string(run.join("status.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    Source::ALL
+        .into_iter()
+        .filter_map(|s| {
+            let code = *status.get(s.name())?;
+            let text = fs::read_to_string(run.join(format!("{}.txt", s.name()))).ok()?;
+            Some((s, Output { text, status: code }))
+        })
+        .collect()
+}
+
+/// bot-sweep's newest status in DIR, or why there is none.
+fn read_sweep_status(dir: &Path) -> std::result::Result<SweepStatus, String> {
+    let path = dir.join(SWEEP_STATUS);
+    let text = fs::read_to_string(&path).map_err(|e| format!("reading {}: {e}", path.display()))?;
+    serde_json::from_str(&text)
+        .map_err(|e| format!("{} is not bot-sweep's status: {e}", path.display()))
+}
+
+/// Whether a sweep is running in DIR: its running.json names a live pid.
+fn sweep_running(dir: &Path) -> bool {
+    fs::read_to_string(dir.join(SWEEP_RUNNING))
+        .ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .and_then(|v| v.get("pid")?.as_u64())
+        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+}
+
 struct Store {
     dir: PathBuf,
 }
@@ -444,19 +508,7 @@ impl Store {
 
     /// The outputs of a run's steps that finished.
     fn read_run(&self, id: &str) -> BTreeMap<Source, Output> {
-        let run = self.runs().join(id);
-        let status: BTreeMap<String, Option<i32>> = fs::read_to_string(run.join("status.json"))
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok())
-            .unwrap_or_default();
-        Source::ALL
-            .into_iter()
-            .filter_map(|s| {
-                let code = *status.get(s.name())?;
-                let text = fs::read_to_string(run.join(format!("{}.txt", s.name()))).ok()?;
-                Some((s, Output { text, status: code }))
-            })
-            .collect()
+        read_run_dir(&self.runs().join(id))
     }
 
     fn prune_runs(&self) {
@@ -509,12 +561,23 @@ impl Store {
 
     /// Records the news of run `id` as the last reported; its NEWS line.
     fn record_news(&self, state: &mut State, news: Vec<KindNews>, id: &str) -> Option<String> {
+        self.record_news_at(state, news, id, &self.runs().join(id))
+    }
+
+    /// The same for a run in directory `run`.
+    fn record_news_at(
+        &self,
+        state: &mut State,
+        news: Vec<KindNews>,
+        id: &str,
+        run: &Path,
+    ) -> Option<String> {
         if news.is_empty() {
             return None;
         }
         let now = Utc::now();
         let hhmm = now.with_timezone(&Local).format("%H%M").to_string();
-        let line = news_line(&news, &hhmm, &self.runs().join(id).display().to_string());
+        let line = news_line(&news, &hhmm, &run.display().to_string());
         state.last_news = Some(LastNews {
             at: now.to_rfc3339(),
             run: id.to_string(),
@@ -579,6 +642,140 @@ fn hot_cycle(
     Ok((store.record_news(state, cycle.news, &id), cycle.stat))
 }
 
+/// The completed runs in DIR after run `last` up to and including
+/// `newest`, oldest first (always `newest`, even if `last` sorts after
+/// it, as a hot cycle's id would).
+fn sweep_runs_after(dir: &Path, last: &str, newest: &str) -> Vec<String> {
+    let mut ids: Vec<String> = fs::read_dir(dir.join(SWEEP_RUNS))
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok()?.file_name().into_string().ok())
+                .filter(|n| {
+                    chrono::NaiveDateTime::parse_from_str(n, RUN_ID_FORMAT).is_ok()
+                        && n.as_str() > last
+                        && n.as_str() < newest
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    ids.sort();
+    ids.push(newest.to_string());
+    ids
+}
+
+/// One --from-sweep check of DIR: the news of its newest sweep, if not
+/// evaluated yet (then the hot set is rebuilt), and of the sweeps'
+/// health; its NEWS line, if any.
+fn sweep_check(store: &Store, poller: &Poller, state: &mut State, dir: &Path) -> Option<String> {
+    let now = now_ms();
+    let status = read_sweep_status(dir);
+    // Before evaluate(), which keeps only the sets of the sweeps' outputs.
+    let old = state.seen.remove(SWEEP_SET).unwrap_or_default();
+    let mut news: BTreeMap<String, Vec<NewsItem>> = BTreeMap::new();
+    let mut run_id = "sweep-health".to_string();
+    let mut run_dir = dir.to_path_buf();
+    if let Ok(st) = &status {
+        run_id = st.run.clone();
+        run_dir = dir.join(SWEEP_RUNS).join(&st.run);
+        if state.evaluated.as_deref() != Some(st.run.as_str()) {
+            store.prune_runs();
+            // Every sweep that completed since the last check, oldest first:
+            // bot-watch --apply consumed what each one reported. On a first
+            // start, only the newest.
+            let pending = match state.evaluated.as_deref() {
+                Some(last) => sweep_runs_after(dir, last, &st.run),
+                None => vec![st.run.clone()],
+            };
+            for id in pending {
+                let (found, seen, reported) = evaluate(
+                    &read_run_dir(&dir.join(SWEEP_RUNS).join(&id)),
+                    &state.seen,
+                    &state.reported,
+                    now,
+                );
+                state.seen = seen;
+                state.reported = reported;
+                for k in found {
+                    news.entry(k.kind).or_default().extend(k.items);
+                }
+            }
+            state.evaluated = Some(st.run.clone());
+            if let Some(started) = bot_poll::hot::parse_time(&st.started_at) {
+                state.hot.start_sweep(started);
+            }
+            poller.rebuild(state, now);
+        }
+    }
+    let health = sweep_health(
+        status.as_ref().map_err(String::as_str),
+        &dir.display().to_string(),
+        now,
+    );
+    let (found, cur) = evaluate_set(health, &old, now);
+    state.seen.insert(SWEEP_SET.to_string(), cur);
+    if !found.is_empty() {
+        news.entry(SWEEP_SET.to_string()).or_default().extend(found);
+    }
+    store.record_news_at(state, in_kind_order(news), &run_id, &run_dir)
+}
+
+/// The --from-sweep poll: a check of DIR every [`FROM_SWEEP_CHECK`], hot
+/// cycles in between, until news or --max-duration.
+fn from_sweep_loop(
+    cli: &Cli,
+    dir: &Path,
+    store: &Store,
+    poller: &Poller,
+    state: &mut State,
+    start: Instant,
+    report: &dyn Fn(&State, &str) -> Result<()>,
+) -> Result<()> {
+    let hot_every = (cli.hot_interval > 0).then(|| Duration::from_secs(cli.hot_interval));
+    let end = start + Duration::from_secs(cli.max_duration);
+    let mut next_check = start;
+    let mut next_hot = start + hot_every.unwrap_or_default();
+    loop {
+        let now = Instant::now();
+        if now >= end {
+            break;
+        }
+        if now >= next_check {
+            if let Some(line) = sweep_check(store, poller, state, dir) {
+                return report(state, &line);
+            }
+            store.save(state)?;
+            next_check = now + FROM_SWEEP_CHECK;
+        } else if let Some(every) = hot_every
+            && now >= next_hot
+        {
+            match hot_cycle(store, poller, state) {
+                Ok((Some(line), _)) => return report(state, &line),
+                Ok((None, _)) => store.save(state)?,
+                Err(e) => eprintln!("bot-poll: warning: the hot cycle failed: {e:#}"),
+            }
+            next_hot = now + every;
+        }
+        let wake = match hot_every {
+            Some(_) => next_check.min(next_hot),
+            None => next_check,
+        }
+        .min(end);
+        sleep(wake.saturating_duration_since(Instant::now()));
+    }
+    let last = state
+        .evaluated
+        .as_ref()
+        .map(|id| {
+            format!(
+                " (last sweep: {}/*.txt)",
+                dir.join(SWEEP_RUNS).join(id).display()
+            )
+        })
+        .unwrap_or_default();
+    println!("No news in {}s{last}", cli.max_duration);
+    Ok(())
+}
+
 fn run(cli: Cli) -> Result<()> {
     let store = Store {
         dir: state_dir(&cli)?,
@@ -607,7 +804,51 @@ fn run(cli: Cli) -> Result<()> {
         gh: gh_path(),
         sweeper: &sweeper,
         dir: &store.dir,
+        sweep_dir: cli.from_sweep.as_deref(),
     };
+    if cli.dry_run
+        && let Some(dir) = &cli.from_sweep
+    {
+        println!(
+            "No sweep here: bot-sweep's in {} are read every {}s, with hot cycles every {}s.",
+            dir.display(),
+            FROM_SWEEP_CHECK.as_secs(),
+            cli.hot_interval
+        );
+        let mut state = store.load()?;
+        let status = read_sweep_status(dir);
+        match &status {
+            Ok(st) if state.evaluated.as_deref() == Some(st.run.as_str()) => {
+                println!("The newest sweep, {}, was evaluated already.", st.run);
+            }
+            Ok(st) => {
+                let run = dir.join(SWEEP_RUNS).join(&st.run);
+                let (news, _, _) =
+                    evaluate(&read_run_dir(&run), &state.seen, &state.reported, now_ms());
+                match store.record_news_at(&mut state, news, &st.run, &run) {
+                    Some(_) => print!(
+                        "The newest sweep, {}, would report:\n{}",
+                        st.run,
+                        render_summary(state.last_news.as_ref(), &cfg.operator)
+                    ),
+                    None => println!("The newest sweep, {}, has no news.", st.run),
+                }
+            }
+            Err(e) => println!("No sweep status: {e}"),
+        }
+        let health = sweep_health(
+            status.as_ref().map_err(String::as_str),
+            &dir.display().to_string(),
+            now_ms(),
+        );
+        if health.is_empty() {
+            println!("The sweeps are healthy.");
+        }
+        for item in health {
+            println!("Sweep health: {}", item.text);
+        }
+        return Ok(());
+    }
     if cli.dry_run {
         println!("A sweep runs:");
         for (_, tool, args) in STEPS {
@@ -659,9 +900,10 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     // What a sweep found before a restart, if nothing checked it since.
+    // (--from-sweep's first check does that.)
     if let Some(id) = store
         .latest_run()
-        .filter(|id| state.evaluated.as_ref() != Some(id))
+        .filter(|id| cli.from_sweep.is_none() && state.evaluated.as_ref() != Some(id))
     {
         if let Some(line) = store.check(&mut state, &id) {
             return report(&state, &line);
@@ -682,6 +924,24 @@ fn run(cli: Cli) -> Result<()> {
             stat.not_modified
         );
         return Ok(());
+    }
+    if let Some(dir) = &cli.from_sweep {
+        if cli.once {
+            if let Some(line) = sweep_check(&store, &poller, &mut state, dir) {
+                return report(&state, &line);
+            }
+            store.save(&state)?;
+            println!(
+                "No news at {}: {}",
+                hhmm(),
+                state.evaluated.as_deref().map_or_else(
+                    || "no sweep yet".to_string(),
+                    |id| format!("{}/*.txt", dir.join(SWEEP_RUNS).join(id).display())
+                )
+            );
+            return Ok(());
+        }
+        return from_sweep_loop(&cli, dir, &store, &poller, &mut state, start, &report);
     }
     if cli.once {
         let (id, line) = full_sweep(&store, &sweeper, &poller, &mut state)?;

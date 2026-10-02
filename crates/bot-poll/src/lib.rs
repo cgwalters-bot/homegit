@@ -128,8 +128,10 @@ const WATCH_SECTION_FAILURES: [(&str, &[&str]); 6] = [
 /// health-P0 is the new health lines of P0 PRs (they share the health
 /// seen-set); drive is the P0 PRs' new merge blockers (bot-drive);
 /// operator is what the operator did that the bot should act on
-/// (bot-operator-activity).
-pub const KINDS: [(&str, &str); 14] = [
+/// (bot-operator-activity); sweep is what went wrong with the sweeps
+/// bot-sweep runs, which `--from-sweep` reads (see [`sweep_health`]).
+pub const KINDS: [(&str, &str); 15] = [
+    ("sweep", "Sweep health (bot-sweep)"),
     ("health-P0", "Priority health (P0)"),
     ("drive", "P0 drive"),
     ("operator", "OPERATOR'S activity to act on"),
@@ -656,6 +658,10 @@ pub fn evaluate(
             next.insert(set.to_string(), cur);
         }
     }
+    // The sets no output feeds (the sweep health's) are kept as they are.
+    for (set, keys) in seen {
+        next.entry(set.clone()).or_insert_with(|| keys.clone());
+    }
     let news = news.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
     next_reported.retain(|_, at| now - *at < REPORTED_KEEP_MS);
     (in_kind_order(news), next, next_reported)
@@ -674,6 +680,138 @@ pub fn in_kind_order(mut news: BTreeMap<String, Vec<NewsItem>>) -> Vec<KindNews>
                 })
         })
         .collect()
+}
+
+/// The seen-set of the sweep health items.
+pub const SWEEP_SET: &str = "sweep";
+/// A complete sweep older than this is news: the sweeps stopped, or
+/// keep failing.
+pub const SWEEP_STALE_MS: i64 = 30 * 60 * 1000;
+/// A stale sweep is news again this often, and a problem that persists
+/// this often too (rounded to these periods): silence must never mean
+/// the sweeps are broken.
+pub const SWEEP_STALE_REPEAT_MS: i64 = 3600 * 1000;
+pub const SWEEP_PROBLEM_REPEAT_MS: i64 = 6 * 3600 * 1000;
+
+/// A completed sweep, as bot-sweep names it in its status.json.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepRef {
+    pub run: String,
+    pub ended_at: String,
+}
+
+/// What bot-poll reads of bot-sweep's DIR/status.json, written when a
+/// sweep ends.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SweepStatus {
+    pub run: String,
+    pub started_at: String,
+    pub ended_at: String,
+    /// What went wrong, one line each.
+    #[serde(default)]
+    pub problems: Vec<String>,
+    /// Whether its news is whole (bot-watch's report, bot-notify and
+    /// inbox).
+    #[serde(default)]
+    pub complete: bool,
+    /// The newest complete sweep, this one or an earlier one.
+    #[serde(default)]
+    pub last_complete: Option<SweepRef>,
+}
+
+/// A problem's key: its text before any ':' (which details it), digits
+/// masked, so that the same failure is one item from sweep to sweep.
+fn problem_key(problem: &str) -> String {
+    let head = problem.split(':').next().unwrap_or_default();
+    head.chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect()
+}
+
+/// What is wrong with the sweeps at `now` (ms), as items of the sweep
+/// set: the newest one's problems, and no complete one for over
+/// [`SWEEP_STALE_MS`]. `status` is the newest status, or why it can't be
+/// read. Their keys change every [`SWEEP_STALE_REPEAT_MS`] or
+/// [`SWEEP_PROBLEM_REPEAT_MS`], so that what persists is news again.
+pub fn sweep_health(status: Result<&SweepStatus, &str>, dir: &str, now: i64) -> Vec<Item> {
+    let stale_period = now / SWEEP_STALE_REPEAT_MS;
+    let st = match status {
+        Ok(st) => st,
+        Err(why) => {
+            return vec![Item::new(
+                format!("no-status@{stale_period}"),
+                "",
+                format!(
+                    "no sweep results in {dir}: {why}; is bot-sweep.timer running? \
+                     (systemctl --user status bot-sweep.timer bot-sweep)"
+                ),
+            )];
+        }
+    };
+    let problem_period = now / SWEEP_PROBLEM_REPEAT_MS;
+    let mut items: Vec<Item> = st
+        .problems
+        .iter()
+        .map(|p| {
+            Item::new(
+                format!("{}@{problem_period}", problem_key(p)),
+                "",
+                format!("sweep {}: {p} (see {dir}/runs/{}/)", st.run, st.run),
+            )
+        })
+        .collect();
+    let last = st.last_complete.as_ref();
+    let age = last
+        .and_then(|l| hot::parse_time(&l.ended_at))
+        .map(|at| now - at);
+    if age.is_none_or(|a| a > SWEEP_STALE_MS) {
+        let since = match (last, age) {
+            (Some(l), Some(a)) => format!(
+                "the last complete sweep, {}, ended {} ago",
+                l.run,
+                human_secs(a / 1000)
+            ),
+            _ => "no sweep has completed yet".to_string(),
+        };
+        // A new stale spell (after another complete sweep) is news at once.
+        let spell = last.map_or("none", |l| l.run.as_str());
+        items.push(Item::new(
+            format!("stale:{spell}@{stale_period}"),
+            "",
+            format!(
+                "{since} (newest: {}, ended {}); see {dir}/status.json and \
+                 systemctl --user status bot-sweep",
+                st.run, st.ended_at
+            ),
+        ));
+    }
+    items
+}
+
+/// The new items of one seen-set, and the set after them: as
+/// [`evaluate`] does for a whole output.
+pub fn evaluate_set(
+    items: Vec<Item>,
+    old: &BTreeMap<String, i64>,
+    now: i64,
+) -> (Vec<NewsItem>, BTreeMap<String, i64>) {
+    let mut news = Vec::new();
+    let mut cur = BTreeMap::new();
+    for item in items {
+        if cur.insert(item.key.clone(), now).is_some() || old.contains_key(&item.key) {
+            continue;
+        }
+        news.push(NewsItem {
+            url: item.url,
+            text: item.text,
+        });
+    }
+    for (key, at) in old {
+        if now - at < FORGET_MS {
+            cur.entry(key.clone()).or_insert(*at);
+        }
+    }
+    (news, cur)
 }
 
 /// The last NEWS report, for --summary.
@@ -916,6 +1054,60 @@ mod tests {
         "forge-review",
         "news",
     ];
+
+    #[test]
+    fn evaluate_keeps_the_sets_no_output_feeds() {
+        let mut seen = Seen::new();
+        seen.insert(
+            SWEEP_SET.to_string(),
+            BTreeMap::from([("stale:x@1".to_string(), 5)]),
+        );
+        // A hot cycle's bot-notify output alone.
+        let o = BTreeMap::from([(
+            Source::Notify,
+            Output {
+                text: String::new(),
+                status: Some(0),
+            },
+        )]);
+        let (_, next, _) = evaluate(&o, &seen, &Reported::new(), 10);
+        assert_eq!(next.get(SWEEP_SET), seen.get(SWEEP_SET));
+    }
+
+    #[test]
+    fn sweep_health_items() {
+        let hour = SWEEP_STALE_REPEAT_MS;
+        let now = 100 * hour;
+        let st = |problems: &[&str], last_ago: Option<i64>| SweepStatus {
+            run: "r2".into(),
+            started_at: hot::rfc3339(now - 60_000),
+            ended_at: hot::rfc3339(now),
+            problems: problems.iter().map(|p| p.to_string()).collect(),
+            complete: problems.is_empty(),
+            last_complete: last_ago.map(|ago| SweepRef {
+                run: "r1".into(),
+                ended_at: hot::rfc3339(now - ago),
+            }),
+        };
+        let keys = |items: Vec<Item>| items.into_iter().map(|i| i.key).collect::<Vec<_>>();
+        assert!(sweep_health(Ok(&st(&[], Some(60_000))), "D", now).is_empty());
+        assert_eq!(
+            keys(sweep_health(
+                Ok(&st(&["watch exited 1: boom 12"], Some(SWEEP_STALE_MS + 1))),
+                "D",
+                now
+            )),
+            [
+                format!("watch exited #@{}", now / SWEEP_PROBLEM_REPEAT_MS),
+                "stale:r1@100".to_string()
+            ]
+        );
+        assert_eq!(
+            keys(sweep_health(Ok(&st(&[], None)), "D", now)),
+            ["stale:none@100"]
+        );
+        assert_eq!(keys(sweep_health(Err("gone"), "D", now)), ["no-status@100"]);
+    }
 
     #[test]
     fn watch_sections() {
