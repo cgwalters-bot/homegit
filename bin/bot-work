@@ -2,6 +2,14 @@
 # Run one non-interactive bot session against the Workstream board (both
 # named by the operator config).
 set -euo pipefail
+
+# Worktrees are local state rather than board sessions, so dispatch them before
+# loading the operator configuration or requiring GitHub credentials.
+if test "${1:-}" = worktree; then
+    shift
+    exec node "$(dirname "$(readlink -f "$0")")/../lib/bot-work-worktree.js" "$@"
+fi
+
 # shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/operator.sh"
 
@@ -31,6 +39,8 @@ readonly BOT_BOARD
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [--agent opencode|claude] [--item ITEM | --plan [--since YYYY-MM-DD]] [EXTRA INSTRUCTIONS...]
+       $(basename "$0") worktree add REPO_DIR NAME [--base REF]
+       $(basename "$0") worktree rm NAME [--force]
 
 Run an agent non-interactively to pick up or advance the next item on the
 ${BOT_LOGIN} Workstream board (${BOARD_URL}).
@@ -44,6 +54,12 @@ Options:
                  skill) instead of working on an item
   --since DATE   With --plan, look back to DATE instead of the last 7 days
   -h, --help     Show this help
+
+Worktrees:
+  worktree add   Create ~/.cache/bot-work/NAME/REPO (or XDG_CACHE_HOME) on
+                 branch bot/NAME, without changing the shared clone's branch
+  worktree rm    Remove all clean worktrees owned by NAME; --force also
+                 removes worktrees with tracked or untracked changes
 
 Any remaining arguments are appended to the prompt as extra instructions.
 
