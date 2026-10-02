@@ -29,6 +29,10 @@ const BOT_EMAIL_TAG: &str = "llm";
 const OWNER_TYPES: [&str; 2] = ["orgs", "users"];
 const WORKSTREAM: &str = "workstream";
 const MAX_NUMBER: u64 = 1_000_000_000;
+const DEFAULT_AGENTS: u64 = 4;
+const MAX_AGENTS: u64 = 64;
+const DEFAULT_BUDGETS: [(&str, &str); 3] = [("P0", "M"), ("P1", "S"), ("P2", "S")];
+const BUCKETS: [&str; 5] = ["XS", "S", "M", "L", "XL"];
 
 /// The config file as written: every key optional.
 #[derive(Debug, Default, Deserialize)]
@@ -46,6 +50,8 @@ struct Raw {
     generated_by_url: Option<String>,
     #[serde(default)]
     devspace: RawDevspace,
+    #[serde(default)]
+    pacing: RawPacing,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -83,6 +89,14 @@ struct RawDevspace {
     host_prefix: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPacing {
+    agents: Option<u64>,
+    harness_agents: Option<u64>,
+    budgets: Option<BTreeMap<String, String>>,
+}
+
 /// The resolved config, defaults filled in.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Config {
@@ -95,6 +109,7 @@ pub struct Config {
     pub board: Board,
     pub generated_by_url: String,
     pub devspace: Devspace,
+    pub pacing: Pacing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -133,6 +148,16 @@ pub struct StateItem {
 pub struct Devspace {
     pub repo: String,
     pub host_prefix: String,
+}
+
+/// How many work agents the coordinator keeps busy, how many of them on
+/// the harness, and the Est. cost bucket an unestimated item is budgeted
+/// at, by priority (see homegit's bin/bot-pace).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Pacing {
+    pub agents: u64,
+    pub harness_agents: u64,
+    pub budgets: BTreeMap<String, String>,
 }
 
 impl Operator {
@@ -241,6 +266,19 @@ fn check_number(v: Option<u64>, key: &str) -> Result<()> {
     }
 }
 
+fn is_priority(s: &str) -> bool {
+    matches!(s.as_bytes(), [b'P', d] if d.is_ascii_digit())
+}
+
+fn check_agents(v: Option<u64>, key: &str, min: u64) -> Result<()> {
+    match v {
+        Some(n) if !(min..=MAX_AGENTS).contains(&n) => {
+            bail!("{key} must be an integer from {min} to {MAX_AGENTS}, not {n}")
+        }
+        _ => Ok(()),
+    }
+}
+
 fn validate(raw: &Raw) -> Result<()> {
     check_opt(&raw.operator.login, "operator.login", is_login)?;
     check_opt(&raw.operator.name, "operator.name", is_name)?;
@@ -281,6 +319,16 @@ fn validate(raw: &Raw) -> Result<()> {
         "devspace.host_prefix",
         is_short_name,
     )?;
+    check_agents(raw.pacing.agents, "pacing.agents", 1)?;
+    check_agents(raw.pacing.harness_agents, "pacing.harness_agents", 0)?;
+    for (prio, bucket) in raw.pacing.budgets.iter().flatten() {
+        check(is_priority(prio), "pacing.budgets priority", prio)?;
+        check(
+            BUCKETS.contains(&bucket.as_str()),
+            &format!("pacing.budgets.{prio}"),
+            bucket,
+        )?;
+    }
     Ok(())
 }
 
@@ -350,6 +398,16 @@ fn resolve(raw: Raw) -> Result<Config> {
             p
         }
     };
+    let agents = raw.pacing.agents.unwrap_or(DEFAULT_AGENTS);
+    let harness_agents = raw.pacing.harness_agents.unwrap_or(agents / 2);
+    if harness_agents > agents {
+        bail!("pacing.harness_agents ({harness_agents}) must not exceed pacing.agents ({agents})");
+    }
+    let mut budgets: BTreeMap<String, String> = DEFAULT_BUDGETS
+        .iter()
+        .map(|(p, b)| (p.to_string(), b.to_string()))
+        .collect();
+    budgets.extend(raw.pacing.budgets.unwrap_or_default());
     // The trust split: the bot must never pass for the operator.
     if operator.login.eq_ignore_ascii_case(&bot.login) {
         bail!("bot.login must differ from operator.login");
@@ -376,6 +434,11 @@ fn resolve(raw: Raw) -> Result<Config> {
         devspace: Devspace {
             repo: devspace_repo,
             host_prefix,
+        },
+        pacing: Pacing {
+            agents,
+            harness_agents,
+            budgets,
         },
     })
 }

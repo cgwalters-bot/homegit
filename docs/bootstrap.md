@@ -48,6 +48,9 @@ forge org, and the rest is derived:
 | `generated_by_url` | `https://github.com/OPERATOR/#llms` | the `Generated-by:` line `bot-pr fork-pr` expects in PR bodies |
 | `devspace.repo` | `bootc-dev/cgwalters-devspace-sandbox` | the repository whose `devspace.yml` `bot-devspace` dispatches, and `bot-runs` reads |
 | `devspace.host_prefix` | the repository's name without `-sandbox`, plus `-` | the runners' MagicDNS host names, `PREFIX` + run id |
+| `pacing.agents` | 4 | how many work agents the coordinator keeps busy (`bot-pace slots`) |
+| `pacing.harness_agents` | half of `pacing.agents`, rounded down | how many of them work on the harness (the bot's and the forge org's repositories); the rest on upstream work |
+| `pacing.budgets` | `{"P0": "M", "P1": "S", "P2": "S"}` | the Est. cost bucket (XS to XL) an item without one is budgeted at, by priority; merged over the defaults |
 
 Node tools load it with `lib/operator.js`, shell tools by sourcing
 `bin/operator.sh` (which runs `bot-operator --shell`), and `bot-poll`
