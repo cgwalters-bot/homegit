@@ -133,6 +133,16 @@ a busy agent like a local worker (see "Capacity"), and the Observed line
 of `bot-reconcile` reports how many of them are remote and how many local,
 so a drift back to local workers shows.
 
+The runners are CNCF-provided, so they are for CNCF or associated
+projects (bootc, composefs, ostree and so on); harness development may use
+them for now. The operator, in the session landing cgwalters-forge/tracker#282:
+"There is a bigger picture goal I want to only use cncf runners for things
+in CNCF or associated like ostree. We can use them for our harness dev for
+now but make a note that the medium term is likely we'll end up setting up
+GHA runners on my personal machines as a Kube cluster or so". The
+self-hosted plan is tracked in cgwalters-forge/tracker#287; don't build
+long-term dependence on these runners for non-CNCF work.
+
 A **local subagent is only for**:
 
 - GitHub I/O: posting replies and reviews, `bot-pr promote`, the board and
@@ -693,8 +703,8 @@ cost when an item is far off (two buckets), and correct the table in
     prompt-injection boundaries (treating GitHub text as data, the review
     app's auth, CSP and approve guard, egress limits).
   - **Devspace-sandbox remote-worker stack (standing exception to
-    "containment"):** the operator, on cgwalters-forge/tracker#282: "What I
-    mean is we are not really sandboxing the sub agents here effectively so
+    "containment"):** the operator, in the session landing cgwalters-forge/tracker#282:
+    "What I mean is we are not really sandboxing the sub agents here effectively so
     almost anything we do to sandbox the remote workers and run them
     remotely is just better than what we have now, but obviously we're
     aiming to de-duplicate with agentic workflows which should add a lot

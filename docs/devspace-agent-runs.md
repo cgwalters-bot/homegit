@@ -49,6 +49,17 @@ The workflow sets `run-name: agent ${{ inputs.item }} ${{ inputs.repo }}`:
 `bot-runs` reads the item and repository from a run's `display_title`
 when nothing else is left of the run.
 
+**Whose runners.** The runners behind `agent.yml` and the devspaces are
+provided for CNCF projects, so use them for CNCF or associated work
+(bootc, composefs, ostree and so on). The operator allows the bot's own
+harness development on them for now, and said the medium term is likely
+self-hosted: "There is a bigger picture goal I want to only use cncf
+runners for things in CNCF or associated like ostree. We can use them for
+our harness dev for now but make a note that the medium term is likely
+we'll end up setting up GHA runners on my personal machines as a Kube
+cluster or so" (the operator, in the session landing cgwalters-forge/tracker#282). That plan is tracked in
+[tracker#287](https://github.com/cgwalters-forge/tracker/issues/287).
+
 ### On the board
 
 The run, not the session that dispatched it, is the source of truth for
