@@ -41,7 +41,8 @@ EOF
 # The fake bot-reconcile prints $FAKE/reconcile-N.txt on its Nth call,
 # else $FAKE/reconcile.txt (and exits with $FAKE/reconcile-N.rc, else
 # $FAKE/reconcile.rc, else 0), the fake bot-heartbeat prints
-# $FAKE/heartbeat.err to stderr (and exits with $FAKE/heartbeat.rc), both
+# $FAKE/CMD.err to stderr and exits with $FAKE/CMD.rc for its command CMD
+# (prune, refresh), both
 # logging to $FAKE/order; the fake bot-board
 # lists $FAKE/board.json; the others log, and print $FAKE/NAME.out.
 cat >"${WORK}/tools/bot-reconcile" <<'EOF'
@@ -57,8 +58,8 @@ EOF
 cat >"${WORK}/tools/bot-heartbeat" <<'EOF'
 #!/usr/bin/env bash
 echo "heartbeat $*" >>"${FAKE}/order"
-cat "${FAKE}/heartbeat.err" 1>&2 2>/dev/null
-exit "$(cat "${FAKE}/heartbeat.rc" 2>/dev/null || echo 0)"
+cat "${FAKE}/$1.err" 1>&2 2>/dev/null
+exit "$(cat "${FAKE}/$1.rc" 2>/dev/null || echo 0)"
 EOF
 cat >"${WORK}/tools/bot-board" <<'EOF'
 #!/usr/bin/env bash
@@ -172,35 +173,44 @@ test "$(tail -n+2 <<<"${out}")" = 'Observed: nothing
 rm "${FAKE}/reconcile.rc"
 printf '%s\n' "${QUIET_REPORT}" >"${FAKE}/reconcile.txt"
 
-# Each cycle refreshes the heartbeat before reconciling; the report says
-# why when it didn't refresh it.
+# Each cycle prunes and refreshes the heartbeat before reconciling; the
+# report says why when it didn't.
 reset
 sweep 20261002-100000-000 ""
 out=$(loop 1)
-test "$(cat "${FAKE}/order")" = 'heartbeat refresh
-reconcile
+test "$(cat "${FAKE}/order")" = 'heartbeat prune
 heartbeat refresh
-reconcile' || fail "refresh and reconcile order: $(cat "${FAKE}/order")"
+reconcile
+heartbeat prune
+heartbeat refresh
+reconcile' || fail "prune, refresh and reconcile order: $(cat "${FAKE}/order")"
 if grep -q '^Heartbeat' <<<"${out}"; then fail "a refreshed heartbeat was reported: ${out}"; fi
-# [heartbeat refresh's exit status, its stderr, the report's last line]
+readonly DECLINED="bot-heartbeat: not refreshed: someone published since" HTTP502="bot-heartbeat: cannot edit the heartbeat comment: HTTP 502"
+# [prune's exit status and stderr, refresh's, the report's last lines,
+# separated by ~]
 hb_cases=(
-    "0|bot-heartbeat: fresh: published 3 min ago|Observed: 4 of 4 agents busy"
-    "4|bot-heartbeat: not refreshed: someone published since|Heartbeat not refreshed: bot-heartbeat: not refreshed: someone published since (exit 4)"
-    "1|bot-heartbeat: cannot edit the heartbeat comment: HTTP 502|Heartbeat not refreshed: bot-heartbeat: cannot edit the heartbeat comment: HTTP 502 (exit 1)"
+    "0|bot-heartbeat: dropping w1 (Done)|0|bot-heartbeat: fresh: published 3 min ago|Observed: 4 of 4 agents busy"
+    "4|${DECLINED}|4|${DECLINED}|Heartbeat not refreshed: ${DECLINED} (exit 4)"
+    "0||1|${HTTP502}|Heartbeat not refreshed: ${HTTP502} (exit 1)"
+    "1|${HTTP502}|0||Heartbeat not pruned: ${HTTP502} (exit 1)"
+    "1|${HTTP502}|1|${HTTP502}|Heartbeat not pruned: ${HTTP502} (exit 1)~Heartbeat not refreshed: ${HTTP502} (exit 1)"
 )
 for c in "${hb_cases[@]}"; do
-    IFS='|' read -r rc err want <<<"${c}"
-    echo "${rc}" >"${FAKE}/heartbeat.rc"
-    echo "${err}" >"${FAKE}/heartbeat.err"
+    IFS='|' read -r prc perr rc err want <<<"${c}"
+    want=${want//\~/$'\n'}
+    echo "${prc}" >"${FAKE}/prune.rc"
+    echo "${perr}" >"${FAKE}/prune.err"
+    echo "${rc}" >"${FAKE}/refresh.rc"
+    echo "${err}" >"${FAKE}/refresh.err"
     out=$(loop)
     expect_first "${out}" '^QUIET'
-    test "$(tail -n1 <<<"${out}")" = "${want}" || fail "refresh exit ${rc}: QUIET ends: $(tail -n1 <<<"${out}")"
+    test "$(tail -n "$(wc -l <<<"${want}")" <<<"${out}")" = "${want}" || fail "prune exit ${prc}, refresh exit ${rc}: QUIET ends: ${out}"
 done
 # A wake carries it too.
 printf '%s\n' 'Observed: 2 of 4 agents busy' 'Actions (1):' '* heartbeat: the heartbeat is 20 min old' >"${FAKE}/reconcile.txt"
 out=$(loop)
 expect_first "${out}" '^ACTIONS \(actions: heartbeat\)'
-test "$(tail -n1 <<<"${out}")" = "${want}" || fail "the wake doesn't say why the heartbeat wasn't refreshed: ${out}"
+test "$(tail -n "$(wc -l <<<"${want}")" <<<"${out}")" = "${want}" || fail "the wake doesn't say why the heartbeat wasn't refreshed: ${out}"
 
 # A stale sweep is a problem, reported at most hourly.
 reset
@@ -264,14 +274,14 @@ test "$(grep -c '^reconcile$' "${FAKE}/order")" = 5 || fail "--until-actions: re
 # have shown: [file, its content, the wake line].
 fail_cases=(
     "reconcile.rc|1|^ACTIONS \\(reconcile-failing\\) at [0-9]{4}: bot-reconcile failed 3 cycles in a row; "
-    "heartbeat.rc|4|^ACTIONS \\(heartbeat-refresh\\) at [0-9]{4}: bot-heartbeat refresh failed 3 cycles in a row: .* \\(exit 4\\)$"
+    "refresh.rc|4|^ACTIONS \\(heartbeat-refresh\\) at [0-9]{4}: bot-heartbeat refresh failed 3 cycles in a row: .* \\(exit 4\\)$"
 )
 for c in "${fail_cases[@]}"; do
     IFS='|' read -r f v want <<<"${c}"
     reset
     sweep 20261002-100000-000 ""
     echo "${v}" >"${FAKE}/${f}"
-    echo "bot-heartbeat: not refreshed: someone published since" >"${FAKE}/heartbeat.err"
+    echo "bot-heartbeat: not refreshed: someone published since" >"${FAKE}/refresh.err"
     out=$(loop 0 --until-actions)
     expect_first "${out}" "${want}"
     test "$(grep -c '^reconcile$' "${FAKE}/order")" = 3 || fail "${f}: cycles before the wake: $(cat "${FAKE}/order")"

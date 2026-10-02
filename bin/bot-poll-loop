@@ -45,7 +45,8 @@ or, after about $(((CYCLES * FAST_S + 59) / 60)) minutes with nothing,
   <bot-reconcile's Observed line, the inputs it couldn't read, and
    its exit status if it failed>
 
-Both end with why the heartbeat wasn't refreshed, when it wasn't.
+Both end with why the heartbeat wasn't refreshed (or pruned), when it
+wasn't.
 
 With --until-actions it doesn't stop after a quiet window: it keeps
 cycling, so a background run of it ends only when there is something to
@@ -73,11 +74,12 @@ humans (news). A sweep problem (the newest status lists problems that
 the run before it had too, or no sweep completed in $((STALE_S / 60)) minutes) wakes
 it at most hourly (sweep-problem).
 
-Each cycle first runs 'bot-heartbeat refresh', which republishes the
-heartbeat as last published with updated_at moved to now, while that
-publish was this session's and nobody changed it since: so the heartbeat
-stays fresh without a wake, and is stale only when the refresh can't
-keep it so. Then it runs 'bot-reconcile --state ${S}/actions.json'
+Each cycle first runs 'bot-heartbeat prune', then 'bot-heartbeat
+refresh': they republish the heartbeat as last published with
+updated_at moved to now, prune without the workers whose item is Done
+or closed, while that publish was this session's and nobody changed it
+since. So the heartbeat stays fresh and drops finished workers without
+a wake, and is stale only when the refresh can't keep it so. Then it runs 'bot-reconcile --state ${S}/actions.json'
 and wakes on its fired actions: those that are new, and those still
 open ${RESYNC_MIN} minutes after they last woke it (a controller's resync). So the
 same unresolved action doesn't wake it again and again.
@@ -240,10 +242,16 @@ sweep_problem() {
     echo "${why}"
 }
 
-# refresh: bot-heartbeat refresh, leaving in refreshed why it didn't
-# refresh (empty when it did, or needn't yet).
+# refresh: bot-heartbeat prune, then refresh, leaving in refreshed why
+# it didn't refresh (empty when it did, or needn't yet). A prune that
+# declines (4) declines for the reason refresh then gives; another
+# failure of it is noted there too, but only refresh's count.
 refresh() {
     local rc=0 out
+    out=$("${TOOLS}/bot-heartbeat" prune 2>&1) || rc=$?
+    pruned=""
+    test "${rc}" -eq 0 || test "${rc}" -eq 4 || pruned="$(tail -n1 <<<"${out}") (exit ${rc})"
+    rc=0
     out=$("${TOOLS}/bot-heartbeat" refresh 2>&1) || rc=$?
     refreshed=""
     if test "${rc}" -eq 0; then
@@ -278,6 +286,7 @@ wake() {
 }
 
 heartbeat_note() {
+    test -z "${pruned}" || echo "Heartbeat not pruned: ${pruned}"
     test -z "${refreshed}" || echo "Heartbeat not refreshed: ${refreshed}"
 }
 

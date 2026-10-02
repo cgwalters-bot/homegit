@@ -40,6 +40,8 @@ fail() {
 
 # The fake gh. $FAKE holds: private (OWNER/REPO per line: private
 # repositories), broken (repositories whose read fails with a 500),
+# closed and broken-items (repos/OWNER/REPO/issues/N per line: closed
+# items, and items whose read fails with a 500; others are open),
 # comments.json (the issue's comments), calls (every call) and
 # written (the last POST or PATCH, as "METHOD PATH" then its input);
 # usage-comments.json and usage-written are the same for the usage
@@ -77,7 +79,12 @@ case "${method} ${path}" in
         { echo "${method} ${path}"; cat; } >"${FAKE}/usage-written"
         echo '{"html_url": "https://github.com/cgwalters-forge/bot-ops/issues/1#issuecomment-8"}' | jq -r "${filter}" ;;
     "GET user") jq -rn --arg login "${FAKE_LOGIN:-cgwalters-bot}" "{login: \$login} | ${filter}" ;;
-    "GET repos/"*/missing) echo "gh: Not Found (HTTP 404)" 1>&2; exit 1 ;;
+    "GET repos/"*/missing|"GET repos/"*/missing/issues/*) echo "gh: Not Found (HTTP 404)" 1>&2; exit 1 ;;
+    "GET repos/"*/issues/[0-9]*)
+        if grep -qxF "${path}" "${FAKE}/broken-items" 2>/dev/null; then echo "gh: Server Error (HTTP 500)" 1>&2; exit 1; fi
+        state=open
+        grep -qxF "${path}" "${FAKE}/closed" 2>/dev/null && state=closed
+        jq -rn --arg s "${state}" "{state: \$s} | ${filter}" ;;
     "GET repos/"*)
         repo=${path#repos/}
         if grep -qxiF "${repo}" "${FAKE}/broken" 2>/dev/null; then echo "gh: Server Error (HTTP 500)" 1>&2; exit 1; fi
@@ -338,6 +345,59 @@ refresh_at 20:10:00
 if test "${rc}" -ne 4 || ! grep -qF 'nothing published from here yet' "${WORK}/err"; then
     fail "refresh with nothing published: exit ${rc}: $(cat "${WORK}/err")"
 fi
+
+# --- prune: republish the last publish without the workers whose item
+# is Done on the board (as an item or in one's Branch) or closed, under
+# refresh's conditions; never one whose item it can't read.
+readonly ITEM=https://github.com/o/r/issues
+# Published by s1 at 20:00: done and branch are Done on the board,
+# closed is closed, open is In Progress, flaky can't be read.
+published_for_prune() {
+    published_by_s1
+    rm -f "${FAKE}/written"
+    heartbeat "done|${ITEM}/1|" "branch|${ITEM}/2|" "closed|${ITEM}/3|" "open|${ITEM}/4|" "flaky|${ITEM}/5|" |
+        CLAUDE_CODE_SESSION_ID=s1 "${TOOL}" publish --no-usage 2>"${WORK}/err" || fail "publish for prune failed: $(cat "${WORK}/err")"
+    as_comment
+    echo repos/o/r/issues/3 >"${FAKE}/closed"
+    echo repos/o/r/issues/5 >"${FAKE}/broken-items"
+    jq -n --arg i "${ITEM}" '[{id: "PVTI_1", status: "Done", content: {url: "\($i)/1"}},
+        {id: "PVTI_2", status: "Done", content: {url: "https://github.com/o/r/issues/99"}, branch: "\($i)/2 https://github.com/o/r/pull/7"},
+        {id: "PVTI_4", status: "In Progress", content: {url: "\($i)/4"}}]' >"${WORK}/board.json"
+}
+# [case#session#setup#arguments#exit status#in stderr#workers published, or - for none]
+prune_cases=(
+    "Done and closed#s1###0#dropping done (Done), branch (Done), closed (closed)#open flaky"
+    "unreadable board#s1##--board-file ${WORK}/nonexistent#0#only closed items count#done branch open flaky"
+    "nothing finished#s1#rm ${FAKE}/closed; jq 'map(.status = \"Todo\")' ${WORK}/board.json >${WORK}/b && mv ${WORK}/b ${WORK}/board.json##0##-"
+    "dry run#s1##--dry-run#0#would drop done (Done), branch (Done), closed (closed)#-"
+    "another session#s2###4#ran in session s1, not this one (s2)#-"
+    "someone published since#s1#jq '.[0].body |= gsub(\"testing\"; \"working\")' ${FAKE}/comments.json >${WORK}/c && mv ${WORK}/c ${FAKE}/comments.json##4#someone published since#-"
+)
+for case in "${prune_cases[@]}"; do
+    IFS='#' read -r name session setup args want_rc want_err want_workers <<<"${case}"
+    published_for_prune
+    eval "${setup}"
+    rc=0
+    # shellcheck disable=SC2086 # one argument per word
+    env CLAUDE_CODE_SESSION_ID="${session}" BOT_HEARTBEAT_NOW=2026-09-28T20:01:00Z \
+        "${TOOL}" prune --board-file "${WORK}/board.json" ${args} 2>"${WORK}/err" || rc=$?
+    test "${rc}" -eq "${want_rc}" || fail "prune, ${name}: exit ${rc}, want ${want_rc}: $(cat "${WORK}/err")"
+    grep -qF -- "${want_err}" "${WORK}/err" || fail "prune, ${name}: stderr lacks '${want_err}': $(cat "${WORK}/err")"
+    if test "${want_workers}" = -; then
+        test ! -e "${FAKE}/written" || fail "prune, ${name}: wrote the heartbeat"
+        continue
+    fi
+    json=$(tail -n +2 "${FAKE}/written" | jq -r .body | json_of)
+    test "$(jq -r '[.workers[].name] | join(" ")' <<<"${json}")" = "${want_workers}" || fail "prune, ${name}: published ${json}"
+    test "$(jq -r .updated_at <<<"${json}")" = 2026-09-28T20:01:00Z || fail "prune, ${name}: updated_at: ${json}"
+done
+# A Done worker is dropped without a read of its item.
+published_for_prune
+CLAUDE_CODE_SESSION_ID=s1 "${TOOL}" prune --board-file "${WORK}/board.json" 2>"${WORK}/err" || fail "prune: $(cat "${WORK}/err")"
+if grep -qE 'issues/(1|2) ' "${FAKE}/calls"; then fail "prune read a Done worker's item: $(cat "${FAKE}/calls")"; fi
+# What it published is the new last publish: refresh builds on it.
+test "$(jq -r '[.input.workers[].name] | join(" ")' "${XDG_STATE_HOME}/bot-heartbeat/last-publish.json")" = "open flaky" ||
+    fail "prune didn't save its publish: $(cat "${XDG_STATE_HOME}/bot-heartbeat/last-publish.json")"
 
 # The usage goes only to a private repository.
 reset
