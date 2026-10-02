@@ -90,11 +90,24 @@ included, nothing committed, at most 8 MiB), and `base.json`
 (`{repo, ref, commit}`). The runner has no credentials, so it can't push.
 The patch isn't redacted, because that would corrupt it; a
 secret-shaped string in it fails the upload instead.
-`bot-runs apply RUN --slug SLUG --message FILE` checks it again locally
-(size, base, secret-shaped strings, no `.github/`, `.git` or
-`.gitmodules` paths, no symlinks or submodules). It then commits it as
-the bot on `bot/SLUG` in a fresh clone of the target. After review,
-`bot-pr fork-pr --from DIR` opens it on the forge.
+`bot-runs apply RUN --repo OWNER/REPO --slug SLUG --message FILE`
+treats all of it as untrusted and checks it again locally. The run must
+be a successful dispatch of `agent.yml` from the expected ref, for the
+declared repository (its title, summary and `base.json` all agreeing),
+and the artifact must be the only `agent-out` of that run and head,
+made during its one job, `Agent` (the one running the agent as
+`runner-sandbox`). The artifact must hold just the two files, within
+8 MiB and 100 files; the base commit must be on the base branch of
+the target (never fetched by id, since GitHub serves fork commits that
+way). The change, as git sees it once applied, may hold no
+secret-shaped strings, binaries, symlinks, submodules, mode changes or
+new executables, and may touch only plain relative paths outside `.git*`
+(including `.github/` and `.gitattributes`) and CI or hook
+configuration. It is applied with hooks and the caller's git
+configuration off, in a fresh clone whose `origin` has no push URL, and
+committed as the bot on `bot/SLUG` with an `Agent-run:` trailer linking
+the run attempt; a refused change's clone is removed. Nothing is pushed:
+after review, `bot-pr fork-pr --from DIR` opens it on the forge.
 
 **`agent-transcript`**, with `retention-days: 30`, holds one file,
 `transcript.tar.zst`: a zstd-compressed tar, public like the rest, since the
