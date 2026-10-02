@@ -6,7 +6,8 @@
 # A fake gh keeps one dispatched run in a temporary directory, and a fake
 # ssh admits the users in $FAKE_SSH_USERS and records what it was asked to
 # run, and answers the CPU model probe with $FAKE_CPU. Then which runs of another start count as the same devspace, by
-# their titles. No network.
+# their titles. Last, jobs, which the fake ssh runs locally: what wait
+# reports and exits with for each way one can end. No network.
 #   tests/bot-devspace.sh
 set -euo pipefail
 
@@ -95,6 +96,11 @@ grep -qw -- "${user}" <<<"${FAKE_SSH_USERS}" || exit 255
 case "$*" in
     true) exit 0 ;;
     "awk "*/proc/cpuinfo) test -n "${FAKE_CPU:-}" && echo "${FAKE_CPU}" ;;
+    # Jobs run here for real, in $FAKE/home as the devspace's home.
+    "bash -s -- job "*)
+        mkdir -p "${FAKE}/home"
+        cd "${FAKE}/home"
+        HOME=${FAKE}/home exec bash -c "$*" ;;
     "bash -s -- "*)
         { echo "$4"; cat; } >"${FAKE}/provision"
         test "$4" != check || exit "${FAKE_CHECK_RC:-0}" ;;
@@ -183,8 +189,74 @@ for case in "${title_cases[@]}"; do
     fi
 done
 
+# Jobs: what wait reports and exits with for each way a job can end.
+# (command, wait options, wait's exit status, a line its output must have)
+export XDG_STATE_HOME=${WORK}/state FAKE_SSH_USERS=runner-sandbox BOT_DEVSPACE_JOB_POLL=1
+rm -rf "${XDG_STATE_HOME}" "${FAKE:?}"/*
+"${BOT_DEVSPACE}" start --no-provision --duration 30 t-jobs >/dev/null 2>&1 || fail "[jobs] start failed"
+mkdir -p "${FAKE}/home/src/repo"
+job_cases=(
+    "echo built; exit 0||0|built"
+    "echo broke; exit 3||1|exited with 3"
+    "printf '%s\n' 'a  b' \"\$HOME\"||0|a  b"
+    "seq 50||0|50"
+    "seq 50|--tail 2|0|49"
+    "pwd|--cd src/repo|0|${FAKE}/home/src/repo"
+    "sleep 30|--timeout 1|124|still running after 1s"
+)
+for case in "${job_cases[@]}"; do
+    IFS='|' read -r cmd opts want line <<<"${case}"
+    run_opts=() wait_opts=()
+    case "${opts}" in
+        --cd*) read -ra run_opts <<<"${opts}" ;;
+        ?*) read -ra wait_opts <<<"${opts}" ;;
+    esac
+    "${BOT_DEVSPACE}" run "${run_opts[@]}" t-jobs job1 "${cmd}" >/dev/null 2>"${WORK}/err" ||
+        { fail "[${cmd}] run failed: $(cat "${WORK}/err")"; continue; }
+    rc=0
+    "${BOT_DEVSPACE}" wait "${wait_opts[@]}" t-jobs job1 >"${WORK}/out" 2>&1 || rc=$?
+    test "${rc}" = "${want}" || fail "[${cmd}] wait exited ${rc}, want ${want}: $(cat "${WORK}/out")"
+    grep -qF -- "${line}" "${WORK}/out" ||
+        fail "[${cmd}] wait output lacks '${line}': $(cat "${WORK}/out")"
+    if test "${opts}" = "--tail 2"; then
+        grep -qx 48 "${WORK}/out" && fail "[${cmd}] --tail 2 printed more than 2 lines"
+    fi
+    # Starting a job that is still running is refused.
+    if test "${want}" = 124; then
+        "${BOT_DEVSPACE}" run t-jobs job1 true 2>/dev/null && fail "[${cmd}] run replaced a running job"
+        kill "$(cat "${FAKE}/home/.bot-devspace/jobs/job1/pid")"
+    fi
+done
+
+# The errors, all exit 2: no such job, a job killed before it could record
+# its status, and a devspace whose run has finished. (setup, job, message)
+kill_job2() {
+    "${BOT_DEVSPACE}" run t-jobs job2 sleep 30 >/dev/null 2>&1 || fail "[lost job] run failed"
+    pkill -KILL -s "$(cat "${FAKE}/home/.bot-devspace/jobs/job2/pid")" || true
+}
+finish_run() {
+    jq '.workflow_runs[].status = "completed"' "${FAKE}/runs.json" >"${FAKE}/runs.json.new"
+    mv "${FAKE}/runs.json.new" "${FAKE}/runs.json"
+    export FAKE_SSH_USERS=nobody
+}
+error_cases=(
+    "true|nosuchjob|no job named 'nosuchjob'"
+    "kill_job2|job2|died without recording"
+    "finish_run|job1|devspace t-jobs is gone"
+)
+for case in "${error_cases[@]}"; do
+    IFS='|' read -r setup job message <<<"${case}"
+    "${setup}"
+    rc=0
+    "${BOT_DEVSPACE}" wait t-jobs "${job}" 2>"${WORK}/err" || rc=$?
+    test "${rc}" = 2 || fail "[${setup}] wait exited ${rc}, want 2: $(cat "${WORK}/err")"
+    grep -qF -- "${message}" "${WORK}/err" || fail "[${setup}] wait error lacks '${message}': $(cat "${WORK}/err")"
+done
+export FAKE_SSH_USERS=runner-sandbox
+"${BOT_DEVSPACE}" stop t-jobs 2>/dev/null || fail "[jobs] stop failed"
+
 if test "${failures}" -ne 0; then
     echo "${failures} failure(s)" 1>&2
     exit 1
 fi
-echo "ok: bot-devspace SSH user detection, provision modes, CPU model and run titles"
+echo "ok: bot-devspace SSH user detection, provision modes, CPU model, run titles and jobs"

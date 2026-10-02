@@ -69,6 +69,22 @@ readonly TMT_VERSION=1.78.0
 # https://github.com/cgwalters-forge/tracker/issues/235. start records the
 # CPU model so that results can be tied to the hardware they ran on.
 readonly CPU_PROBE="awk -F ': *' '/^model name/ { print \$2; exit }' /proc/cpuinfo"
+# Jobs ('run' and 'wait'): each lives in JOBS_DIR/JOB on the devspace, with
+# its command, pid, log and, once it ended, its exit status.
+readonly JOBS_DIR='.bot-devspace/jobs'
+# The default fits under the 10-minute cap agents' foreground shell
+# commands have; longer waits run in the background with a longer --timeout.
+readonly DEFAULT_WAIT_TIMEOUT=540
+readonly DEFAULT_WAIT_TAIL=20
+readonly JOB_POLL_INTERVAL=${BOT_DEVSPACE_JOB_POLL:-15}
+# Consecutive failed polls of a devspace whose run is still active before
+# wait gives up on reaching it.
+readonly JOB_POLL_ATTEMPTS=5
+# wait's exit statuses besides 0 (the job succeeded); timeout(1)'s for a
+# timeout.
+readonly EX_JOB_FAILED=1
+readonly EX_WAIT_ERROR=2
+readonly EX_WAIT_TIMEOUT=124
 
 usage() {
     cat <<EOF
@@ -94,6 +110,18 @@ Commands:
   ssh NAME [CMD...]  Run CMD on the devspace, or an interactive shell
   ssh-config NAME    Print the path of an ssh_config defining Host ${ALIAS_PREFIX}NAME,
                      for use with 'ssh -F' and GIT_SSH_COMMAND="ssh -F <path>"
+  run [--cd DIR] NAME JOB CMD...
+                     Start CMD (joined like ssh does, run by bash) on the
+                     devspace as the detached job JOB, in DIR (relative to
+                     the home directory; default: home), and print its log
+                     path. It survives SSH disconnects; re-running a JOB
+                     that ended replaces it.
+  wait [--timeout SEC] [--tail N] NAME JOB
+                     Block until JOB ends, then print the last N lines of
+                     its log (default ${DEFAULT_WAIT_TAIL}). Exits 0 if the job succeeded,
+                     ${EX_JOB_FAILED} if it failed, ${EX_WAIT_TIMEOUT} if it is still running after SEC
+                     seconds (default ${DEFAULT_WAIT_TIMEOUT}), ${EX_WAIT_ERROR} on any other error (no such
+                     job, job killed, devspace gone).
   list               List known devspaces with their live run status and the
                      CPU model each one got (runner hardware varies)
   stop NAME          Cancel the run and remove local state
@@ -101,14 +129,18 @@ Commands:
 
 State (keys, known_hosts, ssh_config) lives in ${STATE_ROOT}/NAME.
 BOT_DEVSPACE_SSH_TIMEOUT (seconds, default 900) bounds the wait for SSH.
+BOT_DEVSPACE_JOB_POLL (seconds, default 15) is how often wait polls a job.
 Runners are billed while they run: stop them when done. Never copy
 credentials (GitHub tokens etc.) to a devspace.
 EOF
 }
 
+# The status fatal exits with; wait sets its own (EX_WAIT_ERROR).
+fatal_status=1
+
 fatal() {
     echo "error: $*" 1>&2
-    exit 1
+    exit "${fatal_status}"
 }
 
 info() {
@@ -144,10 +176,10 @@ one_of() { # one_of VALUE CHOICES...
     return 1
 }
 
-validate_name() {
-    local name=$1
+validate_name() { # validate_name NAME [KIND]
+    local name=$1 kind=${2:-devspace}
     [[ "${name}" =~ ^[a-z0-9][a-z0-9_.-]{0,62}$ ]] ||
-        fatal "invalid devspace name '${name}': use lowercase letters, digits, '-', '_' or '.' (at most 63 characters)"
+        fatal "invalid ${kind} name '${name}': use lowercase letters, digits, '-', '_' or '.' (at most 63 characters)"
 }
 
 state_dir() {
@@ -518,6 +550,138 @@ cmd_ssh_config() {
     echo "$(state_dir "$1")/ssh_config"
 }
 
+# job_remote NAME OP JOB [ARG...]: runs a job operation on the devspace.
+# The ARGs are quoted for the remote shell, which ssh hands the joined
+# command line to.
+job_remote() {
+    local name=$1 op=$2 job=$3 args=() arg
+    shift 3
+    for arg in "$@"; do
+        args+=("$(printf '%q' "${arg}")")
+    done
+    ssh -F "$(state_dir "${name}")/ssh_config" -o BatchMode=yes "${ALIAS_PREFIX}${name}" \
+        bash -s -- job "${op}" "${job}" "${JOBS_DIR}" "${args[@]}" <<'EOF'
+set -euo pipefail
+op=$2 job=$3 dir=${HOME}/$4/$3
+shift 4
+# Prints done STATUS, running, lost (it died without recording a status)
+# or unknown. The second look at exit catches a job that ended between
+# the first and kill -0.
+job_state() {
+    if test -e "${dir}/exit"; then
+        echo "done $(cat "${dir}/exit")"
+    elif test -s "${dir}/pid" && kill -0 "$(cat "${dir}/pid")" 2>/dev/null; then
+        echo running
+    elif test -e "${dir}/exit"; then
+        echo "done $(cat "${dir}/exit")"
+    elif test -d "${dir}"; then
+        echo lost
+    else
+        echo unknown
+    fi
+}
+case "${op}" in
+    start)
+        cwd=$1 cmd=$2
+        if test "$(job_state)" = running; then
+            echo "error: job ${job} is still running" 1>&2
+            exit 1
+        fi
+        cd -- "${cwd}"
+        rm -rf -- "${dir}"
+        mkdir -p -- "${dir}"
+        printf '%s\n' "${cmd}" >"${dir}/cmd"
+        # setsid detaches the job from this SSH session. The status is
+        # renamed into place so that a poll never reads a partial one.
+        setsid bash -c 'bash -c "$1" >"$2/log" 2>&1; echo $? >"$2/exit.tmp"; mv "$2/exit.tmp" "$2/exit"' \
+            job "${cmd}" "${dir}" </dev/null >/dev/null 2>&1 &
+        echo $! >"${dir}/pid"
+        echo "${dir}/log" ;;
+    state) job_state ;;
+    tail) tail -n "$1" "${dir}/log" ;;
+esac
+EOF
+}
+
+cmd_run() {
+    local cwd=.
+    while test $# -gt 0; do
+        case "$1" in
+            --cd) test $# -ge 2 || fatal "--cd requires an argument"; cwd=$2; shift 2 ;;
+            --cd=*) cwd=${1#--cd=}; shift ;;
+            -*) fatal "unknown option for run: $1 (see --help)" ;;
+            *) break ;;
+        esac
+    done
+    test $# -ge 3 || fatal "usage: $(basename "$0") run [--cd DIR] NAME JOB CMD..."
+    local name=$1 job=$2 log
+    shift 2
+    validate_name "${name}"
+    validate_name "${job}" job
+    run_id_of "${name}" >/dev/null
+    log=$(job_remote "${name}" start "${job}" "${cwd}" "$*") ||
+        fatal "could not start job ${job} on ${name}"
+    info "Started job ${job} on ${name}; '$(basename "$0") wait ${name} ${job}' blocks until it ends"
+    echo "${log}"
+}
+
+cmd_wait() {
+    fatal_status=${EX_WAIT_ERROR}
+    local timeout=${DEFAULT_WAIT_TIMEOUT} tail=${DEFAULT_WAIT_TAIL}
+    while test $# -gt 0; do
+        case "$1" in
+            --timeout) test $# -ge 2 || fatal "--timeout requires an argument"; timeout=$2; shift 2 ;;
+            --timeout=*) timeout=${1#--timeout=}; shift ;;
+            --tail) test $# -ge 2 || fatal "--tail requires an argument"; tail=$2; shift 2 ;;
+            --tail=*) tail=${1#--tail=}; shift ;;
+            -*) fatal "unknown option for wait: $1 (see --help)" ;;
+            *) break ;;
+        esac
+    done
+    test $# -eq 2 || fatal "usage: $(basename "$0") wait [--timeout SEC] [--tail N] NAME JOB"
+    local name=$1 job=$2 id
+    [[ "${timeout}" =~ ^[0-9]{1,6}$ ]] || fatal "--timeout must be a number of seconds (got '${timeout}')"
+    [[ "${tail}" =~ ^[0-9]{1,6}$ ]] || fatal "--tail must be a number of lines (got '${tail}')"
+    validate_name "${name}"
+    validate_name "${job}" job
+    id=$(run_id_of "${name}")
+
+    [[ "${JOB_POLL_INTERVAL}" =~ ^[1-9][0-9]{0,3}$ ]] || fatal "BOT_DEVSPACE_JOB_POLL must be a number of seconds (got '${JOB_POLL_INTERVAL}')"
+    local deadline=$((SECONDS + 10#${timeout})) started=${SECONDS} failures=0 state status conclusion job_status remaining
+    while :; do
+        if state=$(job_remote "${name}" state "${job}" 2>/dev/null); then
+            failures=0
+            case "${state}" in
+                running) ;;
+                "done "*)
+                    job_status=${state#done }
+                    info "Job ${job} on ${name} exited with ${job_status} after waiting $((SECONDS - started))s; last lines of its log:"
+                    job_remote "${name}" tail "${job}" "$((10#${tail}))" ||
+                        info "warning: could not read the log of job ${job}"
+                    test "${job_status}" = 0 && return 0
+                    return "${EX_JOB_FAILED}" ;;
+                lost) fatal "job ${job} on ${name} died without recording an exit status (killed?)" ;;
+                unknown) fatal "no job named '${job}' on ${name} (start one with '$(basename "$0") run')" ;;
+                *) fatal "unexpected job state from ${name}: ${state}" ;;
+            esac
+        else
+            state=$(run_state "${id}")
+            read -r status conclusion <<<"${state}"
+            is_active_status "${status}" ||
+                fatal "devspace ${name} is gone (run ${id} ${conclusion:-finished}), and job ${job} with it"
+            failures=$((failures + 1))
+            test "${failures}" -lt "${JOB_POLL_ATTEMPTS}" ||
+                fatal "cannot reach ${name} over SSH (${failures} attempts in a row); its run ${id} is still ${status}"
+        fi
+        remaining=$((deadline - SECONDS))
+        if test "${remaining}" -le 0; then
+            info "Job ${job} on ${name} is still running after ${timeout}s; run wait again to keep waiting"
+            return "${EX_WAIT_TIMEOUT}"
+        fi
+        sleep "$((remaining < 10#${JOB_POLL_INTERVAL} ? remaining : 10#${JOB_POLL_INTERVAL}))"
+    done
+}
+
 cmd_list() {
     test $# -eq 0 || fatal "usage: $(basename "$0") list"
     local dirs=("${STATE_ROOT}"/*/) dir name id state cpu
@@ -587,7 +751,7 @@ command=$1
 shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
-    start|provision|ssh|ssh-config|list|stop) ;;
+    start|provision|ssh|ssh-config|run|wait|list|stop) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
 require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
@@ -598,6 +762,8 @@ case "${command}" in
     provision) cmd_provision "$@" ;;
     ssh) cmd_ssh "$@" ;;
     ssh-config) cmd_ssh_config "$@" ;;
+    run) cmd_run "$@" ;;
+    wait) cmd_wait "$@" ;;
     list) cmd_list "$@" ;;
     stop) cmd_stop "$@" ;;
 esac
