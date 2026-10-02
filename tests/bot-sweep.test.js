@@ -29,7 +29,7 @@ exit "\${FAKE_${envName}_EXIT:-0}"
 }
 fs.mkdirSync(BIN);
 for (const [name, env] of [["bot-watch", "WATCH"], ["bot-notify", "NOTIFY"], ["bot-pr", "INBOX"],
-  ["bot-tmt-number", "GC"], ["bot-actuals", "ACTUALS"], ["git", "GIT"]]) fake(name, env);
+  ["bot-tmt-number", "GC"], ["bot-actuals", "ACTUALS"], ["bot-board", "BOARD"], ["git", "GIT"]]) fake(name, env);
 
 // Whether PID is gone (or a zombie) within a few seconds: a killed
 // orphan is reaped by init, which may take a moment.
@@ -72,12 +72,14 @@ test("a clean sweep publishes its outputs and a complete status", () => {
   assert.deepEqual(s.last_complete.run, s.run);
   assert.match(s.run, /^[0-9]{8}-[0-9]{6}-[0-9]{3}$/);
   assert.ok(s.duration_s >= 0 && s.ended_at >= s.started_at);
-  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "git", "inbox", "notify", "tmt-gc", "watch"]);
+  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "fill-org", "git", "inbox", "notify", "tmt-gc", "watch"]);
+  assert.deepEqual(s.org_filled, []);
+  assert.doesNotMatch(r.stdout, /Org filled/);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-notify.txt"), "utf8"), "notify says\n");
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-inbox.txt"), "utf8"), "inbox says\n");
   // The run, in bot-poll's layout.
-  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0 });
+  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0, "fill-org": 0 });
   assert.equal(fs.readFileSync(path.join(r.stateDir, "runs", s.run, "watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.ok(!fs.existsSync(path.join(r.stateDir, "running.json")));
   assert.deepEqual(fs.readdirSync(path.join(r.stateDir, "runs")), [s.run]);
@@ -105,6 +107,56 @@ for (const c of [
     assert.match(r.stdout, /problems:/);
   });
 }
+
+// fill-org: what it set goes in the report; failing, it is a problem but
+// the run is still complete.
+for (const c of [
+  { name: "sets two items' Org", env: { FAKE_BOARD_OUT: "PVTI_a\tbootc-dev\tcomposefs: x\nPVTI_b\tother\tSomething\n" },
+    code: 0, filled: [{ id: "PVTI_a", org: "bootc-dev", title: "composefs: x" }, { id: "PVTI_b", org: "other", title: "Something" }],
+    stdout: /\nOrg filled:\n {2}PVTI_a bootc-dev: composefs: x\n {2}PVTI_b other: Something\n$/ },
+  { name: "fails", env: { FAKE_BOARD_RUN: "echo 'error: listing board items failed' >&2", FAKE_BOARD_EXIT: "1" },
+    code: 1, filled: [], problem: /^fill-org exited 1: error: listing board items failed$/ },
+]) {
+  test(`fill-org ${c.name}`, () => {
+    const r = sweep(c.env);
+    assert.equal(r.code, c.code, r.stdout + r.stderr);
+    assert.equal(r.st.complete, true);
+    assert.deepEqual(r.st.org_filled, c.filled);
+    if (c.stdout) assert.match(r.stdout, c.stdout);
+    if (c.problem) assert.ok(r.st.problems.some((p) => c.problem.test(p)), JSON.stringify(r.st.problems));
+  });
+}
+
+test("fill-org with the real bot-board gives an Org-less item its Org", () => {
+  // The real bot-board, against a fake gh serving a board with one item
+  // that the project's auto-add left without an Org.
+  const bin = path.join(WORK, "bin-real-board");
+  const store = path.join(WORK, "board-store");
+  fs.mkdirSync(path.join(bin, "path"), { recursive: true });
+  fs.mkdirSync(store);
+  for (const f of fs.readdirSync(BIN)) if (f !== "bot-board") fs.copyFileSync(path.join(BIN, f), path.join(bin, f));
+  fs.symlinkSync(path.join(__dirname, "..", "bin", "bot-board"), path.join(bin, "bot-board"));
+  fs.writeFileSync(path.join(store, "fields.json"), JSON.stringify({ fields: [{ id: "F_org", name: "Org",
+    options: ["bootc-dev", "other"].map((n) => ({ id: `O_${n}`, name: n })) }] }));
+  fs.writeFileSync(path.join(store, "items.json"), JSON.stringify({ items: [
+    { id: "PVTI_new", title: "bootc: auto-added", content: { type: "Issue", url: "https://github.com/bootc-dev/bootc/issues/1", body: "" } },
+    { id: "PVTI_old", title: "Has one", org: "other", content: { type: "Issue", url: "https://github.com/example/x/issues/2", body: "" } },
+  ] }));
+  fs.writeFileSync(path.join(bin, "path", "gh"), `#!/bin/bash
+case "$1 $2" in
+  "project field-list") cat "${store}/fields.json" ;;
+  "api -i") exec "${path.join(__dirname, "fixtures", "bot-board", "fake-rest")}" "${store}/items.json" "$3" ;;
+  "project view") echo PVT_fake ;;
+  "api rate_limit") echo 5000 ;;
+  "api graphql") printf '%s\n' "$*" >>"${store}/mutations"; echo '{}' ;;
+  *) echo "fake gh: unexpected call: $*" >&2; exit 1 ;;
+esac
+`, { mode: 0o755 });
+  const r = sweep({ BOT_SWEEP_BIN_DIR: bin, PATH: `${path.join(bin, "path")}:${process.env.PATH}`, XDG_CACHE_HOME: path.join(WORK, "board-cache") });
+  assert.equal(r.code, 0, r.stdout + r.stderr + JSON.stringify(r.st && r.st.problems));
+  assert.deepEqual(r.st.org_filled, [{ id: "PVTI_new", org: "bootc-dev", title: "bootc: auto-added" }]);
+  assert.match(fs.readFileSync(path.join(store, "mutations"), "utf8"), /itemId: "PVTI_new",\s+fieldId: \$field, value: \{singleSelectOptionId: "O_bootc-dev"\}/);
+});
 
 test("a step whose lock is held only for a while is retried", () => {
   const r = sweep({ FAKE_NOTIFY_RUN: `if [ "$n" -lt 3 ]; then echo '${LOCK_MSG}' >&2; exit 1; fi` });

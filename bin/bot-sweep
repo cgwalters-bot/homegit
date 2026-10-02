@@ -37,8 +37,14 @@ const PHASES = [
     { name: "tmt-gc", tool: "bot-tmt-number", args: ["--gc"], timeoutMin: 2 },
     // The tokens spent on busy and Done items, once bot-watch moved them.
     { name: "actuals", tool: "bot-actuals", args: ["--open"], timeoutMin: 3 },
+    // Items the project's auto-add workflow put on the board have no Org,
+    // which the capacity lanes, bot-reconcile and planning select by.
+    // With none to set, it reads only the REST listing: no GraphQL.
+    { name: "fill-org", tool: "bot-board", args: ["fill-org"], timeoutMin: 2 },
   ],
 ];
+// What 'bot-board fill-org' prints for each item it sets: ID, Org, title.
+const ORG_SET_RE = /^(PVTI_\S+)\t([^\t]+)\t(.*)$/gm;
 // The steps whose output bot-poll reads for news: published as
 // latest-NAME.txt too.
 const NEWS_STEPS = ["watch", "notify", "inbox"];
@@ -84,13 +90,15 @@ never killed halfway by a poll's timeout:
   bot-watch --apply --exclude-lead '*'   \\
   bot-notify                              > at once
   bot-pr inbox --dry-run                 /
-  bot-tmt-number --gc                    \ at once
-  bot-actuals --open                     /
+  bot-tmt-number --gc                    \\
+  bot-actuals --open                      > at once
+  bot-board fill-org                     /
 
 Each step has a timeout (git 2, bot-watch 20, bot-notify 5, inbox 10,
-gc 2, actuals 3 minutes) and runs in its own process group, all of which is killed
-when it times out, so no orphan keeps holding bot-watch's lock. A step
-that finds another run holding its lock is retried ${LOCK_RETRIES} times.
+gc 2, actuals 3, fill-org 2 minutes) and runs in its own process group,
+all of which is killed when it times out, so no orphan keeps holding
+bot-watch's lock. A step that finds another run holding its lock is
+retried ${LOCK_RETRIES} times.
 
 The run goes to DIR/runs/.ID.partial, renamed to DIR/runs/ID when done
 (ID is its UTC start, YYYYMMDD-HHMMSS-mmm): NAME.txt per step (stdout and
@@ -103,14 +111,18 @@ renamed into place:
                                         duration_s, steps: {NAME: {exit,
                                         signal, timed_out, attempts,
                                         duration_s, bytes}}, problems,
-                                        complete, last_complete}
+                                        complete, last_complete,
+                                        org_filled}
 
 problems lists what went wrong (a step that failed, timed out or found
 its lock held; bot-watch's report empty or without its closing "Swept"
 line); complete says whether bot-watch's report is whole and bot-notify
 and inbox succeeded; last_complete is the newest complete run {run,
-ended_at}. While a sweep runs, DIR/running.json holds its pid, and
-another sweep refuses to start. Runs are kept ${KEEP_DAYS} days.
+ended_at}; org_filled lists the items fill-org gave an Org ([{id, org,
+title}]), which the report ends with under "Org filled". A failing
+fill-org is a problem like any step's, but leaves the run complete.
+While a sweep runs, DIR/running.json holds its pid, and another sweep
+refuses to start. Runs are kept ${KEEP_DAYS} days.
 
 DIR defaults to \${XDG_STATE_HOME:-~/.local/state}/bot-sweep.
 
@@ -455,11 +467,13 @@ async function sweep(opts) {
       duration_s: Math.round((ended - started) / 100) / 10,
       steps, problems, complete,
       last_complete: complete ? { run: id, ended_at: ended.toISOString() } : (prev?.last_complete ?? null),
+      org_filled: [...(outputs["fill-org"] || "").matchAll(ORG_SET_RE)].map(([, itemId, org, title]) => ({ id: itemId, org, title })),
     };
     writeAtomic(statusFile, `${JSON.stringify(status, null, 1)}\n`);
     prune(runsDir, Date.now());
     process.stdout.write(`${PROG}: run ${id} took ${status.duration_s}s` +
-      `${problems.length ? `; problems:\n${problems.map((p) => `  ${p}`).join("\n")}` : "; no problems"}\n`);
+      `${problems.length ? `; problems:\n${problems.map((p) => `  ${p}`).join("\n")}` : "; no problems"}\n` +
+      `${status.org_filled.length ? `Org filled:\n${status.org_filled.map((o) => `  ${o.id} ${o.org}: ${o.title}`).join("\n")}\n` : ""}`);
     return problems.length ? EX_ERROR : 0;
   } finally {
     if (killed) await killed;
