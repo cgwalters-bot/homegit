@@ -1,6 +1,6 @@
 ---
 name: coordinator
-description: Run the bot (cgwalters-bot) as the top-level coordinator session - poll bot-notify, bot-pr inbox and bot-watch on a loop, promote approved fork PRs, dispatch worker subagents for Todo items and the operator's asks, have an independent reviewer check every result, and post the morning brief. Load this when asked to run or coordinate the bot; workers and reviewers read the preambles next to it instead.
+description: Run the bot (cgwalters-bot) as the top-level coordinator session - poll bot-notify, bot-pr inbox and bot-watch on a loop, promote approved fork PRs, dispatch devspace agent runs (bot-runs) and local worker subagents for Todo items and the operator's asks, apply the runs' patches, have an independent reviewer check every result, and post the morning brief. Load this when asked to run or coordinate the bot; workers and reviewers read the preambles next to it instead.
 ---
 
 # coordinator — Running the bot as a coordinator
@@ -67,7 +67,9 @@ to this one, by path in the homegit checkout
 - `worker-preamble.md` for a worker (implementing an item, answering an
   ask, turning Drafts into forge PRs);
 - `reviewer-preamble.md` for a reviewer;
-- `policy-check.md` for a policy check (see "Promote" below).
+- `policy-check.md` for a policy check (see "Promote" below);
+- `apply-preamble.md` for the Sonnet worker that applies, reviews and
+  proposes a devspace run's patch (see "Applying a run's patch").
 
 A worker dispatched to a devspace runner (`bin/bot-runs dispatch`) gets
 `runner-preamble.md` instead: `bot-runs` puts it before the brief
@@ -111,71 +113,69 @@ diff, which the caller reviews and commits through `bin/bot-git`. Don't pass `mo
 would override the pin. Reviews, design, security and root-causing a
 failure it reports as "unexplained" stay on the default model.
 
-### Devspace agent runs instead of a subagent
+### Devspace agent runs are the default
 
-A worker can also run on a devspace runner instead of in this session:
-`bot-runs dispatch --item PVTI_... --repo OWNER/REPO BRIEF` starts an
-`agent.yml` run (see docs/devspace-agent-runs.md), records it in the
-item's `Run` field, sets it In Progress and gives it its token budget
-(`bot-pace budget`). From then on the run is
-the item's source of truth: `bot-runs reconcile`, on every
+Implementation and test work runs on a devspace runner, not in a local
+subagent: the operator's standing ask is "make devspaces really the
+default". Dispatch it with `bot-runs dispatch --item PVTI_... --repo
+OWNER/REPO BRIEF`, which starts an `agent.yml` run (see
+docs/devspace-agent-runs.md; opencode with GPT-6.1 Sol through the praxis
+broker by default, and the runner has the Rust toolchain, podman and the
+usual build dependencies), records it in the item's `Run` field, sets it
+In Progress and gives it its token budget (`bot-pace budget`). From then
+on the run is the item's source of truth: `bot-runs reconcile`, on every
 `bot-watch --apply` sweep, moves it to Draft when the run hands back a
-patch (its Why says how to `bot-runs apply` it; that isn't done
-unattended yet) or back to Todo with the run linked in Why when it
-fails, times out or changes nothing. Don't track it in the session or
-poll the run: its section in the sweep ("Devspace runs") and the board
-say where it stands.
+patch (its Why says which run: "ready for bot-runs apply RUN") or back to
+Todo with the run linked in Why when it fails, times out or changes
+nothing. Don't track it in the session or poll the run: its section in the
+sweep ("Devspace runs") and the board say where it stands. A run counts as
+a busy agent like a local worker (see "Capacity"), and the Observed line
+of `bot-reconcile` reports how many of them are remote and how many local,
+so a drift back to local workers shows.
 
-Dispatch to a devspace when the task is long builds and tests in a
-public repository and needs no GitHub writes until it is done: the run
-has no credentials, so it can't push, comment, open PRs or set the
-board, and it can't ask anything mid-task. The brief is public (a
-dispatch input), so it carries no private data, and it must stand on
-its own: the run sees only the target repository. Everything else
-stays a local subagent: work that pushes or talks on GitHub as it goes,
-reviews, policy checks, harness changes, anything that needs the
-operator's judgment midway, and private repositories. A run that fails
-lands back in Todo; look at it (`bot-runs show`/`log`) before
-dispatching it again, and never dispatch an item whose `Run` is set:
-that run still owns it.
+A **local subagent is only for**:
 
-### Work that doesn't need Claude: opencode with GPT-6.1 Sol
+- GitHub I/O: posting replies and reviews, `bot-pr promote`, the board and
+  question issues, applying and proposing a run's patch (below), anything
+  that pushes or talks on GitHub as it goes: the run has no credentials,
+  so it can't push, comment, open PRs or set the board;
+- coordination: reviewers, policy checks, harness changes (a change to the
+  runner's own workflow can't test itself the same way), anything that
+  needs the operator's judgment midway, since a run can't ask anything
+  mid-task;
+- work where a remote run is impossible: a private repository (logs and
+  transcripts of runs are public, and `bot-runs dispatch` refuses it),
+  a task that needs a credential or a service only this machine reaches,
+  or one whose brief can't be made public and self-contained (it is a
+  dispatch input, so it carries no private data, and the run sees only the
+  target repository).
 
-Claude usage is the scarce budget, so work that needs no Claude-specific
-judgment can run on opencode with GPT-6.1 Sol (`praxis/gpt-6.1-sol`),
-through the praxis broker's Codex subscription: small mechanical
-changes, test additions, docs, a first pass at a well-specified item.
-Reviews, policy checks, harness changes and anything security-relevant
-stay on Claude. Two shapes, both with no credential copied anywhere
-(inference goes through the broker, whose base URL opencode's
-configuration holds with a placeholder key):
+Say which of these it is in the worker's brief when you start a local
+worker for implementation or test work, and in the board item's News. A
+run that fails lands back in Todo; look at it (`bot-runs show`/`log`)
+before dispatching it again, and never dispatch an item whose `Run` is
+set: that run still owns it.
 
-- **Remote:** `bot-runs dispatch` already defaults opencode runs to that
-  model (`--model` or `BOT_RUNS_MODEL` change it); see the previous
-  section. The patch it hands back waits for `bot-runs apply`'s
-  hardening (homegit#82) like any other run's.
-- **Local:** `bin/bot-opencode [--repo DIR] [--base REF] [--task NAME]
-  [--timeout MIN] BRIEF` (a file, or `-`) starts `opencode acp`, the
-  Agent Client Protocol over stdio, in a new detached worktree of the
-  repository under `~/.cache/bot-work/opencode/NAME`, sends the brief,
-  prints tool-call progress and token counts on stderr, cancels the agent
-  at the timeout (exit 124), and prints opencode's final message and the
-  diff on stdout (`--out DIR` also saves `message.md` and
-  `changes.patch`). It commits nothing: review the diff as you would a
-  builder's and commit from the worktree with `bin/bot-git`, then
-  `git worktree remove` it (or pass `--rm`). It refuses any model not on
-  the praxis provider. It runs as the bot, never with your own setup:
-  its HOME (`~/.cache/bot-work/opencode/home`) holds only homegit's
-  `dotfiles/.config/opencode` (opencode.json with the praxis provider and
-  the bot's AGENTS.md) and `dotfiles/.agents/skills`, its environment is
-  cut to PATH and the locale (no token, SSH agent or XDG/OPENCODE_*
-  override), the repository's own opencode configuration is switched off,
-  and commits carry the bot's identity from the operator config. The
-  wrapper prepends the worker rules to the brief: edit only, no commits (a
-  pre-commit hook refuses them), no GitHub, and no local builds or tests,
-  which belong on a devspace: run them yourself (see devspace-work). The
-  worktree is still not a sandbox: the agent runs as your user and shares
-  the repository's `.git`, so don't point it at what it shouldn't see.
+### Applying a run's patch
+
+A run's patch comes back to the board as a Draft item whose Why says
+"ready for bot-runs apply RUN". The reconcile rule **patch-ready** names
+it. The flow, once `bot-runs apply` may run unattended: dispatch a local
+Sonnet worker (Agent with `model: sonnet`) on `apply-preamble.md`, with
+`Item:` and `Run:` lines. It reads the run, applies the patch with `bot-runs
+apply` (which re-checks it), reviews the diff as a reviewer would, and
+opens or updates the fork PR with the run as its CI evidence, leaving the
+item Draft with the PR as its Branch. A separate reviewer then checks that
+PR, like any worker's result. A patch the worker can't vouch for goes back
+as a new run with the feedback in its brief, not as a local rewrite.
+
+`bot-runs apply` isn't run unattended yet: its hardening is
+[homegit#82](https://github.com/cgwalters-bot/homegit/pull/82), a critical
+change for the operator's review. Until it merges the patch-ready action
+only reports the patch, and applying it waits for the operator's word. The
+switch is one line, `APPLY_UNATTENDED` in `lib/reconcile.js`: set it to
+`true` after #82 lands and the action tells you to dispatch the apply
+worker.
 
 ## Polling
 
@@ -309,8 +309,10 @@ with the desired one, and prints the actions that close the gap, each
 with a stable key, a kind, the item's URL and what to do. It changes
 nothing itself. Its rules (`bot-reconcile --help` has the details):
 
-- **capacity:** the work agents busy per lane against the target (see
-  "Capacity"); a lane under it gets its top Todo candidates, but only
+- **capacity:** the work agents busy per lane against the target, and how
+  many are remote runs and how many local (see "Capacity"); a lane under
+  it gets its top Todo candidates, to dispatch via `bot-runs dispatch`
+  first, but only
   while the total is under the target too: a lane short of its share
   while the other runs over is only noted in the Observed line. A busy task
   past its Budget tokens is a **budget** action.
@@ -337,6 +339,9 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   sweep's P0 drive or priority health step failed, the last run's actions
   of that kind carry over as still open (the Observed line names the
   step), so they neither drop out nor wake you again once it recovers.
+- **patch-ready:** a Draft item whose Why says a devspace run's patch is
+  ready for `bot-runs apply` (see "Applying a run's patch"). Reported only,
+  as waiting for the operator, until `APPLY_UNATTENDED` is switched on.
 - **answer-unapplied:** a question the operator answered whose Unblocks
   items are still open and untouched since the answer.
 - **closed-not-done:** an item whose own issue or PR is closed or merged
@@ -413,9 +418,12 @@ candidates: by priority, then (upstream) spread over repositories, then
 toward where the operator was active lately (`bot-operator-activity`
 keeps that), leaving out topic sessions' items, asks, manual items, and
 bot-text work for a repository whose policy keeps the bot's text out.
-Fill a free slot with `bot-pace assign ITEM` (In Progress, Lead
-`coordinator`, and its budget) before briefing the worker, or with
-`bot-runs dispatch`.
+Fill a free slot with `bot-runs dispatch` (see "Devspace agent runs
+are the default"); only for the cases listed there that need a local
+worker, use `bot-pace assign ITEM` (In Progress, Lead `coordinator`, and
+its budget) before briefing it. `bot-reconcile`'s Observed line says how
+many of the busy agents are remote and how many local, and flags a drift
+toward local.
 
 Every task has a token budget, **Budget tokens** on the board: the upper
 bound of its Est. cost bucket, else its priority's bucket in
@@ -724,7 +732,9 @@ cost when an item is far off (two buckets), and correct the table in
      also mentions the bot comes as a mention request too: handle both
      as this one triage.
 - **Dispatch** workers for Todo items and for the operator's asks from
-  `bot-notify`, into the free slots of each lane (see "Capacity"):
+  `bot-notify`, into the free slots of each lane (see "Capacity"), as
+  devspace runs (`bot-runs dispatch`) unless the work is one of the local
+  cases under "Devspace agent runs are the default":
   within a lane by priority, so composefs stability (P0) comes first
   there, but a lane whose P0 work waits on a human goes on with P1 and P2
   rather than idling. The operator's asks come before the lane's Todo
