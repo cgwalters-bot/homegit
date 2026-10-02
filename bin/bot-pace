@@ -1,0 +1,156 @@
+#!/usr/bin/env node
+// Claim a board item for an agent and give the task a token budget: see
+// --help. Node's standard library only, plus bot-board.
+"use strict";
+
+const { execFileSync } = require("node:child_process");
+const path = require("node:path");
+
+const cap = require(path.join(__dirname, "..", "lib", "capacity.js"));
+const pace = require(path.join(__dirname, "..", "lib", "pacing.js"));
+const operator = require(path.join(__dirname, "..", "lib", "operator.js"));
+
+const PROG = path.basename(process.argv[1] || "bot-pace");
+const BOARD = process.env.BOT_PACE_BOARD || path.join(__dirname, "bot-board");
+const MAX_BUFFER = 256 * 1024 * 1024;
+const EX_USAGE = 2;
+
+class Exit extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} assign ITEM [--lead LEAD] [--est BUCKET | --tokens N] [--force] [--dry-run]
+       ${PROG} budget ITEM [--est BUCKET | --tokens N] [--force] [--dry-run]
+
+Gives the coordinator's tasks a token budget, which bot-reconcile's
+capacity rule weighs (with how many agents are busy: pacing in the operator
+config, see docs/bootstrap.md) and the board shows next to Actual tokens.
+
+  assign   Claim ITEM for an agent: Status ${pace.ACTIVE_STATUS}, Lead LEAD (default
+           ${pace.COORDINATOR_LEAD}, for the coordinator's workers: any other Lead is a
+           topic session's, which the coordinator's sweep leaves out), and
+           its budget, as 'budget' sets it. Refused for an item with
+           another Lead (--force: take it over) or a Run.
+  budget   Set ITEM's '${pace.BUDGET_FIELD}' (a number field, added to the board
+           if missing) unless it has one (--force: overwrite): N, else the
+           upper bound of BUCKET (which also becomes its Est. cost), else of
+           its Est. cost, else of its priority's bucket in pacing.budgets
+           (XL: ${pace.tokens(pace.XL_BUDGET)}). bot-runs dispatch runs it.
+
+BUCKET is XS, S, M, L or XL. ITEM is a board item id (PVTI_...) or its issue
+or PR URL. Actual tokens are what bot-actuals measured (see its --help).
+`;
+}
+
+const run = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "inherit"] });
+const board = (args) => run(BOARD, args);
+
+const loadItems = () => JSON.parse(board(["list", "--json"]));
+
+// findItem(items, ref): the item with id ref, or whose issue or PR is ref.
+function findItem(items, ref) {
+  const key = cap.normalizeItem(ref);
+  const it = items.find((i) => i.id === ref || (key && cap.normalizeItem(i.content && i.content.url) === key));
+  if (!it) throw new Exit(1, `${ref} is not on the board`);
+  return it;
+}
+
+function parseArgs(argv, spec) {
+  const opts = { positional: [] };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-h" || a === "--help") throw new Exit(0, null);
+    if (!a.startsWith("--")) {
+      opts.positional.push(a);
+      continue;
+    }
+    const name = a.slice(2);
+    if (!(name in spec)) throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    if (spec[name] === "flag") opts[name] = true;
+    else {
+      if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${a} needs a value`);
+      opts[name] = argv[++i];
+    }
+  }
+  return opts;
+}
+
+// budgetArgs(item, opts, force): the bot-board set arguments that give
+// item its budget (none if it has one and not force), and what they say.
+function budgetArgs(item, opts, force) {
+  if (opts.est && opts.tokens) throw new Exit(EX_USAGE, "give --est or --tokens, not both");
+  const args = [];
+  let tokens;
+  let why;
+  if (opts.tokens) {
+    if (!/^[1-9][0-9]*$/.test(opts.tokens)) throw new Exit(EX_USAGE, `--tokens must be a positive whole number, not '${opts.tokens}'`);
+    tokens = Number(opts.tokens);
+    why = "given";
+  } else if (opts.est) {
+    const b = cap.bucketOf(opts.est);
+    if (!b || b.key !== opts.est.trim().toUpperCase()) throw new Exit(EX_USAGE, `--est must be one of ${cap.BUCKETS.map((x) => x.key).join(", ")}, not '${opts.est}'`);
+    tokens = pace.budgetTokens(b);
+    args.push("--field", pace.EST_FIELD, b.option);
+    why = `Est. cost ${b.key}`;
+  } else {
+    const b = pace.budgetFor(item, operator.loadOrExit(PROG).pacing);
+    tokens = b.tokens;
+    why = b.source === "est" ? `Est. cost ${b.bucket}` : `${item.priority || "no priority"}: ${b.bucket}`;
+  }
+  const had = pace.num(item[pace.BUDGET_FIELD.toLowerCase()]);
+  if (had !== null && !force && !opts.tokens && !opts.est) return { args: [], note: `${item.id} already has a budget of ${pace.tokens(had)}` };
+  args.push("--field", pace.BUDGET_FIELD, String(tokens));
+  return { args, note: `${pace.BUDGET_FIELD} = ${tokens} (${pace.tokens(tokens)}, ${why}) on ${item.id}` };
+}
+
+function setItem(id, args, dryRun) {
+  if (dryRun) {
+    process.stdout.write(`would run: bot-board set ${id} ${args.map((a) => (/[\s'"]/.test(a) ? `'${a}'` : a)).join(" ")}\n`);
+    return;
+  }
+  if (args.includes(pace.BUDGET_FIELD)) board(["field-ensure", "--number", pace.BUDGET_FIELD]);
+  board(["set", id, ...args]);
+}
+
+function cmdAssign(argv) {
+  const opts = parseArgs(argv, { lead: "value", est: "value", tokens: "value", force: "flag", "dry-run": "flag" });
+  if (opts.positional.length !== 1) throw new Exit(EX_USAGE, `assign takes one ITEM\n\n${usage()}`);
+  const item = findItem(loadItems(), opts.positional[0]);
+  const lead = opts.lead || pace.COORDINATOR_LEAD;
+  if (item.lead && item.lead !== lead && !opts.force) throw new Exit(1, `${item.id} is led by ${item.lead}; it is theirs (--force takes it over)`);
+  if (item.run) throw new Exit(1, `${item.id} is owned by the run ${item.run}`);
+  const b = budgetArgs(item, opts, false);
+  setItem(item.id, ["--status", pace.ACTIVE_STATUS, "--field", "Lead", lead, ...b.args], opts["dry-run"]);
+  process.stdout.write(`${item.id}: ${pace.ACTIVE_STATUS}, Lead ${lead}; ${b.note}\n`);
+}
+
+function cmdBudget(argv) {
+  const opts = parseArgs(argv, { est: "value", tokens: "value", force: "flag", "dry-run": "flag" });
+  if (opts.positional.length !== 1) throw new Exit(EX_USAGE, `budget takes one ITEM\n\n${usage()}`);
+  const item = findItem(loadItems(), opts.positional[0]);
+  const b = budgetArgs(item, opts, opts.force);
+  if (b.args.length) setItem(item.id, b.args, opts["dry-run"]);
+  process.stdout.write(`${b.note}\n`);
+}
+
+function main(argv) {
+  const [cmd, ...rest] = argv;
+  const cmds = { assign: cmdAssign, budget: cmdBudget };
+  try {
+    if (cmd === "-h" || cmd === "--help") throw new Exit(0, null);
+    if (!cmds[cmd]) throw new Exit(EX_USAGE, `${cmd ? `unknown command '${cmd}'` : "missing a command"}\n\n${usage()}`);
+    cmds[cmd](rest);
+    return 0;
+  } catch (e) {
+    if (!(e instanceof Exit)) throw e;
+    if (e.status === 0) process.stdout.write(usage());
+    else process.stderr.write(`${PROG}: ${e.message}\n`);
+    return e.status;
+  }
+}
+
+if (require.main === module) process.exit(main(process.argv.slice(2)));
