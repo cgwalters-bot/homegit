@@ -90,7 +90,9 @@ for it, and the run exits 1); after ${MAX_CLASSIFY_ATTEMPTS} failed runs the eve
 ask for a human instead.
 
 The cursor, the seen events and the decisions are kept in
-${STATE_DIR}
+${STATE_DIR}, and so is repos.json: each event of theirs
+(in scope or not) by repository, for ${KEEP_MS / DAY_MS} days, which bot-reconcile reads
+to send work where they are active.
 (BOT_OPERATOR_ACTIVITY_STATE). The classifier is 'claude -p --model
 haiku' with no tools, or the program in $${CLASSIFIER_ENV}.
 
@@ -351,6 +353,9 @@ async function main() {
   const state = readJson("state.json", { cursor: null, seen: {} });
   state.attempts = state.attempts || {};
   const decisions = readJson("decisions.json", {});
+  // Every new event of theirs by repository, in scope or not: where they
+  // are working lately, which bot-reconcile's capacity rule leans toward.
+  const repos = readJson("repos.json", {});
   const cursor = state.cursor ? new Date(state.cursor) : new Date(now.getTime() - FIRST_LOOKBACK_MS);
   const since = new Date(cursor.getTime() - OVERLAP_MS);
   const ctx = { board: boardIndex(await loadBoard(opts.boardFile)), thread: threadReader() };
@@ -366,6 +371,7 @@ async function main() {
   // The oldest event left for the next run: the cursor stays before it.
   let held = null;
   for (const ev of [...byId.values()].sort((a, b) => a.time.localeCompare(b.time))) {
+    if (ev.repo) (repos[ev.repo.toLowerCase()] ||= {})[ev.id] = ev.time;
     const s = await scope(ev, ctx);
     if (!s) {
       counts.ignored++;
@@ -408,8 +414,13 @@ async function main() {
   const cutoff = now.getTime() - KEEP_MS;
   for (const [id, t] of Object.entries(state.seen)) if (new Date(t).getTime() < cutoff) delete state.seen[id];
   for (const [id, d] of Object.entries(decisions)) if (new Date(d.at).getTime() < cutoff) delete decisions[id];
+  for (const [repo, events] of Object.entries(repos)) {
+    for (const [id, t] of Object.entries(events)) if (new Date(t).getTime() < cutoff) delete events[id];
+    if (!Object.keys(events).length) delete repos[repo];
+  }
   if (!opts.dryRun) {
     writeJson("decisions.json", decisions);
+    writeJson("repos.json", repos);
     writeJson("state.json", { cursor: newest.toISOString(), seen: state.seen, attempts: state.attempts });
   }
 
