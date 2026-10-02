@@ -58,6 +58,15 @@ for file in "${SKILLS}"/coordinator/*.md "${SKILLS}/topic-lead/SKILL.md"; do
     grep -qxF "${ITEM_LINE}" "${file}" ||
         err "${file} has no '${ITEM_LINE}' line: briefs from it would leave the subagent's tokens unattributed"
 done
+# The review checklist is only useful if the briefs and commit-review point
+# at it, and its evidence file stays next to it.
+for file in "${SKILLS}/coordinator/worker-preamble.md" "${SKILLS}/coordinator/reviewer-preamble.md" "${SKILLS}/commit-review/SKILL.md"; do
+    grep -q 'review-checklist' "${file}" ||
+        err "${file} does not reference the review-checklist skill"
+done
+[[ -f ${SKILLS}/review-checklist/references.md ]] ||
+    err "${SKILLS}/review-checklist/references.md (the checklist's evidence) is missing"
+
 grep -q "^Item: " "${SKILLS}/coordinator/SKILL.md" ||
     err "${SKILLS}/coordinator/SKILL.md's briefing example has no 'Item:' line"
 
