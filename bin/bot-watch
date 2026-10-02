@@ -230,15 +230,16 @@ Options:
 
 The last-seen state (url -> updated_at, state, head_sha, checks, and
 edge_ids: the comments seen at updated_at; when the last sweep that
-wrote it started; and when dropped URLs were last seen) lives in the archived
-'bot-state: ${STATE_NAME}' draft item on the board, read and written
-with 'bot-board state-get/state-put' (one GraphQL call each; the write
-only when something changed), and must stay under the ~64KB a draft
-body holds (a few hundred URLs). It advances per URL: one that could
-not be read keeps its last-seen state, so a later sweep reports its
-changes, and the sweep exits nonzero. The board listing comes from
-bot-board (revalidated for --apply); everything else is REST, with
-ETags.
+wrote it started; and when dropped URLs were last seen) lives in
+${LOCK_DIR}/${STATE_NAME}.json on this machine,
+written (to a temporary file, then renamed) only when something
+changed. It used to live in the archived 'bot-state: ${STATE_NAME}' draft
+item on the board, which a few hundred URLs outgrew (a draft body holds
+64KB): without the file, the sweep starts from that item's last state.
+It advances per URL: one that could not be read keeps its last-seen
+state, so a later sweep reports its changes, and the sweep exits
+nonzero. The board listing comes from bot-board (revalidated for
+--apply); everything else is REST, with ETags.
 EOF
 }
 
@@ -411,15 +412,24 @@ else
     ! ${apply} || ${dry_run} || refresh=(--refresh)
     board=$("${BOT_BOARD}" "${refresh[@]}" list --json) || board_failed $? "listing the board failed"
 fi
+migrate=false
 if test -n "${state_file}"; then
-    state=$(if test -s "${state_file}"; then cat "${state_file}"; else echo '{}'; fi)
     warn "testing: keeping the state in ${state_file}"
 else
-    state=$("${BOT_BOARD}" state-get "${STATE_NAME}") || board_failed $? "reading the last-seen state failed"
+    state_file=${LOCK_DIR}/${STATE_NAME}.json
+    test -e "${state_file}" || test -n "${board_file}" || migrate=true
+fi
+if ! ${migrate}; then
+    state=$(if test -s "${state_file}"; then cat "${state_file}"; else echo '{}'; fi) ||
+        fatal "cannot read the last-seen state in ${state_file}"
+else
+    # Once: the state from before it moved here (see --help).
+    state=$("${BOT_BOARD}" state-get "${STATE_NAME}") || board_failed $? "reading the last-seen state (bot-state: ${STATE_NAME}) to start ${state_file} with failed"
+    warn "starting ${state_file} from the board's 'bot-state: ${STATE_NAME}'; it is kept in that file from now on"
 fi
 seen=$(jq -ce --argjson v "${STATE_VERSION}" '
     if (.version // $v) != $v then error("unsupported version \(.version)") else .items // {} end' <<<"${state}") ||
-    fatal "cannot use the last-seen state (bot-state: ${STATE_NAME}); fix it, or empty it to start over"
+    fatal "cannot use the last-seen state in ${state_file}; fix it, or empty it to start over"
 
 # The items this sweep owns, by Lead (see --help).
 exclude_json=$(printf '%s\n' "${exclude_leads[@]}" | jq -Rsc 'split("\n")[:-1]')
@@ -1210,11 +1220,9 @@ else
         --arg host "$(hostname)" --argjson rebase "${new_rebase}" \
         '{version: $v, updated_at: $now, swept_at: $swept, host: $host, items: $items[0], dropped: $dropped[0]}
          + if $rebase == {} then {} else {rebase: $rebase} end')
-    if test -n "${state_file}"; then
-        printf '%s\n' "${new_state}" >"${state_file}"
-    else
-        "${BOT_BOARD}" state-put "${STATE_NAME}" - <<<"${new_state}" || board_failed $? "recording the last-seen state failed; the next sweep reports these changes again"
-    fi
+    # A sweep killed while writing must not leave half a state.
+    { printf '%s\n' "${new_state}" >"${state_file}.tmp.$$" && mv -f "${state_file}.tmp.$$" "${state_file}"; } ||
+        fatal "recording the last-seen state in ${state_file} failed; the next sweep reports these changes again"
     echo "State advanced; ${napplied} item(s) updated on the board." 1>&2
 fi
 if test "${nfailed}" -gt 0; then
