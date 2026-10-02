@@ -82,6 +82,7 @@ readonly DRIVE
 RUNS=$(dirname "$(readlink -f "$0")")/bot-runs
 readonly RUNS
 OPERATOR_ACTIVITY=$(dirname "$(readlink -f "$0")")/bot-operator-activity
+RECONCILE=$(dirname "$(readlink -f "$0")")/bot-reconcile
 readonly OPERATOR_ACTIVITY
 # shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
@@ -204,6 +205,14 @@ Upstream PRs that don't conflict are left out where 'upstream-policy
 rebase' says conflicts-only (a merge queue the record doesn't override
 with 'rebase: any', or the maintainers asked),
 as 'bot-pr rebase' refuses them.
+
+Then "Closed, set Done" ('bot-reconcile --rule closed-not-done', see its
+--help): level-triggered, on the state this sweep found, an item whose own
+issue or PR is closed or merged is Done whatever this sweep saw happen
+(not while one of its Branch PRs is open). A PR closed unmerged needs a
+human, so it is only listed, and not at all when its item is Needs human
+(the question below). With --apply it sets the others Done (with News);
+with --dry-run (or --board-file) it says it would.
 
 Then suggest board bookkeeping, for an item one of whose PRs this sweep
 saw merge or close (open at the last sweep), once none of the PRs it
@@ -1268,6 +1277,40 @@ done < <(${apply} && jq -c '.[] | {item: {id, why}, action: (.actions[] | select
 
 timing "board changes" "${t0}"
 
+# Level-triggered: an item whose own issue or PR is closed or merged is
+# Done, whatever transitions this sweep saw (bot-reconcile's
+# closed-not-done), on the state it found: only what this sweep read
+# (and what is gone), not the last-seen state a failed read kept, which
+# may be that of an issue since reopened. bot-reconcile lists the board
+# afresh: the changes above cleared bot-board's cache.
+t0=${EPOCHREALTIME}
+closed_failed=false
+jq --slurpfile results "${scratch}/results.json" \
+    '{items: (with_entries(select(.value.state == "gone")) + ($results[0] | map_values(.cur)))}' <<<"${new_seen}" >"${scratch}/seen.json"
+closed_args=(--rule closed-not-done --json --watch-state "${scratch}/seen.json")
+if test -n "${board_file}"; then
+    closed_args+=(--board-file "${board_file}")
+elif ${apply} && ! ${dry_run}; then
+    closed_args+=(--apply)
+fi
+rc=0
+"${RECONCILE}" "${closed_args[@]}" >"${scratch}/closed.json" 2>"${scratch}/closed.err" || rc=$?
+cat "${scratch}/closed.err" 1>&2
+closed_dry=false
+if test -n "${board_file}" || ${dry_run}; then closed_dry=true; fi
+if ! closed=$(jq -c --argjson would "${closed_dry}" '[.actions[] | {url, id: .apply.id, applied: (.applied // null),
+        line: "\(.url): \(.do) (\(if .applied then .applied elif .apply == null then "a human decides"
+                elif $would then "--apply would do it" else "with --apply" end))"}]' \
+        "${scratch}/closed.json" 2>/dev/null); then
+    closed='[]'
+    test "${rc}" -ne 0 || rc="invalid output"
+fi
+if test "${rc}" != 0; then
+    warn "looking for closed items to set Done failed (status ${rc}); its section is incomplete"
+    closed_failed=true
+fi
+timing "closed, set Done" "${t0}"
+
 # --- Report ----------------------------------------------------------------
 
 t0=${EPOCHREALTIME}
@@ -1307,12 +1350,13 @@ if ${json}; then
         --slurpfile activity <(printf '%s\n' "${activity}") --argjson activity_failed "${activity_failed}" \
         --slurpfile propagation <(printf '%s\n' "${propagation}") --argjson propagation_failed "${propagation_failed}" \
         --slurpfile runs <(printf '%s\n' "${runs}") --argjson runs_failed "${runs_failed}" \
+        --slurpfile closed <(printf '%s\n' "${closed}") --argjson closed_failed "${closed_failed}" \
         '$new[0] as $new | $failed[0] as $failed | $gone[0] as $gone
          | $outstanding[0] as $outstanding | $needs_rebase[0] as $needs_rebase
          | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], p0_drive: $drive[0], signoffs: $signoffs[0], promotions: $promotions[0], priority_propagation: $propagation[0],
-          devspace_runs: $runs[0], operator_activity: $activity[0], needs_text: $needs_text[0], items: ., outstanding_reviews: $outstanding,
+          devspace_runs: $runs[0], operator_activity: $activity[0], needs_text: $needs_text[0], closed_done: $closed[0], items: ., outstanding_reviews: $outstanding,
           needs_rebase: $needs_rebase, new_urls: $new, failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed,
-          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, operator_activity_failed: $activity_failed, devspace_runs_failed: $runs_failed, priority_propagation_failed: $propagation_failed, state_advanced: $advance}' <<<"${report}"
+          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, operator_activity_failed: $activity_failed, devspace_runs_failed: $runs_failed, priority_propagation_failed: $propagation_failed, closed_done_failed: $closed_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news. The P0 and P1
     # health lines come first of all.
@@ -1324,6 +1368,7 @@ else
     jq -r 'if length == 0 then empty else "Priority propagation:", (.[] | "  \(.line)"), "" end' <<<"${propagation}"
     jq -r 'if length == 0 then empty else "Devspace runs:", (.[] | "  \(.line)"), "" end' <<<"${runs}"
     jq -r 'if length == 0 then empty else "Operator activity:", (.[] | "  \(.line)"), "" end' <<<"${activity}"
+    jq -r 'if length == 0 then empty else "Closed, set Done:", (.[] | "  \(.line)"), "" end' <<<"${closed}"
     jq -r --arg req "${REQUESTER}" "${REPO_REF_JQ}"'
         if length == 0 then empty else
             "Outstanding reviews by \($req):",
@@ -1365,7 +1410,7 @@ else
               elif .allowed then " (with --apply)"
               else " (not applied from \($status // "no status"); a human decides)" end),
         ""' <<<"${report}"
-    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${drive}") P0 PRs driven, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${runs}") devspace runs, $(jq length <<<"${activity}") operator activity lines, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${drive}") P0 PRs driven, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${runs}") devspace runs, $(jq length <<<"${activity}") operator activity lines, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${closed}") closed set Done, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
 # Failed URLs kept their last-seen state in new_seen, so their changes
@@ -1395,6 +1440,7 @@ test "${napply_failed}" -eq 0 || exit 1
 ! ${drive_failed} || exit 1
 ! ${activity_failed} || exit 1
 ! ${runs_failed} || exit 1
+! ${closed_failed} || exit 1
 ! ${propagation_failed} || exit 1
 ! ${signoff_failed} || exit 1
 ! ${promotion_failed} || exit 1
