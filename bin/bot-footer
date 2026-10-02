@@ -24,6 +24,9 @@ const SHORT_ID = 8;
 // Models shown in the human line; the JSON has them all.
 const TOP_MODELS = 2;
 const CLOSE_MATCHES = 5;
+// --details folds the footer in this block, as bot-pr does in PR bodies.
+const DETAILS_OPEN = "<details><summary>Run details</summary>";
+const DETAILS_CLOSE = "</details>";
 const EX_ERROR = 1;
 const EX_USAGE = 2;
 
@@ -36,7 +39,7 @@ class Exit extends Error {
 
 function usage() {
   return `Usage: ${PROG} (--item PVTI_... | --scratch NAME | --task KEY) [--since AGE]
-                  [--projects DIR]... [--no-compute] [--json]
+                  [--projects DIR]... [--no-compute] [--json | --details]
 
 Prints a footer for a PR body or comment recording the bot run that made
 it: one compact human line, then the same data as JSON in an HTML comment,
@@ -49,13 +52,15 @@ board item (--item), the scratch dir named in a subagent's prompt
 (--scratch, bot-cost's task scratch:NAME), or any bot-cost task key
 (--task). Costs are estimates at list prices; the duration is wall time
 from the task's first to its last message. The JSON has no free text.
---json prints only the JSON. --projects and --no-compute are passed on
-to bot-cost.
+--json prints only the JSON. --details folds the footer in a collapsed
+<details> block, for a comment that posts it as is ('bot-pr fork-pr' and
+'set-body' take the plain footer and fold it themselves). --projects and
+--no-compute are passed on to bot-cost.
 `;
 }
 
 function parseArgs(argv) {
-  const opts = { task: null, since: DEFAULT_SINCE, projects: [], compute: true, json: false };
+  const opts = { task: null, since: DEFAULT_SINCE, projects: [], compute: true, json: false, details: false };
   const value = (i, name) => {
     if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `${name} needs a value\n\n${usage()}`);
     return argv[i + 1];
@@ -90,10 +95,12 @@ function parseArgs(argv) {
       case "--projects": opts.projects.push(value(i++, a)); break;
       case "--no-compute": opts.compute = false; break;
       case "--json": opts.json = true; break;
+      case "--details": opts.details = true; break;
       default:
         throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
     }
   }
+  if (opts.json && opts.details) throw new Exit(EX_USAGE, "give --json or --details, not both");
   if (!opts.task) throw new Exit(EX_USAGE, `name the task with --item, --scratch or --task\n\n${usage()}`);
   return opts;
 }
@@ -201,11 +208,19 @@ function humanLine(rec, compute) {
 // marker(rec): the HTML comment carrying REC; no '--' may end it early.
 const marker = (rec) => `<!-- ${SCHEMA} ${JSON.stringify(rec).replace(/--/g, "-\\u002d")} -->`;
 
+// render(rec, opts): what main prints for REC. The blank lines let the
+// markdown inside the <details> block render.
+function render(rec, opts) {
+  if (opts.json) return `${JSON.stringify(rec, null, 2)}\n`;
+  const footer = `${humanLine(rec, opts.compute)}\n${marker(rec)}`;
+  return opts.details ? `${DETAILS_OPEN}\n\n${footer}\n\n${DETAILS_CLOSE}\n` : `${footer}\n`;
+}
+
 async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const report = await costReport(opts);
   const rec = record(report, findTask(report, opts.task, opts.since));
-  process.stdout.write(opts.json ? `${JSON.stringify(rec, null, 2)}\n` : `${humanLine(rec, opts.compute)}\n${marker(rec)}\n`);
+  process.stdout.write(render(rec, opts));
 }
 
 if (require.main === module) {
@@ -215,5 +230,5 @@ if (require.main === module) {
     process.exit(e.status);
   });
 } else {
-  module.exports = { parseArgs, findTask, record, humanLine, marker, fmtDuration };
+  module.exports = { parseArgs, findTask, record, humanLine, marker, render, fmtDuration };
 }

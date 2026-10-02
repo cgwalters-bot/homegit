@@ -10,7 +10,7 @@ shopt -s inherit_errexit
 TESTS=$(cd "$(dirname "$0")" && pwd)
 readonly TESTS
 readonly TOOL=${TESTS}/../bin/upstream-policy
-readonly EX_ERROR=1 EX_MISSING=3 EX_STALE=4 EX_HUMAN_TEXT=5 EX_REFUSED=6 EX_INVALID=7 EX_RATELIMIT=75
+readonly EX_ERROR=1 EX_USAGE=2 EX_MISSING=3 EX_STALE=4 EX_HUMAN_TEXT=5 EX_REFUSED=6 EX_INVALID=7 EX_RATELIMIT=75
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/upstream-policy-test.XXXXXX")
 readonly WORK
@@ -237,6 +237,11 @@ tree acme/.github trunk "CONTRIBUTING.md blob ${ORG_CONTRIB}" ".github tree ${OR
 run "stale: new in the org" "${EX_STALE}" 'acme/.github:CLAUDE.md is not in the record' check acme/proj
 tree acme/.github trunk "CONTRIBUTING.md blob ${ORG_CONTRIB}" ".github tree ${ORG_GITHUB_DIR}"
 run "current again" 0 '^bot-ok$' check acme/proj
+# --ai-trailer adds the record's ai-trailer, for promote; repeating a
+# flag is an error.
+run "ai-trailer" 0 '^Assisted-by$' check acme/proj --ai-trailer
+test "$("${TOOL}" check acme/proj --ai-trailer 2>/dev/null)" = $'bot-ok\nAssisted-by' || fail "ai-trailer: not the verdict, then the trailer"
+run "ai-trailer twice" "${EX_USAGE}" 'unknown arguments for check' check acme/proj --ai-trailer --ai-trailer
 
 # Git is the source of truth: a record counts once it's on origin's main.
 record bot-ok "" uncommitted

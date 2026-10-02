@@ -4,7 +4,7 @@
 # it records and the text outside it (edits by cgwalters included, with
 # line endings normalized), writes nothing when the section is current,
 # and refuses a section it can't parse, one someone else edited, or one
-# whose Fork CI line it can't know. It keeps the run footers at the end
+# whose Fork CI line it can't know. It keeps the run footers folded at the end
 # of the section, where 'set-body --footer' adds them after any earlier
 # ones, and set-body and fork-pr refuse a --footer that isn't one. bot-pr
 # runs from a copy of bin/ whose
@@ -274,6 +274,14 @@ readonly F2='<sub>Bot run: session bbbbbbbb, agent cccccccc · ~$2.00 inference 
 readonly AGENT_FOOTER='Agent run [1003](https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1003): claude, 10m, success
 <!-- agent-run-summary/v1 {"run_id":1003,"result":"success","duration_s":600} -->'
 readonly SECTION_END=$'\n<!-- /bot-meta -->'
+# folded FOOTER...: the footers, blank-separated, in their <details> block.
+folded() {
+    local all="" f
+    for f in "$@"; do
+        all+=${all:+$'\n\n'}${f}
+    done
+    printf '<details><summary>Run details</summary>\n\n%s\n\n</details>' "${all}"
+}
 
 # refresh-meta keeps both, at the end, and then finds the section current.
 meta=$(old_meta)
@@ -281,8 +289,8 @@ meta=${meta%%$'\n'*}$'\n'${AGENT_FOOTER}$'\n'${meta#*$'\n'}
 reset "${TEXT}"$'\n\n'"${meta%"${SECTION_END}"}"$'\n\n'"${F1}${SECTION_END}"
 if run footers; then
     check_refreshed footers main
-    [[ "$(body)" == *$'with a reply here.\n\n'"${AGENT_FOOTER}"$'\n\n'"${F1}${SECTION_END}" ]] ||
-        fail "footers: not kept at the end of the section: $(body)"
+    [[ "$(body)" == *$'with a reply here.\n\n'"$(folded "${AGENT_FOOTER}" "${F1}")${SECTION_END}" ]] ||
+        fail "footers: not folded at the end of the section: $(body)"
     test "$(grep -c 'run/v1\|run-summary/v1' <<<"$(body)")" = 2 || fail "footers: duplicated: $(body)"
     : >"${FAKE_GH}/calls"
     run footers-again || fail "footers-again: $(cat "${WORK}/footers-again.err")"
@@ -295,14 +303,14 @@ fi
 # with --body-file too, it replaces the text as well. A pipe works.
 printf '%s\n' "${F2}" >"${WORK}/f2"
 if "${WORK}/bin/bot-pr" set-body "${URL}" --footer "${WORK}/f2" 2>"${WORK}/add.err"; then
-    [[ "$(body)" == "${TEXT}"$'\n\n<!-- bot-meta -->\n'*$'with a reply here.\n\n'"${AGENT_FOOTER}"$'\n\n'"${F1}"$'\n\n'"${F2}${SECTION_END}" ]] ||
+    [[ "$(body)" == "${TEXT}"$'\n\n<!-- bot-meta -->\n'*$'with a reply here.\n\n'"$(folded "${AGENT_FOOTER}" "${F1}" "${F2}")${SECTION_END}" ]] ||
         fail "add: $(body)"
 else
     fail "add: set-body --footer failed: $(cat "${WORK}/add.err")"
 fi
 printf 'New text.\n\nGenerated-by: https://github.com/cgwalters/#llms\n' >"${WORK}/new-body"
 if "${WORK}/bin/bot-pr" set-body "${URL}" --body-file "${WORK}/new-body" --footer <(printf '%s\n' "${F1}") 2>"${WORK}/both.err"; then
-    [[ "$(body)" == $'New text.\n\nGenerated-by: https://github.com/cgwalters/#llms\n\n<!-- bot-meta -->\n'*"${F1}"$'\n\n'"${F2}"$'\n\n'"${F1}${SECTION_END}" ]] ||
+    [[ "$(body)" == $'New text.\n\nGenerated-by: https://github.com/cgwalters/#llms\n\n<!-- bot-meta -->\n'*$'with a reply here.\n\n'"$(folded "${AGENT_FOOTER}" "${F1}" "${F2}" "${F1}")${SECTION_END}" ]] ||
         fail "both: $(body)"
 else
     fail "both: set-body --body-file --footer failed: $(cat "${WORK}/both.err")"
@@ -311,6 +319,47 @@ fi
 : >"${FAKE_GH}/calls"
 run footers-kept || fail "footers-kept: $(cat "${WORK}/footers-kept.err")"
 test "$(patches)" = 0 || fail "footers-kept: refresh-meta rewrote the footers: $(body)"
+
+# set-body --footer folds every footer into one block at the end of the
+# section, whatever layout it finds: none yet, unfolded ones from before
+# the block (at the end, or right after the start, where the apply step
+# puts them), or the block already, maybe hand-edited. A marker right
+# after the section's list takes no list line along. Each case names what
+# goes before and after the section's content, and the footers expected
+# in the block.
+# shellcheck disable=SC2034 # read by name below
+{
+    AFTER_F1=$'\n\n'${F1}
+    AFTER_FOLDED_F1=$'\n\n'$(folded "${F1}")
+    AFTER_HAND_FOLDED_F1=$'\n\n  <details><summary>Run details</summary> \n\n'${F1}$'\n\n</details>  '
+    F1_MARKER=${F1#*$'\n'}
+    AFTER_F1_MARKER=$'\n'${F1_MARKER}
+}
+OLD_META=$(old_meta)
+readonly META_HEAD=${OLD_META%%$'\n'*}
+META_BODY=${OLD_META#*$'\n'}
+readonly META_BODY=${META_BODY%"${SECTION_END}"}
+while IFS='|' read -r name before after want; do
+    reset "${TEXT}"$'\n\n'"${META_HEAD}"$'\n'"${before:+${!before}$'\n'}${META_BODY}${after:+${!after}}${SECTION_END}"
+    footers=()
+    for f in ${want}; do
+        footers+=("${!f}")
+    done
+    if "${WORK}/bin/bot-pr" set-body "${URL}" --footer "${WORK}/f2" 2>"${WORK}/${name}.err"; then
+        test "$(body)" = "${TEXT}"$'\n\n'"${META_HEAD}"$'\n'"${META_BODY}"$'\n\n'"$(folded "${footers[@]}")${SECTION_END}" ||
+            fail "${name}: $(body)"
+    else
+        fail "${name}: set-body --footer failed: $(cat "${WORK}/${name}.err")"
+    fi
+done <<'EOF'
+layout-none|||F2
+layout-end||AFTER_F1|F1 F2
+layout-start|AGENT_FOOTER||AGENT_FOOTER F2
+layout-both|AGENT_FOOTER|AFTER_F1|AGENT_FOOTER F1 F2
+layout-folded||AFTER_FOLDED_F1|F1 F2
+layout-hand-edited||AFTER_HAND_FOLDED_F1|F1 F2
+layout-no-summary||AFTER_F1_MARKER|F1_MARKER F2
+EOF
 
 # A footer needs a complete section to go in, and --force only means
 # something with --body-file; nothing is written otherwise.
@@ -359,6 +408,7 @@ empty||is empty; did bot-footer fail
 no-marker|<sub>Bot run: x</sub>\n|doesn't look like bot-footer output
 marker-only|<!-- bot-run/v1 {"task":"x"} -->\n|doesn't look like bot-footer output
 three-lines|a\nb\n<!-- bot-run/v1 {"task":"x"} -->\n|doesn't look like bot-footer output
+other-summary|- Board item: x\n<!-- bot-run/v1 {"task":"x"} -->\n|doesn't look like bot-footer output
 other-comment|<sub>x</sub>\n<!-- bot-run/v2 {"task":"x"} -->\n|doesn't look like bot-footer output
 meta-marker|<!-- /bot-meta -->\n<!-- bot-run/v1 {"task":"x"} -->\n|doesn't look like bot-footer output
 EOF

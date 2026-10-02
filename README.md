@@ -19,7 +19,9 @@ the operator config (`~/.config/bot-harness/operator.json`, printed by
 `bot-operator`); another operator sets up their own as
 [docs/bootstrap.md](docs/bootstrap.md) describes.
 
-Install with `make install` as usual. The shared agent prompt is still
+Install with `make install` as usual; it also builds the Rust tools in
+`crates/` with `cargo install` (among them `bot-meta`, which `bot-pr` uses
+to edit the run footers in fork PR bodies). The shared agent prompt is still
 [AGENTS.md](AGENTS.md). The skills are plain [Agent Skills](https://agentskills.io)
 in `dotfiles/.agents/skills`, installed as `~/.agents/skills` where
 opencode, Codex, Gemini CLI and Cursor look; Claude Code reads only
@@ -152,8 +154,9 @@ that may be self-hosted), and inference tokens from the local
 transcripts and agent runs' `token-usage.jsonl`, at the per-model prices
 from [models.dev](https://models.dev). The coordinator puts yesterday's
 estimate in the morning brief. `bot-footer` turns one task's share into
-a run footer that fork PRs carry in their bot-meta section (see "Run
-footer" in the same doc).
+a run footer that fork PRs carry in their bot-meta section, folded in a
+collapsed `<details>` block, and upstream PRs after their body (see
+"Run footer" in the same doc).
 
 Planning is by cost and capacity. Items carry an `Est. cost` bucket (XS to
 XL, in fresh inference tokens; see "Cost estimates" in the `workstream`
@@ -240,7 +243,8 @@ branch, and the board item. On that PR:
   An approval or `/promote` covers the commits pushed before it, so
   changes pushed after it need another one.
 - **Edit** the title and description as you like: they are copied
-  upstream as they stand at approval, minus the bot-meta section.
+  upstream as they stand at approval, minus the bot-meta section (its
+  run footers go along after the body, folded).
 - **Close** it to drop the change; the item becomes Done as dropped.
 
 Forge forks start with a clean `main` synced from upstream, and both
