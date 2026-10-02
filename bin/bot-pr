@@ -331,6 +331,10 @@ Commands:
         A stacked fork PR whose base branch moved (its parent was
         force-pushed, say) is listed too, to be rebased.
         --dry-run doesn't record the check.
+  context PR_URL [--json]
+        Read a pull request and its reviews, inline review comments, and
+        conversation comments using REST. The default is a compact readable
+        context; --json preserves the complete API responses in one object.
   -h, --help
         Show this help
 
@@ -1947,6 +1951,58 @@ parse_fork_pr_url() {
     NUMBER=${BASH_REMATCH[3]}
 }
 
+# parse_pr_url URL: sets PR_REPO and PR_NUMBER for a GitHub pull request.
+parse_pr_url() {
+    [[ "$1" =~ ^https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([0-9]+)/?$ ]] ||
+        fatal "expected a GitHub PR URL (https://github.com/OWNER/REPO/pull/N), got '$1'"
+    PR_REPO=${BASH_REMATCH[1]}
+    PR_NUMBER=${BASH_REMATCH[2]}
+}
+
+# context_pages PATH: read every page of an array endpoint as one JSON array.
+# Its caller prints only after all four REST reads have completed, so a failed
+# later endpoint cannot leave a misleading partial context on stdout.
+context_pages() {
+    ghapi --paginate "$1" | jq -sc 'add // []'
+}
+
+cmd_context() {
+    local url="" json=false pr reviews review_comments issue_comments context
+    while test $# -gt 0; do
+        case "$1" in
+            --json) json=true ;;
+            -*) fatal "unknown argument for context: $1 (see --help)" ;;
+            *) test -z "${url}" || fatal "context takes one PR URL"; url=$1 ;;
+        esac
+        shift
+    done
+    test -n "${url}" || fatal "context takes a PR URL"
+    parse_pr_url "${url}"
+    ${json} || require_cmd node "install Node.js to format context"
+
+    pr=$(ghapi "repos/${PR_REPO}/pulls/${PR_NUMBER}") ||
+        fatal "cannot read ${url}"
+    reviews=$(context_pages "repos/${PR_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100") ||
+        fatal "cannot list the reviews of ${url}"
+    review_comments=$(context_pages "repos/${PR_REPO}/pulls/${PR_NUMBER}/comments?per_page=100") ||
+        fatal "cannot list the review comments of ${url}"
+    issue_comments=$(context_pages "repos/${PR_REPO}/issues/${PR_NUMBER}/comments?per_page=100") ||
+        fatal "cannot list the comments of ${url}"
+    # Via files: a busy PR's comments exceed the kernel's per-argument limit.
+    context=$(jq -nc --slurpfile pr <(printf '%s\n' "${pr}") \
+        --slurpfile reviews <(printf '%s\n' "${reviews}") \
+        --slurpfile review_comments <(printf '%s\n' "${review_comments}") \
+        --slurpfile issue_comments <(printf '%s\n' "${issue_comments}") \
+        '{pull_request: $pr[0], reviews: $reviews[0], review_comments: $review_comments[0], issue_comments: $issue_comments[0]}') ||
+        fatal "cannot assemble context for ${url}"
+    if ${json}; then
+        printf '%s\n' "${context}"
+    else
+        printf '%s\n' "${context}" | node "$(dirname "${BOT_GIT}")/../lib/bot-pr-context.js" ||
+            fatal "cannot format context for ${url}"
+    fi
+}
+
 # git_url REPO: the URL git fetches and pushes REPO (OWNER/NAME) with.
 git_url() {
     printf '%s%s\n' "${GIT_URL_PREFIX}" "$1"
@@ -3031,7 +3087,7 @@ case "${command}" in
     prune-runs) command=prune_runs ;;
     set-item) command=set_item ;;
     refresh-meta) command=refresh_meta ;;
-    promote|signoff|inbox|rebase) ;;
+    promote|signoff|inbox|rebase|context) ;;
     *) fatal "unknown command '${command}' (see --help)" ;;
 esac
 [[ "${FORGE_ORG}" =~ ^[A-Za-z0-9-]+$ ]] || fatal "BOT_PR_FORGE must be a GitHub organization name, not '${FORGE_ORG}'"
