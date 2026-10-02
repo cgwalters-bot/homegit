@@ -38,9 +38,13 @@ BOARD_URL=
 BOARD_CACHE=
 readonly TITLE_WIDTH=70
 # Board fields that 'set' can change, and the option that sets each.
-readonly SET_OPTIONS=(--status --priority --workflow --org --why --branch --gist)
+readonly SET_OPTIONS=(--status --priority --workflow --org --why --news --branch --gist)
 # Free-text fields; the rest of SET_OPTIONS are single-selects.
-readonly TEXT_FIELDS=(Why Branch Gist)
+readonly TEXT_FIELDS=(Why News Branch Gist)
+# News is one dated line saying what last happened to an item, which the
+# review app's board changes feed shows; 'set --news' dates it.
+readonly NEWS_MAX=200
+readonly NEWS_DATE_RE='^[0-9]{4}-[0-9]{2}-[0-9]{2}: '
 # Number fields, which only --field sets (the field list doesn't tell a
 # number field from a text one).
 readonly NUMBER_FIELDS=("Actual tokens")
@@ -239,8 +243,12 @@ Commands:
                               ${ASK_LABELS[*]}), close it and set its item
                               ${DONE_STATUS}
   set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT]
-           [--branch URL...] [--gist URL...] [--field NAME VALUE]...
-                              Update fields of an item. Branch holds the
+           [--news TEXT] [--branch URL...] [--gist URL...] [--field NAME VALUE]...
+                              Update fields of an item. News is one line
+                              (at most ${NEWS_MAX} characters) saying what
+                              last happened to it, prefixed with today's
+                              date (UTC) unless it starts with one; it
+                              replaces the previous News. Branch holds the
                               fork or upstream PR URL (or compare URLs of
                               pushed branches), Gist the write-up URL(s);
                               separate several with spaces. --field sets
@@ -1182,32 +1190,48 @@ validate_links() {
     done
 }
 
+# news_line TEXT: TEXT as the News field holds it: one line, dated
+# (today, UTC) unless it already starts with a date; empty clears it.
+news_line() {
+    local text=$1
+    [[ "${text}" != *$'\n'* ]] || fatal "--news takes one line; put details in Why or on the item"
+    text=${text#"${text%%[![:space:]]*}"}
+    text=${text%"${text##*[![:space:]]}"}
+    test -n "${text}" || return 0
+    [[ "${text}" =~ ${NEWS_DATE_RE} ]] || text="$(date -u +%F): ${text}"
+    test "${#text}" -le "${NEWS_MAX}" ||
+        fatal "--news is ${#text} characters with its date; keep it to ${NEWS_MAX}"
+    printf '%s\n' "${text}"
+}
+
 cmd_set() {
-    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT] [--branch URL] [--gist URL] [--field NAME VALUE]..."
+    test $# -ge 1 || fatal "usage: $(basename "$0") set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT] [--news TEXT] [--branch URL] [--gist URL] [--field NAME VALUE]..."
     local item=$1
     shift
     test $# -gt 0 || fatal "nothing to set; valid options: ${SET_OPTIONS[*]}"
     # Resolve and validate everything before changing anything.
-    local field_ids=() args=() names=() field field_id option label_args=()
+    local field_ids=() args=() names=() field field_id option value label_args=()
     load_fields
     while test $# -gt 0; do
         case "$1" in
-            --status|--priority|--workflow|--org|--why|--branch|--gist)
+            --status|--priority|--workflow|--org|--why|--news|--branch|--gist)
                 test $# -ge 2 || fatal "$1 requires an argument"
                 field=${1#--}
                 field=${field^}
                 # Plain assignments, so that a failed lookup stops the script.
+                value=$2
+                test "${field}" != News || value=$(news_line "$2")
                 field_id=$(field_json "${field}")
                 field_ids+=("$(jq -r .id <<<"${field_id}")")
                 if one_of "${field}" "${TEXT_FIELDS[@]}"; then
-                    validate_links "${field}" "$2"
-                    if test -n "$2"; then args+=("--text=$2"); else args+=(--clear); fi
+                    validate_links "${field}" "${value}"
+                    if test -n "${value}"; then args+=("--text=${value}"); else args+=(--clear); fi
                 else
-                    option=$(option_id "${field}" "$2")
+                    option=$(option_id "${field}" "${value}")
                     args+=("--single-select-option-id=${option}")
                 fi
-                names+=("${field} = $2")
-                case "${field}" in Priority|Org) label_args+=("--${field,,}" "$2") ;; esac
+                names+=("${field} = ${value}")
+                case "${field}" in Priority|Org) label_args+=("--${field,,}" "${value}") ;; esac
                 shift 2
                 ;;
             --field)

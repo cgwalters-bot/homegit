@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Offline tests of how 'bot-board fill-org' derives an item's Org, and of
-# 'list --field' filtering by a text field (Lead), against
+# Offline tests of how 'bot-board fill-org' derives an item's Org, of
+# 'list --field' filtering by a text field (Lead), and of 'set --news'
+# dating its one line, against
 # a fake 'gh' serving a fixed board and repository lookups. No network,
 # no quota.
 #   tests/bot-board-org.sh
@@ -35,6 +36,7 @@ case "$1 $2" in
     "project field-list") cat "${store}/fields.json" ;;
     "api -i") exec "${FAKE_BOARD_REST:?}" "${store}/items.json" "$3" ;;
     "project view") echo PVT_fake ;;
+    "project item-edit") printf '%s\n' "${@: -1}" >>"${store}/edits" ;;
     "api rate_limit") echo 5000 ;;
     "api graphql") { printf '%s' "$*" | tr -s '\n ' ' '; echo; } >>"${store}/mutations"; echo '{}' ;;
     # Tracker issues have no labels yet; label writes are logged.
@@ -53,7 +55,7 @@ chmod +x "${WORK}/bin/gh"
 
 jq -n '{fields: [{id: "F_org", name: "Org", options: [
     "bootc-dev", "coreos", "osbuild", "redhat-cop", "cgwalters-forge", "cgwalters-bot", "other"
-    | {id: "O_\(.)", name: .}]}, {id: "F_lead", name: "Lead"}]}' >"${FAKE_GH}/fields.json"
+    | {id: "O_\(.)", name: .}]}, {id: "F_lead", name: "Lead"}, {id: "F_news", name: "News"}]}' >"${FAKE_GH}/fields.json"
 cat >"${FAKE_GH}/sources" <<'EOF'
 cgwalters-forge/bootc bootc-dev/bootc
 cgwalters-forge/image-builder osbuild/image-builder
@@ -150,3 +152,29 @@ done
 grep -q "no 'Nope' field" "${WORK}/err" || fail "unknown --field: $(cat "${WORK}/err")"
 "${BIN}/bot-board" list --field Lead >/dev/null 2>"${WORK}/err" && fail "list --field without a value succeeded"
 echo "list --field cases passed"
+
+# set --news: CASE|INPUT|EXPECTED value given to item-edit ('!' fails).
+today=$(date -u +%F)
+long=$(printf 'x%.0s' $(seq 1 200))
+readonly NEWS_CASES=(
+    "dated today|rebased onto main|--text=${today}: rebased onto main"
+    "keeps its own date|2026-09-30: merged|--text=2026-09-30: merged"
+    "trims spaces|  needs your approval  |--text=${today}: needs your approval"
+    "empty clears|   |--clear"
+    "too long with its date|${long}|!"
+)
+for c in "${NEWS_CASES[@]}"; do
+    IFS='|' read -r name input want <<<"${c}"
+    rm -f "${FAKE_GH}/edits"
+    if "${BIN}/bot-board" set PVTI_0 --news "${input}" >/dev/null 2>"${WORK}/err"; then
+        test "${want}" != '!' || fail "set --news ${name}: succeeded"
+        got=$(cat "${FAKE_GH}/edits")
+        test "${got}" = "${want}" || fail "set --news ${name}: got '${got}', want '${want}'"
+    else
+        test "${want}" = '!' || fail "set --news ${name}: $(cat "${WORK}/err")"
+        test ! -e "${FAKE_GH}/edits" || fail "set --news ${name}: edited the board anyway"
+    fi
+done
+"${BIN}/bot-board" set PVTI_0 --news $'one\ntwo' >/dev/null 2>"${WORK}/err" && fail "set --news with two lines succeeded"
+grep -q "one line" "${WORK}/err" || fail "two-line --news: $(cat "${WORK}/err")"
+echo "set --news cases passed"
