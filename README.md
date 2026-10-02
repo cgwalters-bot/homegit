@@ -100,12 +100,15 @@ PRs whose head I approved for a bot-ok repository (`bot-promote-due`),
 so my approval is all a promotion takes too. Approved fork PRs for a
 human-text repository are only listed, under "Needs your text".
 
-The coordinator doesn't run these by hand: `bot-poll` (Rust, in
-`crates/`, installed by `make install`) sweeps with `bot-notify`, `bot-pr
-inbox` and `bot-watch` every 15 minutes, keeps their output, and exits
+The coordinator doesn't run these by hand: `bot-sweep`, run every 10
+minutes by the `bot-sweep.timer` systemd user unit (in
+`dotfiles/.config/systemd/user`), sweeps with `bot-watch`, `bot-notify`
+and `bot-pr inbox` apart from any agent session, and publishes each
+completed sweep under `~/.local/state/bot-sweep`. `bot-poll --from-sweep`
+(Rust, in `crates/`, installed by `make install`) reads them and exits
 only when something is new since it last reported (an approval, a
-review, a new P0 health problem, ...), which wakes the coordinator;
-`bot-poll --summary` lists what's new. Between sweeps it polls a hot
+review, a new P0 health problem, ...), or when the sweeps fail or stop,
+which wakes the coordinator; `bot-poll --summary` lists what's new. Between sweeps it polls a hot
 set (the bot's open PRs, my open asks, what I touched lately) every 90
 seconds with conditional requests, so my approvals and answers wake the
 coordinator within a couple of minutes, while a quiet cycle costs two

@@ -97,33 +97,52 @@ failure it reports as "unexplained" stay on the default model.
 
 ## Polling
 
-Poll with `bot-poll`, run in the background, which wakes the session
-(by exiting) only when something new turns up:
+The sweeps run apart from this session: the `bot-sweep.timer` systemd
+user unit runs `bin/bot-sweep` every 10 minutes, which pulls the shared
+checkout (`git pull --ff-only`), then runs
 
 ```bash
-bot-poll --exclude-lead '*'
-```
-
-(`--exclude-lead '*'` leaves the items led by a topic session to it; see
-"Topic sessions" below.) Every 15 minutes it sweeps the checkout with `git pull --ff-only`, then
-runs:
-
-```bash
+bot-watch --apply --exclude-lead '*'
 bot-notify
 bot-pr inbox --dry-run
-bot-watch --apply
 bot-tmt-number --gc
 ```
 
-saving each one's whole output under `~/.local/state/bot-poll/runs/`,
-and compares what they list against what it has already reported:
+with a timeout each, killing a step's whole process group when it times
+out (so no orphan keeps holding bot-watch's lock), and publishes each
+completed sweep under `~/.local/state/bot-sweep/`: `runs/ID/NAME.txt`
+(kept 2 days), `latest-{watch,notify,inbox}.txt`, and `status.json`
+(start, end, duration, each step's exit status, the problems, and the
+last complete sweep). (`--exclude-lead '*'` leaves the items led by a
+topic session to it; see "Topic sessions" below.) Never run `bot-watch
+--apply` yourself: it would race the timer's sweep for its lock (and
+consume its news). `systemctl --user status bot-sweep.timer
+bot-sweep` shows the schedule and the last run.
+
+To wait for news, run this in the background, with the longest timeout
+the harness allows (in Claude Code, `run_in_background` with a timeout
+of 7200000 ms):
+
+```bash
+bot-poll --from-sweep ~/.local/state/bot-sweep --max-duration 6900
+```
+
+It never sweeps: every minute it reads the newest completed sweep, and
+compares what it lists against what it has already reported:
 approvals, the operator's activity on fork PRs, outstanding reviews,
 rebase needs, priority health lines (a new P0 one is its own kind),
 P0 drive lines (each new blocker of a P0 PR), operator activity lines
 (each event of the operator's to act on), sign-offs, requests, answers and coordination questions from
 `bot-notify`, and item news other
 than bots'. A review, comment or sign-off is news once, by its id,
-whichever report lists it.
+whichever report lists it. It also wakes the session, as kind `sweep`,
+when the sweeps themselves are broken: the newest sweep's problems (a
+step failed, timed out or found its lock held; bot-watch's report empty
+or cut short), and no complete sweep for over 30 minutes (or no status
+at all), again every hour while that lasts. So a quiet poll means the
+sweeps work; on a `sweep` wake, fix the sweeps first (`journalctl --user
+-u bot-sweep`, the run's files), since every other kind of news waits on
+them.
 
 Each sweep also rebuilds a *hot set*: the bot's open PRs (fork PRs in
 the forge and the rest), the tracker's open asks assigned to the
@@ -147,30 +166,34 @@ activity in private repositories, items the bot doesn't follow) waits
 for the next sweep, as before.
 
 On the first new item it exits printing
-`NEWS (KINDS) at HHMM: RUN/*.txt` (RUN is `hot-*` for a hot cycle's);
+`NEWS (KINDS) at HHMM: RUN/*.txt` (RUN is a sweep's directory under
+`~/.local/state/bot-sweep/runs/`, or `hot-*` for a hot cycle's);
 then run `bot-poll --summary` for the new items themselves, grouped,
 with their URLs, and read the run's files for the rest. The summary
 ends with how long it has been quiet, the hot set's size and the
 requests per cycle and per hour (also in
-`~/.local/state/bot-poll/status.json`). After 12h without news it exits
-too. Handle the news, then start `bot-poll` again: what it reported
-stays reported,
-and news a sweep found before a restart is reported on the next
-start, since it keeps what it has seen in its state dir, and keeps
-the sweeps' 15-minute schedule across restarts. `bot-poll
---once` sweeps right away (at session start, say); `--help` has the
-rest. It is homegit's Rust crate `crates/bot-poll`: `make
-install-crates` in the shared checkout installs it into `~/.cargo/bin`,
-and it runs that checkout's `bin/` tools. Its sweeps pull the checkout
-but don't rebuild it, so after a pull that changes `crates/bot-poll`,
-run `make install-crates` again before restarting it.
+`~/.local/state/bot-poll/status.json`). After `--max-duration` without
+news it exits printing "No news"; start it again. Handle the news, then
+start `bot-poll` again: what it reported stays reported, and a sweep
+that completed meanwhile is checked on the next start, since it keeps
+what it has seen in its state dir. `bot-poll --from-sweep DIR --once`
+checks once, and `--dry-run` shows what the newest sweep would report
+and whether the sweeps are healthy; `--help` has the rest. It is
+homegit's Rust crate `crates/bot-poll`: `make install-crates` in the
+shared checkout installs it into `~/.cargo/bin`, and it runs that
+checkout's `bin/` tools in its hot cycles. The timer's sweeps pull the
+checkout but don't rebuild it, so after a pull that changes
+`crates/bot-poll`, run `make install-crates` again before restarting it;
+after one that changes `dotfiles/.config/systemd/user/bot-sweep.*`,
+copy them to `~/.config/systemd/user/` and `systemctl --user
+daemon-reload`.
 
 `bot-notify` routes new pings (see its skill; ack requests once they're on
 the board). `bot-pr inbox --dry-run` shows the operator's review activity on
 fork PRs without consuming it, so the worker who picks up a fork PR still
 sees it. `bot-watch --apply` consumes its news (the next sweep won't
-report it again), which is why `bot-poll` keeps its whole output: read
-the file rather than rerunning it. `bot-tmt-number --gc` releases the
+report it again), which is why `bot-sweep` keeps its whole output: read
+the run's file rather than rerunning it. `bot-tmt-number --gc` releases the
 bootc tmt test numbers workers reserved once their number is on main
 or in their open PR, or their PR closed.
 
@@ -565,8 +588,8 @@ work is.
 
 ## Loop cadence
 
-`bot-poll` in the background is the loop's heartbeat: it wakes the
-session on news, or after 12h. Worker completions wake the session too;
+`bot-poll --from-sweep` in the background is the loop's heartbeat: it wakes the
+session on news, or after its --max-duration. Worker completions wake the session too;
 handle them as they arrive, and keep one `bot-poll` running (a second
 one refuses to start while the first holds its state dir).
 
@@ -588,8 +611,8 @@ jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{
 
 `session` is this session's id, `loop_state` what the loop does next
 (`polling`, `working`, `sleeping`, or `stopped` when the operator says to
-stop), `next_wake_at` when the running `bot-poll` gives up (its start plus
-12h; it wakes the session sooner on news), and each running worker is listed by the name, board item and
+stop), `next_wake_at` when the running `bot-poll` gives up (its start plus its
+--max-duration; it wakes the session sooner on news), and each running worker is listed by the name, board item and
 devspace in its brief, with the `status` it last reported (`starting`,
 `working`, `testing`, `reviewing`, `landing`, `waiting`); a finished one
 is left out. `agent_ids` are the agentIds the Agent tool returned for the
