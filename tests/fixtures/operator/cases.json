@@ -31,6 +31,15 @@
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
+      },
+      "pacing": {
+        "agents": 4,
+        "harness_agents": 2,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        }
       }
     }
   },
@@ -77,6 +86,15 @@
       "devspace": {
         "repo": "jmarrero-bot/jmarrero-devspace-sandbox",
         "host_prefix": "jmarrero-devspace-"
+      },
+      "pacing": {
+        "agents": 4,
+        "harness_agents": 2,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        }
       }
     }
   },
@@ -116,6 +134,14 @@
       "devspace": {
         "repo": "jm-bot/sandbox",
         "host_prefix": "jm-devspace-"
+      },
+      "pacing": {
+        "agents": 3,
+        "harness_agents": 0,
+        "budgets": {
+          "P2": "XS",
+          "P3": "XL"
+        }
       }
     },
     "expect": {
@@ -152,6 +178,16 @@
       "devspace": {
         "repo": "jm-bot/sandbox",
         "host_prefix": "jm-devspace-"
+      },
+      "pacing": {
+        "agents": 3,
+        "harness_agents": 0,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "XS",
+          "P3": "XL"
+        }
       }
     }
   },
@@ -201,6 +237,15 @@
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
+      },
+      "pacing": {
+        "agents": 4,
+        "harness_agents": 2,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        }
       }
     }
   },
@@ -238,6 +283,15 @@
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
+      },
+      "pacing": {
+        "agents": 4,
+        "harness_agents": 2,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        }
       }
     }
   },
@@ -274,6 +328,15 @@
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
+      },
+      "pacing": {
+        "agents": 4,
+        "harness_agents": 2,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        }
       }
     }
   },
@@ -313,6 +376,63 @@
       "devspace": {
         "repo": "bootc-dev/cgwalters-devspace-sandbox",
         "host_prefix": "cgwalters-devspace-"
+      },
+      "pacing": {
+        "agents": 4,
+        "harness_agents": 2,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: more agents, half of them on the harness",
+    "config": {
+      "pacing": {
+        "agents": 7
+      }
+    },
+    "expect": {
+      "operator": {
+        "login": "cgwalters",
+        "name": "Colin Walters",
+        "email": "walters@verbum.org"
+      },
+      "bot": {
+        "login": "cgwalters-bot",
+        "git_name": "Colin Walters",
+        "git_email": "walters+llm@verbum.org",
+        "issue_repo": "cgwalters-bot/cgwalters-bot",
+        "homegit_repo": "cgwalters-bot/homegit"
+      },
+      "forge_org": "cgwalters-forge",
+      "tracker_repo": "cgwalters-forge/tracker",
+      "heartbeat_issue": 176,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "cgwalters-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {
+          "composefs-stable": "users/cgwalters-bot/2"
+        }
+      },
+      "generated_by_url": "https://github.com/cgwalters/#llms",
+      "devspace": {
+        "repo": "bootc-dev/cgwalters-devspace-sandbox",
+        "host_prefix": "cgwalters-devspace-"
+      },
+      "pacing": {
+        "agents": 7,
+        "harness_agents": 3,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        }
       }
     }
   },
@@ -506,6 +626,85 @@
     "config": {
       "board": {
         "epics": null
+      }
+    }
+  },
+  {
+    "name": "pacing: no agents",
+    "config": {
+      "pacing": {
+        "agents": 0
+      }
+    }
+  },
+  {
+    "name": "pacing: too many agents",
+    "config": {
+      "pacing": {
+        "agents": 65
+      }
+    }
+  },
+  {
+    "name": "pacing: fractional agents",
+    "config": {
+      "pacing": {
+        "agents": 2.5
+      }
+    }
+  },
+  {
+    "name": "pacing: more harness agents than agents",
+    "config": {
+      "pacing": {
+        "agents": 2,
+        "harness_agents": 3
+      }
+    }
+  },
+  {
+    "name": "pacing: negative harness agents",
+    "config": {
+      "pacing": {
+        "harness_agents": -1
+      }
+    }
+  },
+  {
+    "name": "pacing: budget of an unknown bucket",
+    "config": {
+      "pacing": {
+        "budgets": {
+          "P1": "XXL"
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: budget of a bucket option name",
+    "config": {
+      "pacing": {
+        "budgets": {
+          "P1": "S (<1M tok)"
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: budget for a non-priority",
+    "config": {
+      "pacing": {
+        "budgets": {
+          "high": "S"
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: unknown key",
+    "config": {
+      "pacing": {
+        "slots": 4
       }
     }
   }
