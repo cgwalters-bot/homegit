@@ -99,7 +99,11 @@ Rules (${rules}):
                     requested, or, on someone else's PR, a dated "waits on
                     the author" note in a board item's Why or Next (on the
                     bot's own PR, only for staleness); an older ask fires as
-                    a nudge.
+                    a nudge. When the sweep's P0 drive or priority health
+                    step failed (bot-watch warned that its section is
+                    incomplete), the previous run's actions of that kind
+                    (from --state) are carried over as still open, and the
+                    Observed line says so.
   answer-unapplied  a question the operator answered whose Unblocks items
                     are still open and untouched since the answer.
   closed-not-done   an item whose own issue or PR is closed or merged is
@@ -326,10 +330,12 @@ async function apply(actions, errors) {
 async function main(argv) {
   const opts = parseArgs(argv);
   const { obs, errors } = await observe(opts);
+  const previous = opts.state ? readState(opts.state) : {};
+  obs.previous = Object.keys(previous);
   let actions = rec.reconcile(obs, opts.rules).map((a) => ({ ...a, fired: null }));
   if (opts.apply) await apply(actions, errors);
   if (opts.state) {
-    const r = rec.edge(readState(opts.state), actions, opts.now, opts.resync, rec.unreadKinds(obs, opts.rules));
+    const r = rec.edge(previous, actions, opts.now, opts.resync, rec.unreadKinds(obs, opts.rules));
     actions = r.actions;
     writeState(opts.state, r.state, opts.now);
   }

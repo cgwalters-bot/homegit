@@ -380,6 +380,60 @@ test("bot-reconcile --state: fires once, then on resync; an unread input keeps i
   assert.equal(fired(cli(["--state", state, "--resync", "30"], { now: "2026-10-02T14:31:00Z" })), ALL_KEYS.length + 1);
 });
 
+// sweepDir(name, watch): a sweep directory like the fixture's, whose
+// latest run printed watch.
+function sweepDir(name, watch) {
+  const dir = path.join(TMP, `sweep-${name}`);
+  const runDir = path.join(dir, "runs", "20261002-115500-000");
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(path.join(runDir, "watch.txt"), watch);
+  fs.copyFileSync(path.join(run, "inbox.txt"), path.join(runDir, "inbox.txt"));
+  fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ version: 1, run: "20261002-115500-000", problems: [], complete: true,
+    last_complete: { run: "20261002-115500-000", ended_at: "2026-10-02T11:58:00Z" } }));
+  return dir;
+}
+
+test("bot-reconcile --state: a failed drive or health step carries its actions over", () => {
+  const base = fs.readFileSync(path.join(run, "watch.txt"), "utf8");
+  const drop = (text, header) => text.replace(new RegExp(`${header}\\n(?:  .*\\n)*\\n`), "");
+  const DRIVE_WARN = "warning: looking for P0 drive steps failed (status 1); its section is incomplete\n";
+  const HEALTH_WARN = "warning: the priority health sweep failed (status 1); its section is incomplete\n";
+  const DRIVE_KEY = "drive:conflict https://github.com/o/r/pull/1 aaaaaaaaaaaa";
+  const healthKeys = ALL_KEYS.filter((k) => k.startsWith("health:"));
+  // [case, the sweep's watch output, the drive and health actions and how
+  // each fired, the Observed line's note on the failed steps (null: none)]
+  const cases = [
+    ["drive failed, same blocker", DRIVE_WARN + drop(base, "P0 drive:"),
+      [[DRIVE_KEY, null], ...healthKeys.map((k) => [k, null])], "P0 drive"],
+    ["drive recovered, changed blocker", base.replaceAll("aaaaaaaaaaaa", "abababababab"),
+      [["drive:conflict https://github.com/o/r/pull/1 abababababab", "new"], ...healthKeys.map((k) => [k, null])], null],
+    ["health failed", HEALTH_WARN + drop(base, "Priority health:"),
+      [[DRIVE_KEY, null], ...healthKeys.map((k) => [k, null])], "priority health"],
+    ["both failed", DRIVE_WARN + HEALTH_WARN + drop(drop(base, "P0 drive:"), "Priority health:"),
+      [[DRIVE_KEY, null], ...healthKeys.map((k) => [k, null])], "priority health and P0 drive"],
+    ["drive failed, its section partly there", DRIVE_WARN + base,
+      [[DRIVE_KEY, null], ...healthKeys.map((k) => [k, null])], "P0 drive"],
+  ];
+  const first = path.join(TMP, "carry-state.json");
+  cli(["--state", first]);
+  for (const [name, watch, want, note] of cases) {
+    const state = path.join(TMP, `carry-${name.replaceAll(" ", "-")}.json`);
+    fs.copyFileSync(first, state);
+    const dir = sweepDir(name.replaceAll(/\W+/g, "-"), watch);
+    const j = JSON.parse(cli(["--json", "--state", state, "--rule", "drive", "--sweep-dir", dir], { now: "2026-10-02T12:10:00Z" }));
+    const got = j.actions.filter((a) => a.kind === "drive" || a.kind === "health").map((a) => [a.key, a.fired]);
+    assert.deepEqual(got.sort(), want.sort(), name);
+    assert.deepEqual(j.observed.sweep_failed_steps, note ? note.split(" and ") : undefined, `${name}: observed`);
+    if (note) {
+      assert.match(cli(["--state", state, "--rule", "drive", "--sweep-dir", dir], { now: "2026-10-02T12:11:00Z" }),
+        new RegExp(`^Observed: .*\\(its ${note} step failed: carried over\\)`), `${name}: the Observed line`);
+    }
+  }
+  // Without --state there is nothing to carry over.
+  const j = JSON.parse(cli(["--json", "--rule", "drive", "--sweep-dir", sweepDir("no-state", DRIVE_WARN + drop(base, "P0 drive:"))]));
+  assert.deepEqual(j.actions.filter((a) => a.kind === "drive"), []);
+});
+
 test("bot-reconcile --apply: sets closed items Done, and reads only the rule's inputs", () => {
   const log = path.join(TMP, "board-calls");
   const fakeBoard = path.join(TMP, "bot-board");
