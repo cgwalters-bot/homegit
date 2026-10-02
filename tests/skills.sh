@@ -46,6 +46,21 @@ for entry in "${CLAUDE_SKILLS}"/*; do
         err "${entry} is not a link to a skill in ${SKILLS}; skills go there"
 done
 
+# The brief templates: what heads a subagent's prompt must carry the
+# board item's "Item:" line (bot-cost attributes tokens by it), as a
+# placeholder line of its own. runner-preamble.md is exempt: bot-runs
+# titles the run "agent PVTI_...", which bot-cost reads instead, and the
+# coordinator's SKILL.md shows a filled-in example.
+readonly ITEM_LINE='Item: ITEM_URL'
+readonly ITEM_EXEMPT=("${SKILLS}/coordinator/SKILL.md" "${SKILLS}/coordinator/runner-preamble.md")
+for file in "${SKILLS}"/coordinator/*.md "${SKILLS}/topic-lead/SKILL.md"; do
+    [[ " ${ITEM_EXEMPT[*]} " == *" ${file} "* ]] && continue
+    grep -qxF "${ITEM_LINE}" "${file}" ||
+        err "${file} has no '${ITEM_LINE}' line: briefs from it would leave the subagent's tokens unattributed"
+done
+grep -q "^Item: " "${SKILLS}/coordinator/SKILL.md" ||
+    err "${SKILLS}/coordinator/SKILL.md's briefing example has no 'Item:' line"
+
 # Install into a HOME that has an older install's copy of a skill and a
 # directory Claude Code keeps there itself.
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/skills-test.XXXXXX")

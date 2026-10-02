@@ -80,10 +80,22 @@ devspace, name it after the task and give it 16 cores or fewer (16 is
 the default) and the shortest duration that fits; brief 64 cores only
 when a 16-core run has proven too slow for this work, and say why.
 Put the board item on a line of its own, `Item: ITEM_URL` (or the
-`PVTI_` id), and tell the worker to repeat that line in the prompts of
-its own subagents (reviewer, builder): `bot-cost` joins transcripts to
-board items on it, and `bot-actuals` writes the sum to the item's Actual
-tokens. Naming the scratch dir and devspace in the prompt is also what
+`PVTI_` id), in every subagent's prompt, reviewers' and policy checks'
+too: `bot-cost` joins transcripts to board items on it, and
+`bot-actuals` writes the sum to the item's Actual tokens. The preambles
+tell the agent to repeat it in the prompts of its own subagents
+(reviewer, builder) and to use it for `bot-footer --item`. A prompt
+starts like this:
+
+```
+Read ~/src/github/cgwalters-bot/homegit/dotfiles/.agents/skills/coordinator/reviewer-preamble.md and follow it.
+Item: https://github.com/cgwalters-forge/tracker/issues/NNN
+Scratch dir: SCRATCHPAD/review-NNN
+...
+```
+
+`tests/skills.sh` checks that each preamble still has its `Item:`
+line. Naming the scratch dir and devspace in the prompt is also what
 lets `bot-cost` attribute the task's compute. For the overnight batch
 job of turning Draft items into review-ready forge PRs, also point the
 worker at `forge-migrate.md` in the same directory and list its batch of

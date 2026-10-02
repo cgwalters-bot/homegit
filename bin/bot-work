@@ -30,13 +30,16 @@ readonly BOT_BOARD
 
 usage() {
     cat <<EOF
-Usage: $(basename "$0") [--agent opencode|claude] [--plan [--since YYYY-MM-DD]] [EXTRA INSTRUCTIONS...]
+Usage: $(basename "$0") [--agent opencode|claude] [--item ITEM | --plan [--since YYYY-MM-DD]] [EXTRA INSTRUCTIONS...]
 
 Run an agent non-interactively to pick up or advance the next item on the
 ${BOT_LOGIN} Workstream board (${BOARD_URL}).
 
 Options:
   --agent AGENT  Agent CLI to use: opencode (default) or claude
+  --item ITEM    Work on this item (its issue or PR URL, or PVTI_ id) rather
+                 than the next one; the prompt names it on an "Item:" line,
+                 which bot-cost attributes the session's tokens by
   --plan         Refill the board from recent GitHub activity (backlog-planning
                  skill) instead of working on an item
   --since DATE   With --plan, look back to DATE instead of the last 7 days
@@ -175,11 +178,14 @@ require_cmd() {
 agent=${DEFAULT_AGENT}
 plan=false
 since=
+item=
 while test $# -gt 0; do
     case "$1" in
         --agent) test $# -ge 2 || fatal "--agent requires an argument"; agent=$2; shift 2 ;;
         --agent=*) agent=${1#--agent=}; shift ;;
         --plan) plan=true; shift ;;
+        --item) test $# -ge 2 || fatal "--item requires an item"; item=$2; shift 2 ;;
+        --item=*) item=${1#--item=}; shift ;;
         --since) test $# -ge 2 || fatal "--since requires a date"; since=$2; shift 2 ;;
         --since=*) since=${1#--since=}; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -192,6 +198,9 @@ case "${agent}" in
     opencode|claude) ;;
     *) fatal "unknown agent '${agent}' (expected opencode or claude)" ;;
 esac
+! ${plan} || test -z "${item}" || fatal "--item and --plan don't go together"
+[[ -z "${item}" || "${item}" =~ ^(PVTI_[A-Za-z0-9_-]+|https://github\.com/[^/]+/[^/]+/(issues|pull)/[0-9]+)$ ]] ||
+    fatal "--item takes an issue or PR URL or a PVTI_ id, not '${item}'"
 if test -n "${since}"; then
     ${plan} || fatal "--since only applies with --plan"
     since_date=$(date -u -d "${since}" +%F 2>/dev/null) || fatal "invalid --since date '${since}' (expected YYYY-MM-DD)"
@@ -204,7 +213,15 @@ if ${plan}; then
         prompt="${prompt} Use a lookback window starting at ${since}."
     fi
 else
-    prompt="Load the workstream skill and follow it: pick up or advance exactly one item on the Workstream board (${BOARD_URL}), keeping its status accurate. Load the upstream-pr skill before making changes to any repository."
+    if test -n "${item}"; then
+        prompt="Load the workstream skill and follow it: pick up or advance this item on the Workstream board (${BOARD_URL}), keeping its status accurate.
+Item: ${item}
+"
+    else
+        prompt="Load the workstream skill and follow it: pick up or advance exactly one item on the Workstream board (${BOARD_URL}), keeping its status accurate. "
+    fi
+    # bot-cost joins subagents' transcripts to the item on that line.
+    prompt+="Once you know your item, put it on a line of its own, 'Item: ITEM_URL', in the prompt of every subagent you dispatch, and use 'bot-footer --item ITEM_URL' for a PR's run footer. Load the upstream-pr skill before making changes to any repository."
 fi
 if test $# -gt 0; then
     prompt="${prompt}
