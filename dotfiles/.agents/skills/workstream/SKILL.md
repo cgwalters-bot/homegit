@@ -593,6 +593,12 @@ below.
 
   The base is usually the upstream default branch; for fixes on top of
   a Renovate PR it is that PR's branch, which fork-pr copies to the fork.
+  For a change that builds on another of your unmerged fork PRs, pass
+  that PR's `bot/...` branch as the base: the new PR is stacked on it
+  (its diff is only its own commits, and bot-meta records "Stacked on"),
+  `bot-pr promote` waits until the parent is merged upstream, and
+  `bot-pr rebase` follows the parent's force-pushes. Any other base that
+  only the fork has is refused.
   To update the description later (e.g. new test results), use
   `bot-pr get-body "$FORK_PR" > pr-body.md`, edit it, then
   `bot-pr set-body "$FORK_PR" --body-file pr-body.md`; a later run

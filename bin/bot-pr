@@ -40,6 +40,8 @@ readonly BRANCH_PREFIX=bot/
 readonly ITEM_ID_RE='PVTI_[A-Za-z0-9_-]+'
 readonly META_START='<!-- bot-meta -->'
 readonly META_END='<!-- /bot-meta -->'
+# The "Stacked on:" line of a bot-meta section; see fork-pr.
+readonly STACKED_RE='Stacked on: (https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+)'
 # The last line of a run footer (bot-footer's bot-run/v1, or an agent.yml
 # run's agent-run-summary/v1), after its summary line; footers accumulate
 # at the end of the bot-meta section.
@@ -142,7 +144,12 @@ Commands:
         the current one) if it has that branch, and open a draft PR from
         ${BRANCH_PREFIX}SLUG into BRANCH; print its URL. A non-default BRANCH
         (e.g. a Renovate branch) is copied from upstream under the same
-        name. TITLE and FILE are the future upstream PR: why, what was
+        name. A BRANCH upstream doesn't have must be the head of an open
+        fork PR of the bot's in the fork: the new PR is stacked on that
+        one, into its branch (so its diff is only its own commits), its
+        bot-meta section records it ('Stacked on:') with that one's
+        upstream base, and promote waits until that one is merged
+        upstream. Any other BRANCH only the fork has is refused. TITLE and FILE are the future upstream PR: why, what was
         tested, caveats, ending with '${LLMS_TRAILER}'.
         A trailing ${META_START} section records the upstream target
         and board item, with instructions for the reviewer, and ends with
@@ -195,6 +202,8 @@ Commands:
         setting the title last, and that the body lost the bot's trailer
         line, and it adds none of its own notes to the body. signoff
         checks the same.
+        A stacked fork PR (see fork-pr) is refused until the one it is
+        stacked on is merged upstream, naming it.
         Then: rebase onto the upstream base if it moved (on conflicts,
         dismiss the approval and stop). If the repository wants DCO (the base
         branch's rules require a DCO check, one ran on the base branch,
@@ -240,7 +249,10 @@ Commands:
         up-to-date branch). PR_URL is an upstream PR from a fork in
         ${FORGE_ORG} or ${BOT_LOGIN}'s own (onto its base branch), or a
         fork PR there (onto the upstream base its bot-meta section names,
-        after syncing the fork's copy of it, as fork-pr does). Only PRs
+        after syncing the fork's copy of it, as fork-pr does; a stacked
+        one onto the branch of the fork PR it is stacked on, dropping
+        that one's older commits, and once that one is merged upstream,
+        onto the upstream base, retargeting it there). Only PRs
         opened by ${BOT_LOGIN} whose commits are all by ${BOT_LOGIN} or
         ${REVIEWER} are touched; a fork PR ${REVIEWER} approved at its
         head is left to promote, which rebases it itself, and an upstream
@@ -316,6 +328,8 @@ Commands:
         they are waiting for 'promote'. A listed PR that isn't approved but
         has a comment of his since its last push that reads like a
         go-ahead gets a hint to ask him for '${PROMOTE_COMMAND}' or an approval.
+        A stacked fork PR whose base branch moved (its parent was
+        force-pushed, say) is listed too, to be rebased.
         --dry-run doesn't record the check.
   -h, --help
         Show this help
@@ -971,10 +985,13 @@ push_branch() {
     info "Pushed ${branch} (${sha:0:12}) to ${fork}"
 }
 
-# The bot-meta section appended to fork PR bodies. Its "Upstream:" and
-# "Board item:" lines are parsed back by promote.
+# The bot-meta section appended to fork PR bodies. Its "Upstream:",
+# "Stacked on:" and "Board item:" lines are parsed back by promote.
+# STACKED is the fork PR this one is stacked on (see fork-pr), if any.
 meta_section() {
-    local upstream=$1 base=$2 item=$3 footers=${4:-} notes list
+    local upstream=$1 base=$2 item=$3 footers=${4:-} stacked=${5:-} notes list stack=""
+    test -z "${stacked}" ||
+        stack=$'\n'"- Stacked on: ${stacked}; promote waits until that is merged upstream"
     # After a blank line, so that the markdown ends the list before them.
     test -z "${footers}" || footers=$'\n'"${footers}"$'\n'
     if test "${#CI_ACTIVE[@]}" -eq 0; then
@@ -997,7 +1014,7 @@ ${META_START}
 
 **Review draft in ${FORGE_ORG}, not upstream yet.** This section is removed when the PR is opened upstream.
 
-- Upstream: \`${upstream}\`, base \`${base}\`
+- Upstream: \`${upstream}\`, base \`${base}\`${stack}
 - Board item: \`${item}\`${notes}
 
 To review:
@@ -1199,8 +1216,9 @@ recorded_item() {
 }
 
 # parse_meta URL META: sets META_UPSTREAM and META_BASE from the bot-meta
-# section META of the fork PR URL, and META_ITEM to its board item (empty
-# if it has none).
+# section META of the fork PR URL, META_ITEM to its board item and
+# META_STACKED to the fork PR it is stacked on (each empty if it has
+# none).
 parse_meta() {
     local url=$1 meta=$2
     # shellcheck disable=SC2016 # literal backticks
@@ -1213,6 +1231,66 @@ parse_meta() {
     META_ITEM=
     if [[ "${meta}" =~ ${item_re} ]]; then
         META_ITEM=${BASH_REMATCH[1]}
+    fi
+    META_STACKED=
+    if [[ "${meta}" =~ ${STACKED_RE} ]]; then
+        META_STACKED=${BASH_REMATCH[1]}
+    fi
+}
+
+# find_stack_parent UPSTREAM FORK BASE: for a BASE that UPSTREAM has no
+# branch of, sets STACK_PARENT to the open fork PR in FORK whose head is
+# BASE, and STACK_UPSTREAM_BASE to the upstream base its bot-meta section
+# names (for a stack of several, the bottom one's). Fails for any other
+# BASE: a branch only the fork has would otherwise go upstream unreviewed.
+find_stack_parent() {
+    local upstream=$1 fork=$2 base=$3 pr parent META_UPSTREAM META_BASE META_ITEM META_STACKED
+    local howto="to stack on another fork PR, pass its branch as --base: it must be the head of an open fork PR in ${fork} that fork-pr opened"
+    pr=$(ghapi -X GET "repos/${fork}/pulls" -f head="${fork%%/*}:${base}" -f state=open \
+        --jq '[.[] | select(.state == "open")][0] // empty') ||
+        fatal "cannot list the PRs of ${fork}"
+    test -n "${pr}" || fatal "${upstream} has no branch '${base}', and no open fork PR in ${fork} is from it; ${howto}"
+    parent=$(jq -r .html_url <<<"${pr}")
+    test "$(jq -r .user.login <<<"${pr}")" = "${BOT_LOGIN}" ||
+        fatal "${upstream} has no branch '${base}', and ${parent} is not ${BOT_LOGIN}'s; ${howto}"
+    local meta
+    meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
+    test -n "${meta}" || fatal "${upstream} has no branch '${base}', and ${parent} has no bot-meta section; ${howto}"
+    parse_meta "${parent}" "${meta}"
+    test "${META_UPSTREAM}" = "${upstream}" ||
+        fatal "${parent}, which --base '${base}' is the branch of, goes to ${META_UPSTREAM}, not ${upstream}"
+    STACK_PARENT=${parent}
+    STACK_UPSTREAM_BASE=${META_BASE}
+}
+
+# stack_state URL UPSTREAM PARENT: sets STACK_BRANCH to the branch of the
+# fork PR PARENT that the fork PR URL is stacked on, and STACK_STATE to
+# where PARENT is: open (a fork PR still), promoted (its upstream PR,
+# STACK_UPSTREAM_PR, is open), merged (STACK_UPSTREAM_PR merged), or
+# dropped (closed, and nothing from it merged upstream).
+stack_state() {
+    local url=$1 upstream=$2 parent=$3 FORK NUMBER pr state owner ups
+    parse_fork_pr_url "${parent}"
+    pr=$(ghapi "repos/${FORK}/pulls/${NUMBER}") || fatal "cannot read ${parent}, which ${url} is stacked on"
+    read -r state STACK_BRANCH < <(jq -r '"\(.state) \(.head.ref)"' <<<"${pr}")
+    STACK_UPSTREAM_PR=""
+    if test "${state}" = open; then
+        STACK_STATE=open
+        return 0
+    fi
+    owner=${FORK%%/*}
+    ups=$(ghapi -X GET "repos/${upstream}/pulls" -f head="${owner}:${STACK_BRANCH}" -f state=all \
+        --jq '[.[] | {html_url, state: (.state // "open"), merged_at}]') || fatal "cannot list the PRs of ${upstream}"
+    STACK_UPSTREAM_PR=$(jq -r '[.[] | select(.merged_at != null)][0].html_url // empty' <<<"${ups}")
+    if test -n "${STACK_UPSTREAM_PR}"; then
+        STACK_STATE=merged
+        return 0
+    fi
+    STACK_UPSTREAM_PR=$(jq -r '[.[] | select(.state == "open")][0].html_url // empty' <<<"${ups}")
+    if test -n "${STACK_UPSTREAM_PR}"; then
+        STACK_STATE=promoted
+    else
+        STACK_STATE=dropped
     fi
 }
 
@@ -1282,9 +1360,18 @@ cmd_fork_pr() {
     fork=$(ensure_fork "${upstream}")
     owner=${fork%%/*}
     ${force} || check_item_free "${fork}" "${item}" "" "${branch}"
+    # A base upstream lacks is another fork PR's branch: this one is
+    # stacked on it, and goes upstream onto that one's upstream base.
+    local STACK_PARENT="" STACK_UPSTREAM_BASE="" upstream_base=${base} compare_repo=${upstream}
+    if test -z "$(ref_sha "${upstream}" "${base}")"; then
+        find_stack_parent "${upstream}" "${fork}" "${base}"
+        upstream_base=${STACK_UPSTREAM_BASE}
+        compare_repo=${fork}
+        info "Stacking on ${STACK_PARENT} (${base}); upstream base ${upstream_base}"
+    fi
     # Before sync_base, whose push to the fork would start its CI.
     fork_setup "${fork}" false "${ci[@]}"
-    sync_base "${upstream}" "${fork}" "${base}"
+    test -n "${STACK_PARENT}" || sync_base "${upstream}" "${fork}" "${base}"
     push_branch "${from}" "${fork}" "${branch}"
 
     local head_sha compare ahead behind
@@ -1293,11 +1380,15 @@ cmd_fork_pr() {
     # The push, or an earlier force-push by hand, may have left the old
     # head's CI queued; and sync_base moves the base.
     prune_after_push "${fork}" "${head_sha}"
-    compare=$(ghapi "repos/${upstream}/compare/${base}...${owner}:${branch}" --jq '"\(.ahead_by) \(.behind_by)"') ||
-        fatal "cannot compare ${branch} with ${upstream}:${base}"
+    compare=$(ghapi "repos/${compare_repo}/compare/${base}...${owner}:${branch}" --jq '"\(.ahead_by) \(.behind_by)"') ||
+        fatal "cannot compare ${branch} with ${compare_repo}:${base}"
     read -r ahead behind <<<"${compare}"
-    test "${ahead}" -gt 0 || fatal "${branch} has no commits on top of ${upstream}:${base}"
-    test "${behind}" -eq 0 || info "note: ${branch} is ${behind} commit(s) behind ${upstream}:${base}; promote rebases it"
+    test "${ahead}" -gt 0 || fatal "${branch} has no commits on top of ${compare_repo}:${base}"
+    if test "${behind}" -gt 0 && test -n "${STACK_PARENT}"; then
+        info "note: ${branch} is ${behind} commit(s) behind ${base}; rebase it with '$(basename "$0") rebase' once the PR is open"
+    elif test "${behind}" -gt 0; then
+        info "note: ${branch} is ${behind} commit(s) behind ${upstream}:${base}; promote rebases it"
+    fi
 
     local existing
     existing=$(ghapi -X GET "repos/${upstream}/pulls" -f head="${owner}:${branch}" -f state=open --jq '.[0].html_url // empty') ||
@@ -1319,7 +1410,7 @@ cmd_fork_pr() {
     fi
 
     local full_body url
-    full_body="${body}"$'\n\n'"$(meta_section "${upstream}" "${base}" "${item}" "${footer}")"
+    full_body="${body}"$'\n\n'"$(meta_section "${upstream}" "${upstream_base}" "${item}" "${footer}" "${STACK_PARENT}")"
     local created
     created=$(jq -n --arg title "${title}" --arg head "${branch}" --arg base "${base}" --arg body "${full_body}" \
         '{title: $title, head: $head, base: $base, body: $body, draft: true}' |
@@ -1403,7 +1494,7 @@ read_refresh_target() {
 
 cmd_refresh_meta() {
     test $# -eq 1 || fatal "usage: $(basename "$0") refresh-meta FORK_PR_URL"
-    local url=$1 FORK NUMBER PR HIS EDITS_UNKNOWN META_UPSTREAM META_BASE META_ITEM
+    local url=$1 FORK NUMBER PR HIS EDITS_UNKNOWN META_UPSTREAM META_BASE META_ITEM META_STACKED
     parse_fork_pr_url "${url}"
     [[ "${FORK}" == "${FORGE_ORG}/"* ]] ||
         fatal "${url} is not in ${FORGE_ORG}; refresh-meta only handles forge fork PRs, whose CI fork-setup manages"
@@ -1420,7 +1511,7 @@ cmd_refresh_meta() {
     lock_state
     state=$(load_state)
     read_refresh_target "${url}"
-    fresh=$(meta_section "${META_UPSTREAM}" "${META_BASE}" "${META_ITEM}" "$(meta_footers <<<"${META}")")
+    fresh=$(meta_section "${META_UPSTREAM}" "${META_BASE}" "${META_ITEM}" "$(meta_footers <<<"${META}")" "${META_STACKED}")
     if test "${META}" = "${fresh}"; then
         info "${url}'s bot-meta section is already current"
         return 0
@@ -2178,7 +2269,7 @@ cmd_promote() {
 
     # The upstream repository comes from the bot-meta section: a fork's
     # parent is not necessarily the upstream.
-    local meta upstream meta_base item title body META_UPSTREAM META_BASE META_ITEM
+    local meta upstream meta_base item title body META_UPSTREAM META_BASE META_ITEM META_STACKED
     meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
     test -n "${meta}" || fatal "${url} has no complete ${META_START} ... ${META_END} section; was it opened with fork-pr? Restore it in the PR body"
     parse_meta "${url}" "${meta}"
@@ -2191,8 +2282,25 @@ cmd_promote() {
     item=${META_ITEM}
     test -n "${item}" || warn "no board item in ${url}'s bot-meta section; the board won't be updated"
     local base=${meta_base} owner=${FORK%%/*}
-    test "${fork_base}" = "${base}" ||
+    # A stacked fork PR goes upstream only once its parent is merged
+    # there: before, its upstream PR would carry the parent's commits too.
+    # The rebase onto upstream's base below then drops those.
+    if test -n "${META_STACKED}"; then
+        local STACK_STATE STACK_BRANCH STACK_UPSTREAM_PR stack_refusal=""
+        stack_state "${url}" "${upstream}" "${META_STACKED}"
+        case "${STACK_STATE}" in
+            open) stack_refusal="it is stacked on ${META_STACKED}, which is not promoted yet: promote that first, and this one once it is merged upstream" ;;
+            promoted) stack_refusal="it is stacked on ${META_STACKED}, whose upstream PR ${STACK_UPSTREAM_PR} is not merged yet: promote this one once it is" ;;
+            dropped) stack_refusal="it is stacked on ${META_STACKED}, which was closed without being merged upstream: rebase ${head} onto ${upstream}:${base} by hand and drop the 'Stacked on' line" ;;
+            merged) info "${META_STACKED}, which ${url} is stacked on, is merged upstream as ${STACK_UPSTREAM_PR}" ;;
+        esac
+        if test -n "${stack_refusal}"; then
+            ${dry_run} || fatal "not promoting ${url}: ${stack_refusal}"
+            warn "${stack_refusal}; a real promote would stop here"
+        fi
+    elif test "${fork_base}" != "${base}"; then
         warn "the fork PR targets '${fork_base}', but bot-meta says upstream base '${base}'; using '${base}'"
+    fi
     title=$(jq -r .title <<<"${pr}")
     body=$(jq -r "${BODY_JQ} .body | strip_meta" <<<"${pr}")
     ! grep -qF 'bot-meta' <<<"${body}" || fatal "${url}'s body still mentions bot-meta after stripping the section; fix its markers"
@@ -2399,28 +2507,46 @@ plural() {
     if test "$1" -eq 1; then echo "$1 $2"; else echo "$1 $2s"; fi
 }
 
-# rebase_pr FORK BRANCH OLD_SHA UPSTREAM BASE DRY_RUN CHECK_ARGS...:
+# rebase_pr FORK BRANCH OLD_SHA UPSTREAM BASE DRY_RUN STACKED CHECK_ARGS...:
 # rebases BRANCH onto UPSTREAM's BASE in a cached clone (see rebase_head),
 # keeps REVIEWER's sign-offs with 'bot-git rework', runs 'bot-git check'
 # (with CHECK_ARGS) against OLD_SHA, and unless DRY_RUN force-pushes it.
 # Prints "NEW_SHA COMMITS CHANGED", CHANGED being how many commits' patch-id
 # changed; on conflicts, the conflicting paths, returning EX_CONFLICT.
-# Runs in a '||' list, like rebase_onto_upstream.
+# Runs in a '||' list, like rebase_onto_upstream. With STACKED true, the
+# branch is a stacked fork PR's: the commits it has of its parent's older
+# head (or of the parent merged upstream) are dropped where BASE has their
+# patch, and only its own are counted; it has no sign-offs to keep then.
 rebase_pr() {
-    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 dry_run=$6 CLONE dir new_sha i changed=0
-    shift 6
+    local fork=$1 branch=$2 old_sha=$3 upstream=$4 base=$5 dry_run=$6 stacked=$7 CLONE dir new_sha i changed=0
+    shift 7
     open_clone "${fork}" "${branch}" "${old_sha}" "${upstream}" "${base}"
     dir=${CLONE}
     rebase_head "${dir}" "${branch}" "${old_sha}" "${upstream}" "${base}" || return
     local -a olds news
-    mapfile -t olds < <(sgit -C "${dir}" rev-list --reverse "refs/bot-pr/base..${old_sha}")
+    if ${stacked}; then
+        mapfile -t olds < <(sgit -C "${dir}" rev-list --reverse --no-merges --cherry-pick --right-only "refs/bot-pr/base...${old_sha}")
+    else
+        mapfile -t olds < <(sgit -C "${dir}" rev-list --reverse "refs/bot-pr/base..${old_sha}")
+    fi
     mapfile -t news < <(sgit -C "${dir}" rev-list --reverse refs/bot-pr/base..HEAD)
     test "${#news[@]}" -eq "${#olds[@]}" ||
         fatal "rebasing ${branch} onto ${upstream}:${base} left $(plural "${#news[@]}" commit) of ${#olds[@]}: some are upstream already; that needs a look, nothing was pushed"
-    (cd "${dir}" && "${BOT_GIT}" rework --was "${old_sha}" refs/bot-pr/base) 1>&2 ||
-        fatal "'bot-git rework' refused the rebased ${branch} in ${dir}; nothing was pushed"
-    (cd "${dir}" && "${BOT_GIT}" check "$@" --was "${old_sha}" refs/bot-pr/base..HEAD) 1>&2 ||
-        fatal "'bot-git check' found problems with the rebased ${branch} in ${dir} (see above); nothing was pushed"
+    if ${stacked}; then
+        # 'bot-git rework' pairs every commit of the old head, the parent's
+        # dropped ones too; a fork PR has no sign-off of his before promote.
+        for i in "${olds[@]}"; do
+            test "$(has_signoff "${dir}" "${i}")" -eq 0 ||
+                fatal "${i:0:12} of the stacked ${branch} has ${REVIEWER}'s sign-off, which a rebase onto ${upstream}:${base} can't keep; that needs a look, nothing was pushed"
+        done
+        (cd "${dir}" && "${BOT_GIT}" check "$@" refs/bot-pr/base..HEAD) 1>&2 ||
+            fatal "'bot-git check' found problems with the rebased ${branch} in ${dir} (see above); nothing was pushed"
+    else
+        (cd "${dir}" && "${BOT_GIT}" rework --was "${old_sha}" refs/bot-pr/base) 1>&2 ||
+            fatal "'bot-git rework' refused the rebased ${branch} in ${dir}; nothing was pushed"
+        (cd "${dir}" && "${BOT_GIT}" check "$@" --was "${old_sha}" refs/bot-pr/base..HEAD) 1>&2 ||
+            fatal "'bot-git check' found problems with the rebased ${branch} in ${dir} (see above); nothing was pushed"
+    fi
     mapfile -t news < <(sgit -C "${dir}" rev-list --reverse refs/bot-pr/base..HEAD)
     for i in "${!olds[@]}"; do
         test "$(sgit -C "${dir}" diff-tree -p "${olds[i]}" | sgit -C "${dir}" patch-id --stable | cut -d' ' -f1)" = \
@@ -2458,18 +2584,30 @@ cmd_rebase() {
     [[ "${head_repo}" =~ ^(${FORGE_ORG}|${BOT_LOGIN})/ ]] ||
         fatal "${url}'s head is in ${head_repo}, not in a fork in ${FORGE_ORG} or ${BOT_LOGIN}'s"
 
-    # A fork PR rebases onto the upstream base, like promote.
-    local upstream=${base_repo} base=${base_ref} fork_pr=false
+    # A fork PR rebases onto the upstream base, like promote; a stacked
+    # one onto its parent's branch in the fork, until the parent is merged
+    # upstream (then onto the upstream base, retargeting it there).
+    local upstream=${base_repo} base=${base_ref} fork_pr=false stacked=false retarget=""
     if [[ "${repo}" =~ ^(${FORGE_ORG}|${BOT_LOGIN})/ ]]; then
         fork_pr=true
         test "${head_repo}" = "${repo}" || fatal "${url}'s head is in ${head_repo}, not ${repo}"
-        local meta META_UPSTREAM META_BASE META_ITEM
+        local meta META_UPSTREAM META_BASE META_ITEM META_STACKED
         meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
         test -n "${meta}" || fatal "${url} has no complete ${META_START} ... ${META_END} section; was it opened with fork-pr? Restore it in the PR body"
         parse_meta "${url}" "${meta}"
         upstream=${META_UPSTREAM} base=${META_BASE}
-        test "${base_ref}" = "${base}" ||
+        if test -n "${META_STACKED}"; then
+            local STACK_STATE STACK_BRANCH STACK_UPSTREAM_PR
+            stacked=true
+            stack_state "${url}" "${upstream}" "${META_STACKED}"
+            case "${STACK_STATE}" in
+                open|promoted) upstream=${repo} base=${STACK_BRANCH} ;;
+                merged) test "${base_ref}" = "${base}" || retarget=${base} ;;
+                dropped) fatal "${url} is stacked on ${META_STACKED}, which was closed without being merged upstream; rebase it onto ${upstream}:${base} by hand and drop the 'Stacked on' line" ;;
+            esac
+        elif test "${base_ref}" != "${base}"; then
             warn "the fork PR targets '${base_ref}', but bot-meta says upstream base '${base}'; using '${base}'"
+        fi
         # A push voids his approval of the head, and promote rebases.
         local activity pushed
         activity=$(reviewer_activity "${repo}" "${number}")
@@ -2527,12 +2665,12 @@ cmd_rebase() {
         fi
     fi
     info "${head} is $(plural "${behind}" commit) behind ${upstream}:${base}; rebasing$(! ${dry_run} || echo " (dry run)")"
-    if ${fork_pr} && ! ${dry_run}; then
+    if ${fork_pr} && test "${upstream}" != "${repo}" && ! ${dry_run}; then
         sync_base "${upstream}" "${repo}" "${base}"
     fi
 
     local out rc=0 new_sha ncommits changed summary
-    out=$(rebase_pr "${head_repo}" "${head}" "${head_sha}" "${upstream}" "${base}" "${dry_run}" "${check_args[@]}") || rc=$?
+    out=$(rebase_pr "${head_repo}" "${head}" "${head_sha}" "${upstream}" "${base}" "${dry_run}" "${stacked}" "${check_args[@]}") || rc=$?
     if test "${rc}" -eq "${EX_CONFLICT}"; then
         echo "error: ${head} conflicts with ${upstream}:${base} in: ${out}; nothing was pushed. Resolving that is a worker's job (or ${REVIEWER}'s)" 1>&2
         exit "${EX_CONFLICT}"
@@ -2547,6 +2685,12 @@ cmd_rebase() {
         return 0
     fi
     info "Pushed ${head} rebased onto ${upstream}:${base} (${new_sha:0:12}; ${summary})"
+    if test -n "${retarget}"; then
+        # Its parent's branch may be gone, and its diff is against base now.
+        ghapi -X PATCH "repos/${repo}/pulls/${number}" -f base="${retarget}" >/dev/null ||
+            warn "retargeting ${url} to ${retarget} failed; do it by hand"
+        info "Retargeted ${url} to ${retarget}: ${META_STACKED}, which it is stacked on, is merged upstream as ${STACK_UPSTREAM_PR}"
+    fi
     if ${fork_pr}; then
         prune_after_push "${repo}" "${new_sha}"
     else
@@ -2687,6 +2831,24 @@ cmd_signoff() {
     echo "${signed}"
 }
 
+# stack_moved URL REPO PR_JSON: for a stacked fork PR (see fork-pr) whose
+# head no longer contains its base branch, the parent's (force-pushed, or
+# with new commits), prints a line saying to rebase it; nothing otherwise.
+stack_moved() {
+    local url=$1 repo=$2 pr=$3 parent base behind
+    parent=$(jq -r --arg re "${STACKED_RE}" "${BODY_JQ}"' .body | meta | [match($re).captures[0].string] | first // empty' <<<"${pr}")
+    test -n "${parent}" || return 0
+    base=$(jq -r .base.ref <<<"${pr}")
+    # Retargeted onto the upstream base once the parent merged.
+    # shellcheck disable=SC2016 # literal backticks
+    jq -e --arg b "${base}" "${BODY_JQ}"' .body | meta | test("Upstream: `[^`]+`, base `\($b)`")' <<<"${pr}" >/dev/null && return 0
+    if ! behind=$(ghapi "repos/${repo}/compare/${base}...${repo%%/*}:$(jq -r .head.ref <<<"${pr}")" --jq .behind_by); then
+        echo "  -> stacked on ${parent}, but its base ${base} can't be compared (gone?): $(basename "$0") rebase ${url}"
+    elif test "${behind}" -gt 0; then
+        echo "  -> stacked on ${parent}, whose branch ${base} moved ($(plural "${behind}" commit) not in this one): $(basename "$0") rebase ${url}"
+    fi
+}
+
 cmd_inbox() {
     local since="" dry_run=false
     while test $# -gt 0; do
@@ -2737,7 +2899,7 @@ cmd_inbox() {
     closed=$(jq -c --arg m "${META_START}" '[.[] | select((.body // "") | contains($m))]' <<<"${closed}")
 
     local nreported=0 found url repo number pr head_sha pr_since activity events lines verdict hash old_hash
-    local pushed go_ahead
+    local pushed go_ahead stack_note
     local bot_body edits_seen pending edits body_note
     while IFS= read -r found; do
         test -n "${found}" || continue
@@ -2803,9 +2965,11 @@ cmd_inbox() {
             [if approved then "APPROVED" elif approved_any then "APPROVED earlier; new commits since" else empty end,
              if wants_draft then "'"${DRAFT_COMMAND}"'" else empty end,
              if approved and approval.human_text then "text by '"${REVIEWER}"'" else empty end] | join(", ")')
-        test -n "${lines}" || test -n "${verdict}" || continue
+        stack_note=$(stack_moved "${url}" "${repo}" "${pr}")
+        test -n "${lines}" || test -n "${verdict}" || test -n "${stack_note}" || continue
         echo "${url}${verdict:+  [${verdict}]}  $(jq -r .title <<<"${pr}")"
         test -z "${lines}" || echo "${lines}"
+        test -z "${stack_note}" || echo "${stack_note}"
         if [[ "${verdict}" == APPROVED ]] || [[ "${verdict}" == "APPROVED, "* ]]; then
             # Names the approving review or comment, which bot-poll keys it by.
             echo "  -> approved by $(verdict approval.url): $(basename "$0") promote ${url}$([[ "${verdict}" == *"${DRAFT_COMMAND}"* ]] && echo " --draft")"
@@ -2851,7 +3015,7 @@ cmd_inbox() {
             | .closed |= with_entries(select(.value | type == "string" and . >= $fc))
             | .prs |= with_entries(select(.key as $u | ($urls | index($u)) or (.value.seen // "") >= $fp))' <<<"${state}")"
     fi
-    info "$(jq length <<<"${open}") open fork PR(s); ${nreported} with activity by ${REVIEWER} or awaiting promote"
+    info "$(jq length <<<"${open}") open fork PR(s); ${nreported} with activity by ${REVIEWER}, awaiting promote, or to rebase onto the PR they are stacked on"
 }
 
 test $# -gt 0 || { usage 1>&2; exit 1; }
