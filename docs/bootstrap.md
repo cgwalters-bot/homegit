@@ -117,7 +117,16 @@ able to reach the runners on port 22.
 
 Clone homegit where the skills expect it, `~/src/github/BOT/homegit`, and
 install the tools with `make install-bin` (symlinks into `~/.local/bin`)
-and `make install-crates` (`bot-poll`, with cargo). `make install` and
+and `make install-crates` (`bot-poll`, with cargo). The coordinator's
+sweeps run from the `bot-sweep.timer` systemd user unit in
+`dotfiles/.config/systemd/user`: copy both `bot-sweep.*` units to
+`~/.config/systemd/user`, put any host settings in
+`~/.config/bot-sweep.env` (see `bin/bot-sweep --help`: the toolbox to
+sweep in, and the existing file holding the bot's gh token if `GH_TOKEN`
+isn't in the user manager's environment), then `systemctl --user
+daemon-reload && systemctl --user enable --now bot-sweep.timer`, and
+`loginctl enable-linger` so that it runs without a login session.
+`make install` and
 `make install-dotfiles` also copy `dotfiles/` into the home directory,
 which includes cgwalters' own `.bashrc`, `.gitconfig` and `AGENTS.md`;
 install the skills by hand instead: `dotfiles/.agents/skills` as
