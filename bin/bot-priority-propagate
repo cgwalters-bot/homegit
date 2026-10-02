@@ -1,0 +1,263 @@
+#!/usr/bin/env node
+// Priority follows structure: raises the sub-issues and Branch items of
+// the Workstream board's P0 (then P1) items to that priority, and adds
+// those not on the board. bot-watch runs it on every sweep and lists
+// what it did as its "Priority propagation" section. See --help.
+// Node's standard library only, plus gh (through bot-priority-health's
+// REST helpers, with their ETag cache) and bot-board.
+"use strict";
+
+const { execFile } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+const { promisify } = require("node:util");
+
+const execFileP = promisify(execFile);
+
+const PROG = path.basename(process.argv[1] || "bot-priority-propagate");
+const BIN_DIR = path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const { Exit, restGet, pool, loadBoard, EX_RATELIMIT } = require(path.join(BIN_DIR, "bot-priority-health"));
+const BOT_BOARD = process.env.BOT_PRIORITY_PROPAGATE_BOT_BOARD || path.join(BIN_DIR, "bot-board");
+// Parent priorities that propagate, most urgent first; one pass each. A
+// priority outside the list (P2, or none) ranks below all of them.
+const PRIORITIES = ["P0", "P1"];
+const RANK_UNSET = 99;
+const DONE_STATUS = "Done";
+const THEME_FIELD = "Theme";
+const PER_PAGE = 100;
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+const ISSUE_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/(issues|pull)\/([0-9]+)(?:[/#?]|$)/i;
+
+function usage() {
+  return `Usage: ${PROG} [--apply | --dry-run] [--board-file FILE] [--json]
+
+Priority follows structure. For every open item (not ${DONE_STATUS}) of the Workstream
+board at ${PRIORITIES.join(", then ")} (one pass each, so a P0 parent's children are settled
+first), its children get its priority if theirs is lower or unset
+(never lowered):
+
+  - its sub-issues (GitHub's sub-issues API, an issue's only);
+  - the issues and PRs in its Branch field.
+
+A child on the board is raised (and gets the parent's ${THEME_FIELD} if it has
+none); one that is not on the board is added at that priority, with the
+parent's ${THEME_FIELD}. Children that are ${DONE_STATUS} on the board, or closed or merged on
+GitHub, are left alone. A raised child is a parent in its turn, in
+the pass of its new priority. Of several parents, the most urgent wins.
+
+One line per change:
+
+  raised URL P2 -> P0 (under PARENT-URL)[, ${THEME_FIELD} X]
+  added URL at P0 (under PARENT-URL)[, ${THEME_FIELD} X]
+
+With --apply, the changes are made through bot-board, a line starting
+"FAILED" for one that was refused; with --dry-run, or neither, the lines
+are only what would change. Idempotent: a later run finds nothing.
+
+Options:
+  --apply             make the changes
+  --dry-run           report only (the default)
+  --board-file FILE   the board as 'bot-board list --json' prints it
+  --json              print a JSON array of {action, url, parent, from, to,
+                      theme, result, line}, result being planned, applied or failed
+  -h, --help          show this help
+
+Exits 1 if a change failed or a parent's children could not be read, and
+${EX_RATELIMIT} if GitHub is rate limiting the bot.
+`;
+}
+
+function parseArgs(argv) {
+  const opts = { apply: false, boardFile: null, json: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case "-h":
+      case "--help":
+        process.stdout.write(usage());
+        process.exit(0);
+      case "--apply": opts.apply = true; break;
+      case "--dry-run": opts.apply = false; break;
+      case "--json": opts.json = true; break;
+      case "--board-file":
+        if (i + 1 >= argv.length) throw new Exit(EX_USAGE, `--board-file needs a value\n\n${usage()}`);
+        opts.boardFile = argv[++i];
+        break;
+      default:
+        throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
+    }
+  }
+  return opts;
+}
+
+const warn = (msg) => process.stderr.write(`${PROG}: warning: ${msg}\n`);
+
+// Issues and PRs share numbers, so an item is keyed by repository and
+// number alone, case-insensitively.
+function parseUrl(url) {
+  const m = ISSUE_URL_RE.exec(url || "");
+  if (!m) return null;
+  const repo = `${m[1]}/${m[2]}`;
+  return {
+    repo, number: Number(m[4]), key: `${repo}#${m[4]}`.toLowerCase(),
+    url: `https://github.com/${repo}/${m[3].toLowerCase()}/${m[4]}`, isIssue: m[3].toLowerCase() === "issues",
+  };
+}
+
+const rank = (p) => (PRIORITIES.includes(p) ? PRIORITIES.indexOf(p) : RANK_UNSET);
+
+// sub_issues(repo, number): the sub-issues of an issue, as parsed URLs
+// with their state.
+async function subIssues(repo, number) {
+  const out = [];
+  for (let page = 1; ; page++) {
+    const body = await restGet(`repos/${repo}/issues/${number}/sub_issues?per_page=${PER_PAGE}&page=${page}`);
+    if (!Array.isArray(body)) return out;
+    for (const s of body) {
+      const u = parseUrl(s.html_url);
+      if (u) out.push({ ...u, state: s.state });
+    }
+    if (body.length < PER_PAGE) return out;
+  }
+}
+
+// plan(board, children): the changes, as [{action, url, ...}], in
+// the order made. children(item) is the parsed children of an item, each
+// {key, url, repo, number, isIssue, state?}, state unknown for those off
+// the sub-issues API; open(child) is whether GitHub has it open.
+async function plan(board, children, isOpen) {
+  const items = new Map(); // key -> {url, key, issue, branch, priority, status, theme, id, onBoard}
+  for (const it of board) {
+    const u = parseUrl(it.content && it.content.url);
+    if (!u) continue;
+    items.set(u.key, {
+      ...u, branch: it.branch || "", priority: it.priority || null, status: it.status || null, theme: it.theme || null,
+      id: it.id, onBoard: true,
+    });
+  }
+  const changes = [];
+  for (const level of PRIORITIES) {
+    const queue = [...items.values()].filter((i) => i.priority === level && i.status !== DONE_STATUS);
+    const seen = new Set(queue.map((i) => i.key));
+    while (queue.length) {
+      const parent = queue.shift();
+      for (const child of await children(parent)) {
+        if (child.key === parent.key) continue;
+        let item = items.get(child.key);
+        if (item && item.status === DONE_STATUS) continue;
+        if (!(await isOpen(child))) continue;
+        let change = null;
+        if (!item) {
+          item = { ...child, branch: "", priority: parent.priority, status: null, theme: parent.theme, onBoard: false };
+          items.set(child.key, item);
+          change = { action: "added", from: null, theme: parent.theme };
+        } else if (rank(item.priority) > rank(parent.priority)) {
+          change = { action: "raised", from: item.priority, theme: item.theme ? null : parent.theme };
+          item.priority = parent.priority;
+          if (change.theme) item.theme = change.theme;
+        }
+        if (change) {
+          changes.push({ ...change, url: item.url, parent: parent.url, to: parent.priority, id: item.id || null });
+        }
+        if (item.priority === level && !seen.has(item.key)) {
+          seen.add(item.key);
+          queue.push(item);
+        }
+      }
+    }
+  }
+  return changes;
+}
+
+function describe(c, result) {
+  const theme = c.theme ? `, ${THEME_FIELD} ${c.theme}` : "";
+  const what = c.action === "added" ? `added ${c.url} at ${c.to}` : `raised ${c.url} ${c.from || "unset"} -> ${c.to}`;
+  return `${result === "failed" ? "FAILED " : ""}${what} (under ${c.parent})${theme}`;
+}
+
+async function bb(args) {
+  try {
+    const { stdout } = await execFileP(BOT_BOARD, args, { maxBuffer: 64 << 20 });
+    return stdout.trim();
+  } catch (e) {
+    if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, "GitHub is rate limiting the bot (bot-board)");
+    throw new Error(`bot-board ${args.join(" ")} failed: ${(e.stderr || e.message).trim().split("\n").pop()}`);
+  }
+}
+
+async function applyChange(c) {
+  let id = c.id;
+  if (c.action === "added") id = (await bb(["add", "--priority", c.to, c.url])).split("\n").pop();
+  const set = ["set", id];
+  if (c.action === "raised") set.push("--priority", c.to);
+  if (c.theme) set.push("--field", THEME_FIELD, c.theme);
+  if (set.length > 2) await bb(set);
+}
+
+async function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const board = await loadBoard(opts.boardFile, null);
+  let failedReads = 0;
+  const state = new Map();
+  const childrenOf = async (parent) => {
+    const out = new Map();
+    try {
+      if (parent.isIssue) for (const c of await subIssues(parent.repo, parent.number)) out.set(c.key, c);
+      for (const word of parent.branch.split(/\s+/)) {
+        const u = parseUrl(word);
+        if (u && !out.has(u.key)) out.set(u.key, u);
+      }
+    } catch (e) {
+      if (e instanceof Exit && e.status === EX_RATELIMIT) throw e;
+      warn(`reading the sub-issues of ${parent.url} failed: ${e.message}`);
+      failedReads++;
+    }
+    return [...out.values()];
+  };
+  const isOpen = async (child) => {
+    if (child.state) return child.state === "open";
+    if (!state.has(child.key)) {
+      try {
+        const body = await restGet(`repos/${child.repo}/issues/${child.number}`);
+        state.set(child.key, body ? body.state === "open" : false);
+      } catch (e) {
+        if (e instanceof Exit && e.status === EX_RATELIMIT) throw e;
+        warn(`reading ${child.url} failed: ${e.message}`);
+        failedReads++;
+        state.set(child.key, false);
+      }
+    }
+    return state.get(child.key);
+  };
+  const changes = await plan(board, childrenOf, isOpen);
+  let failed = 0;
+  const results = [];
+  for (const c of changes) {
+    let result = opts.apply ? "applied" : "planned";
+    if (opts.apply) {
+      try {
+        await applyChange(c);
+      } catch (e) {
+        if (e instanceof Exit) throw e;
+        warn(e.message);
+        result = "failed";
+        failed++;
+      }
+    }
+    results.push({ action: c.action, url: c.url, parent: c.parent, from: c.from, to: c.to, theme: c.theme, result, line: describe(c, result) });
+  }
+  if (opts.json) process.stdout.write(`${JSON.stringify(results)}\n`);
+  else process.stdout.write(results.length ? results.map((r) => `${r.line}\n`).join("") : "Priority propagation: nothing to change\n");
+  if (failed || failedReads) throw new Exit(EX_ERROR, `${failed} change(s) failed, ${failedReads} read(s) failed`);
+}
+
+if (require.main === module) {
+  main().catch((e) => {
+    if (!(e instanceof Exit)) throw e;
+    process.stderr.write(`${PROG}: ${e.message}\n`);
+    process.exit(e.status);
+  });
+} else {
+  module.exports = { plan, parseUrl };
+}
