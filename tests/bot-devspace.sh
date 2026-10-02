@@ -5,7 +5,7 @@
 # revisions that predate it, only 'runner' (sudo; provision installs it).
 # A fake gh keeps one dispatched run in a temporary directory, and a fake
 # ssh admits the users in $FAKE_SSH_USERS and records what it was asked to
-# run. Then which runs of another start count as the same devspace, by
+# run, and answers the CPU model probe with $FAKE_CPU. Then which runs of another start count as the same devspace, by
 # their titles. No network.
 #   tests/bot-devspace.sh
 set -euo pipefail
@@ -76,7 +76,8 @@ sed -i "s/\${RUN_ID}/${RUN_ID}/g" "${WORK}/bin/gh"
 # The fake ssh. The user is -l's, else the config's User. A login that
 # isn't in $FAKE_SSH_USERS is refused; a provision script is recorded in
 # $FAKE/provision (its mode argument, then its stdin) and exits with
-# $FAKE_CHECK_RC in check mode.
+# $FAKE_CHECK_RC in check mode. The CPU model probe prints $FAKE_CPU,
+# failing if it is empty.
 cat >"${WORK}/bin/ssh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -93,6 +94,7 @@ test -n "${user}" || user=$(awk '$1 == "User" { print $2 }' "${config}")
 grep -qw -- "${user}" <<<"${FAKE_SSH_USERS}" || exit 255
 case "$*" in
     true) exit 0 ;;
+    "awk "*/proc/cpuinfo) test -n "${FAKE_CPU:-}" && echo "${FAKE_CPU}" ;;
     "bash -s -- "*)
         { echo "$4"; cat; } >"${FAKE}/provision"
         test "$4" != check || exit "${FAKE_CHECK_RC:-0}" ;;
@@ -109,7 +111,7 @@ cases=(
 )
 for case in "${cases[@]}"; do
     IFS='|' read -r admitted want mode <<<"${case}"
-    export XDG_STATE_HOME=${WORK}/state FAKE_SSH_USERS=${admitted}
+    export XDG_STATE_HOME=${WORK}/state FAKE_SSH_USERS=${admitted} FAKE_CPU="AMD EPYC 7763 64-Core Processor"
     rm -rf "${XDG_STATE_HOME}" "${FAKE:?}"/*
     name=t-${want}
     if ! host=$("${BOT_DEVSPACE}" start --duration 30 "${name}" 2>"${WORK}/err"); then
@@ -121,6 +123,10 @@ for case in "${cases[@]}"; do
     test "$(cat "${dir}/ssh_user")" = "${want}" || fail "[${admitted}] recorded user $(cat "${dir}/ssh_user"), want ${want}"
     grep -qx "    User ${want}" "${dir}/ssh_config" || fail "[${admitted}] ssh_config lacks 'User ${want}'"
     test "$(head -1 "${FAKE}/provision")" = "${mode}" || fail "[${admitted}] provision ran in mode $(head -1 "${FAKE}/provision"), want ${mode}"
+    # The CPU model is recorded, reported at start and listed.
+    test "$(cat "${dir}/cpu" 2>/dev/null)" = "${FAKE_CPU}" || fail "[${admitted}] recorded CPU '$(cat "${dir}/cpu" 2>/dev/null)'"
+    grep -qxF "CPU: ${FAKE_CPU}" "${WORK}/err" || fail "[${admitted}] start did not report the CPU: $(cat "${WORK}/err")"
+    "${BOT_DEVSPACE}" list | grep -q "^${name} .*${FAKE_CPU}\$" || fail "[${admitted}] list lacks the CPU: $("${BOT_DEVSPACE}" list)"
     if test "${want}" = runner; then
         grep -q 'only admits runner' "${WORK}/err" || fail "[${admitted}] no note about the legacy user"
     fi
@@ -140,6 +146,18 @@ for case in "${cases[@]}"; do
 
     "${BOT_DEVSPACE}" stop "${name}" 2>/dev/null || fail "[${admitted}] stop failed"
 done
+
+# A devspace whose CPU model can't be read still starts, with a warning,
+# and list shows '-' for it.
+export XDG_STATE_HOME=${WORK}/state FAKE_SSH_USERS=runner-sandbox FAKE_CPU=
+rm -rf "${XDG_STATE_HOME}" "${FAKE:?}"/*
+if "${BOT_DEVSPACE}" start --no-provision --duration 30 t-nocpu >/dev/null 2>"${WORK}/err"; then
+    grep -q 'could not read the CPU model' "${WORK}/err" || fail "[no cpu] no warning: $(cat "${WORK}/err")"
+    "${BOT_DEVSPACE}" list | grep -q '^t-nocpu .* -$' || fail "[no cpu] list: $("${BOT_DEVSPACE}" list)"
+    "${BOT_DEVSPACE}" stop t-nocpu 2>/dev/null || fail "[no cpu] stop failed"
+else
+    fail "[no cpu] start failed: $(cat "${WORK}/err")"
+fi
 
 # Which active runs start takes for another devspace of the same name:
 # titles with and without the size, never a longer name that shares the
@@ -169,4 +187,4 @@ if test "${failures}" -ne 0; then
     echo "${failures} failure(s)" 1>&2
     exit 1
 fi
-echo "ok: bot-devspace SSH user detection, provision modes and run titles"
+echo "ok: bot-devspace SSH user detection, provision modes, CPU model and run titles"

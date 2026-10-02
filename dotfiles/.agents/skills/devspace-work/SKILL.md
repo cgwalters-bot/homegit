@@ -84,6 +84,12 @@ the host; give the command a 15-minute tool timeout or run it in the
 background. If it fails or is interrupted after dispatching, it cancels
 the runner itself (unless `--keep-on-failure`), so just retry.
 
+The pools mix hardware (AMD EPYC 7763 and 9V45 hosts so far, nested
+under Hyper-V), and VM tests can behave differently between them: SMM +
+Secure Boot guests abort QEMU on some 7763 hosts (tracker#235). `start`
+prints the CPU model and `bot-devspace list` shows it; name it next to
+the host when you report a VM test result.
+
 ## Push the branch
 
 `bot-devspace ssh-config NAME` prints an ssh_config defining the host alias

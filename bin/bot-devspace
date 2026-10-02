@@ -63,6 +63,12 @@ readonly PROVISION_PACKAGES=(
 # bootc's .github/actions/install-tmt. Keep them in sync with those.
 readonly BCVK_VERSION=0.19.0
 readonly TMT_VERSION=1.78.0
+# The runner pools mix hardware (e.g. AMD EPYC 7763 and 9V45 hosts under the
+# same label), and nested-KVM behavior differs between them: sealed (SMM +
+# Secure Boot) VMs abort QEMU on some 7763 hosts only, see
+# https://github.com/cgwalters-forge/tracker/issues/235. start records the
+# CPU model so that results can be tied to the hardware they ran on.
+readonly CPU_PROBE="awk -F ': *' '/^model name/ { print \$2; exit }' /proc/cpuinfo"
 
 usage() {
     cat <<EOF
@@ -88,7 +94,8 @@ Commands:
   ssh NAME [CMD...]  Run CMD on the devspace, or an interactive shell
   ssh-config NAME    Print the path of an ssh_config defining Host ${ALIAS_PREFIX}NAME,
                      for use with 'ssh -F' and GIT_SSH_COMMAND="ssh -F <path>"
-  list               List known devspaces with their live run status
+  list               List known devspaces with their live run status and the
+                     CPU model each one got (runner hardware varies)
   stop NAME          Cancel the run and remove local state
   -h, --help         Show this help
 
@@ -245,6 +252,20 @@ ssh_probe() {
         ${user:+-l "${user}"} "${ALIAS_PREFIX}${name}" true </dev/null >/dev/null 2>&1
 }
 
+# record_cpu NAME: stores NAME's CPU model in its state and prints it. Only
+# informational, so a failure is a warning, not an error.
+record_cpu() {
+    local name=$1 dir cpu
+    dir=$(state_dir "${name}")
+    if cpu=$(timeout 20 ssh -F "${dir}/ssh_config" -o BatchMode=yes "${ALIAS_PREFIX}${name}" \
+        "${CPU_PROBE}" </dev/null 2>/dev/null) && test -n "${cpu}"; then
+        echo "${cpu}" >"${dir}/cpu"
+        info "CPU: ${cpu}"
+    else
+        info "warning: could not read the CPU model of ${name}"
+    fi
+}
+
 # The user a devspace's SSH sessions run as (see SSH_USERS).
 ssh_user_of() {
     local file
@@ -388,6 +409,7 @@ cmd_start() {
 
     wait_for_ssh "${name}" "${id}"
     info "SSH ready on ${HOST_PREFIX}${id} $((SECONDS - started))s after dispatch"
+    record_cpu "${name}"
     if ${provision}; then
         # stdout is reserved for the host name.
         cmd_provision "${name}" 1>&2
@@ -498,20 +520,22 @@ cmd_ssh_config() {
 
 cmd_list() {
     test $# -eq 0 || fatal "usage: $(basename "$0") list"
-    local dirs=("${STATE_ROOT}"/*/) dir name id state
+    local dirs=("${STATE_ROOT}"/*/) dir name id state cpu
     test -d "${dirs[0]}" || return 0
     {
-        printf 'NAME\tRUN\tSTATUS\tHOST\n'
+        printf 'NAME\tRUN\tSTATUS\tHOST\tCPU\n'
         for dir in "${dirs[@]}"; do
             name=$(basename "${dir}")
+            cpu=-
+            test -s "${dir}/cpu" && cpu=$(cat "${dir}/cpu")
             if test -s "${dir}/run_id"; then
                 id=$(cat "${dir}/run_id")
                 state=$(run_state "${id}" 2>/dev/null) || state=unknown
                 state=${state% }
                 state=${state/ /:}
-                printf '%s\t%s\t%s\t%s\n' "${name}" "${id}" "${state}" "${HOST_PREFIX}${id}"
+                printf '%s\t%s\t%s\t%s\t%s\n' "${name}" "${id}" "${state}" "${HOST_PREFIX}${id}" "${cpu}"
             else
-                printf '%s\t-\tincomplete-start\t-\n' "${name}"
+                printf '%s\t-\tincomplete-start\t-\t-\n' "${name}"
             fi
         done
     } | column -t -s $'\t'
