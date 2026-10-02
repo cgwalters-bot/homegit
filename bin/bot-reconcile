@@ -38,6 +38,7 @@ const RULE_INPUTS = {
   heartbeat: ["items", "heartbeat", "children"],
   "lead-orphan": ["items", "heartbeat", "children"],
   drive: ["sweep", "prs", "items", "epicItems"],
+  "patch-ready": ["items"],
   "answer-unapplied": ["questions"],
   "closed-not-done": ["items", "contentStates"],
   "stale-lead": ["items"],
@@ -106,6 +107,13 @@ Rules (${rules}):
                     incomplete), the previous run's actions of that kind
                     (from --state) are carried over as still open, and the
                     Observed line says so.
+  patch-ready       a Draft item whose Why says a devspace run's patch is ready
+                    for bot-runs apply (bot-runs reconcile sets that): apply
+                    it with a local Sonnet worker (apply-preamble.md in the
+                    coordinator skill), which reviews it and opens or updates
+                    the PR. Reported only, as waiting for the operator, until
+                    APPLY_UNATTENDED in lib/reconcile.js is true (after
+                    ${rec.HARDENING_PR}).
   answer-unapplied  a question the operator answered whose Unblocks items
                     are still open and untouched since the answer.
   closed-not-done   an item whose own issue or PR is closed or merged is
