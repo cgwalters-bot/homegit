@@ -253,7 +253,9 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   past its Budget tokens is a **budget** action.
 - **heartbeat:** the heartbeat is fresh and lists exactly the busy
   items' workers; for a drift it prints the `bot-heartbeat publish`
-  input without the finished workers.
+  input without the finished workers. `bot-poll-loop` keeps an unchanged
+  heartbeat fresh itself, so a stale one means its refresh failed: its
+  report ends with why.
 - **lead-orphan:** each of your busy items (Lead `coordinator`, or any
   Lead not in the topic-lead skill's table) has a worker in the
   heartbeat, and each worker there a busy item; an In Progress item with
@@ -724,10 +726,15 @@ wake the session too; handle them as they arrive, then run
 ## Heartbeat
 
 The review app's ops view can't see the workers on this machine, so
-publish them: on each loop wake (after polling) and whenever a worker
-starts or finishes, pipe the current state to `bot-heartbeat publish`
+publish them: whenever a worker starts, finishes or changes status, or
+the loop's state changes, pipe the current state to `bot-heartbeat publish`
 (`bot-reconcile`'s heartbeat and lead-orphan rules check that it did, and
-that it agrees with the board):
+that it agrees with the board). There is no need to publish just to keep
+it fresh: each `bot-poll-loop` cycle runs `bot-heartbeat refresh`, which
+republishes your last publish with `updated_at` (and `next_wake_at`)
+moved to now, as long as that publish ran in this Claude Code session and
+nobody published since; when it can't, the loop's report ends with
+"Heartbeat not refreshed: WHY".
 
 ```bash
 jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{

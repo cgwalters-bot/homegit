@@ -27,6 +27,9 @@ export FAKE=${WORK}/fake PATH=${WORK}/bin:${PATH}
 export BOT_HEARTBEAT_NOW=2026-09-28T20:00:00Z
 # The usage snapshot reads these transcripts, and no status line reading.
 export BOT_HEARTBEAT_PROJECTS=${TESTS}/fixtures/bot-heartbeat/projects XDG_CACHE_HOME=${WORK}/cache
+# What publish saves for refresh, and no session of the one running the tests.
+export XDG_STATE_HOME=${WORK}/state
+unset CLAUDE_CODE_SESSION_ID
 mkdir -p "${WORK}/bin" "${FAKE}"
 
 failures=0
@@ -244,6 +247,8 @@ no_usage "publish" "$(tail -n +2 "${FAKE}/written" | jq -r .body)"
 tail -n +2 "${FAKE}/usage-written" | jq -r .body | grep -qF '"cache_read": 2000' || fail "the usage comment lacks the worker's tokens"
 # The body as JSON: a command substitution would drop its final newline.
 body=$(tail -n +2 "${FAKE}/written" | jq .body)
+test "$(jq -c '[.session, .input.workers[0].agent_ids, .published.updated_at, (.published.workers | length)]' "${XDG_STATE_HOME}/bot-heartbeat/last-publish.json")" = \
+    '[null,["aw1"],"2026-09-28T19:59:30Z",1]' || fail "publish didn't save what refresh needs: $(cat "${XDG_STATE_HOME}/bot-heartbeat/last-publish.json")"
 # Someone else's comment that looks like it, then the bot's.
 jq -n --argjson b "${body}" '[{id: 1, html_url: "u1", user: {login: "someone"}, body: $b},
     {id: 2, html_url: "u2", user: {login: "cgwalters-bot"}, body: "hello"},
@@ -269,6 +274,69 @@ rc=0
 "${TOOL}" show >/dev/null 2>"${WORK}/err" || rc=$?
 if test "${rc}" -ne 1 || ! grep -q "JSON block is malformed" "${WORK}/err"; then
     fail "show of a malformed comment: exit ${rc}: $(cat "${WORK}/err")"
+fi
+
+# --- refresh: republish the last publish, moved to now, while it is
+# this session's and nobody published since.
+# as_comment: the last write is now the bot's comment on the issue.
+as_comment() {
+    local body
+    body=$(tail -n +2 "${FAKE}/written" | jq .body)
+    jq -n --argjson b "${body}" '[{id: 3, html_url: "u3", user: {login: "cgwalters-bot"}, body: $b}]' >"${FAKE}/comments.json"
+    rm "${FAKE}/written"
+}
+# refresh_at TIME [SESSION]: runs refresh at 2026-09-28TTIMEZ in SESSION,
+# setting rc and the stderr in ${WORK}/err.
+refresh_at() {
+    rc=0
+    env ${2:+CLAUDE_CODE_SESSION_ID=$2} BOT_HEARTBEAT_NOW="2026-09-28T$1Z" "${TOOL}" refresh 2>"${WORK}/err" || rc=$?
+}
+# Published at 20:00 (as of 19:59:30, waking at 20:29:30) in session s1.
+published_by_s1() {
+    reset
+    rm -rf "${XDG_STATE_HOME}"
+    heartbeat "ops-v2|${PUB}|ops-v2" | jq -c '.coordinator.next_wake_at = "2026-09-28T20:29:30Z" | .workers[0].agent_ids = ["aw1"]' |
+        CLAUDE_CODE_SESSION_ID=s1 "${TOOL}" publish --no-usage 2>"${WORK}/err" || fail "publish in s1 failed: $(cat "${WORK}/err")"
+    as_comment
+}
+# [case#time#session#jq edit of the issue's comments#exit status#in stderr]
+refresh_cases=(
+    "too fresh to bother#20:02:30#s1##0#fresh: published 3 min ago"
+    "another session#20:10:00#s2##4#ran in session s1, not this one (s2)"
+    "outside a session#20:10:00###4#not this one (none)"
+    "someone published since#20:10:00#s1#.[0].body |= gsub(\"testing\"; \"working\")#4#someone published since"
+    "no comment any more#20:10:00#s1#[]#4#someone published since"
+    "due#20:10:00#s1##0#updated https://github.com/cgwalters-forge/tracker/issues/176"
+)
+for case in "${refresh_cases[@]}"; do
+    IFS='#' read -r name at session edit want_rc want_err <<<"${case}"
+    published_by_s1
+    if test -n "${edit}"; then jq "${edit}" "${FAKE}/comments.json" >"${WORK}/c.json" && mv "${WORK}/c.json" "${FAKE}/comments.json"; fi
+    refresh_at "${at}" "${session}"
+    test "${rc}" -eq "${want_rc}" || fail "refresh, ${name}: exit ${rc}, want ${want_rc}: $(cat "${WORK}/err")"
+    grep -qF -- "${want_err}" "${WORK}/err" || fail "refresh, ${name}: stderr lacks '${want_err}': $(cat "${WORK}/err")"
+    if test "${want_rc}" -ne 0 || test "${at}" = 20:02:30; then
+        test ! -e "${FAKE}/written" || fail "refresh, ${name}: wrote the heartbeat"
+    fi
+done
+# The due refresh moved updated_at to now and next_wake_at by as much,
+# kept the rest, and published the usage too.
+json=$(tail -n +2 "${FAKE}/written" | jq -r .body | json_of)
+test "$(jq -c '[.updated_at, .coordinator, [.workers[].name]]' <<<"${json}")" = \
+    '["2026-09-28T20:10:00Z",{"session":"s-1","loop_state":"sleeping","next_wake_at":"2026-09-28T20:40:00Z"},["ops-v2"]]' ||
+    fail "refresh published: ${json}"
+no_usage "refresh" "$(tail -n +2 "${FAKE}/written" | jq -r .body)"
+tail -n +2 "${FAKE}/usage-written" | jq -r .body | grep -qF '"name": "ops-v2"' || fail "refresh didn't publish the worker's usage"
+# What it published is the new last publish: the next refresh builds on it.
+as_comment
+refresh_at 20:20:00 s1
+test "${rc}" -eq 0 || fail "second refresh: exit ${rc}: $(cat "${WORK}/err")"
+tail -n +2 "${FAKE}/written" | jq -r .body | grep -qF '"next_wake_at": "2026-09-28T20:50:00Z"' || fail "second refresh: $(cat "${FAKE}/written")"
+# Nothing published from here yet.
+rm -rf "${XDG_STATE_HOME}"
+refresh_at 20:10:00
+if test "${rc}" -ne 4 || ! grep -qF 'nothing published from here yet' "${WORK}/err"; then
+    fail "refresh with nothing published: exit ${rc}: $(cat "${WORK}/err")"
 fi
 
 # The usage goes only to a private repository.

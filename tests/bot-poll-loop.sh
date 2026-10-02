@@ -39,13 +39,22 @@ test -e "${f}" || f=$(find "${FAKE}" -name 'events-*' | sort | tail -n1)
 test -z "${f}" || cat "${f}"
 EOF
 # The fake bot-reconcile prints $FAKE/reconcile.txt (and exits with
-# $FAKE/reconcile.rc, else 0), the fake bot-board
+# $FAKE/reconcile.rc, else 0), the fake bot-heartbeat prints
+# $FAKE/heartbeat.err to stderr (and exits with $FAKE/heartbeat.rc), both
+# logging to $FAKE/order; the fake bot-board
 # lists $FAKE/board.json; the others log, and print $FAKE/NAME.out.
 cat >"${WORK}/tools/bot-reconcile" <<'EOF'
 #!/usr/bin/env bash
 echo "$*" >>"${FAKE}/reconcile-calls"
+echo reconcile >>"${FAKE}/order"
 cat "${FAKE}/reconcile.txt"
 exit "$(cat "${FAKE}/reconcile.rc" 2>/dev/null || echo 0)"
+EOF
+cat >"${WORK}/tools/bot-heartbeat" <<'EOF'
+#!/usr/bin/env bash
+echo "heartbeat $*" >>"${FAKE}/order"
+cat "${FAKE}/heartbeat.err" 1>&2 2>/dev/null
+exit "$(cat "${FAKE}/heartbeat.rc" 2>/dev/null || echo 0)"
 EOF
 cat >"${WORK}/tools/bot-board" <<'EOF'
 #!/usr/bin/env bash
@@ -150,6 +159,36 @@ test "$(tail -n+2 <<<"${out}")" = 'Observed: nothing
 (bot-reconcile exited 1)' || fail "QUIET after a failing reconcile: ${out}"
 rm "${FAKE}/reconcile.rc"
 printf '%s\n' "${QUIET_REPORT}" >"${FAKE}/reconcile.txt"
+
+# Each cycle refreshes the heartbeat before reconciling; the report says
+# why when it didn't refresh it.
+reset
+sweep 20261002-100000-000 ""
+out=$(loop 1)
+test "$(cat "${FAKE}/order")" = 'heartbeat refresh
+reconcile
+heartbeat refresh
+reconcile' || fail "refresh and reconcile order: $(cat "${FAKE}/order")"
+if grep -q '^Heartbeat' <<<"${out}"; then fail "a refreshed heartbeat was reported: ${out}"; fi
+# [heartbeat refresh's exit status, its stderr, the report's last line]
+hb_cases=(
+    "0|bot-heartbeat: fresh: published 3 min ago|Observed: 4 of 4 agents busy"
+    "4|bot-heartbeat: not refreshed: someone published since|Heartbeat not refreshed: bot-heartbeat: not refreshed: someone published since (exit 4)"
+    "1|bot-heartbeat: cannot edit the heartbeat comment: HTTP 502|Heartbeat not refreshed: bot-heartbeat: cannot edit the heartbeat comment: HTTP 502 (exit 1)"
+)
+for c in "${hb_cases[@]}"; do
+    IFS='|' read -r rc err want <<<"${c}"
+    echo "${rc}" >"${FAKE}/heartbeat.rc"
+    echo "${err}" >"${FAKE}/heartbeat.err"
+    out=$(loop)
+    expect_first "${out}" '^QUIET'
+    test "$(tail -n1 <<<"${out}")" = "${want}" || fail "refresh exit ${rc}: QUIET ends: $(tail -n1 <<<"${out}")"
+done
+# A wake carries it too.
+printf '%s\n' 'Observed: 2 of 4 agents busy' 'Actions (1):' '* heartbeat: the heartbeat is 20 min old' >"${FAKE}/reconcile.txt"
+out=$(loop)
+expect_first "${out}" '^ACTIONS \(actions: heartbeat\)'
+test "$(tail -n1 <<<"${out}")" = "${want}" || fail "the wake doesn't say why the heartbeat wasn't refreshed: ${out}"
 
 # A stale sweep is a problem, reported at most hourly.
 reset
