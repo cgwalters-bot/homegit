@@ -99,6 +99,33 @@ diff, which the caller reviews and commits through `bin/bot-git`. Don't pass `mo
 would override the pin. Reviews, design, security and root-causing a
 failure it reports as "unexplained" stay on the default model.
 
+### Devspace agent runs instead of a subagent
+
+A worker can also run on a devspace runner instead of in this session:
+`bot-runs dispatch --item PVTI_... --repo OWNER/REPO BRIEF` starts an
+`agent.yml` run (see docs/devspace-agent-runs.md), records it in the
+item's `Run` field and sets it In Progress. From then on the run is
+the item's source of truth: `bot-runs reconcile`, on every
+`bot-watch --apply` sweep, moves it to Draft when the run hands back a
+patch (its Why says how to `bot-runs apply` it; that isn't done
+unattended yet) or back to Todo with the run linked in Why when it
+fails, times out or changes nothing. Don't track it in the session or
+poll the run: its section in the sweep ("Devspace runs") and the board
+say where it stands.
+
+Dispatch to a devspace when the task is long builds and tests in a
+public repository and needs no GitHub writes until it is done: the run
+has no credentials, so it can't push, comment, open PRs or set the
+board, and it can't ask anything mid-task. The brief is public (a
+dispatch input), so it carries no private data, and it must stand on
+its own: the run sees only the target repository. Everything else
+stays a local subagent: work that pushes or talks on GitHub as it goes,
+reviews, policy checks, harness changes, anything that needs the
+operator's judgment midway, and private repositories. A run that fails
+lands back in Todo; look at it (`bot-runs show`/`log`) before
+dispatching it again, and never dispatch an item whose `Run` is set:
+that run still owns it.
+
 ## Polling
 
 The sweeps run apart from this session: the `bot-sweep.timer` systemd
