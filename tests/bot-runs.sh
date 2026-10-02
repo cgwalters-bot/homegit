@@ -116,8 +116,9 @@ case "${method} ${path%%\?*}" in
         id=${id%%/*}
         # Artifacts are uploaded at the end of the run (its latest attempt).
         created=$(jq -r --argjson id "${id}" '.workflow_runs[] | select(.id == $id) | .updated_at' "${runs}")
-        reply "$(for a in agent-run agent-transcript; do
-                n=$(( id * 10 + $(test "${a}" = agent-run && echo 1 || echo 2) ))
+        # Artifact ids are RUN * 10 + 1, 2, 3 in this order.
+        reply "$(k=0; for a in agent-run agent-transcript agent-out; do
+                k=$((k + 1)) n=$(( id * 10 + k ))
                 if grep -qx "${id} ${a}" "${store}/expired.txt"; then
                     jq -nc --argjson n "${n}" --arg a "${a}" --arg c "${created}" '{id: $n, name: $a, expired: true, created_at: $c, expires_at: "2026-09-24T10:45:00Z"}'
                 elif test -d "${store}/artifacts/${id}/${a}"; then
@@ -139,7 +140,7 @@ case "${method} ${path%%\?*}" in
         n=${path#repos/"${repo}"/actions/artifacts/}
         n=${n%/zip}
         id=$((n / 10))
-        a=$(test $((n % 10)) -eq 1 && echo agent-run || echo agent-transcript)
+        case $((n % 10)) in 1) a=agent-run ;; 2) a=agent-transcript ;; *) a=agent-out ;; esac
         ! grep -qx "${id} ${a}" "${store}/expired.txt" || fail_http 410 "Artifact has expired"
         test -d "${store}/artifacts/${id}/${a}" || fail_http 404 "Not Found"
         cd "${store}/artifacts/${id}/${a}"
@@ -472,6 +473,78 @@ test_transcript_link() {
         expect_lines "${out}" 'holds entries other than files and directories'
     done
     test -z "$(ls -A "${XDG_CACHE_HOME}/bot-runs/transcripts" 2>/dev/null)" || fail "unpacked something"
+}
+
+# --- apply -------------------------------------------------------------------
+
+# make_change RUN [EDIT]: a target repository in $WORK/target (made once)
+# and RUN's agent-out artifact holding the diff that the shell code EDIT
+# (default: editing src/lib.rs) makes in it. Prints the base commit.
+make_change() {
+    local target=${WORK}/target out=${FAKE_GH}/artifacts/$1/agent-out commit
+    if ! test -d "${target}"; then
+        git init -q -b main "${target}"
+        mkdir -p "${target}/src"
+        echo 'pub fn f() {}' >"${target}/src/lib.rs"
+        git -C "${target}" add -A
+        git -C "${target}" -c user.name=t -c user.email=t@example.com commit -q -m init
+    fi
+    commit=$(git -C "${target}" rev-parse HEAD)
+    (cd "${target}" && eval "${2:-echo 'pub fn g() {}' >>src/lib.rs}" && git add -A -N &&
+        git diff --binary HEAD) >"${WORK}/changes.patch"
+    git -C "${target}" reset -q --hard
+    git -C "${target}" clean -q -fdx
+    mkdir -p "${out}"
+    cp "${WORK}/changes.patch" "${out}/changes.patch"
+    jq -nc --arg c "${commit}" '{repo: "composefs/composefs-rs", ref: "main", commit: $c}' >"${out}/base.json"
+    printf 'fsck: Check the superblock first\n\nA truncated image failed late.\n' >"${WORK}/message"
+    echo "${commit}"
+}
+
+test_apply() {
+    local commit out dir bot
+    bot=$("${TESTS}/../bin/bot-operator" --json | jq -r '"\(.bot.git_name) <\(.bot.git_email)>"')
+    commit=$(make_change 1001)
+    out=$("${BOT_RUNS}" apply 1001 --slug fsck-sb --message "${WORK}/message" --source "${WORK}/target" --json)
+    dir=${XDG_CACHE_HOME}/bot-runs/apply/1001-fsck-sb
+    expect_json "$(jq -c 'del(.head)' <<<"${out}")" "$(jq -nc --arg c "${commit}" --arg d "${dir}" '{run_id: 1001,
+        repo: "composefs/composefs-rs", base: "main", base_commit: $c, branch: "bot/fsck-sb", dir: $d,
+        item: "PVTI_item1", files: ["src/lib.rs"]}')" "apply --json"
+    expect_eq "$(git -C "${dir}" rev-parse HEAD^)" "${commit}" "parent"
+    expect_eq "$(git -C "${dir}" rev-parse --abbrev-ref HEAD)" bot/fsck-sb "branch"
+    expect_eq "$(git -C "${dir}" log -1 --format='%an <%ae>|%cn <%ce>')" "${bot}|${bot}" "identity"
+    expect_eq "$(git -C "${dir}" log -1 --format='%(trailers:key=Generated-by,valueonly)' | head -n1)" AI "AI trailer"
+    expect_eq "$(git -C "${dir}" show HEAD:src/lib.rs | tail -n1)" 'pub fn g() {}' "applied content"
+    test -z "$(git -C "${dir}" status --porcelain)" || fail "apply left changes uncommitted"
+    # Never over an existing directory.
+    out=$("${BOT_RUNS}" apply 1001 --slug fsck-sb --message "${WORK}/message" --source "${WORK}/target" 2>&1) &&
+        fail "applied over an existing directory"
+    expect_lines "${out}" "already exists"
+}
+
+# Each refusal: RUN, the change's EDIT (or - for none), extra setup,
+# and the expected error.
+test_apply_refused() {
+    local run edit setup want out
+    while IFS='|' read -r run edit setup want; do
+        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${FAKE_GH}/artifacts/${run}/agent-out"
+        echo 'A subject' >"${WORK}/message"
+        test "${edit}" = - || make_change "${run}" "${edit}" >/dev/null
+        eval "${setup}"
+        out=$("${BOT_RUNS}" apply "${run}" --slug s --message "${WORK}/message" --source "${WORK}/target" 2>&1) &&
+            fail "applied run ${run} (${want})"
+        expect_lines "${out}" "${want}"
+    done <<'EOF'
+1001|mkdir -p .github/workflows && echo x >.github/workflows/ci.yml|:|\.github/workflows/ci\.yml \(protected path\)
+1001|echo x >.gitmodules|:|\.gitmodules \(protected path\)
+1001|ln -s /etc/passwd leak|:|leak \(symlink or submodule\)
+1001|echo "t=ghp_$(printf 'a%.0s' $(seq 36))" >>src/lib.rs|:|secret-shaped string
+1001|echo x >>src/lib.rs|jq '.repo = "other/repo"' "${FAKE_GH}/artifacts/1001/agent-out/base.json" >"${WORK}/b" && mv "${WORK}/b" "${FAKE_GH}/artifacts/1001/agent-out/base.json"|another repository
+1001|echo x >>src/lib.rs|printf 'x\n\nSigned-off-by: A <a@b>\n' >"${WORK}/message"|has a Signed-off-by
+1001|-|:|has no agent-out artifact
+1002|echo x >>src/lib.rs|:|agent result is failure, not success
+1004|echo x >>src/lib.rs|:|run 1004 is failure, not success
+EOF
 }
 
 # --- diff, stats -------------------------------------------------------------

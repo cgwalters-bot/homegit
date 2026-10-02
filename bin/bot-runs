@@ -21,6 +21,15 @@ readonly RUNS_WORKFLOW=${BOT_RUNS_WORKFLOW:-agent.yml}
 readonly RUNS_REF=${BOT_RUNS_REF:-main}
 readonly SUMMARY_ARTIFACT=agent-run
 readonly TRANSCRIPT_ARTIFACT=agent-transcript
+# A branch run's change: changes.patch and base.json.
+readonly OUT_ARTIFACT=agent-out
+readonly MAX_PATCH_BYTES=$((8 << 20))
+# Paths a run's change may never touch: CI and git's own files.
+readonly PROTECTED_PATH_RE='^(\.github/|\.gitmodules$)|(^|/)\.git(/|$)'
+# Secret-shaped strings (GitHub, Anthropic, AWS tokens; private keys).
+readonly SECRET_RE='gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+# The AI trailer of the bot's commits (shared AGENTS.md).
+readonly AI_TRAILER='Generated-by: AI'
 # The files of the summary artifact that are kept; anything else in it is
 # ignored.
 readonly SUMMARY_FILES=(summary.json summary.md condensed.log outcome.json)
@@ -89,6 +98,15 @@ Commands:
   diff RUN1 RUN2
       Compare two runs: result, duration, turns, tokens, AIC, tool
       calls, failures, files touched, tests and outcome.
+  apply RUN --slug SLUG --message FILE [--dir DIR] [--source GIT_URL]
+      Turn a successful branch run's change (its agent-out artifact) into
+      a local commit on bot/SLUG, as the bot, with FILE as the message
+      (the AI trailer is added). The change is checked again first: size,
+      base commit, secret-shaped strings, and no .github/, .git or
+      .gitmodules paths, symlinks or submodules. DIR (default
+      ${CACHE_DIR}/apply/RUN-SLUG) is a fresh clone of GIT_URL
+      (default: the run's target on GitHub). Nothing is pushed: after
+      review, bot-pr fork-pr --from DIR opens it on the forge.
   stats [--since AGE] [--limit N] [--by agent|model|repo|item|result]
       Aggregate the finished runs (the last ${DEFAULT_STATS_SINCE}, at most ${DEFAULT_STATS_LIMIT} by
       default): success rate, failures by kind, duration, tokens and
@@ -986,6 +1004,126 @@ cmd_stats() {
     fi
 }
 
+# --- apply -------------------------------------------------------------------
+
+# apply_paths DIR: the paths the staged change in DIR touches, one per
+# line as "NEWMODE PATH" (000000 for a deletion), from git itself.
+apply_paths() {
+    git -C "$1" diff --cached --raw -z --no-renames --no-abbrev HEAD |
+        awk 'BEGIN { RS = "\0" } NR % 2 == 1 { split($0, f, " "); mode = f[2]; next } { print mode " " $0 }'
+}
+
+cmd_apply() {
+    local run_id="" slug="" dir="" source="" message_file="" json=false
+    local meta rec art rc=0 repo base ref commit item workflow result conclusion branch paths bad head files
+    while test $# -gt 0; do
+        case "$1" in
+            --slug|--dir|--source|--message)
+                test $# -ge 2 || fatal "$1 requires a value"
+                case "$1" in
+                    --slug) slug=$2 ;;
+                    --dir) dir=${2%/} ;;
+                    --source) source=$2 ;;
+                    --message) message_file=$2 ;;
+                esac
+                shift 2
+                ;;
+            --json) json=true; shift ;;
+            -h|--help) usage; exit 0 ;;
+            -*) fatal "unknown apply option: $1 (see --help)" ;;
+            *) test -z "${run_id}" || fatal "apply takes one RUN"; run_id=$(parse_run "$1"); shift ;;
+        esac
+    done
+    test -n "${run_id}" || fatal "apply requires a RUN"
+    [[ "${slug}" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || fatal "--slug must be a branch slug like fix-typo (the branch is bot/SLUG)"
+    test -n "${message_file}" || fatal "--message FILE is required: the commit message, why first (see upstream-pr/SKILL.md)"
+    test -r "${message_file}" || fatal "cannot read ${message_file}"
+    grep -q '[^[:space:]]' "${message_file}" || fatal "the commit message in ${message_file} is empty"
+    ! grep -qi '^Signed-off-by:' "${message_file}" ||
+        fatal "the commit message has a Signed-off-by; only the operator's own approval adds one (bot-pr promote)"
+    branch=bot/${slug}
+
+    meta=$(fetch_run "${run_id}")
+    read -r conclusion < <(jq -r '.conclusion // .status' <<<"${meta}")
+    test "${conclusion}" = success ||
+        fatal "run ${run_id} is ${conclusion}, not success; only a successful run's change is applied"
+    rec=$(load_record "${meta}")
+    test "$(jq -r '.source == "artifact" and .summary != null' <<<"${rec}")" = true ||
+        fatal "run ${run_id} has no summary.json (its ${SUMMARY_ARTIFACT} artifact expired or is missing)"
+    read -r item repo base workflow result < <(jq -r '.summary | "\(.item // "") \(.repo // "") \(.base // "") \(.workflow // "") \(.result // "")"' <<<"${rec}")
+    test "${result}" = success || fatal "run ${run_id}'s agent result is ${result:-unknown}, not success"
+    test "${workflow}" = branch || fatal "run ${run_id} is a ${workflow:-?} run; only branch runs hand back a change"
+    [[ "${repo}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fatal "run ${run_id}'s summary has no valid repo"
+
+    art=$(latest_artifact "${meta}" "${OUT_ARTIFACT}") || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || fatal "listing the artifacts of run ${run_id} failed"
+    test -n "${art}" ||
+        fatal "run ${run_id} has no ${OUT_ARTIFACT} artifact: it changed no files, or its change was dropped ('$(basename "$0") show ${run_id}' says why)"
+    test "$(jq -r .expired <<<"${art}")" = false ||
+        fatal "the ${OUT_ARTIFACT} artifact of run ${run_id} expired on $(jq -r '.expires_at // "?"' <<<"${art}") (kept 30 days)"
+    mkdir "${scratch}/out"
+    download_artifact "$(jq -r .id <<<"${art}")" "${scratch}/out" || rc=$?
+    test "${rc}" -eq 0 || fatal "downloading the ${OUT_ARTIFACT} artifact of run ${run_id} failed"
+    for f in changes.patch base.json; do
+        if ! test -f "${scratch}/out/${f}" || test -L "${scratch}/out/${f}"; then
+            fatal "the ${OUT_ARTIFACT} artifact of run ${run_id} has no ${f}"
+        fi
+    done
+
+    # Everything from the run is checked again here: the runner's own
+    # checks ran where the agent did.
+    test "$(stat -c %s "${scratch}/out/changes.patch")" -le "${MAX_PATCH_BYTES}" ||
+        fatal "run ${run_id}'s change is over ${MAX_PATCH_BYTES} bytes"
+    read -r ref commit < <(jq -r --arg r "${repo}" 'if .repo == $r then "\(.ref) \(.commit)" else "repo-mismatch -" end' "${scratch}/out/base.json")
+    test "${ref}" != repo-mismatch || fatal "run ${run_id}'s base.json names another repository than its summary (${repo})"
+    [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || fatal "run ${run_id}'s base.json has no valid commit"
+    test "${ref}" = "${base}" || fatal "run ${run_id}'s base.json ref (${ref}) differs from its summary's base (${base})"
+    if grep -qaE -- "${SECRET_RE}" "${scratch}/out/changes.patch"; then
+        fatal "run ${run_id}'s change holds a secret-shaped string; not applying it"
+    fi
+
+    test -n "${dir}" || dir=${CACHE_DIR}/apply/${run_id}-${slug}
+    ! test -e "${dir}" || fatal "${dir} already exists; remove it or pass --dir"
+    test -n "${source}" || source=https://github.com/${repo}
+    mkdir -p "$(dirname "${dir}")"
+    git clone -q --no-checkout "${source}" "${dir}" || fatal "cloning ${source} failed"
+    # No hooks, filters or fsmonitor of the target's: only git itself
+    # touches the change.
+    git -C "${dir}" config core.hooksPath /dev/null
+    git -C "${dir}" cat-file -e "${commit}^{commit}" 2>/dev/null ||
+        git -C "${dir}" fetch -q origin "${commit}" || fatal "${source} has no commit ${commit}"
+    git -C "${dir}" checkout -q -b "${branch}" "${commit}" || fatal "checking out ${commit} failed"
+    git -C "${dir}" apply --index --binary --whitespace=nowarn "${scratch}/out/changes.patch" ||
+        fatal "run ${run_id}'s change doesn't apply to ${commit}; ${dir} is left as it was"
+    paths=$(apply_paths "${dir}")
+    test -n "${paths}" || fatal "run ${run_id}'s change is empty"
+    # ENVIRON: awk -v would process the regex's backslashes.
+    bad=$(RE=${PROTECTED_PATH_RE} awk '{ mode = $1; p = substr($0, 8) }
+        p ~ ENVIRON["RE"] { print "  " p " (protected path)"; next }
+        mode == "120000" || mode == "160000" { print "  " p " (symlink or submodule)" }' <<<"${paths}")
+    test -z "${bad}" || fatal "run ${run_id}'s change touches what a run may not change; review it in ${dir}:
+${bad}"
+
+    cp "${message_file}" "${scratch}/message"
+    grep -q '^Generated-by: ' "${scratch}/message" || printf '\n%s\n' "${AI_TRAILER}" >>"${scratch}/message"
+    GIT_AUTHOR_NAME=${OP_BOT_GIT_NAME} GIT_AUTHOR_EMAIL=${OP_BOT_GIT_EMAIL} \
+        GIT_COMMITTER_NAME=${OP_BOT_GIT_NAME} GIT_COMMITTER_EMAIL=${OP_BOT_GIT_EMAIL} \
+        git -C "${dir}" commit -q --no-verify -F "${scratch}/message" || fatal "committing the change failed"
+    head=$(git -C "${dir}" rev-parse HEAD)
+    files=$(cut -c8- <<<"${paths}" | jq -Rsc 'split("\n") | map(select(. != ""))')
+    if ${json}; then
+        jq -n --argjson run "${run_id}" --arg repo "${repo}" --arg base "${base}" --arg commit "${commit}" \
+            --arg branch "${branch}" --arg dir "${dir}" --arg head "${head}" --arg item "${item}" --argjson files "${files}" \
+            '{run_id: $run, repo: $repo, base: $base, base_commit: $commit, branch: $branch, dir: $dir, head: $head, item: $item, files: $files}'
+        return 0
+    fi
+    printf 'Applied run %s to %s@%s as %s in %s (%s file(s)), commit %s.\n' \
+        "${run_id}" "${repo}" "${commit:0:12}" "${branch}" "${dir}" "$(jq length <<<"${files}")" "${head:0:12}"
+    printf 'Review it (commit-review), then open it on the forge:\n  bot-pr fork-pr --repo %s --base %s --branch %s --item %s --from %s --title TITLE --body-file FILE\n' \
+        "${repo}" "${base}" "${branch}" "${item:-ITEM}" "${dir}"
+}
+
 # --- main ---------------------------------------------------------------------
 
 test $# -gt 0 || { usage 1>&2; exit 1; }
@@ -993,7 +1131,7 @@ cmd=$1
 shift
 case "${cmd}" in
     -h|--help|help) usage; exit 0 ;;
-    dispatch|list|show|log|transcript|diff|stats) ;;
+    dispatch|list|show|log|transcript|diff|stats|apply) ;;
     *) fatal "unknown command: ${cmd} (see --help)" ;;
 esac
 
@@ -1001,6 +1139,10 @@ require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate
 require_cmd jq "install jq"
 case "${cmd}" in
     list|show|log|diff|stats) require_cmd unzip "install unzip" ;;
+    apply)
+        require_cmd unzip "install unzip"
+        require_cmd git "install git"
+        ;;
     transcript)
         require_cmd unzip "install unzip"
         require_cmd zstd "install zstd"
