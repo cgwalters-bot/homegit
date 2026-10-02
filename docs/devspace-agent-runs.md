@@ -58,9 +58,11 @@ Status In Progress with a News line. `bot-runs reconcile`, which
 `bot-watch` runs on every sweep, follows that field: while the run goes
 on the item stays In Progress; once it is over, an item still In
 Progress moves to Draft if the run succeeded with a patch (ready for
-`bot-runs apply`, which isn't run unattended until
+`bot-runs apply`; `bot-reconcile`'s patch-ready rule then names it, and
+a local Sonnet worker applies, reviews and proposes it, see "Applying a
+run's patch" in the coordinator skill. That isn't run unattended until
 [homegit#82](https://github.com/cgwalters-bot/homegit/pull/82) hardens
-it), and back to Todo otherwise (failure, timeout, budget, cancelled, or
+`apply`), and back to Todo otherwise (failure, timeout, budget, cancelled, or
 no change), with Why and News linking the run. Either way `Run` is
 cleared, so an item In Progress without a `Run` is local work, and a
 finished run never moves an item twice.
