@@ -12,6 +12,7 @@ TESTS=$(cd "$(dirname "$0")" && pwd)
 readonly TESTS
 readonly BOT_RUNS=${TESTS}/../bin/bot-runs
 readonly FIXTURES=${TESTS}/fixtures/bot-runs
+readonly RUNS_URL=https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs
 
 fail() {
     echo "FAIL: $*" 1>&2
@@ -112,6 +113,8 @@ case "${method} ${path%%\?*}" in
             | {total_count: length, workflow_runs: .[($page - 1) * $per:$page * $per]}' "${runs}")"
         ;;
     "GET repos/${repo}/actions/runs/"*/artifacts)
+        # $FAKE_GH/artifacts-fail: listing artifacts fails.
+        test ! -e "${store}/artifacts-fail" || fail_http 502 "Bad Gateway"
         id=${path#repos/"${repo}"/actions/runs/}
         id=${id%%/*}
         # Artifacts are uploaded at the end of the run (its latest attempt).
@@ -188,6 +191,40 @@ test -r "$3" || { echo "age: error: reading identity $3" 1>&2; exit 1; }
 cp "$6" "$5"
 EOF
     chmod +x "$1/age"
+}
+
+# The fake bot-board: logs its calls to $FAKE_GH/board-calls, lists
+# $FAKE_GH/board.json and applies 'set' to it (an empty value removes
+# the field). $FAKE_GH/board-fails makes every call fail.
+write_fake_board() {
+    cat >"$1/bot-board" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+store=${FAKE_GH:?}
+board=${store}/board.json
+echo "$*" >>"${store}/board-calls"
+test ! -e "${store}/board-fails" || { echo "fake bot-board: failing" 1>&2; exit 1; }
+test "$1" != --refresh || shift
+case "$1" in
+    field-ensure) ;;
+    list) cat "${board}" ;;
+    set)
+        item=$2
+        shift 2
+        while test $# -gt 0; do
+            case "$1" in
+                --field) key=${2,,} value=$3; shift 3 ;;
+                *) key=${1#--} value=$2; shift 2 ;;
+            esac
+            jq --arg i "${item}" --arg k "${key}" --arg v "${value}" \
+                'map(if .id == $i then (if $v == "" then del(.[$k]) else .[$k] = $v end) else . end)' "${board}" >"${board}.new"
+            mv "${board}.new" "${board}"
+        done
+        ;;
+    *) echo "fake bot-board: unexpected: $*" 1>&2; exit 1 ;;
+esac
+EOF
+    chmod +x "$1/bot-board"
 }
 
 # make_transcript RUN NAME [DIR]: packs the fixture transcript (or DIR)
@@ -643,8 +680,8 @@ test_dispatch() {
     printf 'Fix the fsck bug.\n' >"${WORK}/brief.md"
     out=$("${BOT_RUNS}" dispatch --item PVTI_item1 --repo composefs/composefs-rs --cores 16 --budget 250 "${WORK}/brief.md")
     expect_eq "${out}" "Dispatched run 1006: https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006" "dispatch output"
-    expect_json "$(jq -c '.inputs.brief = null' "${FAKE_GH}/dispatch-body.json")" '{"ref": "main", "return_run_details": true, "inputs": {
-        "item": "PVTI_item1", "repo": "composefs/composefs-rs", "base": "main", "agent": "claude", "model": "",
+    expect_json "$(jq -c '.inputs.brief = null' "${FAKE_GH}/dispatch-body.json")" '{"ref": "bot/agent-run-praxis", "return_run_details": true, "inputs": {
+        "item": "PVTI_item1", "repo": "composefs/composefs-rs", "base": "main", "agent": "opencode", "model": "",
         "cores": "16", "timeout": "120", "budget": "250", "workflow": "branch", "brief": null}}' "dispatch request"
     # The runner brief, the run's target, then the task.
     jq -e --rawfile p "${TESTS}/../dotfiles/.agents/skills/coordinator/runner-preamble.md" \
@@ -656,11 +693,31 @@ test_dispatch() {
         "api_url": "https://api.github.com/repos/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006"}' "dispatch --json"
     expect_json "$(jq -c '.inputs | {agent, model, workflow, timeout, brief}' "${FAKE_GH}/dispatch-body.json")" \
         '{"agent": "opencode", "model": "gpt-5-codex", "workflow": "analysis", "timeout": "330", "brief": "Write up the bisect."}' "dispatch from stdin"
+    # Each dispatch put its run on its item.
+    local run=${RUNS_URL}/1006
+    expect_eq "$(cat "${FAKE_GH}/board-calls")" "field-ensure Run
+set PVTI_item1 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 16 cores)
+field-ensure Run
+set PVTI_item2 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 4 cores)" "board calls"
     # --dry-run sends nothing.
     : >"${FAKE_GH}/calls"
+    : >"${FAKE_GH}/board-calls"
     out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs "${WORK}/brief.md")
     expect_lines "${out}" '^POST repos/bootc-dev/cgwalters-devspace-sandbox/actions/workflows/agent.yml/dispatches$' '"return_run_details": true'
     expect_eq "$(calls .)" 0 "calls of a dry run"
+    expect_eq "$(cat "${FAKE_GH}/board-calls")" "" "board calls of a dry run"
+}
+
+# The run is dispatched but the board can't record it: say how to fix
+# that by hand, rather than dispatching again.
+test_dispatch_board_failed() {
+    printf 'x\n' >"${WORK}/brief.md"
+    touch "${FAKE_GH}/board-fails"
+    local out
+    out=$("${BOT_RUNS}" dispatch --item PVTI_item1 --repo composefs/composefs-rs "${WORK}/brief.md" 2>&1) &&
+        fail "succeeded without recording the run"
+    expect_lines "${out}" '^Dispatched run 1006' \
+        "recording it on the board failed; run: bot-board set PVTI_item1 --status 'In Progress' --field Run ${RUNS_URL}/1006"
 }
 
 test_dispatch_invalid() {
@@ -717,6 +774,94 @@ test_dispatch_no_run_id() {
     expect_lines "${out}" "GitHub returned no run id; find it with 'bot-runs list --item PVTI_item1' instead of dispatching again"
 }
 
+# --- reconcile ---------------------------------------------------------------
+
+# reconcile_board: a board of items with a Run in each state, and one
+# without. Run 1001's summary gets a patch.
+reconcile_board() {
+    jq '.patch = {base: "abc", bytes: 1234}' "${FAKE_GH}/artifacts/1001/agent-run/summary.json" >"${WORK}/s.json"
+    mv "${WORK}/s.json" "${FAKE_GH}/artifacts/1001/agent-run/summary.json"
+    jq -n --arg r "${RUNS_URL}" '[
+        {id: "PVTI_running", title: "Running", status: "In Progress", run: "\($r)/1005"},
+        {id: "PVTI_failed", title: "Failed", status: "In Progress", run: "\($r)/1004"},
+        {id: "PVTI_patch", title: "Patch", status: "In Progress", run: "\($r)/1001"},
+        {id: "PVTI_nochange", title: "No change", status: "In Progress", run: "\($r)/1003"},
+        {id: "PVTI_moved", title: "Moved", status: "Done", run: "\($r)/1002"},
+        {id: "PVTI_bad", title: "Bad", status: "In Progress", run: "https://example.com/1"},
+        {id: "PVTI_local", title: "Local", status: "In Progress"}]' >"${FAKE_GH}/board.json"
+}
+
+test_reconcile() {
+    reconcile_board
+    local out want
+    # Without --apply: report only.
+    out=$("${BOT_RUNS}" reconcile)
+    expect_eq "${out}" "Running [In Progress] PVTI_running: run 1005 is in_progress
+Failed [In Progress] PVTI_failed: run 1004 ended (failure): set Todo (with --apply)
+Patch [In Progress] PVTI_patch: run 1001 succeeded, patch ready: set Draft (with --apply)
+No change [In Progress] PVTI_nochange: run 1003 ended (success): set Todo (with --apply)
+Moved [Done] PVTI_moved: run 1002 ended (failure) after the item left In Progress: clear Run (with --apply)
+Bad [In Progress] PVTI_bad: Run is not a run URL of bootc-dev/cgwalters-devspace-sandbox: https://example.com/1" "report"
+    expect_eq "$(grep -c '^set' "${FAKE_GH}/board-calls")" 0 "board changes without --apply"
+    # --dry-run prints the changes instead.
+    out=$("${BOT_RUNS}" reconcile --dry-run 2>&1 >/dev/null)
+    expect_lines "${out}" "^bot-board set PVTI_failed --status Todo --field Run '' --why "
+    expect_eq "$(grep -c '^set' "${FAKE_GH}/board-calls")" 0 "board changes of a dry run"
+    out=$("${BOT_RUNS}" reconcile --apply --json)
+    expect_json "$(jq -c 'map({item, result, applied})' <<<"${out}")" '[
+        {"item": "PVTI_running", "result": null, "applied": null},
+        {"item": "PVTI_failed", "result": "failure", "applied": "applied"},
+        {"item": "PVTI_patch", "result": "success", "applied": "applied"},
+        {"item": "PVTI_nochange", "result": "success", "applied": "applied"},
+        {"item": "PVTI_moved", "result": "failure", "applied": "applied"},
+        {"item": "PVTI_bad", "result": null, "applied": null}]' "reconcile --apply"
+    want=$(jq -c --arg r "${RUNS_URL}" '[
+        {id: "PVTI_running", status: "In Progress", run: "\($r)/1005"},
+        {id: "PVTI_failed", status: "Todo", run: null, why: "Agent run \($r)/1004 ended: failure",
+         news: "Devspace agent run 1004 ended (failure): \($r)/1004"},
+        {id: "PVTI_patch", status: "Draft", run: null,
+         why: "Agent run \($r)/1001 succeeded with a patch (1234 bytes): ready for bot-runs apply 1001 --slug SLUG --message FILE, then bot-pr fork-pr (not applied unattended until https://github.com/cgwalters-bot/homegit/pull/82 merges)",
+         news: "Devspace agent run 1001 succeeded; patch ready"},
+        {id: "PVTI_nochange", status: "Todo", run: null, why: "Agent run \($r)/1003 succeeded without a change",
+         news: "Devspace agent run 1003 ended (success): \($r)/1003"},
+        {id: "PVTI_moved", status: "Done", run: null},
+        {id: "PVTI_bad", status: "In Progress", run: "https://example.com/1"},
+        {id: "PVTI_local", status: "In Progress", run: null}]' <<<null)
+    expect_json "$(jq -c 'map({id, status, run, why, news} | with_entries(select(.value != null or .key == "run")))' "${FAKE_GH}/board.json")" \
+        "${want}" "board after --apply"
+    # Level-triggered: a second pass changes nothing.
+    : >"${FAKE_GH}/board-calls"
+    out=$("${BOT_RUNS}" reconcile --apply)
+    expect_eq "${out}" "Running [In Progress] PVTI_running: run 1005 is in_progress
+Bad [In Progress] PVTI_bad: Run is not a run URL of bootc-dev/cgwalters-devspace-sandbox: https://example.com/1" "second pass"
+    expect_eq "$(grep -c '^set' "${FAKE_GH}/board-calls")" 0 "board changes of a second pass"
+}
+
+# A run that can't be read fails the reconcile, but not the other items.
+test_reconcile_unreadable() {
+    jq -n --arg r "${RUNS_URL}" '[{id: "PVTI_gone", title: "Gone", status: "In Progress", run: "\($r)/999"},
+        {id: "PVTI_failed", title: "Failed", status: "In Progress", run: "\($r)/1004"}]' >"${FAKE_GH}/board.json"
+    local out
+    out=$("${BOT_RUNS}" reconcile --board-file "${FAKE_GH}/board.json" --apply 2>&1) && fail "succeeded with an unreadable run"
+    expect_lines "${out}" 'reading the run of item PVTI_gone failed' '^Failed .*: set Todo \(done\)$'
+}
+
+# A finished run whose files can't be read yet is left for a later pass:
+# its patch would look like no change.
+test_reconcile_files_unreadable() {
+    reconcile_board
+    jq '[.[] | select(.id == "PVTI_patch")]' "${FAKE_GH}/board.json" >"${WORK}/b.json"
+    mv "${WORK}/b.json" "${FAKE_GH}/board.json"
+    touch "${FAKE_GH}/artifacts-fail"
+    local out
+    out=$("${BOT_RUNS}" reconcile --apply 2>&1) && fail "succeeded without the run's files"
+    expect_lines "${out}" 'the files of run 1001 could not be read'
+    expect_eq "$(grep -c '^set' "${FAKE_GH}/board-calls")" 0 "board changes without the run's files"
+    rm "${FAKE_GH}/artifacts-fail"
+    out=$("${BOT_RUNS}" reconcile --apply)
+    expect_eq "${out}" "Patch [In Progress] PVTI_patch: run 1001 succeeded, patch ready: set Draft (done)" "reconcile once readable"
+}
+
 # --- runner -------------------------------------------------------------------
 
 all_tests() {
@@ -732,6 +877,9 @@ run_test() {
     cp -r "${FIXTURES}" "${FAKE_GH}"
     mkdir -p "${WORK}/bin" "${WORK}/home"
     write_fake_gh "${WORK}/bin"
+    write_fake_board "${WORK}/bin"
+    echo "[]" >"${FAKE_GH}/board.json"
+    export BOT_RUNS_BOT_BOARD=${WORK}/bin/bot-board
     export FAKE_GH WORK
     export PATH=${WORK}/bin:${PATH}
     export HOME=${WORK}/home XDG_STATE_HOME=${WORK}/home/state XDG_CACHE_HOME=${WORK}/home/cache

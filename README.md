@@ -138,7 +138,9 @@ in the Actions log and a summary artifact per run
 ([plan](https://gist.github.com/cgwalters-bot/3d0b10312e6d6170f8e07967b7795bed)).
 `bot-runs`, modeled on `gh aw logs` and `gh aw audit`, dispatches those
 runs and reads them back (`list`, `show`, `log`, `transcript`, `diff`
-and `stats`, over REST only). What a run leaves behind is specified in
+and `stats`, over REST only). A dispatched run is recorded in its board
+item's `Run` field, and `bot-runs reconcile` (on every `bot-watch`
+sweep) moves the item on when the run is over. What a run leaves behind is specified in
 [docs/devspace-agent-runs.md](docs/devspace-agent-runs.md), and
 `tests/bot-runs.sh` tests the tool offline against fixtures that follow
 it.

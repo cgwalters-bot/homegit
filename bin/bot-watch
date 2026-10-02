@@ -79,6 +79,8 @@ PROMOTE_DUE=$(dirname "$(readlink -f "$0")")/bot-promote-due
 readonly PROMOTE_DUE
 DRIVE=$(dirname "$(readlink -f "$0")")/bot-drive
 readonly DRIVE
+RUNS=$(dirname "$(readlink -f "$0")")/bot-runs
+readonly RUNS
 OPERATOR_ACTIVITY=$(dirname "$(readlink -f "$0")")/bot-operator-activity
 readonly OPERATOR_ACTIVITY
 # shellcheck source=bin/gh-http.sh disable=SC1091 # followed with shellcheck -x
@@ -161,6 +163,11 @@ With --apply, each gets 'bot-pr promote' (with --draft after his
 refused; with --dry-run (or --board-file), the command it would run;
 otherwise they are only listed. Approved fork PRs for a human-text
 repository are never promoted: they are listed under "Needs your text".
+
+Then "Devspace runs" ('bot-runs reconcile', see 'bot-runs --help'):
+the items whose Run field names a devspace agent run, and with --apply
+the In Progress ones whose run is over move on (a patch ready to Draft,
+anything else back to Todo).
 
 Then the "Operator activity" of 'bot-operator-activity' (see its
 --help): what ${REQUESTER} did on GitHub lately that the bot should act
@@ -924,6 +931,8 @@ step_start promote "${PROMOTE_DUE}" "${due_args[@]}"
 # bot-poll, which ignores the section).
 printf '%s\n' "${board}" >"${scratch}/full-board.json"
 step_start propagate "${PRIORITY_PROPAGATE}" "${due_args[@]}" --board-file "${scratch}/full-board.json"
+# The items whose devspace agent run is over move on (--apply only).
+step_start runs "${RUNS}" reconcile "${due_args[@]}" --board-file "${scratch}/board.json"
 # What the operator did that the bot should act on (by event, so
 # bot-poll wakes once per event however often a sweep lists it).
 step_start activity "${OPERATOR_ACTIVITY}" "${due_args[@]}" --board-file "${scratch}/board.json" ${now:+--now "${now}"}
@@ -1196,6 +1205,8 @@ promotion_failed=false
 promotions=$(due_step promote "promotions due") || promotion_failed=true
 propagation_failed=false
 propagation=$(due_step propagate "priority propagation") || propagation_failed=true
+runs_failed=false
+runs=$(due_step runs "devspace runs") || runs_failed=true
 activity_failed=false
 activity=$(due_step activity "operator activity") || activity_failed=true
 needs_text=$(jq -c '[.[] | select(.result == "needs-text")]' <<<"${promotions}")
@@ -1295,12 +1306,13 @@ if ${json}; then
         --slurpfile needs_text <(printf '%s\n' "${needs_text}") --argjson promotion_failed "${promotion_failed}" \
         --slurpfile activity <(printf '%s\n' "${activity}") --argjson activity_failed "${activity_failed}" \
         --slurpfile propagation <(printf '%s\n' "${propagation}") --argjson propagation_failed "${propagation_failed}" \
+        --slurpfile runs <(printf '%s\n' "${runs}") --argjson runs_failed "${runs_failed}" \
         '$new[0] as $new | $failed[0] as $failed | $gone[0] as $gone
          | $outstanding[0] as $outstanding | $needs_rebase[0] as $needs_rebase
          | {swept: {urls: $nurls, items: $nitems}, priority_health: $health[0], p0_drive: $drive[0], signoffs: $signoffs[0], promotions: $promotions[0], priority_propagation: $propagation[0],
-          operator_activity: $activity[0], needs_text: $needs_text[0], items: ., outstanding_reviews: $outstanding,
+          devspace_runs: $runs[0], operator_activity: $activity[0], needs_text: $needs_text[0], items: ., outstanding_reviews: $outstanding,
           needs_rebase: $needs_rebase, new_urls: $new, failed_urls: $failed, gone_urls: $gone, search_failed: $search_failed,
-          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, operator_activity_failed: $activity_failed, priority_propagation_failed: $propagation_failed, state_advanced: $advance}' <<<"${report}"
+          priority_health_failed: $health_failed, p0_drive_failed: $drive_failed, signoffs_failed: $signoff_failed, promotions_failed: $promotion_failed, operator_activity_failed: $activity_failed, devspace_runs_failed: $runs_failed, priority_propagation_failed: $propagation_failed, state_advanced: $advance}' <<<"${report}"
 else
     # First: these are to-dos, the items below only news. The P0 and P1
     # health lines come first of all.
@@ -1310,6 +1322,7 @@ else
     jq -r 'if length == 0 then empty else "Promotions:", (.[] | "  \(.line)"), "" end' <<<"${promotions}"
     jq -r 'if length == 0 then empty else "Needs your text:", (.[] | "  \(.line)"), "" end' <<<"${needs_text}"
     jq -r 'if length == 0 then empty else "Priority propagation:", (.[] | "  \(.line)"), "" end' <<<"${propagation}"
+    jq -r 'if length == 0 then empty else "Devspace runs:", (.[] | "  \(.line)"), "" end' <<<"${runs}"
     jq -r 'if length == 0 then empty else "Operator activity:", (.[] | "  \(.line)"), "" end' <<<"${activity}"
     jq -r --arg req "${REQUESTER}" "${REPO_REF_JQ}"'
         if length == 0 then empty else
@@ -1352,7 +1365,7 @@ else
               elif .allowed then " (with --apply)"
               else " (not applied from \($status // "no status"); a human decides)" end),
         ""' <<<"${report}"
-    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${drive}") P0 PRs driven, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${activity}") operator activity lines, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
+    echo "Swept ${nurls} URLs of ${nitems} board items: $(jq length <<<"${health}") priority health problems, $(jq length <<<"${drive}") P0 PRs driven, $(jq length <<<"${signoffs}") sign-offs, $(jq length <<<"${promotions}") promotions, $(jq length <<<"${runs}") devspace runs, $(jq length <<<"${activity}") operator activity lines, $(jq length <<<"${needs_text}") needing your text, $(jq length <<<"${report}") items with news, $(jq length <<<"${outstanding}") outstanding reviews, $(jq length <<<"${needs_rebase}") needing a rebase, $(jq length <<<"${new_urls}") URLs newly tracked, $(jq length <<<"${failed}") failed."
 fi
 
 # Failed URLs kept their last-seen state in new_seen, so their changes
@@ -1381,6 +1394,7 @@ test "${napply_failed}" -eq 0 || exit 1
 ! ${health_failed} || exit 1
 ! ${drive_failed} || exit 1
 ! ${activity_failed} || exit 1
+! ${runs_failed} || exit 1
 ! ${propagation_failed} || exit 1
 ! ${signoff_failed} || exit 1
 ! ${promotion_failed} || exit 1
