@@ -102,6 +102,12 @@ test("slots: busy agents per lane, candidates by priority, spread, then the oper
   assert.deepEqual([r.busy, r.target, r.unowned_in_progress], [2, 4, 1]);
   assert.deepEqual(r.lanes.upstream.active.map((a) => a.id), ["b1", "b3"]);
   assert.deepEqual([r.lanes.harness.free, r.lanes.upstream.free], [2, 0]);
+  // A lane's free slots are capped by the total's: [agents, harness_agents, total free, harness free, harness under_share]
+  const capped = [[4, 2, 2, 2, 0], [3, 2, 1, 1, 1], [2, 1, 0, 0, 1], [1, 1, 0, 0, 1]];
+  for (const [agents, harness, total, free, under] of capped) {
+    const c = report({ config: operator.resolve({ pacing: { agents, harness_agents: harness } }) });
+    assert.deepEqual([c.free, c.lanes.harness.free, c.lanes.harness.under_share, c.lanes.upstream.free], [total, free, under, 0], `${agents}/${harness}`);
+  }
   assert.deepEqual(r.lanes.harness.candidates.map((c) => c.id), ["t6"]);
   // P0 first; then the P1s in repositories nothing busy is in, by board order;
   // bootc, with a busy agent, last.
