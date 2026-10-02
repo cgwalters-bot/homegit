@@ -47,6 +47,10 @@ readonly NONE_RETRY_MINUTES=1440
 # credential; fake is the scripted agent, which needs no inference.
 readonly AGENTS='["opencode", "fake", "claude"]'
 readonly DEFAULT_AGENT=opencode
+# opencode's model for a run, in its provider/model form: GPT-6.1 Sol
+# through the praxis broker (the Codex subscription), so runs that don't
+# need Claude don't spend its usage. Other agents choose their own.
+readonly DEFAULT_OPENCODE_MODEL=${BOT_RUNS_MODEL:-praxis/gpt-6.1-sol}
 readonly CORES='["4", "16", "64"]'
 readonly WORKFLOWS='["branch", "analysis"]'
 readonly MAX_TIMEOUT=330
@@ -105,7 +109,8 @@ Commands:
       URL, then put the run URL in the item's ${RUN_FIELD} field (added to the
       board if missing), with Status ${RUN_STATUS} and a News line, and give the
       item a token budget ('bot-pace budget ITEM', unless it has one).
-      Defaults: base main, agent ${DEFAULT_AGENT}, 4 cores, ${DEFAULT_TIMEOUT} minutes,
+      Defaults: base main, agent ${DEFAULT_AGENT} (model ${DEFAULT_OPENCODE_MODEL}, as
+      provider/model; BOT_RUNS_MODEL or --model changes it), 4 cores, ${DEFAULT_TIMEOUT} minutes,
       budget ${DEFAULT_BUDGET} AIC, workflow branch. The task sent is the
       runner-side worker brief (runner-preamble.md in the coordinator
       skill), the run's target, then BRIEF; --no-preamble sends BRIEF
@@ -600,6 +605,9 @@ cmd_dispatch() {
     test -n "${base}" || fatal "--base must not be empty"
     jq -e --arg v "${agent}" 'index($v)' <<<"${AGENTS}" >/dev/null || fatal "--agent must be one of ${AGENTS}"
     jq -e --arg v "${cores}" 'index($v)' <<<"${CORES}" >/dev/null || fatal "--cores must be one of ${CORES}"
+    if test -z "${model}" && test "${agent}" = opencode; then
+        model=${DEFAULT_OPENCODE_MODEL}
+    fi
     jq -e --arg v "${workflow}" 'index($v)' <<<"${WORKFLOWS}" >/dev/null || fatal "--workflow must be one of ${WORKFLOWS}"
     if ! [[ "${timeout}" =~ ^[0-9]+$ ]] || test "${timeout}" -lt 1 || test "${timeout}" -gt "${MAX_TIMEOUT}"; then
         fatal "--timeout must be 1 to ${MAX_TIMEOUT} minutes (the job's cap is 360)"
