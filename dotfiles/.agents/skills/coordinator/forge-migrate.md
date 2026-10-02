@@ -2,6 +2,14 @@ Batch task: turn Draft board items into review-ready forge draft PRs
 
 Goal: the operator (`operator.login`, cgwalters by default) reviews everything as draft PRs on https://github.com/cgwalters-forge (the default config's forge org; see `bot-operator get forge_org`), one per item, each quick to judge. Your batch of board items is listed in your task. Process them one at a time, highest priority first. Follow `worker-preamble.md` throughout.
 
+A batch has no single board item, so its brief has no `Item:` line, and its tokens go to your scratch dir's task. Brief a subagent you start for one item with that item on a line of its own,
+
+```
+Item: ITEM_URL
+```
+
+so that `bot-cost` counts it toward that item; that subagent then ends its PR with `--footer <(bin/bot-footer --item ITEM_URL)` in step 6.
+
 For each item:
 1. `bot-board show ITEM`: read Why, Branch and Gist. Skip it (and say why in your report) if Branch is already a cgwalters-forge PR, or if the status isn't Draft when you start.
 2. Triage against current upstream (REST): is the issue/PR closed, already fixed on main, superseded, or duplicated by another board item? If so, don't make a PR: open a question issue proposing to close it as Done/duplicate (`bot-board question ITEM_URL "Close as ...?" --option ... --recommend ...`, see `workstream`), and give the evidence in your report. Analysis-only items (Workflow analysis) don't get PRs.

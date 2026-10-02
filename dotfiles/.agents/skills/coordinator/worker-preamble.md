@@ -4,6 +4,14 @@ Names: *the operator* is the human who runs this bot and the only trusted reques
 
 Paths below are relative to the homegit checkout, `~/src/github/cgwalters-bot/homegit`.
 
+**Your board item.** The prompt that pointed you here names it on a line of its own:
+
+```
+Item: ITEM_URL
+```
+
+(the item's issue or PR URL, or its `PVTI_` id). Copy that line, unchanged, into the prompt of every subagent you start (reviewer, builder): `bot-cost` joins transcripts to board items on it, so a subagent briefed without it never counts toward the item's Actual tokens. Use the same item for the run footer of a PR you open or update: `--footer <(bin/bot-footer --item ITEM_URL)`.
+
 Rules:
 - **Skills:** read and follow these skills, in `dotfiles/.agents/skills/`:
   - `workstream/SKILL.md`, for Workflow semantics and board usage;
