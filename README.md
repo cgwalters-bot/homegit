@@ -286,7 +286,12 @@ single bootc PR's matrix fills, and the bot tests every change on a
 devspace, whose results the PR description gives. Upstream CI runs once
 the PR is promoted. A change to a workflow itself is exercised by opting
 that workflow in (`bot-pr fork-setup REPO --ci FILE`, undone with
-`--no-ci`). The bot's
+`--no-ci`). A fork is either a midstream (the default: repository
+topic `bot-midstream`, main mirrors upstream, its PRs are drafts that are
+never merged, and `fork-setup` adds a ruleset that blocks merging them) or
+a real, possibly temporary, fork (`bot-fork`, set with
+`bot-pr fork-setup REPO --fork`), whose main may carry its own commits.
+The bot's
 personal forks (`cgwalters-bot/REPO`) are only for scratch work.
 
 `bot-pr` implements the bot's side: `fork-pr` creates the

@@ -38,7 +38,7 @@ readonly TOOL=${WORK}/land/bot-land
 mkdir -p "${WORK}/land"
 cp "${TESTS}/../bin/bot-land" "${TOOL}"
 # It loads the operator config (the default one here) from ../lib.
-mkdir -p "${WORK}/lib" && cp "${TESTS}/../lib/operator.js" "${WORK}/lib/"
+mkdir -p "${WORK}/lib" && cp "${TESTS}/../lib/operator.js" "${TESTS}/../lib/midstream.js" "${WORK}/lib/"
 ln -s "$(cd "${TESTS}/../bin" && pwd)/bot-git" "${WORK}/land/bot-git"
 cat >"${WORK}/land/bot-board" <<'EOF'
 #!/usr/bin/env bash
@@ -69,7 +69,7 @@ cat >"${WORK}/bin/gh" <<'EOF'
 set -euo pipefail
 printf '%s\n' "$*" >>"${FAKE_GH}/calls"
 case "$*" in
-    "api repos/acme/proj") echo '{"default_branch": "main"}' ;;
+    "api repos/acme/proj") if test -e "${FAKE_GH}/repo.json"; then cat "${FAKE_GH}/repo.json"; else echo '{"default_branch": "main"}'; fi ;;
     "api repos/acme/proj/pulls?state=open&head=acme%3Abot%2Ftopic") cat "${FAKE_GH}/open.json" ;;
     "api repos/acme/proj/pulls?state=all&head=acme%3Abot%2Fparent") cat "${FAKE_GH}/parent.json" ;;
     "api --silent -X PATCH repos/acme/proj/pulls/5 -f base="*) ;;
@@ -377,6 +377,28 @@ merged merged ${PARENT}
 gone gone ${PARENT}
 pruned pruned ${PARENT}
 explicit-base merged none --base ${PARENT}
+EOF
+
+# A midstream (the topic, or a GitHub fork with no topic) never takes a
+# merge; a repository that is neither, or a real fork, does.
+while read -r name status repo; do
+    setup
+    echo "${repo}" >"${FAKE_GH}/repo.json"
+    poll 1 merged
+    if test "${status}" -eq 0; then
+        run "midstream ${name}" 0 "." --timeout 1
+        called "pr merge 5" || fail "midstream ${name}: not landed"
+    else
+        run "midstream ${name}" "${status}" "is a midstream" --timeout 1
+        ! called "pr merge" || fail "midstream ${name}: enabled a merge"
+        ! called "-X POST repos/acme/proj/pulls" || fail "midstream ${name}: opened a PR"
+    fi
+done <<EOF
+topic ${EX_USAGE} {"default_branch":"main","topics":["bot-midstream"]}
+untagged-fork ${EX_USAGE} {"default_branch":"main","fork":true,"owner":{"login":"cgwalters-forge"}}
+bot-own-fork 0 {"default_branch":"main","fork":true,"owner":{"login":"cgwalters-bot"}}
+real-fork 0 {"default_branch":"main","fork":true,"topics":["bot-fork"]}
+own-repo 0 {"default_branch":"main","fork":false}
 EOF
 
 # Refusals: several commits without a title, main itself, nothing to land.
