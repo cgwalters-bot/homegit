@@ -45,8 +45,8 @@ or, after about $(((CYCLES * FAST_S + 59) / 60)) minutes with nothing,
   <bot-reconcile's Observed line, the inputs it couldn't read, and
    its exit status if it failed>
 
-Both end with why the heartbeat wasn't refreshed (or pruned), when it
-wasn't.
+Both report successful heartbeat prunes and why the heartbeat wasn't
+refreshed (or pruned), when it wasn't.
 
 With --until-actions it doesn't stop after a quiet window: it keeps
 cycling, so a background run of it ends only when there is something to
@@ -77,7 +77,7 @@ it at most hourly (sweep-problem).
 Each cycle first runs 'bot-heartbeat prune', then 'bot-heartbeat
 refresh': they republish the heartbeat as last published with
 updated_at moved to now, prune without the workers whose item is Done
-or closed, while that publish was this session's and nobody changed it
+or closed or whose activity expired (6h by default), while that publish was this session's and nobody changed it
 since. So the heartbeat stays fresh and drops finished workers without
 a wake, and is stale only when the refresh can't keep it so. Then it runs 'bot-reconcile --apply --state ${S}/actions.json'
 (--apply carries out the deterministic actions: closing finished items, clearing stale
@@ -252,6 +252,11 @@ refresh() {
     local rc=0 out
     out=$("${TOOLS}/bot-heartbeat" prune 2>&1) || rc=$?
     pruned=""
+    if test "${rc}" -eq 0; then
+        local dropped
+        dropped=$(grep -E '^bot-heartbeat: dropping ' <<<"${out}" || true)
+        test -z "${dropped}" || pruned_ok="${pruned_ok:+${pruned_ok}$'\n'}${dropped}"
+    fi
     test "${rc}" -eq 0 || test "${rc}" -eq 4 || pruned="$(tail -n1 <<<"${out}") (exit ${rc})"
     rc=0
     out=$("${TOOLS}/bot-heartbeat" refresh 2>&1) || rc=$?
@@ -288,6 +293,7 @@ wake() {
 }
 
 heartbeat_note() {
+    test -z "${pruned_ok}" || printf 'Heartbeat pruned: %s\n' "${pruned_ok}"
     test -z "${pruned}" || echo "Heartbeat not pruned: ${pruned}"
     test -z "${refreshed}" || echo "Heartbeat not refreshed: ${refreshed}"
 }
@@ -305,7 +311,7 @@ quiet_report() {
 trap 'test -z "${sleeper:-}" || kill "${sleeper}" 2>/dev/null; exit 143' TERM INT HUP
 sleeper=""
 
-cycle=0 refresh_fails=0 reconcile_fails=0
+cycle=0 refresh_fails=0 reconcile_fails=0 pruned_ok=""
 while :; do
     t=$(date +%H%M)
     hits=""

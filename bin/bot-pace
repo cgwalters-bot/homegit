@@ -126,7 +126,7 @@ function cmdAssign(argv) {
   if (item.run) throw new Exit(1, `${item.id} is owned by the run ${item.run}`);
   const b = budgetArgs(item, opts, false);
   setItem(item.id, ["--status", pace.ACTIVE_STATUS, "--field", "Lead", lead, ...b.args], opts["dry-run"]);
-  if (!opts["dry-run"]) heartbeat.register(item, item.id, { heartbeat: process.env.BOT_PACE_HEARTBEAT });
+  if (!opts["dry-run"]) heartbeat.register(item, item.id, { heartbeat: process.env.BOT_PACE_HEARTBEAT, location: "local" });
   process.stdout.write(`${item.id}: ${pace.ACTIVE_STATUS}, Lead ${lead}; ${b.note}\n`);
 }
 

@@ -930,6 +930,14 @@ is missing, invalid or no longer matches the published heartbeat; the
 board claim or run dispatch still stands. Recover by publishing the full
 current worker list, never by reconstructing input from the public JSON.
 
+The worker name identifies an execution: registering a distinct name for
+the same item replaces its old registration with fresh start time and
+metadata, so `done run-ID` removes the current run rather than leaving an
+older identity behind. Retrying the same name/item is a no-op, preserving
+activity and private metadata. A name already used for a different item
+is still rejected. Full publish, registration, cleanup, prune and refresh
+all hold the same state lock through publication and persistence.
+
 The review app's ops view can't see the workers on this machine, so
 publish them: whenever a worker starts, finishes or changes status, or
 the loop's state changes, pipe the current state to `bot-heartbeat publish`
@@ -941,9 +949,22 @@ moved to now, as long as that publish ran in this Claude Code session and
 nobody published since; when it can't, the loop's report ends with
 "Heartbeat not refreshed: WHY". Before that, `bot-heartbeat prune`
 republishes it the same way without the workers whose item is Done on
-the board or closed, so there is no need to publish just to drop a
-finished worker either; it never adds one, and keeps one whose item it
-can't read.
+the board or closed, and expires workers with no activity for 6 hours
+(inclusive; configure with positive `BOT_HEARTBEAT_STALE_HOURS`). The loop
+reports successful prunes and their reasons. Expiration uses the worker's
+`last_activity_at`, falling back to `started_at`, never the heartbeat's
+refresh time. Advance activity only on actual worker progress.
+
+On completion, failure, cancellation or blocking, call `bot-heartbeat done
+NAME`, even if the item stays Draft/open. It preserves other workers and
+the saved session owner under the registration lock and is idempotent.
+`bot-runs reconcile --apply` removes completed remote `run-ID` workers,
+including when artifacts are unavailable; successful `bot-runs apply` also
+removes them. Report/dry-run reconciliation changes no heartbeat state.
+Dispatch registers location `remote` with its engine/model; assign marks
+workers `local`. For local workers, publish their known engine/model and
+activity time with the full current input; never infer these from refresh
+or put task text in metadata. Unreadable items are kept until stale.
 
 ```bash
 jq -n --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '{

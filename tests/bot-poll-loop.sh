@@ -189,7 +189,7 @@ readonly DECLINED="bot-heartbeat: not refreshed: someone published since" HTTP50
 # [prune's exit status and stderr, refresh's, the report's last lines,
 # separated by ~]
 hb_cases=(
-    "0|bot-heartbeat: dropping w1 (Done)|0|bot-heartbeat: fresh: published 3 min ago|Observed: 4 of 4 agents busy"
+    "0|bot-heartbeat: dropping w1 (Done)|0|bot-heartbeat: fresh: published 3 min ago|Heartbeat pruned: bot-heartbeat: dropping w1 (Done)"
     "4|${DECLINED}|4|${DECLINED}|Heartbeat not refreshed: ${DECLINED} (exit 4)"
     "0||1|${HTTP502}|Heartbeat not refreshed: ${HTTP502} (exit 1)"
     "1|${HTTP502}|0||Heartbeat not pruned: ${HTTP502} (exit 1)"
