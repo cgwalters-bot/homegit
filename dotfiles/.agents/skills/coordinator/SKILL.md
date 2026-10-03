@@ -332,6 +332,23 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   while the total is under the target too: a lane short of its share
   while the other runs over is only noted in the Observed line. A busy task
   past its Budget tokens is a **budget** action.
+- **dispatch:** auto-dispatch, deterministic and opt-in: a lane with a
+  free slot, while the remote runs are under the opencode share, gets its
+  top Todo issue labeled `dispatch` (an issue in the bot's own
+  repositories, with `Repo: OWNER/REPO` in its body when it isn't in the
+  target repository; an optional `Base: REF`) dispatched as one `bot-runs
+  dispatch`. `bot-reconcile --apply` (which `bot-poll-loop` runs each cycle)
+  builds the brief from the issue (title, body, the operator's comments,
+  acceptance criteria; the operator's or the bot's issues only), removes the
+  label (one dispatch per label, so a run that fails and returns the item
+  to Todo isn't dispatched again unlabeled), and dispatches. A failure
+  leaves `auto-dispatch failed: ...` in the item's Why, and a labeled item
+  that can't be dispatched is a **dispatch-failed** action. Label an issue
+  yourself (`gh issue edit N --add-label dispatch`) to hand it to the
+  dispatcher.
+- **escalate:** an open issue labeled `escalate`: what the dispatcher
+  (see "The dispatcher") needs your judgment for. Read it, decide or ask
+  the operator, answer on the issue, close it.
 - **heartbeat:** the heartbeat is fresh and lists a worker for each
   busy item. `bot-poll-loop` keeps an unchanged heartbeat fresh itself,
   and drops the workers whose item went Done or closed, so a stale one
@@ -379,6 +396,20 @@ run `bot-reconcile` again to confirm they converged: what remains should
 be only what waits on someone else. An action that keeps coming back
 means the rule or the board is wrong: fix that rather than acting on it
 again.
+
+## The dispatcher
+
+What needs no judgment can run as a Sonnet session with a small context
+instead of this one: the `dispatcher` skill loops `bot-poll-loop
+--until-actions`, handles every action kind with the tools, runs the
+apply worker and the reviewers, merges per the rules below, and files
+an `escalate` issue (the `escalate` rule above) for what it must not
+decide: operator messages that need judgment, design questions,
+conflicts, anything critical, repeated failures, budgets over 2x. Then
+this session is for those, and the operator's messages. Don't run both
+loops at once: `bot-poll-loop` takes a lock, and the one that waits would
+fail. The target is for both to run as scheduled and event-triggered jobs
+(docs/scheduled-dispatcher.md).
 
 ## Topic sessions
 
@@ -437,9 +468,12 @@ bot-text work for a repository whose policy keeps the bot's text out.
 Fill a free slot with `bot-runs dispatch` (see "Devspace agent runs
 are the default"); only for the cases listed there that need a local
 worker, use `bot-pace assign ITEM` (In Progress, Lead `coordinator`, and
-its budget) before briefing it. `bot-reconcile`'s Observed line says how
-many of the busy agents are remote and how many local, and flags a drift
-toward local.
+its budget) before briefing it. The operator's mix is 1 remote run in 4
+agents (`pacing.opencode_share`, since `agent.yml` runs only opencode, so a
+remote run is the opencode share), the rest local Claude workers:
+`bot-reconcile`'s Observed line says how many of the busy agents are
+remote against that target, and flags a share that is over it. The
+`dispatch` rule fills the remote share by itself (see "Reconcile").
 
 Every task has a token budget, **Budget tokens** on the board: the upper
 bound of its Est. cost bucket, else its priority's bucket in
