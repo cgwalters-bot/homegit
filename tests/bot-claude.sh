@@ -234,6 +234,7 @@ alive "${worker}" || fail "an unverified legacy worker was signaled"
 kill -- "-${worker}"
 
 node "${TESTS}/bot-claude-lifecycle.test.js" "${BOT_CLAUDE}" "${WORK}"
+node "${TESTS}/bot-claude-completion.test.js"
 
 # log: the digest names the text and the tool call; --raw is the stream.
 bc log j-ok | grep -q '^tool: Bash ls$' || fail "log digest: $(bc log j-ok)"

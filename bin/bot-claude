@@ -12,6 +12,7 @@ const os = require("node:os");
 const path = require("node:path");
 
 const heartbeat = require(path.join(__dirname, "..", "lib", "heartbeat-register.js"));
+const { completionTracker } = require(path.join(__dirname, "..", "lib", "claude-completion.js"));
 
 const PROG = path.basename(process.argv[1] || "bot-claude");
 const SELF = fs.realpathSync(process.argv[1] || __filename);
@@ -102,10 +103,12 @@ const EX_FAILED = 1;
 const EX_USAGE = 2;
 const EX_JOB_TIMEOUT = 3;
 const EX_JOB_GONE = 4;
+const EX_INCOMPLETE = 5;
 const EX_WAIT_TIMEOUT = 124;
 
 const RUNNING = ["starting", "running"];
-const APPEND_PROMPT = `You are a worker run by bot-claude as a detached non-interactive process: nobody answers questions while you run, so decide, do the task, and end with a final report as your last message (it is stored as the job's result). Keep to the rules in your brief.`;
+const APPEND_PROMPT = `You are a worker run by bot-claude as a detached noninteractive process: nobody answers questions while you run, so decide and do the task to completion. Wait in the foreground with blocking bot-devspace wait, gh run watch, or bot-claude wait for dispatched work and verification. Never use run_in_background. Do not end while work or verification is pending, or promise to continue after your final message. End with a final report of completed work and verification (it is stored as the job's result). Keep to the rules in your brief.`;
+const ATTEMPT_FILES = ["brief.md", "job.json", "status.json", "stream.jsonl", "stderr.log", "result.md", "resume.md"];
 
 class Fatal extends Error {
   constructor(message, status = EX_USAGE) {
@@ -119,6 +122,7 @@ function usage() {
                        [--max-turns N] [--permission-mode MODE] [--add-dir DIR]...
                        [--append-system-prompt TEXT] [--effort LEVEL] BRIEF
        ${PROG} run    (same options: start, then wait, printing the result)
+       ${PROG} resume JOB
        ${PROG} status [--json] [JOB]
        ${PROG} wait [--timeout SEC] JOB
        ${PROG} log [--raw | --stderr] [--tail N] JOB
@@ -142,7 +146,7 @@ subagent.
 State is in ${STATE_ROOT}/JOB/: brief.md, job.json,
 stream.jsonl (the stream-json output), stderr.log, result.md and status.json:
 
-  state       starting, running, succeeded, failed, timeout, killed or lost
+  state       starting, running, succeeded, incomplete, failed, timeout, killed or lost
               (the supervisor died without recording an end)
   exit_code, started_at, ended_at, session_id, num_turns, last_activity,
   result (the final message), is_error, cost_usd and tokens (input, output,
@@ -169,10 +173,14 @@ Options:
 status [JOB]  with no JOB, the ${LIST_LIMIT} newest jobs; --json prints status.json.
 wait JOB      block until JOB ends (default --timeout ${DEFAULT_WAIT_TIMEOUT_S}s), then print its
               result. Exits ${EX_OK} succeeded, ${EX_FAILED} failed, ${EX_JOB_TIMEOUT} job timed out, ${EX_JOB_GONE} job killed
-              or lost, ${EX_WAIT_TIMEOUT} still running when SEC ran out, ${EX_USAGE} no such job or usage.
+              or lost, ${EX_INCOMPLETE} incomplete (further work promised or background tasks pending),
+              ${EX_WAIT_TIMEOUT} still running when SEC ran out, ${EX_USAGE} no such job or usage.
 log JOB       a digest of the stream (text and tool calls), its last N lines
               (default ${DEFAULT_LOG_TAIL}); --raw the stream-json, --stderr the process's stderr.
 kill JOB      stop the job's whole process group (SIGTERM, then SIGKILL).
+resume JOB    continue an ended, unsuccessful job with 'claude -p --resume SESSION',
+              reusing its options and directory. Prints JOB; follow with wait.
+              Prior evidence is preserved in attempts/N/; current results reset.
 
 start and run exit ${EX_USAGE} on bad usage, ${EX_FAILED} on any other error.
 `;
@@ -216,6 +224,7 @@ function loadStatus(job) {
     // The supervisor may have written its end between the two reads.
     const again = readJob(job);
     if (!RUNNING.includes(again.state)) return again;
+    if (supervisorAlive(again)) return again;
     Object.assign(again, { state: "lost", ended_at: nowIso(), exit_code: null });
     writeJson(statusFile(job), again);
     reapLost(again);
@@ -323,7 +332,7 @@ function cmdStart(argv) {
   const { brief: _source, ...job } = opts;
   writeJson(path.join(dir, "job.json"), job);
   // The status first: the supervisor reads it, and records its own pid.
-  const st = { job: opts.job, state: "starting", pid: null, dir: opts.dir, model: opts.model, item: opts.item,
+  const st = { job: opts.job, attempt: 1, state: "starting", pid: null, dir: opts.dir, model: opts.model, item: opts.item,
     timeout_min: opts.timeout_min, started_at: nowIso(), ended_at: null, exit_code: null };
   writeJson(statusFile(opts.job), st);
   spawn(process.execPath, [SELF, SUPERVISE_CMD, opts.job], { detached: true, stdio: "ignore" }).unref();
@@ -337,6 +346,69 @@ function cmdStartCli(argv) {
   return EX_OK;
 }
 
+function cmdResume(argv) {
+  const o = parseOptions(argv, {});
+  if (o.positional.length !== 1) throw new Fatal("resume takes one JOB (reuses its saved options)");
+  const id = o.positional[0];
+  readJob(id);
+  const dir = jobDir(id);
+  const lock = path.join(dir, "resume.lock");
+  let fd;
+  try {
+    fd = fs.openSync(lock, "wx");
+  } catch (e) {
+    throw new Fatal(e.code === "EEXIST" ? `job ${id}: resume already in progress (lock: ${lock})` : e.message, EX_FAILED);
+  }
+  try {
+    const previous = loadStatus(id);
+    if (RUNNING.includes(previous.state)) throw new Fatal(`job ${id} is still running; wait for it to end before resuming`);
+    if (supervisorAlive(previous)) throw new Fatal(`job ${id}: previous supervisor is still exiting; retry resume shortly`);
+    if (previous.state === "succeeded") throw new Fatal(`job ${id} already succeeded`);
+    if (!previous.session_id || typeof previous.session_id !== "string") throw new Fatal(`job ${id} has no Claude session to resume`);
+    const job = JSON.parse(fs.readFileSync(path.join(dir, "job.json"), "utf8"));
+    const attempt = previous.attempt || 1;
+    const history = path.join(dir, "attempts", String(attempt));
+    fs.mkdirSync(path.dirname(history), { recursive: true });
+    fs.mkdirSync(history);
+    try {
+      for (const name of ATTEMPT_FILES) {
+        const source = path.join(dir, name);
+        if (fs.existsSync(source)) fs.copyFileSync(source, path.join(history, name));
+      }
+    } catch (e) {
+      // Originals are untouched until every evidence file has been copied.
+      fs.rmSync(history, { recursive: true });
+      throw e;
+    }
+    try {
+      job.resume_session_id = previous.session_id;
+      writeJson(path.join(dir, "job.json"), job);
+      fs.writeFileSync(path.join(dir, "resume.md"), `${job.item ? `Item: ${job.item}\n\n` : ""}Continue the unfinished task from this session. Complete all outstanding work and verification before your final report. Follow the original brief and its rules.\n`);
+      for (const name of ["result.md", "stream.jsonl", "stderr.log"]) fs.rmSync(path.join(dir, name), { force: true });
+      const st = { job: id, attempt: attempt + 1, state: "starting", pid: null, dir: job.dir, model: job.model,
+        item: job.item, timeout_min: job.timeout_min, session_id: previous.session_id,
+        started_at: nowIso(), ended_at: null, exit_code: null };
+      writeJson(statusFile(id), st);
+      spawn(process.execPath, [SELF, SUPERVISE_CMD, id], { detached: true, stdio: "ignore" }).unref();
+    } catch (e) {
+      // A failed preparation must not leave a stale result paired with a new job.
+      for (const name of ATTEMPT_FILES) {
+        const source = path.join(history, name);
+        if (fs.existsSync(source)) fs.copyFileSync(source, path.join(dir, name));
+        else fs.rmSync(path.join(dir, name), { force: true });
+      }
+      fs.rmSync(history, { recursive: true });
+      throw e;
+    }
+    process.stderr.write(`${PROG}: job ${id} resumed; follow with ${PROG} wait ${id}\n`);
+    process.stdout.write(`${id}\n`);
+    return EX_OK;
+  } finally {
+    fs.closeSync(fd);
+    fs.unlinkSync(lock);
+  }
+}
+
 async function cmdRun(argv) {
   const st = cmdStart(argv);
   process.stderr.write(`${PROG}: job ${st.job} started (${st.model}, timeout ${st.timeout_min}m)\n`);
@@ -346,7 +418,7 @@ async function cmdRun(argv) {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const WAIT_STATUS = { succeeded: EX_OK, failed: EX_FAILED, timeout: EX_JOB_TIMEOUT, killed: EX_JOB_GONE, lost: EX_JOB_GONE };
+const WAIT_STATUS = { succeeded: EX_OK, incomplete: EX_INCOMPLETE, failed: EX_FAILED, timeout: EX_JOB_TIMEOUT, killed: EX_JOB_GONE, lost: EX_JOB_GONE };
 
 function summary(st) {
   const bits = [`job ${st.job}: ${st.state}`];
@@ -364,6 +436,7 @@ async function waitFor(job, limitMs) {
     if (!RUNNING.includes(st.state)) {
       process.stderr.write(`${summary(st)}\n`);
       if (st.result) process.stdout.write(`${st.result}\n`);
+      if (st.state === "incomplete") process.stderr.write(`${PROG}: ${st.incomplete_reasons.join("; ")}. Continue with '${PROG} resume ${job}', then '${PROG} wait ${job}'.\n`);
       return WAIT_STATUS[st.state] ?? EX_FAILED;
     }
     if (Date.now() >= deadline) {
@@ -515,6 +588,7 @@ function claudeArgs(job) {
     "--append-system-prompt", [APPEND_PROMPT, job.append_system_prompt].filter(Boolean).join("\n\n")];
   if (job.max_turns !== null) args.push("--max-turns", String(job.max_turns));
   if (job.effort) args.push("--effort", job.effort);
+  if (job.resume_session_id) args.push("--resume", job.resume_session_id);
   for (const d of job.add_dirs) args.push("--add-dir", d);
   return args;
 }
@@ -544,7 +618,7 @@ async function supervise(jobId) {
   const st = { ...readJob(jobId), pid: process.pid, supervisor_identity: processIdentity(process.pid), state: "running" };
   const save = () => {
     const recorded = readJob(jobId);
-    if (["killed", "lost"].includes(recorded.state)) return;
+    if (recorded.attempt !== st.attempt || ["killed", "lost"].includes(recorded.state)) return;
     writeJson(statusFile(jobId), st);
   };
   save();
@@ -574,7 +648,9 @@ async function supervise(jobId) {
 
   const streamFd = fs.openSync(path.join(dir, "stream.jsonl"), "w");
   const stderrFd = fs.openSync(path.join(dir, "stderr.log"), "w");
-  const briefFd = fs.openSync(path.join(dir, "brief.md"), "r");
+  const briefFd = fs.openSync(path.join(dir, job.resume_session_id ? "resume.md" : "brief.md"), "r");
+  const completion = completionTracker();
+  let resultSuccess = false;
   let lastWrite = 0;
   let pending = "";
   const onLine = (line) => {
@@ -585,9 +661,11 @@ async function supervise(jobId) {
       return;
     }
     st.last_activity = nowIso();
+    completion.observe(ev);
     if (ev.type === "system" && ev.subtype === "init") st.session_id = ev.session_id;
     if (ev.type === "assistant") st.num_turns = (st.num_turns || 0) + 1;
     if (ev.type === "result") {
+      resultSuccess = ev.subtype === "success";
       Object.assign(st, { result: ev.result ?? "", is_error: Boolean(ev.is_error), num_turns: ev.num_turns ?? st.num_turns,
         cost_usd: ev.total_cost_usd ?? 0, session_id: ev.session_id ?? st.session_id,
         tokens: { input: ev.usage?.input_tokens ?? 0, output: ev.usage?.output_tokens ?? 0,
@@ -702,7 +780,11 @@ async function supervise(jobId) {
     });
   }
   if (stopping) st.state = stopping;
-  else if (ended.code === 0 && st.result !== undefined && !st.is_error) st.state = "succeeded";
+  else if (ended.code === 0 && resultSuccess && st.result !== undefined && !st.is_error) {
+    const reasons = completion.reasons(st.result);
+    st.state = reasons.length ? "incomplete" : "succeeded";
+    if (reasons.length) st.incomplete_reasons = reasons;
+  }
   else st.state = "failed";
   st.ended_at = nowIso();
   save();
@@ -714,6 +796,7 @@ async function main(argv) {
     switch (cmd) {
       case "start": return cmdStartCli(rest);
       case "run": return await cmdRun(rest);
+      case "resume": return cmdResume(rest);
       case "status": return cmdStatus(rest);
       case "wait": return await cmdWait(rest);
       case "log": return cmdLog(rest);
