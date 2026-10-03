@@ -72,10 +72,20 @@ JS
 chmod +x "${WORK}/bin/claude"
 # Fakes for the actuals sweep and the heartbeat's publish (which saves what
 # it was given as the state the registration reads next).
-cat >"${WORK}/bin/actuals" <<'SH'
-#!/bin/sh
-echo "$*" >>"${FAKE_OUT}/actuals.calls"
-SH
+cat >"${WORK}/bin/actuals" <<'JS'
+#!/usr/bin/env node
+const fs = require("fs");
+fs.appendFileSync(`${process.env.FAKE_OUT}/actuals.calls`, process.argv.slice(2).join(" ") + "\n");
+const mode = fs.existsSync(`${process.env.FAKE_OUT}/actuals.mode`) ? fs.readFileSync(`${process.env.FAKE_OUT}/actuals.mode`, "utf8") : "ok";
+if (mode === "block") {
+  const child = require("child_process").spawn("sleep", ["300"], { stdio: "ignore" });
+  fs.writeFileSync(`${process.env.FAKE_OUT}/actuals.sleep.pid`, String(child.pid));
+  setInterval(() => {}, 1000);
+}
+else if (mode === "delay") setTimeout(() => {}, 11000);
+else if (mode === "fail") { process.stderr.write("actuals failed\n"); process.exitCode = 7; }
+fs.writeFileSync(`${process.env.FAKE_OUT}/actuals.started`, String(process.pid));
+JS
 cat >"${WORK}/bin/heartbeat" <<JS
 #!/usr/bin/env node
 const fs = require("fs");
@@ -209,8 +219,8 @@ bc wait --timeout 5 j-lost >/dev/null 2>&1 || rc=$?
 expect_eq "lost wait exit" "${rc}" "4"
 expect_eq "lost state" "$(status_of j-lost .state)" "lost"
 
-# ... and its worker, if still running with the job's name on its command
-# line, is killed with it (a stranger's process with a reused pid is not).
+# Legacy status has no verifiable identity: even a matching job name must
+# not authorize signaling a potentially reused pid.
 setsid bash -c 'sleep 300; :' j-lost2 &
 worker=$!
 disown
@@ -220,7 +230,10 @@ bc status j-lost2 >/dev/null
 # (A killed child of this shell may stay a zombie until waited for.)
 alive() { [[ -n $(ps -o stat= -p "$1") && $(ps -o stat= -p "$1") != Z* ]]; }
 for _ in $(seq 20); do alive "${worker}" || break; sleep 0.1; done
-! alive "${worker}" || fail "a lost job's worker kept running"
+alive "${worker}" || fail "an unverified legacy worker was signaled"
+kill -- "-${worker}"
+
+node "${TESTS}/bot-claude-lifecycle.test.js" "${BOT_CLAUDE}" "${WORK}"
 
 # log: the digest names the text and the tool call; --raw is the stream.
 bc log j-ok | grep -q '^tool: Bash ls$' || fail "log digest: $(bc log j-ok)"
