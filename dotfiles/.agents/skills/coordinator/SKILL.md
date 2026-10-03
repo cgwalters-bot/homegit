@@ -170,7 +170,7 @@ set: that run still owns it.
 
 A run's patch comes back to the board as a Draft item whose Why says
 "ready for bot-runs apply RUN". The reconcile rule **patch-ready** names
-it. The flow, once `bot-runs apply` may run unattended: dispatch a local
+it. On the operator's word, dispatch a local
 Sonnet worker (Agent with `model: sonnet`) on `apply-preamble.md`, with
 `Item:` and `Run:` lines. It reads the run, applies the patch with `bot-runs
 apply` (which re-checks it), reviews the diff as a reviewer would, and
@@ -179,13 +179,12 @@ item Draft with the PR as its Branch. A separate reviewer then checks that
 PR, like any worker's result. A patch the worker can't vouch for goes back
 as a new run with the feedback in its brief, not as a local rewrite.
 
-`bot-runs apply` isn't run unattended yet: its hardening is
-[homegit#82](https://github.com/cgwalters-bot/homegit/pull/82), a critical
-change for the operator's review. Until it merges the patch-ready action
-only reports the patch, and applying it waits for the operator's word. The
-switch is one line, `APPLY_UNATTENDED` in `lib/reconcile.js`: set it to
-`true` after #82 lands and the action tells you to dispatch the apply
-worker.
+`APPLY_UNATTENDED` in `lib/reconcile.js` remains false: the patch-ready
+action points at the apply worker, but dispatch waits for the operator's
+word. Enabling unattended dispatch is a separate policy decision.
+Apply accepts workflow branches `bot/agent-run-*` (nonempty suffix) in the
+configured devspace, independently of `BOT_RUNS_REF`;
+see docs/devspace-agent-runs.md for the checks and managed worktree paths.
 
 ## Polling
 
@@ -834,6 +833,15 @@ completions wake the session too; handle them as they arrive, then run
 (no watcher subagents).
 
 ## Heartbeat
+
+`bot-pace assign` and `bot-runs dispatch` append a starting worker from
+the saved local input in `${XDG_STATE_HOME:-~/.local/state}/bot-heartbeat/last-publish.json`
+and publish it through `bot-heartbeat publish`. Existing workers, private
+`agent_ids`, coordinator state and the saved session owner are preserved;
+`next_wake_at` moves with `updated_at`. Registration warns if saved state
+is missing, invalid or no longer matches the published heartbeat; the
+board claim or run dispatch still stands. Recover by publishing the full
+current worker list, never by reconstructing input from the public JSON.
 
 The review app's ops view can't see the workers on this machine, so
 publish them: whenever a worker starts, finishes or changes status, or

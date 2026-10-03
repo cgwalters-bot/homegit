@@ -159,7 +159,7 @@ fs.writeFileSync(path.join(TMP, "operator.json"), "{}");
 
 function pacecli(args, status = 0) {
   fs.rmSync(LOG, { force: true });
-  const r = spawnSync(TOOL, args, { encoding: "utf8", env: { ...process.env, BOT_PACE_BOARD: FAKE_BOARD, BOT_OPERATOR_CONFIG: path.join(TMP, "operator.json") } });
+  const r = spawnSync(TOOL, args, { encoding: "utf8", env: { ...process.env, XDG_STATE_HOME: path.join(TMP, "state"), BOT_PACE_BOARD: FAKE_BOARD, BOT_OPERATOR_CONFIG: path.join(TMP, "operator.json") } });
   assert.equal(r.status, status, `${args}: ${r.stderr}`);
   return { out: r.stdout, err: r.stderr, calls: fs.existsSync(LOG) ? fs.readFileSync(LOG, "utf8").trim().split("\n") : [] };
 }

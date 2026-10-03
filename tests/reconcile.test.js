@@ -337,15 +337,25 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
     ["answer-unapplied", "closed-not-done", "heartbeat", "lead-orphan", "patch-ready", "stale-lead"]);
 });
 
-test("patch-ready: a Draft item whose Why names a run's patch is reported until the switch is on", () => {
-  const [a] = rec.patchReady(obs());
-  assert.equal(a.url, "https://github.com/cgwalters-forge/tracker/issues/60");
-  assert.match(a.do, /^devspace run 4242's patch is ready, but bot-runs apply isn't run unattended until cgwalters-bot\/homegit#82 merges/);
-  assert.equal(rec.APPLY_UNATTENDED, false, "the switch stays off until homegit#82 merges");
-  // With the switch on: a Sonnet worker applies it.
-  const [on] = rec.patchReady(obs({ applyUnattended: true }));
-  assert.match(on.do, /^devspace run 4242's patch is ready: dispatch a local Sonnet worker .*apply-preamble\.md/);
-  assert.equal(on.key, a.key);
+test("patch-ready: operator-released by default, with explicit false/true overrides", () => {
+  assert.equal(rec.APPLY_UNATTENDED, false, "unattended apply requires a separate policy decision");
+  const cases = [
+    ["default", {}, false],
+    ["explicitly disabled", { applyUnattended: false }, false],
+    ["explicitly enabled", { applyUnattended: true }, true],
+  ];
+  for (const [name, changes, unattended] of cases) {
+    const actions = rec.patchReady(obs(changes));
+    assert.equal(actions.length, 1, name);
+    const [a] = actions;
+    assert.equal(a.url, "https://github.com/cgwalters-forge/tracker/issues/60", name);
+    assert.equal(a.key, "patch-ready:https://github.com/cgwalters-forge/tracker/issues/60:4242", name);
+    assert.match(a.do, /dispatch a local Sonnet .*\(model sonnet\) on apply-preamble\.md to bot-runs apply it, review it and open or update the PR$/, name);
+    if (unattended) assert.match(a.do, /^devspace run 4242's patch is ready: dispatch/, name);
+    else assert.match(a.do, /^devspace run 4242's patch is ready; unattended apply is disabled: on the operator's word, dispatch/, name);
+    assert.doesNotMatch(a.do, /until .*merges|homegit#82/, name);
+    assert.equal(a.apply, undefined, `${name}: dispatch guidance, not a board write`);
+  }
   // Applied and proposed: Why no longer says ready, or the item left Draft.
   const board = read("board.json");
   assert.deepEqual(rec.patchReady(obs({ items: setItem(board, "PVTI_p1", { why: "Draft PR https://github.com/cgwalters-forge/r/pull/9" }) })), []);

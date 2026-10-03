@@ -70,13 +70,23 @@ Status In Progress with a News line. `bot-runs reconcile`, which
 on the item stays In Progress; once it is over, an item still In
 Progress moves to Draft if the run succeeded with a patch (ready for
 `bot-runs apply`; `bot-reconcile`'s patch-ready rule then names it, and
-a local Sonnet worker applies, reviews and proposes it, see "Applying a
-run's patch" in the coordinator skill. That isn't run unattended until
-[homegit#82](https://github.com/cgwalters-bot/homegit/pull/82) hardens
-`apply`), and back to Todo otherwise (failure, timeout, budget, cancelled, or
+a local Sonnet apply worker applies, reviews and proposes it on the
+operator's word, see `dotfiles/.agents/skills/coordinator/apply-preamble.md`.
+`APPLY_UNATTENDED` in `lib/reconcile.js` remains false; enabling unattended
+dispatch is a separate policy decision), and back to Todo otherwise (failure, timeout, budget, cancelled, or
 no change), with Why and News linking the run. Either way `Run` is
 cleared, so an item In Progress without a `Run` is local work, and a
 finished run never moves an item twice.
+
+After claiming the item, `bot-runs dispatch` and local `bot-pace assign`
+register a starting worker through `bot-heartbeat publish` from the saved
+input at `${XDG_STATE_HOME:-~/.local/state}/bot-heartbeat/last-publish.json`.
+They preserve existing workers, private `agent_ids`, coordinator state and
+the saved session owner, shifting `next_wake_at` with `updated_at`. Missing
+or invalid saved state, or a published heartbeat that differs from it,
+produces a warning; the claim or dispatch remains in effect. Publish the
+full current worker list to recover, rather than rebuilding input from
+the public heartbeat, which omits private fields.
 
 ## Artifacts
 
@@ -105,7 +115,9 @@ The patch isn't redacted, because that would corrupt it; a
 secret-shaped string in it fails the upload instead.
 `bot-runs apply RUN --repo OWNER/REPO --slug SLUG --message FILE`
 treats all of it as untrusted and checks it again locally. The run must
-be a successful dispatch of `agent.yml` from the expected ref, for the
+be a successful `workflow_dispatch` of `.github/workflows/agent.yml` in the
+configured devspace repository, with matching head and run repository ids,
+from `bot/agent-run-*` (a nonempty suffix), for the
 declared repository (its title, summary and `base.json` all agreeing),
 and the artifact must be the only `agent-out` of that run and head,
 made during its one job, `Agent` (the one running the agent as
@@ -116,11 +128,29 @@ way). The change, as git sees it once applied, may hold no
 secret-shaped strings, binaries, symlinks, submodules, mode changes or
 new executables, and may touch only plain relative paths outside `.git*`
 (including `.github/` and `.gitattributes`) and CI or hook
-configuration. It is applied with hooks and the caller's git
-configuration off, in a fresh clone whose `origin` has no push URL, and
-committed as the bot on `bot/SLUG` with an `Agent-run:` trailer linking
-the run attempt; a refused change's clone is removed. Nothing is pushed:
-after review, `bot-pr fork-pr --from DIR` opens it on the forge.
+configuration. `BOT_RUNS_REF` selects the dispatch branch; changing it does
+not expand this apply allowlist (including to `main`). It is applied with
+hooks, fsmonitor and the caller's git configuration off, in a managed
+`bot-work` worktree backed by a fresh isolated clone whose `origin` has no
+usable push URL, and committed as the bot on `bot/SLUG` with an `Agent-run:`
+trailer linking the run attempt. Nothing is pushed: after review,
+`bot-pr fork-pr --from DIR` opens it on the forge and records Branch, Why
+and News on the item and sets it Draft.
+
+Apply uses `bot-work worktree add REPO_DIR SLUG --base COMMIT`, defaulting
+to `${XDG_CACHE_HOME:-~/.cache}/bot-work/SLUG/REPO`. Its `--dir DIR` option
+passes a custom destination to that helper, which registers it under the
+same cache entry; a custom destination outside the worktree cache must
+not already exist; missing parent directories are created. The backing clone is
+`${XDG_CACHE_HOME:-~/.cache}/bot-runs/apply/sources/RUN_ID-SLUG/REPO`, even
+with `--dir`; keep it while the linked worktree exists. A refusal removes
+the managed worktree and then its backing clone; if worktree removal
+fails, the clone is preserved for recovery. After the PR is open, use
+`bot-work worktree rm SLUG --dir DIR` (or omit `--dir` to remove all that
+slug's managed worktrees), then remove the backing clone once nothing
+needs its commits. The helper prunes Git registrations and preserves
+branches in the backing clone; it refuses tracked or untracked changes
+unless `--force` is given after verifying they can be discarded.
 
 **`agent-transcript`**, with `retention-days: 30`, holds one file,
 `transcript.tar.zst`: a zstd-compressed tar, public like the rest, since the
