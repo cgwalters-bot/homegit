@@ -45,6 +45,76 @@ test("segments strip quotes and heredocs and resolve program variables", () => {
   for (const [cmd, want] of cases) assert.deepEqual(retro.segments(cmd), want, cmd);
 });
 
+test("scanCommand flags shared-clone mutations but not narrow inspection modes", () => {
+  const clone = path.join(FAKE_HOME, "src/github/cgwalters-bot/repo");
+  const cases = [
+    ["stash list", false],
+    ["stash list --oneline", false],
+    ["stash show", false],
+    ["stash show -p stash@{1}", false],
+    ["stash push", true],
+    ["stash pop", true],
+    ["stash", true],
+    ["stash -q", true],
+    ["stash save", true],
+    ["stash apply", true],
+    ["stash drop", true],
+    ["stash clear", true],
+    ["stash branch topic", true],
+    ["stash create", true],
+    ["stash store HEAD", true],
+    ["stash push -- list", true],
+    ["stash -q list", true],
+    ["stash listing", true],
+    ["stash showing", true],
+    ["checkout topic", true],
+    ["checkout -- file", false],
+    ["merge --ff-only topic", false],
+    ["merge topic", true],
+    ["merge --abort", true],
+    ["merge --quit", true],
+    ["rebase --show-current-patch", false],
+    ["rebase --show-current-patch=diff", true],
+    ["rebase --show-current-patch-extra", true],
+    ["rebase --show-current-patch --abort", true],
+    ["rebase --abort --show-current-patch", true],
+    ["rebase --", true],
+    ["rebase topic", true],
+    ["rebase --continue", true],
+    ["rebase --skip", true],
+    ["rebase --abort", true],
+    ["rebase --quit", true],
+    ["rebase --edit-todo", true],
+    ["am --show-current-patch", false],
+    ["am --show-current-patch=raw", false],
+    ["am --show-current-patch=diff", false],
+    ["am --show-current-patch=", true],
+    ["am --show-current-patch=other", true],
+    ["am --show-current-patch raw", true],
+    ["am --show-current-patch --abort", true],
+    ["am --abort --show-current-patch=diff", true],
+    ["am patch.mbox", true],
+    ["am --continue", true],
+    ["am --skip", true],
+    ["am --abort", true],
+    ["am --quit", true],
+    ["am --retry", true],
+    ["am --allow-empty", true],
+  ];
+  for (const [args, changing] of cases) {
+    for (const [cmd, cwd] of [
+      [`git ${args}`, clone],
+      [`git -C ${clone} ${args}`, "/tmp"],
+      [`cd ${clone} && bot-git ${args}`, "/tmp"],
+    ]) {
+      const signals = [];
+      retro.scanCommand({ id: "worker", remote: false }, cmd, cwd,
+        (category, kind) => signals.push([category, kind]), { templates: new Map(), graphql: {} });
+      assert.deepEqual(signals, changing ? [["policy", "shared_clone"]] : [], cmd);
+    }
+  }
+});
+
 test("tool errors are classified", () => {
   const cases = [
     ["<tool_use_error>Blocked: sleep 60 followed by: cat x</tool_use_error>", "blocked_sleep"],
