@@ -6,10 +6,12 @@
 "use strict";
 
 const { spawn, spawnSync } = require("node:child_process");
+const { randomBytes } = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const readline = require("node:readline");
+const { processIdentity, signalJob } = require("../lib/process-identity");
 
 const PROG = path.basename(process.argv[1] || "bot-opencode");
 // The Agent Client Protocol version this client speaks, and what it calls
@@ -25,6 +27,7 @@ const DEFAULT_TIMEOUT_MIN = 30;
 const CANCEL_GRACE_MS = 15000;
 // Time it gets to exit on SIGTERM before SIGKILL.
 const KILL_GRACE_MS = 5000;
+const TOKEN_VAR = "BOT_OPENCODE_JOB_TOKEN";
 const EX_ERROR = 1;
 const EX_USAGE = 2;
 const EX_TIMEOUT = 124;
@@ -325,6 +328,7 @@ async function main() {
   const inherited = Object.fromEntries(Object.entries(process.env)
     .filter(([k]) => INHERITED_ENV.includes(k) || k.startsWith("LC_")));
   const hooksDir = makeNoCommitHooks();
+  const jobToken = randomBytes(32).toString("hex");
   const child = spawn("opencode", ["acp"], {
     cwd: wt.dir, stdio: ["pipe", "pipe", "ignore"], detached: true,
     // Inference comes only from the praxis provider of homegit's
@@ -335,15 +339,11 @@ async function main() {
       ...inherited, ...botIdentityEnv(), HOME: makeAgentHome(), SHELL: "/bin/bash",
       OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_CLAUDE_CODE: "1",
       GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hooksDir,
+      [TOKEN_VAR]: jobToken,
     },
   });
-  const killGroup = (signal) => {
-    try {
-      process.kill(-child.pid, signal);
-    } catch {
-      // Already gone.
-    }
-  };
+  const childIdentity = child.pid ? processIdentity(child.pid) : null;
+  const killJob = (signal) => signalJob(childIdentity, TOKEN_VAR, jobToken, signal);
 
   // The agent's message text, one entry per run of chunks between tool
   // calls: the last one is its final message.
@@ -434,9 +434,16 @@ async function main() {
     stopReason = stopReason || "error";
   } finally {
     clearTimeout(timer);
-    killGroup("SIGTERM");
-    await Promise.race([acp.closed, new Promise((r) => setTimeout(r, KILL_GRACE_MS).unref())]);
-    killGroup("SIGKILL");
+    killJob("SIGTERM");
+    let killTimer;
+    try {
+      await Promise.race([acp.closed, new Promise((r) => {
+        killTimer = setTimeout(r, KILL_GRACE_MS).unref();
+      })]);
+    } finally {
+      clearTimeout(killTimer);
+      killJob("SIGKILL");
+    }
     fs.rmSync(hooksDir, { recursive: true, force: true });
     acp.trace = null;
     if (trace !== null) fs.closeSync(trace);
