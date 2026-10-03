@@ -168,7 +168,7 @@ test("bot-actuals sets Actual tokens on Done items without one; --dry-run only p
   assert.match(out, /^set Actual tokens = 1234 on PVTI_a/m);
   // PVTI_b already has a value and PVTI_c is not Done.
   assert.doesNotMatch(out, /PVTI_[bc]/);
-  assert.equal(fs.readFileSync(BOARD_LOG, "utf8"), "set PVTI_a --field Actual tokens 1234\n");
+  assert.equal(fs.readFileSync(BOARD_LOG, "utf8"), "field-ensure --number Actual tokens\nset PVTI_a --field Actual tokens 1234\n");
   assert.match(run(["--dry-run", "--all"]), /Actual tokens = 5 on PVTI_b/);
 });
 
