@@ -170,7 +170,7 @@ set: that run still owns it.
 
 A run's patch comes back to the board as a Draft item whose Why says
 "ready for bot-runs apply RUN". The reconcile rule **patch-ready** names
-it. On the operator's word, dispatch a local
+it. Dispatch a local
 Sonnet worker (Agent with `model: sonnet`) on `apply-preamble.md`, with
 `Item:` and `Run:` lines. It reads the run, applies the patch with `bot-runs
 apply` (which re-checks it), reviews the diff as a reviewer would, and
@@ -186,9 +186,9 @@ provide. A separate reviewer then checks that
 PR, like any worker's result. A patch the worker can't vouch for goes back
 as a new run with the feedback in its brief, not as a local rewrite.
 
-`APPLY_UNATTENDED` in `lib/reconcile.js` remains false: the patch-ready
-action points at the apply worker, but dispatch waits for the operator's
-word. Enabling unattended dispatch is a separate policy decision.
+The patch-ready action tells you to dispatch the apply worker without
+waiting for the operator (`APPLY_UNATTENDED` in `lib/reconcile.js`): it
+opens a draft PR and never merges; merging stays with the review step.
 Apply accepts workflow branches `bot/agent-run-*` (nonempty suffix) in the
 configured devspace, independently of `BOT_RUNS_REF`;
 see docs/devspace-agent-runs.md for the checks and managed worktree paths.
@@ -373,8 +373,9 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   of that kind carry over as still open (the Observed line names the
   step), so they neither drop out nor wake you again once it recovers.
 - **patch-ready:** a Draft item whose Why says a devspace run's patch is
-  ready for `bot-runs apply` (see "Applying a run's patch"). Reported only,
-  as waiting for the operator, until `APPLY_UNATTENDED` is switched on.
+  ready for `bot-runs apply` (see "Applying a run's patch"): dispatch the
+  Sonnet apply worker. Only reported, as waiting for the operator, if
+  `APPLY_UNATTENDED` is switched off.
 - **answer-unapplied:** a question the operator answered whose Unblocks
   items are still open and untouched since the answer.
 - **closed-not-done:** an item whose own issue or PR is closed or merged

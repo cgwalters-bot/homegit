@@ -337,10 +337,10 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
     ["answer-unapplied", "closed-not-done", "dispatch", "dispatch-failed", "escalate", "heartbeat", "lead-orphan", "patch-ready", "stale-lead"]);
 });
 
-test("patch-ready: operator-released by default, with explicit false/true overrides", () => {
-  assert.equal(rec.APPLY_UNATTENDED, false, "unattended apply requires a separate policy decision");
+test("patch-ready: unattended by default, with explicit false/true overrides", () => {
+  assert.equal(rec.APPLY_UNATTENDED, true);
   const cases = [
-    ["default", {}, false],
+    ["default", {}, true],
     ["explicitly disabled", { applyUnattended: false }, false],
     ["explicitly enabled", { applyUnattended: true }, true],
   ];

@@ -83,10 +83,9 @@ Status In Progress with a News line. `bot-runs reconcile`, which
 on the item stays In Progress; once it is over, an item still In
 Progress moves to Draft if the run succeeded with a patch (ready for
 `bot-runs apply`; `bot-reconcile`'s patch-ready rule then names it, and
-a local Sonnet apply worker applies, reviews and proposes it on the
-operator's word, see `dotfiles/.agents/skills/coordinator/apply-preamble.md`.
-`APPLY_UNATTENDED` in `lib/reconcile.js` remains false; enabling unattended
-dispatch is a separate policy decision), and back to Todo otherwise (failure, timeout, budget, cancelled, or
+a local Sonnet apply worker applies, reviews and proposes it, see
+`dotfiles/.agents/skills/coordinator/apply-preamble.md`; it opens a draft
+PR and never merges), and back to Todo otherwise (failure, timeout, budget, cancelled, or
 no change), with Why and News linking the run. Either way `Run` is
 cleared, so an item In Progress without a `Run` is local work, and a
 finished run never moves an item twice.
