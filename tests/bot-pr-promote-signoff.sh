@@ -11,7 +11,6 @@ set -euo pipefail
 
 TESTS=$(cd "$(dirname "$0")" && pwd)
 readonly TESTS
-readonly BOT_PR=${TESTS}/../bin/bot-pr
 readonly BOT_NAME="Colin Walters" BOT_EMAIL=walters+llm@verbum.org
 # The name of the bot's older commits, which promote replaces with BOT_NAME
 # where it rewrites them.
@@ -23,6 +22,7 @@ readonly TRAILER='Generated-by: https://github.com/cgwalters/#llms'
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/bot-pr-promote-test.XXXXXX")
 readonly WORK
+readonly BOT_PR=${WORK}/bin/bot-pr
 trap 'rm -rf "${WORK}"' EXIT
 readonly REMOTES=${WORK}/remotes SRC=${WORK}/src
 export FAKE_GH=${WORK}/gh REMOTES
@@ -41,6 +41,22 @@ fail() {
 }
 
 mkdir -p "${WORK}/bin" "${FAKE_GH}/rest" "${FAKE_GH}/opened" "${WORK}/hooks"
+# Like refresh-meta's fake board, keep fork-pr's inbox state offline.
+cp "${TESTS}/../bin/bot-pr" "${TESTS}/../bin/bot-git" "${TESTS}/../bin/dco-detect.sh" "${TESTS}/../bin/review-state.sh" \
+    "${TESTS}/../bin/operator.sh" "${TESTS}/../bin/bot-operator" "${WORK}/bin/"
+mkdir -p "${WORK}/lib"
+cp "${TESTS}/../lib/operator.js" "${WORK}/lib/"
+export BOT_PR_UPSTREAM_POLICY=${TESTS}/../bin/upstream-policy
+cat >"${WORK}/bin/bot-board" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$1" in
+    state-get) cat "${FAKE_GH}/state.json" 2>/dev/null || echo '{}' ;;
+    state-put) if test "${@: -1}" = -; then cat; else printf '%s\n' "${@: -1}"; fi >"${FAKE_GH}/state.json" ;;
+    *) echo "fake bot-board: unexpected: $*" 1>&2; exit 1 ;;
+esac
+EOF
+chmod +x "${WORK}/bin/bot-board"
 # The fake gh. GETs are answered from $FAKE_GH/rest/PATH.json (query
 # string ignored), except for what follows the repositories in $REMOTES:
 # branches, compare, and fork PR heads (the fixture's head.sha is replaced
@@ -96,6 +112,22 @@ case "${method} ${path}" in
         s=$(sha "${repo}" "${path#*/git/ref/heads/}")
         test -n "${s}" || notfound
         json=$(jq -n --arg s "${s}" '{object: {sha: $s}}') ;;
+    PATCH\ repos/*/git/refs/heads/*|POST\ repos/*/git/refs)
+        repo=${path#repos/}; repo=${repo%%/git/*}
+        if test "${method}" = PATCH; then
+            test "$(field force)" = false || { echo "fake gh: expected force=false" 1>&2; exit 1; }
+            ref=refs/heads/${path#*/git/refs/heads/}
+            if test -e "${store}/move-base"; then
+                git -C "${REMOTES}/${repo}" update-ref "${ref}" "$(cat "${store}/move-base")"
+                rm "${store}/move-base"
+            fi
+        else
+            ref=$(field ref)
+            test -z "$(sha "${repo}" "${ref#refs/heads/}")" || { echo "fake gh: ref exists" 1>&2; exit 1; }
+        fi
+        # A normal push models GitHub's server-side fast-forward check.
+        git -C "${REMOTES}/acme/proj" push -q "${REMOTES}/${repo}" "$(field sha):${ref}"
+        json='{}' ;;
     GET\ repos/*/compare/*)
         repo=${path#repos/}; repo=${repo%%/compare/*}
         spec=${path#*/compare/}; base=${spec%%...*}; head=${spec#*...}
@@ -169,6 +201,7 @@ case "${method} ${path}" in
         json=$(fork_pr "${store}/rest/${path}.json") ;;
     GET\ repos/cgwalters-forge/*/pulls)
         head=$(field head)
+        test ! -e "${store}/fail-parent-lookup" || { echo "gh: lookup failed (HTTP 500)" 1>&2; exit 1; }
         json=$(for f in "${store}/rest/${path}"/*.json; do test ! -e "${f}" || fork_pr "${f}"; done |
             jq -s --arg ref "${head#*:}" '[.[] | select(.head.ref == $ref)]') ;;
     GET\ *)
@@ -809,28 +842,132 @@ printf 'Builds on the parent.\n\n%s\n' "${TRAILER}" >"${WORK}/stacked-body"
 # in $OUT (without run's failing hooks: fork-pr pushes with the user's
 # git, as it runs in the worker's clone).
 fork_pr_run() {
-    local status=0
+    local status=0 force=()
+    test ! -e "${FAKE_GH}/fail-parent-lookup" || force=(--force)
     OUT=$("${BOT_PR}" fork-pr --repo acme/proj --base "$3" --branch bot/child --item "${ITEM}" --title "Child" \
-        --body-file "${WORK}/stacked-body" --from "${SRC}" 2>&1) || status=$?
+        --body-file "${WORK}/stacked-body" --from "${SRC}" "${force[@]}" 2>&1) || status=$?
     if test "$2" = ok && test "${status}" -ne 0 || test "$2" = fail && test "${status}" -eq 0; then
         fail "$1: exit status ${status}, expected $2; output:"$'\n'"${OUT}"
         return 1
     fi
 }
+
+# The exact PR returned by the last fork-pr run, not an older draft from
+# another case (the fake assigns a fresh URL to each POST).
+fork_pr_created() {
+    find "${FAKE_GH}/opened" -name '*.json' -exec cat {} + |
+        jq -sc --arg u "${OUT##*$'\n'}" '[.[] | select(.html_url == $u)] | first'
+}
+
 REFS_BEFORE=$(all_refs)
 if fork_pr_run "random fork-only base" fail bot/random; then
     expect "random fork-only base" "acme/proj has no branch 'bot/random', and no open fork PR in ${FORGE} is from it; to stack on another fork PR, pass its branch as --base"
 fi
 test "$(all_refs)" = "${REFS_BEFORE}" || fail "random fork-only base: the remotes changed"
-if fork_pr_run "stacked base" ok bot/parent; then
-    expect "stacked base" "Stacking on ${URL}/proj/pull/20 \(bot/parent\); upstream base main"
-fi
-child=$(find "${FAKE_GH}/opened" -name '*.json' -exec cat {} + | jq -sc --arg f "${FORGE}" '[.[] | select(.repo == $f and .head == "bot/child")] | first')
-test "$(jq -r '"\(.repo) \(.base)"' <<<"${child}")" = "${FORGE} bot/parent" || fail "stacked base: not opened into bot/parent: ${child}"
-# shellcheck disable=SC2016 # literal backticks
-for want in '- Upstream: `acme/proj`, base `main`' "- Stacked on: ${URL}/proj/pull/20;" "- Board item: \`${ITEM}\`"; do
-    jq -r .body <<<"${child}" | grep -qF -- "${want}" || fail "stacked base: no '${want}' in: $(jq -r .body <<<"${child}")"
+
+# Ordinary bases, default and nondefault, only advance. Use actual git
+# ancestry in the fake rather than a canned PATCH response.
+new_branch refresh-target
+REFRESH_UP=$(commit_as other refresh "upstream")
+REFRESH_AHEAD=$(commit_as other refresh "fork ahead")
+new_branch refresh-side
+REFRESH_SIDE=$(commit_as other refresh-side "diverged")
+UP_MAIN=$(remote_ref acme/proj main)
+FORK_MAIN=$(remote_ref "${FORGE}" main)
+for base in main bot/refresh; do
+    git -C "${SRC}" push -q --force up "${REFRESH_UP}:refs/heads/${base}"
+    while IFS='|' read -r state fork_sha result mutation; do
+        name="refresh ${base}, ${state}"
+        if test "${fork_sha}" = missing; then
+            git -C "${REMOTES}/${FORGE}" update-ref -d "refs/heads/${base}"
+        else
+            git -C "${SRC}" push -q --force forge "${fork_sha}:refs/heads/${base}"
+        fi
+        test "${state}" != race || printf '%s\n' "${REFRESH_AHEAD}" >"${FAKE_GH}/move-base"
+        before=$(git -C "${REMOTES}/${FORGE}" rev-parse -q --verify "refs/heads/${base}" || true)
+        : >"${FAKE_GH}/calls"
+        if fork_pr_run "${name}" "${result}" "${base}"; then
+            after=$(remote_ref "${FORGE}" "${base}")
+            if test "${result}" = ok; then
+                test "${after}" = "${REFRESH_UP}" || fail "${name}: base not at upstream"
+                child=$(fork_pr_created)
+                test "$(jq -r .base <<<"${child}")" = "${base}" || fail "${name}: wrong PR base"
+                jq -r .body <<<"${child}" | grep -q 'Stacked on:' && fail "${name}: recorded a stack"
+            else
+                expect "${name}" "refusing to replace .*fast-forward.*ahead or diverged"
+                test "${state}" != race || before=${REFRESH_AHEAD}
+                test "${after}" = "${before}" || fail "${name}: discarded fork commits"
+                ! grep -qE -- 'POST repos/.*/pulls --input' "${FAKE_GH}/calls" || fail "${name}: opened a PR after refusal"
+            fi
+        fi
+        case "${mutation}" in
+            PATCH) grep -qF -- "-X PATCH repos/${FORGE}/git/refs/heads/${base} -f sha=${REFRESH_UP} -F force=false" "${FAKE_GH}/calls" || fail "${name}: no safe PATCH" ;;
+            POST) grep -qF -- "-X POST repos/${FORGE}/git/refs -f ref=refs/heads/${base}" "${FAKE_GH}/calls" || fail "${name}: no create" ;;
+            none) ! grep -qE -- '-X (POST|PATCH) .*/git/refs' "${FAKE_GH}/calls" || fail "${name}: equal ref mutated" ;;
+        esac
+        ! grep -qE 'force=true|merge-upstream' "${FAKE_GH}/calls" || fail "${name}: unsafe refresh"
+    done <<EOF
+missing|missing|ok|POST
+equal|${REFRESH_UP}|ok|none
+behind|${BASE}|ok|PATCH
+ahead|${REFRESH_AHEAD}|fail|PATCH
+diverged|${REFRESH_SIDE}|fail|PATCH
+race|${BASE}|fail|PATCH
+EOF
 done
+git -C "${SRC}" push -q --force up "${UP_MAIN}:main"
+git -C "${SRC}" push -q --force forge "${FORK_MAIN}:main"
+
+# An invalid matching parent or failed lookup must never fall through to
+# syncing a same-name upstream branch.
+git -C "${SRC}" push -q up "${SP1}:refs/heads/bot/parent"
+cp "${FAKE_GH}/rest/repos/${FORGE}/pulls/20.json" "${WORK}/parent-valid.json"
+while IFS='|' read -r name filter want; do
+    jq "${filter}" "${WORK}/parent-valid.json" >"${FAKE_GH}/rest/repos/${FORGE}/pulls/20.json"
+    test "${name}" != lookup || touch "${FAKE_GH}/fail-parent-lookup"
+    REFS_BEFORE=$(all_refs)
+    : >"${FAKE_GH}/calls"
+    if fork_pr_run "invalid parent, ${name}" fail bot/parent; then
+        expect "invalid parent, ${name}" "${want}"
+    fi
+    test "$(all_refs)" = "${REFS_BEFORE}" || fail "invalid parent, ${name}: remotes changed"
+    ! grep -qE -- '-X (PUT|POST|PATCH|DELETE)' "${FAKE_GH}/calls" || fail "invalid parent, ${name}: mutated fork"
+    rm -f "${FAKE_GH}/fail-parent-lookup"
+done <<'EOF'
+owner|.user.login = "someone"|is not cgwalters-bot's
+no metadata|.body = "handwritten"|has no bot-meta section
+malformed metadata|.body = "<!-- bot-meta -->broken<!-- /bot-meta -->"|cannot find the 'Upstream:
+wrong upstream|.body = "<!-- bot-meta -->\n- Upstream: `acme/other`, base `main`\n<!-- /bot-meta -->"|goes to acme/other, not acme/proj
+lookup|.|cannot list the PRs
+EOF
+cp "${WORK}/parent-valid.json" "${FAKE_GH}/rest/repos/${FORGE}/pulls/20.json"
+
+# The valid parent wins for every upstream relationship, even when
+# upstream could fast-forward the fork and would thereby change the diff.
+for state in absent equal older newer diverged; do
+    case "${state}" in
+        absent) git -C "${REMOTES}/acme/proj" update-ref -d refs/heads/bot/parent ;;
+        equal) sha=${SP1} ;;
+        older) sha=${BASE} ;;
+        newer) sha=${SC1} ;;
+        diverged) sha=${REFRESH_SIDE} ;;
+    esac
+    test "${state}" = absent || git -C "${SRC}" push -q --force up "${sha}:refs/heads/bot/parent"
+    : >"${FAKE_GH}/calls"
+    if fork_pr_run "stacked base, ${state}" ok bot/parent; then
+        expect "stacked base, ${state}" "Stacking on ${URL}/proj/pull/20 \(bot/parent\); upstream base main"
+    fi
+    child=$(fork_pr_created)
+    test "$(jq -r '"\(.repo) \(.base)"' <<<"${child}")" = "${FORGE} bot/parent" || fail "stacked base, ${state}: wrong target: ${child}"
+    # shellcheck disable=SC2016 # literal backticks
+    for want in '- Upstream: `acme/proj`, base `main`' "- Stacked on: ${URL}/proj/pull/20;" "- Board item: \`${ITEM}\`"; do
+        jq -r .body <<<"${child}" | grep -qF -- "${want}" || fail "stacked base, ${state}: no '${want}'"
+    done
+    test "$(remote_ref "${FORGE}" bot/parent)" = "${SP1}" || fail "stacked base, ${state}: parent changed"
+    ! grep -qE -- '-X (POST|PATCH) .*/git/refs|merge-upstream' "${FAKE_GH}/calls" || fail "stacked base, ${state}: synced base"
+    grep -qF "repos/${FORGE}/compare/bot/parent...cgwalters-forge:bot/child" "${FAKE_GH}/calls" || fail "stacked base, ${state}: compared against upstream"
+done
+git -C "${REMOTES}/acme/proj" update-ref -d refs/heads/bot/parent
 test "$(remote_ref "${FORGE}" bot/child)" = "${SC1}" || fail "stacked base: bot/child not pushed"
 # As GitHub would show it: #21, approved at its head.
 fork_pr proj 21 bot/child "${SC1}"
