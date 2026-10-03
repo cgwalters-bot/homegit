@@ -1,0 +1,648 @@
+#!/usr/bin/env node
+// Run Claude Code workers as separate, detached `claude -p` processes with a
+// job id that is easy to poll: the Claude counterpart of bot-opencode. See
+// --help and the coordinator skill's "Local Claude workers". Node's standard
+// library only.
+"use strict";
+
+const { spawn, spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const heartbeat = require(path.join(__dirname, "..", "lib", "heartbeat-register.js"));
+
+const PROG = path.basename(process.argv[1] || "bot-claude");
+const SELF = fs.realpathSync(process.argv[1] || __filename);
+const BIN_DIR = path.dirname(SELF);
+const BOT_SETTINGS = path.join(BIN_DIR, "..", "dotfiles", ".claude", "settings.json");
+const CLAUDE = process.env.BOT_CLAUDE_CLAUDE || "claude";
+const ACTUALS = process.env.BOT_CLAUDE_ACTUALS || path.join(BIN_DIR, "bot-actuals");
+const HEARTBEAT = process.env.BOT_CLAUDE_HEARTBEAT || path.join(BIN_DIR, "bot-heartbeat");
+const STATE_ROOT = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "bot-claude");
+const DEFAULT_MODEL = process.env.BOT_CLAUDE_MODEL || "opus";
+const DEFAULT_TIMEOUT_MIN = 60;
+// The longest --timeout (a day).
+const MAX_TIMEOUT_MIN = 1440;
+const DEFAULT_PERMISSION_MODE = "bypassPermissions";
+const SUPERVISE_CMD = "_supervise";
+// Time the process group gets to exit on SIGTERM before SIGKILL.
+const KILL_GRACE_MS = 10000;
+const POLL_MS = 2000;
+// How long a started job may take to record its supervisor's pid, and what
+// the final actuals sweep may take.
+const START_GRACE_MS = 15000;
+const ACTUALS_TIMEOUT_MS = 120000;
+// After the worker exits, how long its stdout gets to drain (a straggler
+// holding the pipe open must not keep the job running).
+const DRAIN_MS = 2000;
+// status.json is rewritten at most this often while the stream is busy.
+const STATUS_WRITE_MS = 3000;
+const DEFAULT_WAIT_TIMEOUT_S = 3600;
+const LIST_LIMIT = 20;
+const DEFAULT_LOG_TAIL = 60;
+const DIGEST_WIDTH = 160;
+const JOB_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const ITEM_RE = /^(PVTI_[A-Za-z0-9_-]+|https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/(issues|pull)\/[1-9][0-9]*)$/;
+const ITEM_LINE_RE = /^[ \t>*-]*Item:[ \t]*\S+/im;
+const PERMISSION_MODES = ["acceptEdits", "auto", "bypassPermissions", "manual", "dontAsk", "plan"];
+// Of the CLAUDE_CODE_* variables of the coordinator's own session, only
+// these reach a job: a worker is a session of its own, and must not think
+// it is a child of, or reply to, the one that started it.
+const KEPT_CLAUDE_VARS = ["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"];
+const DROPPED_VARS = ["CLAUDECODE", "AI_AGENT", "CLAUDE_PID", "CLAUDE_EFFORT"];
+const WORKER_SHELL = "/bin/bash";
+const BOT_IDENTITY_KEYS = { name: "bot.git_name", email: "bot.git_email" };
+
+// Exit statuses. wait's are like bot-devspace wait's (timeout(1)'s 124 for a
+// wait that ran out), plus one for each way a job can end without succeeding.
+const EX_OK = 0;
+const EX_FAILED = 1;
+const EX_USAGE = 2;
+const EX_JOB_TIMEOUT = 3;
+const EX_JOB_GONE = 4;
+const EX_WAIT_TIMEOUT = 124;
+
+const RUNNING = ["starting", "running"];
+const APPEND_PROMPT = `You are a worker run by bot-claude as a detached non-interactive process: nobody answers questions while you run, so decide, do the task, and end with a final report as your last message (it is stored as the job's result). Keep to the rules in your brief.`;
+
+class Fatal extends Error {
+  constructor(message, status = EX_USAGE) {
+    super(message);
+    this.status = status;
+  }
+}
+
+function usage() {
+  return `Usage: ${PROG} start --dir DIR [--model MODEL] [--timeout MIN] [--item ITEM] [--job NAME]
+                       [--max-turns N] [--permission-mode MODE] [--add-dir DIR]...
+                       [--append-system-prompt TEXT] [--effort LEVEL] BRIEF
+       ${PROG} run    (same options: start, then wait, printing the result)
+       ${PROG} status [--json] [JOB]
+       ${PROG} wait [--timeout SEC] JOB
+       ${PROG} log [--raw | --stderr] [--tail N] JOB
+       ${PROG} kill JOB
+
+Run BRIEF (a file, or - for stdin) with 'claude -p' as a separate process,
+detached from the session that starts it, in DIR (a worktree from
+'bot-work worktree add', never the shared clone), and print its job id.
+Poll it with status and wait; nothing else is needed to follow a worker.
+
+The process is Claude Code with homegit's settings (CLAUDE_CODE_SHELL and
+the rest, passed with --settings) on top of the bot account's own
+configuration, with the coordinator session's CLAUDE_CODE_* variables
+removed (the OAuth token stays) and the bot's git identity from the
+operator config; the model defaults to ${DEFAULT_MODEL} (BOT_CLAUDE_MODEL), the
+permission mode to ${DEFAULT_PERMISSION_MODE} (unattended: nobody answers prompts), and the
+rules for what it may do are the worker and reviewer preambles in the
+brief. It does the cheap parts of a task through homegit's sonnet-worker
+subagent.
+
+State is in ${STATE_ROOT}/JOB/: brief.md, job.json,
+stream.jsonl (the stream-json output), stderr.log, result.md and status.json:
+
+  state       starting, running, succeeded, failed, timeout, killed or lost
+              (the supervisor died without recording an end)
+  exit_code, started_at, ended_at, session_id, num_turns, last_activity,
+  result (the final message), is_error, cost_usd and tokens (input, output,
+  cache_read, cache_creation) from the stream's result event.
+
+With --item (an issue or PR URL, or a PVTI_ id) the brief gets an 'Item:'
+line if it has none, so bot-cost counts the job's tokens toward the item;
+the job is registered as a worker in the coordinator heartbeat (unless
+that item already is one) and dropped from it when it ends, and
+bot-actuals --open then writes the item's Actual tokens.
+
+Options:
+  --dir DIR          working directory of the process (required)
+  --model MODEL      alias or full name (default ${DEFAULT_MODEL})
+  --timeout MIN      kill the process group after MIN minutes (default ${DEFAULT_TIMEOUT_MIN}, at most ${MAX_TIMEOUT_MIN});
+                     the job ends as 'timeout'
+  --job NAME         the job id (default: a timestamp and a random suffix)
+  --max-turns N      stop after N agentic turns
+  --permission-mode  one of ${PERMISSION_MODES.join(", ")}
+  --add-dir DIR      also let it use DIR (repeatable)
+  --append-system-prompt TEXT   more system prompt than the worker default
+  --effort LEVEL     low, medium, high, xhigh or max
+
+status [JOB]  with no JOB, the ${LIST_LIMIT} newest jobs; --json prints status.json.
+wait JOB      block until JOB ends (default --timeout ${DEFAULT_WAIT_TIMEOUT_S}s), then print its
+              result. Exits ${EX_OK} succeeded, ${EX_FAILED} failed, ${EX_JOB_TIMEOUT} job timed out, ${EX_JOB_GONE} job killed
+              or lost, ${EX_WAIT_TIMEOUT} still running when SEC ran out, ${EX_USAGE} no such job or usage.
+log JOB       a digest of the stream (text and tool calls), its last N lines
+              (default ${DEFAULT_LOG_TAIL}); --raw the stream-json, --stderr the process's stderr.
+kill JOB      stop the job's whole process group (SIGTERM, then SIGKILL).
+
+start and run exit ${EX_USAGE} on bad usage, ${EX_FAILED} on any other error.
+`;
+}
+
+const nowIso = () => new Date().toISOString();
+const jobDir = (job) => path.join(STATE_ROOT, job);
+const statusFile = (job) => path.join(jobDir(job), "status.json");
+
+function writeJson(file, value) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`);
+  fs.renameSync(tmp, file);
+}
+
+function readJob(job) {
+  if (!JOB_RE.test(job)) throw new Fatal(`bad job id '${job}'`);
+  if (!fs.existsSync(statusFile(job))) throw new Fatal(`no such job: ${job} (see '${PROG} status')`);
+  return JSON.parse(fs.readFileSync(statusFile(job), "utf8"));
+}
+
+// A supervisor still alive: its pid exists and is this job's (pids get
+// reused).
+function supervisorAlive(st) {
+  // Just started: the supervisor records its pid itself.
+  if (!st.pid) return st.state === "starting" && Date.now() - Date.parse(st.started_at) < START_GRACE_MS;
+  try {
+    process.kill(st.pid, 0);
+    const cmdline = fs.readFileSync(`/proc/${st.pid}/cmdline`, "utf8");
+    return cmdline.includes(SUPERVISE_CMD) && cmdline.includes(st.job);
+  } catch (e) {
+    return e.code === "EPERM";
+  }
+}
+
+// readJob, but a job that says it runs and has no supervisor is 'lost'.
+function loadStatus(job) {
+  const st = readJob(job);
+  if (RUNNING.includes(st.state) && !supervisorAlive(st)) {
+    // The supervisor may have written its end between the two reads.
+    const again = readJob(job);
+    if (!RUNNING.includes(again.state)) return again;
+    Object.assign(again, { state: "lost", ended_at: nowIso(), exit_code: null });
+    writeJson(statusFile(job), again);
+    reapLost(again);
+    return again;
+  }
+  return st;
+}
+
+// What a job whose supervisor is gone left behind: its worker (if still
+// ours, as its command line says) and its heartbeat entry.
+function reapLost(st) {
+  if (st.claude_pid) {
+    try {
+      if (fs.readFileSync(`/proc/${st.claude_pid}/cmdline`, "utf8").includes(st.job)) signalGroup(st.claude_pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+  }
+  if (st.item) heartbeat.deregister(st.job, { heartbeat: HEARTBEAT });
+}
+
+function parseOptions(argv, spec) {
+  const opts = { positional: [] };
+  for (const [name, kind] of Object.entries(spec)) if (kind === "list") opts[name] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-h" || a === "--help") throw new Fatal(null, 0);
+    if (a === "-" || !a.startsWith("--")) {
+      opts.positional.push(a);
+      continue;
+    }
+    const name = a.slice(2);
+    if (!(name in spec)) throw new Fatal(`unknown option: ${a} (see --help)`);
+    if (spec[name] === "flag") {
+      opts[name] = true;
+      continue;
+    }
+    if (i + 1 >= argv.length) throw new Fatal(`${a} requires a value`);
+    const value = argv[++i];
+    if (spec[name] === "list") opts[name].push(value);
+    else opts[name] = value;
+  }
+  return opts;
+}
+
+const START_SPEC = {
+  dir: "value", model: "value", timeout: "value", item: "value", job: "value", "max-turns": "value",
+  "permission-mode": "value", "add-dir": "list", "append-system-prompt": "value", effort: "value",
+};
+
+function positiveNumber(text, what, max) {
+  const n = Number(text);
+  if (!Number.isFinite(n) || n <= 0 || (max !== undefined && n > max)) {
+    throw new Fatal(`${what} must be above 0${max === undefined ? "" : ` and at most ${max}`}, not '${text}'`);
+  }
+  return n;
+}
+
+function newJobId() {
+  const stamp = nowIso().replace(/[-:]/g, "").replace(/\..*/, "").replace("T", "-");
+  return `${stamp}-${crypto.randomBytes(2).toString("hex")}`;
+}
+
+// The options of a job, checked: what job.json holds for the supervisor.
+function jobOptions(argv) {
+  const o = parseOptions(argv, START_SPEC);
+  if (o.positional.length !== 1) throw new Fatal(`one BRIEF (a file, or - for stdin) is needed (see --help)`);
+  if (!o.dir) throw new Fatal("--dir is required: the worktree the worker runs in (bot-work worktree add)");
+  const dir = path.resolve(o.dir);
+  if (!fs.statSync(dir, { throwIfNoEntry: false })?.isDirectory()) throw new Fatal(`--dir ${dir} is not a directory`);
+  const mode = o["permission-mode"] || DEFAULT_PERMISSION_MODE;
+  if (!PERMISSION_MODES.includes(mode)) throw new Fatal(`--permission-mode must be one of ${PERMISSION_MODES.join(", ")}`);
+  if (o.item !== undefined && !ITEM_RE.test(o.item)) throw new Fatal(`--item takes an issue or PR URL or a PVTI_ id, not '${o.item}'`);
+  const job = o.job || newJobId();
+  if (!JOB_RE.test(job)) throw new Fatal("--job must be letters, digits, . _ - only");
+  if (o["max-turns"] !== undefined) positiveNumber(o["max-turns"], "--max-turns");
+  return {
+    job, dir, brief: o.positional[0], model: o.model || DEFAULT_MODEL, permission_mode: mode,
+    timeout_min: o.timeout === undefined ? DEFAULT_TIMEOUT_MIN : positiveNumber(o.timeout, "--timeout", MAX_TIMEOUT_MIN),
+    item: o.item || null, max_turns: o["max-turns"] === undefined ? null : Number(o["max-turns"]),
+    add_dirs: o["add-dir"].map((d) => path.resolve(d)), append_system_prompt: o["append-system-prompt"] || null,
+    effort: o.effort || null,
+  };
+}
+
+function readBrief(source) {
+  try {
+    return fs.readFileSync(source === "-" ? 0 : source, "utf8");
+  } catch (e) {
+    throw new Fatal(`cannot read the brief ${source}: ${e.message}`);
+  }
+}
+
+// Start a detached supervisor for the job and return its status. The
+// supervisor is the leader of a session and process group of its own, so
+// the coordinator session ending (or being killed) does not touch it.
+function cmdStart(argv) {
+  const opts = jobOptions(argv);
+  let brief = readBrief(opts.brief);
+  if (!brief.trim()) throw new Fatal("the brief is empty");
+  // bot-cost joins a session's tokens to its board item on this line.
+  if (opts.item && !ITEM_LINE_RE.test(brief)) brief = `Item: ${opts.item}\n\n${brief}`;
+  const dir = jobDir(opts.job);
+  fs.mkdirSync(STATE_ROOT, { recursive: true });
+  try {
+    fs.mkdirSync(dir);
+  } catch (e) {
+    throw new Fatal(e.code === "EEXIST" ? `job ${opts.job} exists; pick another --job` : e.message, EX_FAILED);
+  }
+  fs.writeFileSync(path.join(dir, "brief.md"), brief);
+  const { brief: _source, ...job } = opts;
+  writeJson(path.join(dir, "job.json"), job);
+  // The status first: the supervisor reads it, and records its own pid.
+  const st = { job: opts.job, state: "starting", pid: null, dir: opts.dir, model: opts.model, item: opts.item,
+    timeout_min: opts.timeout_min, started_at: nowIso(), ended_at: null, exit_code: null };
+  writeJson(statusFile(opts.job), st);
+  spawn(process.execPath, [SELF, SUPERVISE_CMD, opts.job], { detached: true, stdio: "ignore" }).unref();
+  return st;
+}
+
+function cmdStartCli(argv) {
+  const st = cmdStart(argv);
+  process.stderr.write(`${PROG}: job ${st.job} started (${st.model}, timeout ${st.timeout_min}m); poll: ${PROG} status ${st.job}; ${PROG} wait ${st.job}\n`);
+  process.stdout.write(`${st.job}\n`);
+  return EX_OK;
+}
+
+async function cmdRun(argv) {
+  const st = cmdStart(argv);
+  process.stderr.write(`${PROG}: job ${st.job} started (${st.model}, timeout ${st.timeout_min}m)\n`);
+  // The job's own timeout, and the time to stop it and record its end.
+  return waitFor(st.job, st.timeout_min * 60000 + 2 * (KILL_GRACE_MS + ACTUALS_TIMEOUT_MS));
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const WAIT_STATUS = { succeeded: EX_OK, failed: EX_FAILED, timeout: EX_JOB_TIMEOUT, killed: EX_JOB_GONE, lost: EX_JOB_GONE };
+
+function summary(st) {
+  const bits = [`job ${st.job}: ${st.state}`];
+  if (st.exit_code !== null && st.exit_code !== undefined) bits.push(`exit ${st.exit_code}`);
+  if (st.num_turns !== undefined) bits.push(`${st.num_turns} turns`);
+  if (st.tokens) bits.push(`${st.tokens.input} in / ${st.tokens.output} out tokens`);
+  if (st.cost_usd !== undefined) bits.push(`$${st.cost_usd.toFixed(4)}`);
+  return bits.join(", ");
+}
+
+async function waitFor(job, limitMs) {
+  const deadline = Date.now() + limitMs;
+  for (;;) {
+    const st = loadStatus(job);
+    if (!RUNNING.includes(st.state)) {
+      process.stderr.write(`${summary(st)}\n`);
+      if (st.result) process.stdout.write(`${st.result}\n`);
+      return WAIT_STATUS[st.state] ?? EX_FAILED;
+    }
+    if (Date.now() >= deadline) {
+      process.stderr.write(`${PROG}: job ${job} is still ${st.state} after ${Math.round(limitMs / 1000)}s\n`);
+      return EX_WAIT_TIMEOUT;
+    }
+    await sleep(POLL_MS);
+  }
+}
+
+async function cmdWait(argv) {
+  const o = parseOptions(argv, { timeout: "value" });
+  if (o.positional.length !== 1) throw new Fatal("wait takes one JOB");
+  const sec = o.timeout === undefined ? DEFAULT_WAIT_TIMEOUT_S : positiveNumber(o.timeout, "--timeout");
+  return waitFor(o.positional[0], sec * 1000);
+}
+
+function age(iso) {
+  const s = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 1000));
+  if (s < 90) return `${s}s`;
+  if (s < 5400) return `${Math.round(s / 60)}m`;
+  return `${Math.round(s / 3600)}h`;
+}
+
+function cmdStatus(argv) {
+  const o = parseOptions(argv, { json: "flag" });
+  if (o.positional.length > 1) throw new Fatal("status takes at most one JOB");
+  if (o.positional.length === 1) {
+    const st = loadStatus(o.positional[0]);
+    if (o.json) process.stdout.write(`${JSON.stringify(st, null, 2)}\n`);
+    else {
+      const { result, ...rest } = st;
+      process.stdout.write(`${summary(st)}\n`);
+      for (const [k, v] of Object.entries(rest)) if (v !== null && v !== undefined && k !== "job") process.stdout.write(`  ${k}: ${typeof v === "object" ? JSON.stringify(v) : v}\n`);
+      if (result) process.stdout.write(`  result: ${result.length > 600 ? `${result.slice(0, 600)}... (see ${path.join(jobDir(st.job), "result.md")})` : result}\n`);
+    }
+    return EX_OK;
+  }
+  const jobs = fs.existsSync(STATE_ROOT) ? fs.readdirSync(STATE_ROOT).filter((j) => fs.existsSync(statusFile(j))) : [];
+  const all = jobs.map((j) => loadStatus(j)).sort((a, b) => (a.started_at < b.started_at ? 1 : -1)).slice(0, LIST_LIMIT);
+  if (o.json) process.stdout.write(`${JSON.stringify(all, null, 2)}\n`);
+  else if (!all.length) process.stdout.write("no jobs\n");
+  else for (const st of all) process.stdout.write(`${st.job}\t${st.state}\t${st.model}\t${age(st.started_at)} ago\t${st.item || "-"}\n`);
+  return EX_OK;
+}
+
+// One line per event of the stream that says what the worker did.
+function digest(line) {
+  let ev;
+  try {
+    ev = JSON.parse(line);
+  } catch {
+    return [];
+  }
+  const cut = (s) => String(s).replace(/\s+/g, " ").slice(0, DIGEST_WIDTH);
+  if (ev.type === "assistant") {
+    return (ev.message?.content || []).flatMap((c) => {
+      if (c.type === "text" && c.text.trim()) return [`text: ${cut(c.text)}`];
+      if (c.type === "tool_use") return [`tool: ${c.name} ${cut(c.input?.command ?? c.input?.file_path ?? c.input?.pattern ?? c.input?.description ?? "")}`];
+      return [];
+    });
+  }
+  if (ev.type === "result") return [`result: ${ev.subtype}${ev.is_error ? " (error)" : ""}: ${cut(ev.result ?? "")}`];
+  if (ev.type === "system" && ev.subtype === "init") return [`init: ${ev.model} session ${ev.session_id}`];
+  return [];
+}
+
+function cmdLog(argv) {
+  const o = parseOptions(argv, { raw: "flag", stderr: "flag", tail: "value" });
+  if (o.positional.length !== 1) throw new Fatal("log takes one JOB");
+  const job = o.positional[0];
+  readJob(job);
+  const tail = o.tail === undefined ? DEFAULT_LOG_TAIL : positiveNumber(o.tail, "--tail");
+  const file = path.join(jobDir(job), o.stderr ? "stderr.log" : "stream.jsonl");
+  const lines = fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean) : [];
+  const out = o.raw || o.stderr ? lines : lines.flatMap(digest);
+  process.stdout.write(out.slice(-tail).map((l) => `${l}\n`).join(""));
+  return EX_OK;
+}
+
+function signalGroup(pid, signal) {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function cmdKill(argv) {
+  const o = parseOptions(argv, {});
+  if (o.positional.length !== 1) throw new Fatal("kill takes one JOB");
+  const st = loadStatus(o.positional[0]);
+  if (!RUNNING.includes(st.state)) {
+    process.stdout.write(`job ${st.job} already ${st.state}\n`);
+    return EX_OK;
+  }
+  // The supervisor stops its worker and records the end; if it does not,
+  // the groups are killed here. A job that just started has no pid yet.
+  for (let i = 0; i < 50 && !st.pid; i++) {
+    await sleep(100);
+    st.pid = readJob(st.job).pid;
+  }
+  if (st.pid) signalGroup(st.pid, "SIGTERM");
+  const deadline = Date.now() + KILL_GRACE_MS + 5000;
+  while (Date.now() < deadline && RUNNING.includes(readJob(st.job).state) && supervisorAlive(st)) await sleep(200);
+  const now = readJob(st.job);
+  if (RUNNING.includes(now.state)) {
+    if (st.pid) signalGroup(st.pid, "SIGKILL");
+    if (now.claude_pid) signalGroup(now.claude_pid, "SIGKILL");
+    const killed = { ...now, state: "killed", ended_at: nowIso(), exit_code: null };
+    writeJson(statusFile(st.job), killed);
+    reapLost(killed);
+  }
+  process.stdout.write(`job ${st.job} killed\n`);
+  return EX_OK;
+}
+
+// The bot's git identity from the operator config as git's variables: the
+// operator's own global identity must never author a bot commit.
+function botIdentityEnv() {
+  const get = (key) => {
+    const r = spawnSync(path.join(BIN_DIR, "bot-operator"), ["get", key], { encoding: "utf8" });
+    return r.status === 0 ? r.stdout.trim() : "";
+  };
+  const name = get(BOT_IDENTITY_KEYS.name);
+  const email = get(BOT_IDENTITY_KEYS.email);
+  if (!name || !email) return {};
+  return { GIT_AUTHOR_NAME: name, GIT_AUTHOR_EMAIL: email, GIT_COMMITTER_NAME: name, GIT_COMMITTER_EMAIL: email };
+}
+
+function workerEnv() {
+  const env = {};
+  for (const [k, v] of Object.entries(process.env)) {
+    if (DROPPED_VARS.includes(k) || (k.startsWith("CLAUDE_CODE_") && !KEPT_CLAUDE_VARS.includes(k))) continue;
+    env[k] = v;
+  }
+  return { ...env, ...botIdentityEnv(), CLAUDE_CODE_SHELL: WORKER_SHELL };
+}
+
+function claudeArgs(job) {
+  const args = ["-p", "--output-format", "stream-json", "--verbose", "--model", job.model, "--permission-mode", job.permission_mode,
+    "--settings", BOT_SETTINGS, "--name", `bot-claude ${job.job}`,
+    "--append-system-prompt", [APPEND_PROMPT, job.append_system_prompt].filter(Boolean).join("\n\n")];
+  if (job.max_turns !== null) args.push("--max-turns", String(job.max_turns));
+  if (job.effort) args.push("--effort", job.effort);
+  for (const d of job.add_dirs) args.push("--add-dir", d);
+  return args;
+}
+
+// Register the job as a heartbeat worker (when it has an item), best
+// effort: the job runs whatever the heartbeat does.
+function registerWorker(job) {
+  if (!job.item) return;
+  try {
+    if (job.item.startsWith("PVTI_")) {
+      const r = spawnSync(process.execPath, [path.join(BIN_DIR, "..", "lib", "heartbeat-register.js"), "", job.item, job.job, HEARTBEAT],
+        { encoding: "utf8", stdio: ["ignore", "ignore", "inherit"] });
+      if (r.status !== 0) process.stderr.write(`${PROG}: heartbeat registration of ${job.job} failed\n`);
+    } else {
+      heartbeat.register({ id: job.item, content: { url: job.item } }, job.job, { heartbeat: HEARTBEAT });
+    }
+  } catch (e) {
+    process.stderr.write(`${PROG}: heartbeat registration of ${job.job} failed: ${e.message}\n`);
+  }
+}
+
+// The detached process of a job: runs claude, follows its stream, enforces
+// the timeout and records every state change in status.json.
+async function supervise(jobId) {
+  const dir = jobDir(jobId);
+  const job = JSON.parse(fs.readFileSync(path.join(dir, "job.json"), "utf8"));
+  const st = { ...readJob(jobId), pid: process.pid, state: "running" };
+  const save = () => writeJson(statusFile(jobId), st);
+  save();
+
+  // Signals first (registering the worker can take seconds): a kill that
+  // arrives before the worker exists means it never starts.
+  let child = null;
+  let stopping = null;
+  const stop = (why) => {
+    if (stopping) return;
+    stopping = why;
+    if (!child || !child.pid) return;
+    signalGroup(child.pid, "SIGTERM");
+    setTimeout(() => signalGroup(child.pid, "SIGKILL"), KILL_GRACE_MS).unref();
+  };
+  for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => stop("killed"));
+  registerWorker(job);
+
+  const streamFd = fs.openSync(path.join(dir, "stream.jsonl"), "w");
+  const stderrFd = fs.openSync(path.join(dir, "stderr.log"), "w");
+  const briefFd = fs.openSync(path.join(dir, "brief.md"), "r");
+  let lastWrite = 0;
+  let pending = "";
+  const onLine = (line) => {
+    let ev;
+    try {
+      ev = JSON.parse(line);
+    } catch {
+      return;
+    }
+    st.last_activity = nowIso();
+    if (ev.type === "system" && ev.subtype === "init") st.session_id = ev.session_id;
+    if (ev.type === "assistant") st.num_turns = (st.num_turns || 0) + 1;
+    if (ev.type === "result") {
+      Object.assign(st, { result: ev.result ?? "", is_error: Boolean(ev.is_error), num_turns: ev.num_turns ?? st.num_turns,
+        cost_usd: ev.total_cost_usd ?? 0, session_id: ev.session_id ?? st.session_id,
+        tokens: { input: ev.usage?.input_tokens ?? 0, output: ev.usage?.output_tokens ?? 0,
+          cache_read: ev.usage?.cache_read_input_tokens ?? 0, cache_creation: ev.usage?.cache_creation_input_tokens ?? 0 } });
+    }
+    if (Date.now() - lastWrite > STATUS_WRITE_MS || ev.type === "result") {
+      lastWrite = Date.now();
+      save();
+    }
+  };
+
+  let ended = { code: null, signal: null };
+  let timer = null;
+  if (!stopping) {
+    // Its own process group: what its tools started goes with it.
+    child = spawn(CLAUDE, claudeArgs(job), { cwd: job.dir, env: workerEnv(), detached: true, stdio: [briefFd, "pipe", stderrFd] });
+    // Decode as a stream: a multibyte character may span two chunks.
+    child.stdout.setEncoding("utf8");
+    const finished = new Promise((resolve) => {
+      let exited = null;
+      let stdoutClosed = false;
+      let resolved = false;
+      const done = () => {
+        if (exited && !resolved) {
+          resolved = true;
+          resolve(exited);
+        }
+      };
+      child.on("error", (e) => {
+        fs.writeSync(stderrFd, `${PROG}: cannot run ${CLAUDE}: ${e.message}\n`);
+        exited = { code: 127, signal: null };
+        done();
+      });
+      child.stdout.on("data", (chunk) => {
+        fs.writeSync(streamFd, chunk);
+        pending += chunk;
+        const lines = pending.split("\n");
+        pending = lines.pop();
+        lines.forEach(onLine);
+      });
+      child.stdout.on("close", () => {
+        stdoutClosed = true;
+        done();
+      });
+      // The worker is done when it exits, not when its stdout closes: a
+      // process it left behind may hold that open, so it gets a moment to
+      // drain, and whatever it left running goes with it.
+      child.on("exit", (code, signal) => {
+        exited = { code, signal };
+        signalGroup(child.pid, "SIGKILL");
+        if (stdoutClosed) done();
+        else setTimeout(done, DRAIN_MS);
+      });
+    });
+    if (child.pid) {
+      st.claude_pid = child.pid;
+      save();
+    }
+    timer = setTimeout(() => stop("timeout"), job.timeout_min * 60000);
+    ended = await finished;
+    clearTimeout(timer);
+    if (pending.trim()) onLine(pending);
+  }
+  let state;
+  if (stopping) state = stopping;
+  else if (ended.code === 0 && st.result !== undefined && !st.is_error) state = "succeeded";
+  else state = "failed";
+  Object.assign(st, { exit_code: ended.code, ended_at: nowIso() });
+  if (ended.signal) st.signal = ended.signal;
+  if (st.result !== undefined) fs.writeFileSync(path.join(dir, "result.md"), `${st.result}\n`);
+  if (job.item) {
+    heartbeat.deregister(job.job, { heartbeat: HEARTBEAT });
+    // Their transcripts name the item, so bot-actuals finds the tokens.
+    // The state is recorded after, so that a wait that returns can rely on
+    // the actuals field.
+    const r = spawnSync(ACTUALS, ["--open", "--since", "2d"], { encoding: "utf8", timeout: ACTUALS_TIMEOUT_MS });
+    st.actuals = r.status === 0 ? "recorded" : `failed (exit ${r.status ?? r.signal}): ${(r.stderr || "").trim().slice(0, 200)}`;
+  }
+  st.state = state;
+  save();
+}
+
+async function main(argv) {
+  const [cmd, ...rest] = argv;
+  try {
+    switch (cmd) {
+      case "start": return cmdStartCli(rest);
+      case "run": return await cmdRun(rest);
+      case "status": return cmdStatus(rest);
+      case "wait": return await cmdWait(rest);
+      case "log": return cmdLog(rest);
+      case "kill": return await cmdKill(rest);
+      case SUPERVISE_CMD: await supervise(rest[0]); return EX_OK;
+      case "-h": case "--help": case "help": process.stdout.write(usage()); return EX_OK;
+      default: throw new Fatal(`${cmd ? `unknown command '${cmd}'` : "missing a command"}\n\n${usage()}`);
+    }
+  } catch (e) {
+    if (!(e instanceof Fatal)) throw e;
+    if (e.status === 0) process.stdout.write(usage());
+    else process.stderr.write(`${PROG}: ${e.message}\n`);
+    return e.status;
+  }
+}
+
+// A reader that stops early (head, grep -q) is not an error.
+process.stdout.on("error", (e) => { if (e.code !== "EPIPE") throw e; });
+// Not process.exit(): output on a pipe must drain before the process ends.
+main(process.argv.slice(2)).then((status) => { process.exitCode = status; }, (e) => {
+  process.stderr.write(`${PROG}: ${e.stack || e.message}\n`);
+  process.exitCode = EX_FAILED;
+});
