@@ -52,6 +52,15 @@ for repo in "${repo_one}" "${repo_two}"; do
     test "$(git -C "${repo}" branch --show-current)" = main || fail "shared clone branch changed for ${repo}"
 done
 
+# A non-worktree directory beside the worktrees (bot-claude jobs leave one)
+# is not an error and is left alone.
+run add "${repo_one}" stray >/dev/null || fail "add stray failed"
+mkdir "${XDG_CACHE_HOME}/bot-work/stray/s"
+run rm stray >/dev/null || fail "removal failed beside a non-worktree directory"
+test -d "${XDG_CACHE_HOME}/bot-work/stray/s" || fail "removal deleted a non-worktree directory"
+test ! -e "${XDG_CACHE_HOME}/bot-work/stray/one" || fail "removal kept the worktree beside a stray directory"
+rmdir "${XDG_CACHE_HOME}/bot-work/stray/s" "${XDG_CACHE_HOME}/bot-work/stray"
+
 # One dirty tree prevents an all-or-nothing removal. --force removes both.
 printf 'dirty\n' >>"${XDG_CACHE_HOME}/bot-work/item-77/one/file"
 if run rm item-77 >/dev/null 2>"${WORK}/err"; then
