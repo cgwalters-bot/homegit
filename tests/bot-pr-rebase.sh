@@ -42,8 +42,8 @@ mkdir -p "${WORK}/bin" "${FAKE_GH}/rest"
 # The fake gh. GETs of PRs are answered from $FAKE_GH/rest/PATH.json with
 # head.sha set to its branch's commit; their commits and compare from the
 # repositories in $REMOTES; reviews and comments default to none, and
-# anything else from a fixture. POST .../merge-upstream syncs a fork's
-# main with acme/proj's, and POSTed issue comments are kept in
+# anything else from a fixture. PATCH .../git/refs/heads/main fast-forwards
+# a fork's main with acme/proj's, and POSTed issue comments are kept in
 # $FAKE_GH/comments. A list of PRs comes from a fixture (by default none),
 # filtered by head label, and a PATCH of a PR is logged to
 # $FAKE_GH/patches. Anything else fails. Every call is logged to
@@ -87,9 +87,10 @@ case "${method} ${path}" in
         s=$(sha "${repo}" "${path#*/git/ref/heads/}")
         test -n "${s}" || notfound
         json=$(jq -n --arg s "${s}" '{object: {sha: $s}}') ;;
-    POST\ repos/*/merge-upstream)
-        repo=${path#repos/}; repo=${repo%/merge-upstream}
-        git -C "${REMOTES}/acme/proj" push -q "${REMOTES}/${repo}" "main:refs/heads/$(field branch)"
+    PATCH\ repos/*/git/refs/heads/*)
+        repo=${path#repos/}; repo=${repo%%/git/*}
+        test "$(field force)" = false || { echo "fake gh: expected force=false" 1>&2; exit 1; }
+        git -C "${REMOTES}/acme/proj" push -q "${REMOTES}/${repo}" "$(field sha):refs/heads/${path#*/git/refs/heads/}"
         json='{}' ;;
     GET\ repos/*/compare/*)
         repo=${path#repos/}; repo=${repo%%/compare/*}

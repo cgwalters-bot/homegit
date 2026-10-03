@@ -138,14 +138,15 @@ Commands:
   fork-pr --repo OWNER/REPO --base BRANCH --branch ${BRANCH_PREFIX}SLUG --item PVTI_...
           --title TITLE --body-file FILE [--footer FILE] [--from DIR] [--force] [--ci WORKFLOW]...
         Fork OWNER/REPO into ${FORGE_ORG} if needed, set up its Actions
-        (see fork-setup; --ci is passed on), sync the fork's
+        (see fork-setup; --ci is passed on), fast-forward the fork's
         BRANCH with upstream, push
         ${BRANCH_PREFIX}SLUG to the fork from the git repository DIR (default:
         the current one) if it has that branch, and open a draft PR from
         ${BRANCH_PREFIX}SLUG into BRANCH; print its URL. A non-default BRANCH
         (e.g. a Renovate branch) is copied from upstream under the same
-        name. A BRANCH upstream doesn't have must be the head of an open
-        fork PR of the bot's in the fork: the new PR is stacked on that
+        name; refresh refuses an ahead or diverged fork branch. An open
+        fork PR of the bot's whose head is BRANCH takes precedence even
+        if upstream has that name: the new PR is stacked on that
         one, into its branch (so its diff is only its own commits), its
         bot-meta section records it ('Stacked on:') with that one's
         upstream base, and promote waits until that one is merged
@@ -943,14 +944,12 @@ prune_runs() {
     fi
 }
 
-# sync_base UPSTREAM FORK BRANCH: make the fork's copy of BRANCH match
-# upstream's. The forge's forks are direct forks of upstream, so the
-# default branch is synced with merge-upstream, which fails if the fork's
-# copy has commits of its own: nothing should be committed there. Any
-# other BRANCH is a copy (upstream may force-push it, as Renovate does),
-# so it is set to the upstream commit, which the fork network already has.
+# sync_base UPSTREAM FORK BRANCH: fast-forward the fork's copy of BRANCH
+# to upstream's commit, or create it if missing. Never discard fork-only
+# commits, even on the default branch. The server's force=false check also
+# protects commits pushed between reading the ref and updating it.
 sync_base() {
-    local upstream=$1 fork=$2 base=$3 up_sha fork_sha default
+    local upstream=$1 fork=$2 base=$3 up_sha fork_sha
     up_sha=$(ref_sha "${upstream}" "${base}")
     test -n "${up_sha}" || fatal "${upstream} has no branch '${base}'"
     fork_sha=$(ref_sha "${fork}" "${base}")
@@ -958,16 +957,12 @@ sync_base() {
         info "${fork}:${base} is up to date with ${upstream}"
         return 0
     fi
-    default=$(ghapi "repos/${upstream}" --jq .default_branch) || fatal "cannot read ${upstream}"
-    if test "${base}" = "${default}" && test -n "${fork_sha}"; then
-        ghapi -X POST "repos/${fork}/merge-upstream" -f branch="${base}" >/dev/null ||
-            fatal "syncing ${fork}:${base} with ${upstream} failed; if it has commits of its own, reset it to ${upstream}:${base}"
-    elif test -z "${fork_sha}"; then
+    if test -z "${fork_sha}"; then
         ghapi -X POST "repos/${fork}/git/refs" -f ref="refs/heads/${base}" -f sha="${up_sha}" >/dev/null ||
             fatal "creating ${fork}:${base} at ${upstream}'s ${up_sha} failed"
     else
-        ghapi -X PATCH "repos/${fork}/git/refs/heads/${base}" -f sha="${up_sha}" -F force=true >/dev/null ||
-            fatal "updating ${fork}:${base} to ${upstream}'s ${up_sha} failed"
+        ghapi -X PATCH "repos/${fork}/git/refs/heads/${base}" -f sha="${up_sha}" -F force=false >/dev/null ||
+            fatal "refusing to replace ${fork}:${base}: fast-forward to ${upstream}'s ${up_sha} failed; the fork branch may be ahead or diverged"
     fi
     fork_sha=$(ref_sha "${fork}" "${base}")
     test "${fork_sha}" = "${up_sha}" ||
@@ -1242,24 +1237,25 @@ parse_meta() {
     fi
 }
 
-# find_stack_parent UPSTREAM FORK BASE: for a BASE that UPSTREAM has no
-# branch of, sets STACK_PARENT to the open fork PR in FORK whose head is
-# BASE, and STACK_UPSTREAM_BASE to the upstream base its bot-meta section
-# names (for a stack of several, the bottom one's). Fails for any other
-# BASE: a branch only the fork has would otherwise go upstream unreviewed.
+# find_stack_parent UPSTREAM FORK BASE: sets STACK_PARENT to the open fork
+# PR in FORK whose head is BASE, and STACK_UPSTREAM_BASE to the upstream
+# base its bot-meta section names (for a stack of several, the bottom
+# one's). No matching PR leaves STACK_PARENT empty; a failed lookup or an
+# invalid match is fatal, even when upstream has a same-name branch that
+# could otherwise be synced.
 find_stack_parent() {
     local upstream=$1 fork=$2 base=$3 pr parent META_UPSTREAM META_BASE META_ITEM META_STACKED
     local howto="to stack on another fork PR, pass its branch as --base: it must be the head of an open fork PR in ${fork} that fork-pr opened"
     pr=$(ghapi -X GET "repos/${fork}/pulls" -f head="${fork%%/*}:${base}" -f state=open \
         --jq '[.[] | select(.state == "open")][0] // empty') ||
         fatal "cannot list the PRs of ${fork}"
-    test -n "${pr}" || fatal "${upstream} has no branch '${base}', and no open fork PR in ${fork} is from it; ${howto}"
+    test -n "${pr}" || return 0
     parent=$(jq -r .html_url <<<"${pr}")
     test "$(jq -r .user.login <<<"${pr}")" = "${BOT_LOGIN}" ||
-        fatal "${upstream} has no branch '${base}', and ${parent} is not ${BOT_LOGIN}'s; ${howto}"
+        fatal "${parent} is not ${BOT_LOGIN}'s; ${howto}"
     local meta
     meta=$(jq -r "${BODY_JQ} .body | meta" <<<"${pr}")
-    test -n "${meta}" || fatal "${upstream} has no branch '${base}', and ${parent} has no bot-meta section; ${howto}"
+    test -n "${meta}" || fatal "${parent} has no bot-meta section; ${howto}"
     parse_meta "${parent}" "${meta}"
     test "${META_UPSTREAM}" = "${upstream}" ||
         fatal "${parent}, which --base '${base}' is the branch of, goes to ${META_UPSTREAM}, not ${upstream}"
@@ -1364,14 +1360,16 @@ cmd_fork_pr() {
     fork=$(ensure_fork "${upstream}")
     owner=${fork%%/*}
     ${force} || check_item_free "${fork}" "${item}" "" "${branch}"
-    # A base upstream lacks is another fork PR's branch: this one is
-    # stacked on it, and goes upstream onto that one's upstream base.
+    # A valid stack parent always wins over an upstream same-name branch:
+    # syncing that branch could discard the parent's reviewed commits.
     local STACK_PARENT="" STACK_UPSTREAM_BASE="" upstream_base=${base} compare_repo=${upstream}
-    if test -z "$(ref_sha "${upstream}" "${base}")"; then
-        find_stack_parent "${upstream}" "${fork}" "${base}"
+    find_stack_parent "${upstream}" "${fork}" "${base}"
+    if test -n "${STACK_PARENT}"; then
         upstream_base=${STACK_UPSTREAM_BASE}
         compare_repo=${fork}
         info "Stacking on ${STACK_PARENT} (${base}); upstream base ${upstream_base}"
+    elif test -z "$(ref_sha "${upstream}" "${base}")"; then
+        fatal "${upstream} has no branch '${base}', and no open fork PR in ${fork} is from it; to stack on another fork PR, pass its branch as --base: it must be the head of an open fork PR in ${fork} that fork-pr opened"
     fi
     # Before sync_base, whose push to the fork would start its CI.
     fork_setup "${fork}" false "${ci[@]}"
