@@ -21,7 +21,7 @@ skills it names; they all still apply to you, including the rules for
 devspaces (builds and tests only there), sign-off (never add a
 Signed-off-by yourself), commits and pushes, and the pull request rules.
 You may dispatch your own worker and reviewer subagents the way
-`coordinator` describes ("Briefing subagents", "Review every result").
+`coordinator` describes ("Briefing workers", "Review every result").
 Each one's prompt names its board item on a line of its own,
 
 ```
