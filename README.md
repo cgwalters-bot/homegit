@@ -116,6 +116,17 @@ coordinator within a couple of minutes, while a quiet cycle costs two
 
 ### Overnight working model
 
+Local Claude workers run with `bot-claude start` (or `run`, which also
+waits). Their default prompt requires noninteractive completion and
+foreground, blocking waits for dispatched work and verification.
+`bot-claude wait JOB` returns 5 for an `incomplete` job: Claude exited
+successfully but its final report promises further work, or its stream
+still shows outstanding background tasks. Failed runs remain `failed`.
+Use `bot-claude resume JOB`, then `bot-claude wait JOB`, to continue the
+saved Claude session with the original options. Resume rejects running
+or successful jobs and jobs without a session id; it archives prior
+evidence under the job's `attempts/N/` and resets current results.
+
 The agents run on a trusted machine that holds the clones and the bot's
 credentials, and borrow compute for building and testing. `bot-devspace`
 (installed by `make install` like the rest of `bin/`) dispatches an
