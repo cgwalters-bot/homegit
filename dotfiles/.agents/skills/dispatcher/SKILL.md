@@ -65,7 +65,7 @@ same job failing twice is an escalation.
 
 Mechanical, do it:
 
-- `closed-not-done`, `stale-lead`, `dispatch`: already carried out by
+- `closed-not-done`, `stale-lead`, `midstream-pr`, `dispatch`: already carried out by
   `--apply`, and an action marked `(dispatched)` or `(skipped: ...)` needs
   nothing. `(deferred: ...)` was a rate limit with the label restored, so
   the next cycle retries it. A `(failed: ...)` is a failure: see

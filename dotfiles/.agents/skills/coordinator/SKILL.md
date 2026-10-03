@@ -435,6 +435,14 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
 - **stale-lead:** an item that isn't In Progress still has Lead
   `coordinator`, a finished worker's claim. The same sweep step clears
   it (under "Stale Lead cleared"); a topic's Lead is never touched.
+- **midstream-pr / midstream-drift:** the forge's forks with the
+  `bot-midstream` topic (or a fork with no topic) mirror upstream, and
+  their PRs are drafts that never merge. A PR into one that isn't a draft
+  (`midstream-pr`) is converted back, with a comment, by `--apply`. A main
+  ahead of upstream's (`midstream-drift`) is yours: push the extra commits
+  to `saved/main-DATE`, check which aren't upstream and tell the operator
+  on the tracker, then reset main to upstream; or, if the repository is a
+  real fork, `bot-pr fork-setup REPO --fork`.
 
 `bot-poll-loop` runs it with `--state`, so an action wakes you when it is
 new, and again only if it is still open 2 hours after it last did. On a

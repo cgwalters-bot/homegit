@@ -329,12 +329,12 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
   // An unread input keeps its kind's keys as they were.
   r = rec.edge(r.state, [], t0 + rec.RESYNC_MS + 2 * MIN, rec.RESYNC_MS, new Set(["drive"]));
   assert.deepEqual(Object.keys(r.state), ["drive:y"]);
-  assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: null, sweep: {}, questions: [], contentStates: {} })], []);
+  assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: null, sweep: {}, questions: [], contentStates: {}, midstreams: [] })], []);
   assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: undefined, sweep: undefined, questions: [] })].sort(),
-    ["approval", "closed-not-done", "drive", "health", "heartbeat", "lead-orphan"]);
+    ["approval", "closed-not-done", "drive", "health", "heartbeat", "lead-orphan", "midstream-drift", "midstream-pr"]);
   // The rules that didn't run keep theirs too.
-  assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: null, sweep: {}, questions: [], contentStates: {} }, ["capacity", "drive"])].sort(),
-    ["answer-unapplied", "closed-not-done", "dispatch", "dispatch-failed", "escalate", "heartbeat", "lead-orphan", "patch-ready", "stale-lead"]);
+  assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: null, sweep: {}, questions: [], contentStates: {}, midstreams: [] }, ["capacity", "drive"])].sort(),
+    ["answer-unapplied", "closed-not-done", "dispatch", "dispatch-failed", "escalate", "heartbeat", "lead-orphan", "midstream-drift", "midstream-pr", "patch-ready", "stale-lead"]);
 });
 
 test("patch-ready: unattended by default, with explicit false/true overrides", () => {
@@ -394,7 +394,7 @@ function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) 
   const r = spawnSync(TOOL, [
     "--board-file", path.join(FIX, "board.json"), "--epic-board-file", path.join(FIX, "epic-board.json"), "--sweep-dir", path.join(FIX, "sweep"),
     "--prs-file", path.join(FIX, "prs.json"), "--heartbeat-file", path.join(FIX, "heartbeat.json"), "--children-file", path.join(FIX, "children.json"),
-    "--capacity-file", path.join(FIX, "capacity.json"), "--questions-file", path.join(FIX, "questions.json"),
+    "--capacity-file", path.join(FIX, "capacity.json"), "--questions-file", path.join(FIX, "questions.json"), "--midstreams-file", path.join(FIX, "midstreams.json"),
     "--activity-file", path.join(TMP, "no-activity.json"), "--watch-state", path.join(FIX, "watch.json"), "--now", now, ...args,
   ], { encoding: "utf8", env: { ...process.env, HOME: TMP, XDG_STATE_HOME: path.join(TMP, "state-home"), BOT_OPERATOR_CONFIG: path.join(FIX, "operator.json"), UPSTREAM_POLICY_DIR: path.join(FIX, "upstream-policy"), ...env } });
   assert.equal(r.status, status, r.stderr);
@@ -512,6 +512,45 @@ test("bot-reconcile --apply: sets closed items Done, clears stale Leads, and rea
     ["https://github.com/o/r/pull/3", undefined, undefined], ["https://github.com/o/r/issues/9", "PVTI_lead", "done"]]);
   assert.deepEqual(j.errors, ["applying closed-not-done:https://github.com/o/r/issues/2: fake: quota"]);
   assert.equal(fs.readFileSync(log, "utf8"), "set PVTI_m --status Done --news PR merged; set Done\nset PVTI_lead --field Lead \n");
+});
+
+const MIDSTREAM_PR = { url: "https://github.com/cgwalters-forge/composefs-rs/pull/9", number: 9, title: "x" };
+
+test("midstream: a PR that isn't a draft, and a main ahead of upstream's", () => {
+  const cases = [
+    ["a mirror with draft PRs only", [{ repo: "f/a", upstream: "u/a:main", ahead: 0, ready_prs: [] }], []],
+    ["a ready PR", [{ repo: "f/a", upstream: "u/a:main", ahead: 0, ready_prs: [MIDSTREAM_PR] }], ["midstream-pr:" + MIDSTREAM_PR.url]],
+    ["drift", [{ repo: "f/a", upstream: "u/a:main", ahead: 5, ready_prs: [] }], ["midstream-drift:f/a"]],
+    ["both, in two repositories", [{ repo: "f/a", upstream: "u/a:main", ahead: 1, ready_prs: [MIDSTREAM_PR] }, { repo: "f/b", upstream: "u/b:main", ahead: 0, ready_prs: [] }],
+      ["midstream-pr:" + MIDSTREAM_PR.url, "midstream-drift:f/a"]],
+  ];
+  for (const [name, midstreams, want] of cases) {
+    assert.deepEqual(keys(rec.midstream({ midstreams })), want, name);
+  }
+  assert.deepEqual(rec.midstream({}), [], "unread");
+  const [pr] = rec.midstream({ midstreams: cases[1][1] });
+  assert.deepEqual(pr.draft, { repo: "f/a", number: 9 });
+  assert.deepEqual(rec.reconcile(obs({ midstreams: cases[3][1] }), ["midstream"]).map((a) => a.kind), ["midstream-pr", "midstream-drift"]);
+  assert.ok(rec.unreadKinds(obs({ midstreams: undefined })).has("midstream-drift"));
+  assert.ok(!rec.unreadKinds(obs({ midstreams: [] })).has("midstream-drift"));
+});
+
+test("bot-reconcile --apply: converts a ready PR on a midstream back to a draft and says why", () => {
+  const log = path.join(TMP, "gh-calls");
+  const fakeGh = path.join(TMP, "gh");
+  fs.writeFileSync(fakeGh, `#!/usr/bin/env bash\ntest "$3" != 8 || { echo "fake: quota" >&2; exit 1; }\necho "$*" >>${log}\n`, { mode: 0o755 });
+  const file = path.join(TMP, "midstreams.json");
+  fs.writeFileSync(file, JSON.stringify([{ repo: "f/a", upstream: "u/a:main", ahead: 2,
+    ready_prs: [{ url: "https://github.com/f/a/pull/7", number: 7, title: "x" }, { url: "https://github.com/f/a/pull/8", number: 8, title: "y" }] }]));
+  const r = spawnSync(TOOL, ["--rule", "midstream", "--apply", "--json", "--midstreams-file", file],
+    { encoding: "utf8", env: { ...process.env, BOT_RECONCILE_GH: fakeGh, BOT_OPERATOR_CONFIG: path.join(FIX, "operator.json") } });
+  assert.equal(r.status, 1, r.stderr);
+  const j = JSON.parse(r.stdout);
+  assert.deepEqual(j.actions.map((a) => [a.kind, a.applied]), [["midstream-pr", "done"], ["midstream-pr", "failed: fake: quota"], ["midstream-drift", undefined]]);
+  assert.deepEqual(j.errors, ["applying midstream-pr:https://github.com/f/a/pull/8: fake: quota"]);
+  const calls = fs.readFileSync(log, "utf8");
+  assert.match(calls, /^pr ready 7 --repo f\/a --undo\npr comment 7 --repo f\/a --body Converted back to a draft: .*midstream.*\n\nGenerated-by: https:\/\/github\.com\/cgwalters\/#llms\n$/s);
+  assert.doesNotMatch(calls, /\b8\b/, "the PR whose conversion failed got no comment");
 });
 
 test("bot-reconcile: usage errors", () => {

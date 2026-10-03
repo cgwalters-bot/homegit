@@ -22,6 +22,7 @@ const cap = require(path.join(ROOT, "lib", "capacity.js"));
 const pace = require(path.join(ROOT, "lib", "pacing.js"));
 const operator = require(path.join(ROOT, "lib", "operator.js"));
 const disp = require(path.join(ROOT, "lib", "dispatch.js"));
+const ms = require(path.join(ROOT, "lib", "midstream.js"));
 
 const tool = (name) => process.env[`BOT_RECONCILE_${name.replace(/^bot-/, "").toUpperCase()}`] || path.join(BIN_DIR, name);
 const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
@@ -45,6 +46,7 @@ const RULE_INPUTS = {
   "answer-unapplied": ["questions"],
   "closed-not-done": ["items", "contentStates"],
   "stale-lead": ["items"],
+  midstream: ["midstreams"],
 };
 const MAX_BUFFER = 256 << 20;
 const GH = process.env.BOT_RECONCILE_GH || "gh";
@@ -58,13 +60,13 @@ function usage() {
   return `Usage: ${PROG} [--json] [--apply] [--state FILE [--resync MIN]] [--rule NAME]...
        [--board-file F] [--epic-board-file F] [--sweep-dir D] [--prs-file F]
        [--heartbeat-file F] [--children-file F] [--capacity-file F]
-       [--questions-file F] [--activity-file F] [--issues-file F] [--watch-state F]
+       [--questions-file F] [--midstreams-file F] [--activity-file F] [--issues-file F] [--watch-state F]
        [--now TIME]
 
 Reconciles like a Kubernetes controller: reads the observed state, compares
 it with the desired one, and prints the actions that would close the gap,
 each with a stable key, a kind, the item's URL and what to do. It changes
-nothing itself, except with --apply (see closed-not-done, stale-lead and dispatch). Run it on each
+nothing itself, except with --apply (see closed-not-done, stale-lead, midstream and dispatch). Run it on each
 wake, do the actions, then run it again to confirm they converged
 ("Actions: none").
 
@@ -152,6 +154,15 @@ Rules (${rules}):
                     (a worker's claim, which ends there; a topic's Lead
                     stays). --apply clears it ('bot-board set ITEM --field
                     Lead ""'); bot-watch --apply runs it.
+  midstream         the forge's midstreams (repositories with the ${ms.MIDSTREAM_TOPIC}
+                    topic, or forks with neither it nor ${ms.FORK_TOPIC}; see bot-pr
+                    fork-setup) stay mirrors of upstream whose PRs never
+                    merge: an open PR into the default branch that isn't a
+                    draft is converted back to one with a comment saying
+                    why (--apply carries that out), and a main ahead of
+                    upstream's is a drift action, for the coordinator to fix
+                    by saving the extra commits to saved/main-DATE and
+                    resetting it.
 
 With --state FILE it remembers the actions across runs, and marks with '*'
 (--json: "fired") the ones that are new, or still there ${rec.RESYNC_MS / 3600e3}h (--resync) after
@@ -174,7 +185,7 @@ class Exit extends Error {
 function parseArgs(argv) {
   const opts = { json: false, apply: false, rules: [], resync: rec.RESYNC_MS };
   const values = ["state", "resync", "rule", "board-file", "epic-board-file", "sweep-dir", "prs-file", "heartbeat-file", "children-file", "capacity-file",
-    "questions-file", "activity-file", "issues-file", "watch-state", "now"];
+    "questions-file", "midstreams-file", "activity-file", "issues-file", "watch-state", "now"];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") throw new Exit(0, null);
@@ -313,6 +324,7 @@ async function observe(opts) {
     get("heartbeat", "the heartbeat", fromFile("heartbeat-file", () => runJson(tool("bot-heartbeat"), ["show"]))),
     get("capacity", "the week's capacity", fromFile("capacity-file", () => runJson(tool("bot-capacity"), ["--json"]))),
     get("questions", "the answered questions", fromFile("questions-file", () => questions(config, opts.now))),
+    get("midstreams", "the midstreams", fromFile("midstreams-file", () => midstreams(config))),
     get("contentStates", "bot-watch's last-seen state", () => contentStates(opts["watch-state"] || WATCH_STATE)),
     get("activity", "the operator's activity", () => pace.readActivity(opts["activity-file"] || ACTIVITY_FILE, opts.now)),
   ]);
@@ -333,6 +345,23 @@ async function observe(opts) {
     obs.items && get("children", "the sub-issues", fromFile("children-file", () => children(obs.items, obs.topics))),
   ]);
   return { obs, errors };
+}
+
+// midstreams(config): [{repo, upstream, ahead, ready_prs}] of the forge's
+// midstreams (lib/midstream.js): how many commits the default branch has
+// that its upstream's lacks, and the open PRs into it that aren't drafts.
+async function midstreams(config) {
+  const { restGet, pages, pool } = require(path.join(BIN_DIR, "bot-priority-health"));
+  const repos = (await pages(`orgs/${config.forge_org}/repos`)).filter((r) => !r.archived && ms.kind(r, config.forge_org) === "midstream" && r.fork);
+  return pool(repos, async (r) => {
+    const full = await restGet(`repos/${r.full_name}`);
+    const parent = full && full.parent;
+    if (!parent) throw new Error(`${r.full_name} is a midstream, but GitHub shows no parent repository`);
+    const cmp = await restGet(`repos/${r.full_name}/compare/${parent.owner.login}:${parent.default_branch}...${r.default_branch}?per_page=1`);
+    const prs = await pages(`repos/${r.full_name}/pulls?state=open`);
+    return { repo: r.full_name, upstream: `${parent.full_name}:${parent.default_branch}`, ahead: cmp ? cmp.ahead_by : 0,
+      ready_prs: prs.filter((p) => !p.draft && p.base.ref === r.default_branch).map((p) => ({ url: p.html_url, number: p.number, title: p.title })) };
+  });
 }
 
 function readState(file) {
@@ -422,8 +451,11 @@ async function dispatchOne(a, opts, config) {
   }
 }
 
+// What a PR converted back to a draft is told.
+const MIDSTREAM_DRAFT_COMMENT = `Converted back to a draft: this repository is a midstream (topic ${ms.MIDSTREAM_TOPIC}), whose main mirrors upstream and only moves by fast-forward sync, so its PRs are review vehicles and are never merged.\n\nGenerated-by: https://github.com/cgwalters/#llms`;
+
 // apply(actions, errors, opts, config): carries out the actions that have an
-// `apply` (a board change) or a `dispatch`, recording the result in each. A
+// `apply` (a board change), a `draft` (a PR to convert) or a `dispatch`, recording the result in each. A
 // failed dispatch leaves its reason in the item's Why, so that the rule
 // leaves the item alone until someone looks.
 async function apply(actions, errors, opts, config) {
@@ -434,6 +466,21 @@ async function apply(actions, errors, opts, config) {
     } catch (e) {
       a.applied = `failed: ${firstLine(e)}`;
       errors.push(`applying ${a.key}: ${firstLine(e)}`);
+    }
+  }
+  for (const a of actions.filter((x) => x.draft)) {
+    try {
+      await execFileP(GH, ["pr", "ready", String(a.draft.number), "--repo", a.draft.repo, "--undo"], { maxBuffer: MAX_BUFFER });
+      a.applied = "done";
+    } catch (e) {
+      a.applied = `failed: ${firstLine(e)}`;
+      errors.push(`applying ${a.key}: ${firstLine(e)}`);
+      continue;
+    }
+    try {
+      await execFileP(GH, ["pr", "comment", String(a.draft.number), "--repo", a.draft.repo, "--body", MIDSTREAM_DRAFT_COMMENT], { maxBuffer: MAX_BUFFER });
+    } catch (e) {
+      errors.push(`commenting on ${a.url}: ${firstLine(e)}`);
     }
   }
   for (const a of actions.filter((x) => x.dispatch)) {

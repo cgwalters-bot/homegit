@@ -23,6 +23,7 @@ const AI_TRAILER = "Generated-by: AI";
 // lib/operator.js): requesting their review puts it in their queue (the
 // review app lists the bot's pull requests with review-requested:OPERATOR).
 const operatorConfig = require(path.join(BIN_DIR, "..", "lib", "operator.js"));
+const midstream = require(path.join(BIN_DIR, "..", "lib", "midstream.js"));
 const OPERATOR = operatorConfig.loadOrExit(PROG).operator.login;
 const OPERATOR_S = operatorConfig.possessive(OPERATOR);
 const DEFAULT_TIMEOUT_MIN = 30;
@@ -391,6 +392,9 @@ function main() {
   const branch = git(["symbolic-ref", "--quiet", "--short", "HEAD"], "read the current branch (detached HEAD?)");
   const info = ghJSON([`repos/${repo}`], `read ${repo}`);
   const defaultBranch = info.default_branch;
+  if (midstream.kind(info, operatorConfig.loadOrExit(PROG).forge_org) === "midstream") {
+    throw new Exit(EX_USAGE, `${repo} is a midstream (its main mirrors upstream and only moves by fast-forward sync): its pull requests are never merged. Open a draft fork PR with 'bot-pr fork-pr' instead, or mark a real fork with 'bot-pr fork-setup --fork'`);
+  }
   if (branch === defaultBranch || branch === opts.base) throw new Exit(EX_USAGE, `on ${branch} itself: commit on a topic branch (bot/<slug>)`);
   const existing = findPull(repo, owner, branch);
   let base = opts.base || (existing ? existing.base.ref : defaultBranch);

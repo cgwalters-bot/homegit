@@ -36,6 +36,15 @@ readonly REVIEWER=${HUMAN_LOGIN}
 # bot tests every change on a devspace, and upstream CI runs once promoted.
 readonly FORGE_ORG=${BOT_PR_FORGE:-${OP_FORGE_ORG}}
 readonly BRANCH_PREFIX=bot/
+# The repository topics that say whether a fork in the forge is a
+# midstream (main mirrors upstream, only moves by fast-forward sync, and
+# its pull requests are never merged) or a real fork (see lib/midstream.js,
+# which tests keep these in line with).
+readonly MIDSTREAM_TOPIC=bot-midstream
+readonly FORK_TOPIC=bot-fork
+# The ruleset fork-setup puts on a midstream's default branch.
+readonly RULESET_NAME=bot-midstream-no-merge
+readonly RULESET_CHECK=bot-midstream-never-merge
 # A board item id, as recorded in a fork PR's bot-meta section.
 readonly ITEM_ID_RE='PVTI_[A-Za-z0-9_-]+'
 readonly META_START='<!-- bot-meta -->'
@@ -170,7 +179,7 @@ Commands:
         none; --create forks it, as fork-pr does). A fork may be named
         other than REPO, e.g. when renamed to free the name, so scripts
         look forks up with this rather than assume ${FORGE_ORG}/REPO.
-  fork-setup REPO [--ci WORKFLOW]... [--no-ci]
+  fork-setup REPO [--ci WORKFLOW]... [--no-ci] [--fork] [--no-ruleset] [--topic-only]
         Turn off CI on the fork ${FORGE_ORG}/REPO: Actions stays enabled,
         but every workflow is disabled, and the queued and running runs of
         those it disables are cancelled. The forge's forks share one pool
@@ -189,6 +198,24 @@ Commands:
         labeled PRs, issues, workflow_run: PR bots, release jobs); a gh-aw
         coding agent; or one listed in WORKFLOW_OVERRIDES in this script.
         fork-pr does this on every run; safe to repeat.
+        It also records what the repository is, as a topic: ${MIDSTREAM_TOPIC}
+        (the default, and what no topic means) for a midstream, whose main
+        mirrors upstream exactly and only moves by fast-forward sync, so
+        that its PRs are review vehicles, opened as drafts and never merged
+        (bot-land refuses to land on one, and bot-reconcile turns a PR that
+        is not a draft back into one); ${FORK_TOPIC} (--fork) for a real,
+        possibly temporary, fork, whose main may carry its own commits and
+        whose PRs may merge. A midstream also gets the ${RULESET_NAME}
+        ruleset on its default branch: a PR there can't be merged by
+        anyone without bypass rights, and an admin has to bypass the rules
+        explicitly (the bot's fast-forward sync, a push, still works as
+        admin). --fork removes the ruleset; --no-ruleset and --topic-only
+        leave it alone, and --topic-only sets just the topic. fork-pr
+        only adds the topic. Refuses a repository that isn't a fork.
+  repo-kind REPO
+        Print midstream, fork or none (neither: one of the bot's own
+        repositories) for REPO in ${FORGE_ORG}, by its topics and whether
+        it is a GitHub fork.
   promote FORK_PR_URL [--draft] [--why TEXT] [--include-others] [--no-signoff] [--dry-run]
         Open the upstream PR for a fork PR whose current head ${REVIEWER}
         approved (commits pushed after his approval need a new one, except
@@ -737,6 +764,16 @@ workflow_problem() {
     esac
 }
 
+# check_ci_names [WORKFLOW...]: fails unless each is a workflow file name.
+check_ci_names() {
+    local w
+    for w in "$@"; do
+        w=${w#.github/workflows/}
+        [[ "${w}" =~ ${WORKFLOW_FILE_RE} ]] ||
+            fatal "--ci takes a workflow file name in .github/workflows (e.g. ci.yml), not '${w}'"
+    done
+}
+
 # fork_setup FORK CLEAR [WORKFLOW...]: turn off CI on a fork in the forge.
 # Its forks share one pool of runners, which one project's CI matrix per
 # fork PR (bootc's is ~20 jobs) keeps busy for hours, while every change
@@ -756,11 +793,7 @@ fork_setup() {
     local fork=$1 clear=$2
     shift 2
     local want=("$@") w
-    for w in "${want[@]}"; do
-        w=${w#.github/workflows/}
-        [[ "${w}" =~ ${WORKFLOW_FILE_RE} ]] ||
-            fatal "--ci takes a workflow file name in .github/workflows (e.g. ci.yml), not '${w}'"
-    done
+    check_ci_names "${want[@]}"
     CI_ACTIVE=()
     SCHEDULED_ACTIVE=()
     SECRETS_ACTIVE=()
@@ -881,6 +914,85 @@ fork_setup() {
     test "${#disabled[@]}" -eq 0 || summary+="; ${#disabled[@]} workflow(s) disabled"
     test "${ncancel}" -eq 0 || summary+=", ${ncancel} run(s) cancelled"
     info "CI on ${fork}: ${summary}"
+}
+
+# repo_kind: reads a repository's REST JSON on stdin, prints midstream,
+# fork, or none (not a mirror): the topic decides, and a GitHub fork in
+# the forge org with neither is a midstream, the safe default.
+repo_kind() {
+    jq -r --arg m "${MIDSTREAM_TOPIC}" --arg f "${FORK_TOPIC}" --arg org "${FORGE_ORG}" '
+        (.topics // []) as $t
+        | if ($t | index($f)) then "fork"
+          elif ($t | index($m)) then "midstream"
+          elif .fork and .owner.login == $org then "midstream"
+          else "none" end'
+}
+
+# mark_repo FORK KIND: records KIND (midstream or fork) as FORK's topic,
+# replacing the other; KIND "keep" only adds the midstream topic when it
+# has neither, so that a real fork stays one. Sets MARKED_KIND.
+mark_repo() {
+    local fork=$1 chosen=$2 names old=() new=() t
+    names=$(ghapi "repos/${fork}/topics" --jq '.names | join(" ")') || fatal "cannot read the topics of ${fork}"
+    read -ra old <<<"${names}"
+    if test "${chosen}" = keep; then
+        chosen=midstream
+        [[ " ${names} " != *" ${FORK_TOPIC} "* ]] || chosen=fork
+    fi
+    local keep_topic=${MIDSTREAM_TOPIC} drop=${FORK_TOPIC}
+    test "${chosen}" != fork || { keep_topic=${FORK_TOPIC}; drop=${MIDSTREAM_TOPIC}; }
+    for t in "${old[@]}"; do
+        test "${t}" = "${drop}" || new+=("${t}")
+    done
+    [[ " ${new[*]} " == *" ${keep_topic} "* ]] || new+=("${keep_topic}")
+    MARKED_KIND=${chosen}
+    # Already as wanted.
+    [[ " ${old[*]} " != *" ${drop} "* && " ${old[*]} " == *" ${keep_topic} "* ]] && return 0
+    local args=()
+    for t in "${new[@]}"; do args+=(-f "names[]=${t}"); done
+    ghapi -X PUT "repos/${fork}/topics" "${args[@]}" >/dev/null || fatal "setting the topics of ${fork} failed"
+    info "Marked ${fork} as ${chosen} (topic ${keep_topic})"
+}
+
+# midstream_ruleset: the ruleset that keeps pull requests from merging
+# into a midstream's default branch. Its one required status check is
+# never reported, so only someone with bypass rights can merge a PR (an
+# admin does so by bypassing the rules explicitly, in GitHub's merge box),
+# and admins (the bot's sync from upstream among them) can still
+# fast-forward the branch; nobody else can delete it or force-push.
+midstream_ruleset() {
+    jq -n --arg name "${RULESET_NAME}" --arg check "${RULESET_CHECK}" '{
+        name: $name, target: "branch", enforcement: "active",
+        conditions: {ref_name: {include: ["~DEFAULT_BRANCH"], exclude: []}},
+        bypass_actors: [{actor_id: 5, actor_type: "RepositoryRole", bypass_mode: "always"}],
+        rules: [
+            {type: "required_status_checks", parameters: {strict_required_status_checks_policy: false,
+                required_status_checks: [{context: $check}]}},
+            {type: "non_fast_forward"},
+            {type: "deletion"}]}'
+}
+
+# set_ruleset FORK ENABLE: adds (ENABLE=true) or updates the ruleset of a
+# midstream on FORK, or removes it (ENABLE=false, for a real fork). Prints
+# nothing when it is already as wanted.
+set_ruleset() {
+    local fork=$1 enable=$2 id
+    id=$(ghapi "repos/${fork}/rulesets" --jq ".[] | select(.name == \"${RULESET_NAME}\") | .id") ||
+        fatal "cannot list the rulesets of ${fork}"
+    if ${enable}; then
+        if test -n "${id}"; then
+            midstream_ruleset | ghapi -X PUT "repos/${fork}/rulesets/${id}" --input - >/dev/null ||
+                fatal "updating the ${RULESET_NAME} ruleset of ${fork} failed"
+        else
+            midstream_ruleset | ghapi -X POST "repos/${fork}/rulesets" --input - >/dev/null ||
+                fatal "adding the ${RULESET_NAME} ruleset to ${fork} failed (does the bot administer it?)"
+            info "Added the ${RULESET_NAME} ruleset to ${fork}: pull requests there can't be merged"
+        fi
+    elif test -n "${id}"; then
+        ghapi -X DELETE "repos/${fork}/rulesets/${id}" >/dev/null ||
+            fatal "removing the ${RULESET_NAME} ruleset of ${fork} failed"
+        info "Removed the ${RULESET_NAME} ruleset from ${fork}"
+    fi
 }
 
 # Run statuses that still hold, or wait for, one of the organization's
@@ -1402,6 +1514,8 @@ cmd_fork_pr() {
     fi
     # Before sync_base, whose push to the fork would start its CI.
     fork_setup "${fork}" false "${ci[@]}"
+    # A fork never marked is a midstream; the ruleset is fork-setup's.
+    (mark_repo "${fork}" keep) || warn "marking ${fork} as a midstream failed; run '$(basename "$0") fork-setup ${fork#*/}'"
     test -n "${STACK_PARENT}${mirror_of}" || sync_base "${upstream}" "${fork}" "${base}"
     push_branch "${from}" "${fork}" "${branch}"
 
@@ -1565,10 +1679,13 @@ cmd_fork_setup() {
         classify_workflow <"$2" || fatal "cannot parse $2"
         return 0
     fi
-    local fork="" clear=false ci=()
+    local fork="" clear=false ci=() kind=keep ruleset=true ci_off=true
     while test $# -gt 0; do
         case "$1" in
             --no-ci) clear=true; shift ;;
+            --fork) kind=fork; shift ;;
+            --no-ruleset) ruleset=false; shift ;;
+            --topic-only) ci_off=false; ruleset=false; shift ;;
             --ci)
                 test $# -ge 2 || fatal "--ci requires a WORKFLOW"
                 ci+=("$2")
@@ -1588,12 +1705,29 @@ cmd_fork_setup() {
     if ! valid_repo "${fork}" || test "${fork%%/*}" != "${FORGE_ORG}"; then
         fatal "fork-setup takes a fork in ${FORGE_ORG} (REPO or ${FORGE_ORG}/REPO), not '${arg}'"
     fi
+    check_ci_names "${ci[@]}"
     check_login
     local rc=0
     ghapi "repos/${fork}" --jq .fork >/dev/null || rc=$?
     test "${rc}" -ne "${EX_NOTFOUND}" || fatal "${fork} does not exist"
     test "${rc}" -eq 0 || fatal "cannot read ${fork}"
-    fork_setup "${fork}" "${clear}" "${ci[@]}"
+    local current
+    current=$(ghapi "repos/${fork}" | repo_kind)
+    test "${current}" != none || fatal "${fork} is not a fork, so it is neither a midstream nor a real fork: fork-setup doesn't apply (one of the bot's own repositories?)"
+    mark_repo "${fork}" "${kind}"
+    ! ${ci_off} || fork_setup "${fork}" "${clear}" "${ci[@]}"
+    if ${ruleset}; then
+        set_ruleset "${fork}" "$(test "${MARKED_KIND}" = midstream && echo true || echo false)"
+    fi
+}
+
+cmd_repo_kind() {
+    test $# -eq 1 || fatal "usage: $(basename "$0") repo-kind REPO"
+    local repo=$1 json
+    [[ "${repo}" == */* ]] || repo=${FORGE_ORG}/${repo}
+    valid_repo "${repo}" || fatal "repo-kind takes OWNER/REPO, not '$1'"
+    json=$(ghapi "repos/${repo}") || fatal "cannot read ${repo}"
+    repo_kind <<<"${json}"
 }
 
 cmd_prune_runs() {
@@ -3111,6 +3245,7 @@ case "${command}" in
     fork-pr) command=fork_pr ;;
     fork-setup) command=fork_setup ;;
     fork-of) command=fork_of ;;
+    repo-kind) command=repo_kind ;;
     set-body) command=set_body ;;
     get-body) command=get_body ;;
     prune-runs) command=prune_runs ;;
