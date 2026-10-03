@@ -1,6 +1,6 @@
 ---
 name: coordinator
-description: Run the bot (cgwalters-bot) as the top-level coordinator session - poll bot-notify, bot-pr inbox and bot-watch on a loop, promote approved fork PRs, dispatch devspace agent runs (bot-runs) and local workers (bot-claude jobs) for Todo items and the operator's asks, apply the runs' patches, have an independent reviewer check every result, and post the morning brief. Load this when asked to run or coordinate the bot; workers and reviewers read the preambles next to it instead.
+description: Run the bot (cgwalters-bot) as the top-level coordinator session - poll bot-notify, bot-pr inbox and bot-watch on a loop, promote approved fork PRs, dispatch devspace agent runs (bot-runs) and local workers (bot-claude jobs) for Todo items and the operator's asks, apply the runs' patches, have an independent reviewer check every result, and publish periodic project status updates. Load this when asked to run or coordinate the bot; workers and reviewers read the preambles next to it instead.
 ---
 
 # coordinator — Running the bot as a coordinator
@@ -19,6 +19,10 @@ that do the work. The other skills say how the work is done; this one
 says how to drive it. The board semantics are in the `workstream` skill,
 routing pings in `bot-notify`, building and testing in `devspace-work`,
 and contributing in `upstream-pr`.
+
+The board is the operator's primary interface. Keep fields and asks there
+current, publish periodic summaries as project status updates, and keep
+chat replies to one line of status plus the update URL.
 
 ## What we're working toward
 
@@ -252,6 +256,7 @@ bot-pr inbox --dry-run
 bot-tmt-number --gc
 bot-actuals --open
 bot-board fill-org   # Org for items the project's auto-add put on the board
+bot-board status-update --auto
 ```
 
 with a timeout each, killing a step's whole process group when it times
@@ -264,6 +269,12 @@ topic session to it; see "Topic sessions" below.) Never run `bot-watch
 --apply` yourself: it would race the timer's sweep for its lock (and
 consume its news). `systemctl --user status bot-sweep.timer
 bot-sweep` shows the schedule and the last run.
+
+The status-update step runs last, after the earlier phases even if a step
+failed, with a two-minute timeout. Its output is `runs/ID/status-update.txt`;
+a failure is a sweep problem but does not itself make the watch/notify/inbox
+news incomplete. It has no `latest-*.txt` news feed. See "Project status
+updates" below for the auto checks and publishing limits.
 
 To wait for news, run `bin/bot-poll-loop --until-actions` as one
 background command (in Claude Code, `run_in_background`); the harness
@@ -897,9 +908,9 @@ cost when an item is far off (two buckets), and correct the table in
   never only in the coordinator's terminal chat with them, and never a
   separate `--review`, `--rerun` or `--chore` ask about that PR (if a
   worker opened one, request their review on the PR instead, or note the
-  action in Why, and resolve the ask). Keep chat replies to brief
-  status, pointing at where each question or reply was posted rather
-  than restating the options.
+  action in Why, and resolve the ask). Keep chat replies to one line of
+  status plus the project update URL; put the question or reply's link
+  in the board item so the update points to it.
 - **Coordination questions** (`coordination` records from `bot-notify`,
   shown by `bot-poll` as their own kind): jmarrero-bot or jmarrero
   mentioning @cgwalters-bot, or opening an issue, in
@@ -1008,25 +1019,70 @@ notifies no one. The view warns when `updated_at` is more than 15
 minutes old and `next_wake_at` (if given) has passed by more than a few
 minutes, which means the session is gone or stuck.
 
-## Morning brief
+## Project status updates
 
-Each morning, open an issue on
+Periodic summaries, including the morning brief, go to the Workstream
+project's status updates with `bin/bot-board status-update`, which prints
+the project URL; an update-specific permalink is not yet available. The
+default report is deterministic: **Changed**, **In progress**,
+and **Waiting on the operator**, derived from item state and News, with
+agent/run and Branch/Gist links. Workers come only from this machine's
+privacy-filtered heartbeat publication, with activity (or start) less than
+six hours old and an exact association to an unfinished item in this
+project; Lead is the fallback for an In Progress item with no matching worker. Update the
+board before publishing, and reply in chat with one line plus the URL.
+
+Let the sweep's `--auto` handle routine summaries: it first skips when the
+latest project update or successful local post was less than four hours
+ago (human updates count), then skips if the material observation digest
+matches the baseline. Timestamp changes and a News date-prefix change
+alone do not count; aging a P0 into `at-risk` does. A skip succeeds and
+prints a reason, not a URL; use the existing update URL when known.
+Do not invent a permalink from the returned project URL. Waiting asks
+follow board statuses and labels; exact review-app parity and the live
+GraphQL schema still need validation before deployment.
+
+For an explicit summary, these flags can be combined:
+`--status on-track|at-risk|off-track` overrides status; `--since ISO`
+sets the change window using a full timestamp with seconds and timezone;
+`--body FILE` replaces the generated text with nonempty UTF-8 curated
+text. Without `--since`, changes are since the last project post (or a
+newer successful local post), or the last 24 hours on the first post,
+with the saved observation used for transitions and changed News.
+Without `--status`, any unfinished P0 with at least 24 hours without
+observed material movement makes the project `at-risk`, otherwise
+`on-track`. Movement means changes to Status, Priority, Lead, Branch,
+Why/Gist, News content, title/body/state, or the latest comment's content.
+Token counters, Run changes, generic timestamps and News date-prefix churn
+do not reset a saved movement baseline. On first observation (or recovery
+from an older marker), project/content timestamps seed that baseline;
+bookkeeping before then can delay risk detection. Done, closed and merged
+items are finished.
+`BOT_BOARD_STATUS_P0_HOURS` must be positive and changes that threshold;
+`off-track` is explicit only. Explicit posts bypass the throttle and
+material-change checks; `--auto` refuses all three explicit flags.
+
+Each morning, also open an issue on
 [cgwalters-bot/cgwalters-bot](https://github.com/cgwalters-bot/cgwalters-bot/issues)
-that mentions the operator, with a link to the "Needs cgwalters" view
-(<https://github.com/orgs/cgwalters-forge/projects/1/views/2>) and a
-summary of it:
-
-- **quick wins**: fork PRs that are small and ready, with links;
-- **review queue**: everything else Draft, in priority order;
-- **decisions**: open question issues, each with its link;
-- **reading**: analysis gists and notable upstream activity;
-- **cost**: yesterday's estimate from `bot-cost --since yesterday
-  --until today`: the total, compute (core-hours) against inference, and
-  the top few tasks, labeled as an estimate at list prices; and the
-  `bot-capacity` report (projected percent at reset, what was held back).
-
-Keep it scannable, and end it with
+that mentions the operator, links the "Needs cgwalters" view
+(<https://github.com/orgs/cgwalters-forge/projects/1/views/2>) and the
+latest status update, and summarizes quick wins, the review queue,
+decisions and notable reading. A curated status update can carry the same
+via `--body FILE`; keep it scannable. Cost and capacity
+figures are not generated by status-update: add yesterday's estimate from
+`bot-cost --since yesterday --until today` (compute core-hours, inference
+and top tasks, labeled as an estimate at list prices) and `bot-capacity`'s
+projection and what was held back, respecting the visibility rules in
+"Heartbeat" above. End curated public text with
 `Generated-by: https://github.com/cgwalters/#llms` (the config's `generated_by_url`).
+
+Use one publisher on one machine per project. Posts are serialized by a
+local per-project `flock`; the local snapshot is under
+`${XDG_STATE_HOME:-~/.local/state}/bot-board/KIND/OWNER/NUMBER/status-update.json`.
+The recovery marker appended to each update lets the next run recover a
+baseline after posting succeeded but saving failed; it is not a
+cross-machine lock or atomic check-and-post. See README.md's "Project
+status updates" for the full flag and observation semantics.
 
 ## Stopping
 

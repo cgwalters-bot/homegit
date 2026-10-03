@@ -42,6 +42,7 @@ const PHASES = [
     // With none to set, it reads only the REST listing: no GraphQL.
     { name: "fill-org", tool: "bot-board", args: ["fill-org"], timeoutMin: 2 },
   ],
+  [{ name: "status-update", tool: "bot-board", args: ["status-update", "--auto"], timeoutMin: 2 }],
 ];
 // What 'bot-board fill-org' prints for each item it sets: ID, Org, title.
 const ORG_SET_RE = /^(PVTI_\S+)\t([^\t]+)\t(.*)$/gm;
@@ -93,9 +94,10 @@ never killed halfway by a poll's timeout:
   bot-tmt-number --gc                    \\
   bot-actuals --open                      > at once
   bot-board fill-org                     /
+  bot-board status-update --auto
 
 Each step has a timeout (git 2, bot-watch 20, bot-notify 5, inbox 10,
-gc 2, actuals 3, fill-org 2 minutes) and runs in its own process group,
+gc 2, actuals 3, fill-org 2, status-update 2 minutes) and runs in its own process group,
 all of which is killed when it times out, so no orphan keeps holding
 bot-watch's lock. A step that finds another run holding its lock is
 retried ${LOCK_RETRIES} times.
@@ -474,6 +476,10 @@ async function sweep(opts) {
     process.stdout.write(`${PROG}: run ${id} took ${status.duration_s}s` +
       `${problems.length ? `; problems:\n${problems.map((p) => `  ${p}`).join("\n")}` : "; no problems"}\n` +
       `${status.org_filled.length ? `Org filled:\n${status.org_filled.map((o) => `  ${o.id} ${o.org}: ${o.title}`).join("\n")}\n` : ""}`);
+    if (steps["status-update"]?.exit === 0) {
+      const url = (outputs["status-update"] || "").split("\n").find((line) => /^https:\/\/github\.com\/\S+$/.test(line));
+      if (url) process.stdout.write(`Project status update: ${url}\n`);
+    }
     return problems.length ? EX_ERROR : 0;
   } finally {
     if (killed) await killed;
