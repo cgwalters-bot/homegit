@@ -128,7 +128,7 @@ sweep 20261002-100000-000 "${DRIVE1}"
 out=$(loop)
 expect_first "${out}" '^QUIET: no news in this window$'
 grep -qx 'Observed: 4 of 4 agents busy' <<<"${out}" || fail "QUIET without the Observed line: ${out}"
-grep -q -- "--state ${WORK}/state/actions.json --resync 120" "${FAKE}/reconcile-calls" || fail "reconcile args: $(cat "${FAKE}/reconcile-calls")"
+grep -q -- "--apply --state ${WORK}/state/actions.json --resync 120" "${FAKE}/reconcile-calls" || fail "reconcile args: $(cat "${FAKE}/reconcile-calls")"
 
 # A new run with a new P0 drive blocker wakes it once, with the report;
 # ci-pending is not a blocker to wake for.

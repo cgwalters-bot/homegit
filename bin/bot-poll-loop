@@ -79,7 +79,9 @@ refresh': they republish the heartbeat as last published with
 updated_at moved to now, prune without the workers whose item is Done
 or closed, while that publish was this session's and nobody changed it
 since. So the heartbeat stays fresh and drops finished workers without
-a wake, and is stale only when the refresh can't keep it so. Then it runs 'bot-reconcile --state ${S}/actions.json'
+a wake, and is stale only when the refresh can't keep it so. Then it runs 'bot-reconcile --apply --state ${S}/actions.json'
+(--apply carries out the deterministic actions: closing finished items, clearing stale
+Leads, and dispatching labeled issues, see its dispatch rule)
 and wakes on its fired actions: those that are new, and those still
 open ${RESYNC_MIN} minutes after they last woke it (a controller's resync). So the
 same unresolved action doesn't wake it again and again.
@@ -266,7 +268,7 @@ refresh() {
 # ${S}/reconcile.txt, adding the kinds of its fired actions to hits.
 reconcile() {
     local kinds rc=0
-    "${TOOLS}/bot-reconcile" --state "${S}/actions.json" --resync "${RESYNC_MIN}" >"${S}/reconcile.txt" 2>&1 || rc=$?
+    "${TOOLS}/bot-reconcile" --apply --state "${S}/actions.json" --resync "${RESYNC_MIN}" >"${S}/reconcile.txt" 2>&1 || rc=$?
     if test "${rc}" -eq 0; then
         reconcile_fails=0
     else
