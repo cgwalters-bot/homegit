@@ -66,7 +66,8 @@ fs.appendFileSync(process.env.CALLS, JSON.stringify(['gh', ...args]) + '\\n');
 if (args.includes('POST')) {
   fs.readFileSync(0);
   console.log(JSON.stringify({workflow_run_id: 123, html_url: 'https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/123'}));
-} else if (args.includes('repos/o/r')) console.log('public');
+} else if (args.includes('graphql')) console.log(JSON.stringify(JSON.parse(fs.readFileSync(process.env.ITEMS))[0]));
+else if (args.includes('repos/o/r')) console.log('public');
 else process.exit(1);
 `);
         const pace = script("pace", "process.exit(process.env.SCENARIO === 'budget-fails' ? 1 : 0);\n");
@@ -81,6 +82,13 @@ else process.exit(1);
         assert.equal(r.status, scenario === "board-fails" ? 1 : 0, r.stderr);
         const calls = fs.existsSync(env.CALLS) ? fs.readFileSync(env.CALLS, "utf8").trim().split("\n").map(JSON.parse) : [];
         const publishes = calls.filter((c) => c[0] === "heartbeat");
+        if (mode === "dispatch" && !["board-fails", "dry-run"].includes(scenario)) {
+          assert.equal(calls.filter((c) => c[0] === "board" && c[1] === "list").length, 0);
+          const lookups = calls.filter((c) => c[0] === "gh" && c.includes("graphql"));
+          assert.equal(lookups.length, 1);
+          assert.ok(lookups[0].includes("id=PVTI_item"));
+          assert.ok(lookups[0].some((arg) => arg.includes("node(id: $id)")));
+        }
         const published = ["append", "dedup", "no-session", "publish-fails", "usage-fails", "budget-fails"].includes(scenario);
         assert.deepEqual(publishes, published ? [["heartbeat", "publish", "--require-saved-state"]] : []);
         if (published && scenario !== "publish-fails") {
@@ -104,4 +112,46 @@ else process.exit(1);
       }
     });
   }
+}
+
+for (const scenario of ["issue", "pull", "invalid-id", "null-node", "wrong-id", "draft", "bad-url", "api-fails", "missing-state", "publish-fails"]) {
+  test(`registration CLI: ${scenario}`, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "heartbeat-register-cli-"));
+    try {
+      const calls = path.join(dir, "calls");
+      const item = { id: scenario === "wrong-id" ? "PVTI_other" : "PVTI_item", content: { url: scenario === "pull" ? "https://github.com/o/r/pull/2" : URL } };
+      if (scenario === "draft") item.content = {};
+      if (scenario === "bad-url") item.content.url = "PVTI_other";
+      fs.writeFileSync(path.join(dir, "gh"), `#!/usr/bin/env node
+const fs = require('node:fs');
+fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(process.argv.slice(2)) + '\\n');
+${scenario === "api-fails" ? "process.exit(1);" : `console.log(${JSON.stringify(JSON.stringify(scenario === "null-node" ? null : item))});`}
+`, { mode: 0o755 });
+      const heartbeat = path.join(dir, "heartbeat");
+      fs.writeFileSync(heartbeat, `#!/usr/bin/env node
+require('node:fs').appendFileSync(${JSON.stringify(calls)}, 'publish\\n');
+process.exit(${scenario === "publish-fails" ? 1 : 0});
+`, { mode: 0o755 });
+      const stateDir = path.join(dir, "state", "bot-heartbeat");
+      fs.mkdirSync(stateDir, { recursive: true });
+      if (scenario !== "missing-state") {
+        const updated_at = new Date().toISOString();
+        fs.writeFileSync(path.join(stateDir, "last-publish.json"), JSON.stringify({ session: null, input: { updated_at, coordinator: { session: "coordinator-session", loop_state: "working" }, workers: [] }, published: { updated_at } }));
+      }
+      const r = spawnSync(process.execPath, [path.join(ROOT, "lib", "heartbeat-register.js"), "unused-board", scenario === "invalid-id" ? "bad" : "PVTI_item", "worker", heartbeat], {
+        encoding: "utf8", env: { ...process.env, PATH: `${dir}:${process.env.PATH}`, XDG_STATE_HOME: path.join(dir, "state") },
+      });
+      assert.equal(r.status, ["issue", "pull"].includes(scenario) ? 0 : 1, r.stderr);
+      const recorded = fs.existsSync(calls) ? fs.readFileSync(calls, "utf8").trim().split("\n") : [];
+      if (scenario === "invalid-id") assert.deepEqual(recorded, []);
+      else {
+        const args = JSON.parse(recorded[0]);
+        assert.deepEqual(args.slice(0, 2), ["api", "graphql"]);
+        assert.ok(args.includes("id=PVTI_item"));
+        assert.deepEqual(args.slice(-2), ["--jq", ".data.node"]);
+        assert.equal(recorded.length, ["issue", "pull", "publish-fails"].includes(scenario) ? 2 : 1);
+      }
+      if (r.status !== 0) assert.match(r.stderr, /warning: heartbeat registration/);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
 }

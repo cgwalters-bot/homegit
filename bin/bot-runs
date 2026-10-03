@@ -1272,6 +1272,9 @@ readonly RUN_ORIGIN_JQ='
     elif (.head_repository.id // null) != (.repository.id // "") then "ran code from another repository than \($repo)"
     elif .path != $path then "ran \(.path // "?"), not \($path)"
     elif .event != "workflow_dispatch" then "was triggered by \(.event // "?"), not a dispatch"
+    elif (.actor.login | type) != "string" or (.actor.login == "")
+        or (.actor.login != $bot and .actor.login != $operator)
+        then "was dispatched by \(.actor.login // "?"), not the configured bot or operator"
     elif $repo != $devspace then "is not in the configured devspace repository \($devspace)"
     elif ((.head_branch // "") | test("^bot/agent-run-.+$") | not)
         then "ran the workflow from \(.head_branch // "?"), not a trusted agent branch"
@@ -1444,6 +1447,7 @@ cmd_apply() {
     test "$(jq -r '.conclusion // .status' <<<"${meta}")" = success ||
         fatal "run ${run_id} is $(jq -r '.conclusion // .status' <<<"${meta}"), not success; only a successful run's change is applied"
     why=$(jq -r --arg repo "${RUNS_REPO}" --arg path ".github/workflows/${RUNS_WORKFLOW}" --arg devspace "${OP_DEVSPACE_REPO}" \
+        --arg bot "${OP_BOT_LOGIN}" --arg operator "${OP_OPERATOR_LOGIN}" \
         "${RUN_ORIGIN_JQ}" <<<"${run}")
     test -z "${why}" || fatal "run ${run_id} ${why}; only dispatches of ${RUNS_WORKFLOW} from trusted agent branches are applied"
     test "$(jqlib -r '{run: .} | title_parts | .repo // ""' <<<"${meta}")" = "${want_repo}" ||

@@ -50,7 +50,7 @@ if (args.includes('PATCH') || args.includes('POST')) {
     }
     fs.unlinkSync(active);
     console.log('https://github.com/o/r/issues/1#issuecomment-9');
-  }, fs.existsSync(path.join(dir, 'delay')) ? 200 : 0);
+  }, fs.existsSync(path.join(dir, 'long-delay')) && !usage ? 11000 : fs.existsSync(path.join(dir, 'delay')) ? 200 : 0);
 } else if (api && api.includes('/comments?')) {
   if (fs.existsSync(comments)) console.log(fs.readFileSync(comments, 'utf8'));
   if (!usage && fs.existsSync(path.join(dir, 'fail-save-read'))) {
@@ -75,7 +75,7 @@ else { console.error('unexpected fake API call: ' + args.join(' ')); process.exi
 function register(w, id, number, extraEnv = {}) {
   const item = { id, content: { url: `https://github.com/o/r/issues/${number}` } };
   const code = `const fs = require('node:fs'); const item = JSON.parse(fs.readFileSync(0, 'utf8'));
-process.exit(require(${JSON.stringify(REGISTER)}).register(item, item.id, {lockWaitSeconds: Number(process.env.WAIT || 10)}) ? 0 : 1);`;
+process.exit(require(${JSON.stringify(REGISTER)}).register(item, item.id, process.env.WAIT ? {lockWaitSeconds: Number(process.env.WAIT)} : {}) ? 0 : 1);`;
   const child = spawn(process.execPath, ["-e", code], { env: { ...w.env, CLAUDE_CODE_SESSION_ID: "caller-session", ...extraEnv }, stdio: ["pipe", "pipe", "pipe"] });
   child.stdin.end(JSON.stringify(item));
   let stderr = "";
@@ -86,13 +86,16 @@ process.exit(require(${JSON.stringify(REGISTER)}).register(item, item.id, {lockW
   });
 }
 
-for (const scenario of ["distinct", "same-item", "first-publication-fails", "null-owner"]) {
+for (const scenario of ["distinct", "same-item", "first-publication-fails", "null-owner", "long-publication"]) {
   test(`concurrent registration: ${scenario}`, async () => {
     const w = world(scenario === "null-owner" ? null : OWNER);
     try {
       fs.writeFileSync(path.join(w.dir, "delay"), "");
+      if (scenario === "long-publication") fs.writeFileSync(path.join(w.dir, "long-delay"), "");
       if (scenario === "first-publication-fails") fs.writeFileSync(path.join(w.dir, "fail-one"), "");
+      const start = Date.now();
       const results = await Promise.all([register(w, "PVTI_one", 1), register(w, "PVTI_two", scenario === "same-item" ? 1 : 2)]);
+      if (scenario === "long-publication") assert.ok(Date.now() - start > 10000, "exercise the default lock wait across a publication longer than 10 seconds");
       assert.deepEqual(results.map((r) => r.status), scenario === "first-publication-fails" ? [1, 0] : [0, 0], JSON.stringify(results));
       const saved = w.saved();
       assert.deepEqual(saved.input.workers[0], ORIGINAL);

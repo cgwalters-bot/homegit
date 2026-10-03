@@ -112,6 +112,9 @@ if test -e "${store}/rate-limited" || { test -e "${store}/rate-limited-search" &
     fail_http 403 "API rate limit exceeded for user ID 1"
 fi
 case "${method} ${path%%\?*}" in
+    "GET graphql")
+        reply "$(jq -c --arg id "$(field id)" '{data: {node: (map(select(.id == $id)) | first)}}' "${store}/board.json")"
+        ;;
     "GET repos/${repo}/actions/workflows/agent.yml/runs")
         per=$(query per_page) page=$(query page)
         reply "$(jq -c --arg st "$(query status)" --arg c "$(query created)" --argjson per "${per:-30}" --argjson page "${page:-1}" '
@@ -148,7 +151,7 @@ case "${method} ${path%%\?*}" in
         id=${path#repos/"${repo}"/actions/runs/}
         body=$(jq -c --argjson id "${id}" --arg sha "${head_sha}" --arg repo "${repo}" '.workflow_runs[] | select(.id == $id)
             | {path: ".github/workflows/agent.yml", event: "workflow_dispatch", head_branch: "bot/agent-run-praxis", head_sha: $sha,
-               repository: {id: 1, full_name: $repo}, head_repository: {id: 1, full_name: $repo}} + .' "${runs}" | filtered run)
+               actor: {login: "cgwalters-bot"}, repository: {id: 1, full_name: $repo}, head_repository: {id: 1, full_name: $repo}} + .' "${runs}" | filtered run)
         test -n "${body}" || fail_http 404 "Not Found"
         reply "${body}"
         ;;
@@ -838,6 +841,38 @@ echo x >run.sh && chmod +x run.sh|new symlink, submodule, executable
 EOF
 }
 
+test_apply_actors() {
+    local actor allowed out rc
+    make_change 1001 >/dev/null
+    # Non-default identities prove the allowlist comes from operator config.
+    printf '%s\n' '{"bot":{"login":"test-bot"},"operator":{"login":"test-operator"}}' >"${WORK}/actor-operator.json"
+    while IFS='|' read -r actor allowed; do
+        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${XDG_CACHE_HOME}/bot-work" "${XDG_STATE_HOME}/bot-runs"
+        : >"${FAKE_GH}/calls"
+        printf '%s\n' "${actor}" >"${FAKE_GH}/filter-run.jq"
+        rc=0
+        out=$(BOT_OPERATOR_CONFIG="${WORK}/actor-operator.json" apply_run 1001 --json 2>&1) || rc=$?
+        if test "${allowed}" = yes; then
+            expect_eq "${rc}" 0 "trusted actor: ${out}"
+        else
+            test "${rc}" -ne 0 || fail "trusted actor: ${actor}"
+            expect_lines "${out}" 'not the configured bot or operator'
+            expect_eq "$(calls 'artifacts|tarball|/jobs')" 0 "untrusted actor fetched artifacts or checker"
+        fi
+    done <<'EOF'
+. += {actor: {login: "test-bot"}, triggering_actor: {login: "outsider"}}|yes
+. += {actor: {login: "test-operator"}, triggering_actor: {login: "outsider"}}|yes
+. += {actor: {login: "outsider"}, triggering_actor: {login: "test-bot"}}|no
+. += {actor: {login: "outsider"}, triggering_actor: {login: "test-operator"}}|no
+del(.actor)|no
+. += {actor: null, triggering_actor: {login: "test-bot"}}|no
+.actor.login = null|no
+.actor.login = ""|no
+.actor.login = 42|no
+.actor.login = "cgwalters-bot"|no
+EOF
+}
+
 test_apply_branches() {
     local branch allowed out rc dispatch_ref
     make_change 1001 >/dev/null
@@ -1054,11 +1089,10 @@ test_dispatch() {
     expect_eq "$(cat "${FAKE_GH}/board-calls")" "field-ensure Run
 set PVTI_item1 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 16 cores)
 pace budget PVTI_item1
-list --json
 field-ensure Run
 set PVTI_item2 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 4 cores)
-pace budget PVTI_item2
-list --json" "board calls"
+pace budget PVTI_item2" "board calls"
+    expect_eq "$(calls 'api graphql')" 2 "targeted heartbeat item lookups"
     # The default model is opencode's only: --model overrides it, and the
     # fake agent has none.
     out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs --agent fake "${WORK}/brief.md")
