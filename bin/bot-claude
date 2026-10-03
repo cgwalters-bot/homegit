@@ -54,6 +54,46 @@ const KEPT_CLAUDE_VARS = ["CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK", 
 const DROPPED_VARS = ["CLAUDECODE", "AI_AGENT", "CLAUDE_PID", "CLAUDE_EFFORT"];
 const WORKER_SHELL = "/bin/bash";
 const BOT_IDENTITY_KEYS = { name: "bot.git_name", email: "bot.git_email" };
+const TOKEN_VAR = "BOT_CLAUDE_JOB_TOKEN";
+
+// comm may contain spaces and parentheses; fields after its final ')' have
+// fixed offsets. Keep starttime as text (it need not fit a JS integer).
+function processIdentity(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+    if (fields.length < 20 || !/^\d+$/.test(fields[19])) return null;
+    return { pid, starttime: fields[19], pgrp: Number(fields[2]), session: Number(fields[3]),
+      boot_id: fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() };
+  } catch {
+    return null;
+  }
+}
+
+function sameIdentity(a, b) {
+  return a && b && ["pid", "starttime", "pgrp", "session", "boot_id"].every((k) => a[k] === b[k]);
+}
+
+// Never trust a numeric pgid alone. A surviving member must carry the
+// inherited random token and still belong to the recorded session/group.
+function ownedGroup(identity, token) {
+  if (!identity || identity.pgrp !== identity.pid || identity.session !== identity.pid) return false;
+  const leader = processIdentity(identity.pid);
+  if (sameIdentity(identity, leader)) return true;
+  if (leader || !token) return false;
+  try {
+    for (const entry of fs.readdirSync("/proc")) {
+      if (!/^\d+$/.test(entry)) continue;
+      const member = processIdentity(Number(entry));
+      if (!member || member.boot_id !== identity.boot_id || member.pgrp !== identity.pgrp || member.session !== identity.session) continue;
+      try {
+        const env = fs.readFileSync(`/proc/${entry}/environ`, "utf8").split("\0");
+        if (env.includes(`${TOKEN_VAR}=${token}`) && sameIdentity(member, processIdentity(member.pid))) return true;
+      } catch { /* A member may exit during the scan. */ }
+    }
+  } catch { /* /proc unavailable: do not signal. */ }
+  return false;
+}
 
 // Exit statuses. wait's are like bot-devspace wait's (timeout(1)'s 124 for a
 // wait that ran out), plus one for each way a job can end without succeeding.
@@ -159,6 +199,7 @@ function readJob(job) {
 function supervisorAlive(st) {
   // Just started: the supervisor records its pid itself.
   if (!st.pid) return st.state === "starting" && Date.now() - Date.parse(st.started_at) < START_GRACE_MS;
+  if (st.supervisor_identity) return sameIdentity(st.supervisor_identity, processIdentity(st.pid));
   try {
     process.kill(st.pid, 0);
     const cmdline = fs.readFileSync(`/proc/${st.pid}/cmdline`, "utf8");
@@ -183,16 +224,10 @@ function loadStatus(job) {
   return st;
 }
 
-// What a job whose supervisor is gone left behind: its worker (if still
-// ours, as its command line says) and its heartbeat entry.
+// Reap only a verifiably owned group, including survivors of a gone leader.
 function reapLost(st) {
-  if (st.claude_pid) {
-    try {
-      if (fs.readFileSync(`/proc/${st.claude_pid}/cmdline`, "utf8").includes(st.job)) signalGroup(st.claude_pid, "SIGKILL");
-    } catch {
-      // Already gone.
-    }
-  }
+  signalGroup(st.worker_identity, "SIGKILL", st.worker_token);
+  signalGroup(st.actuals_identity, "SIGKILL", st.actuals_token);
   if (st.item) heartbeat.deregister(st.job, { heartbeat: HEARTBEAT });
 }
 
@@ -409,9 +444,10 @@ function cmdLog(argv) {
   return EX_OK;
 }
 
-function signalGroup(pid, signal) {
+function signalGroup(identity, signal, token) {
+  if (!ownedGroup(identity, token)) return false;
   try {
-    process.kill(-pid, signal);
+    process.kill(-identity.pgrp, signal);
     return true;
   } catch {
     return false;
@@ -421,7 +457,7 @@ function signalGroup(pid, signal) {
 async function cmdKill(argv) {
   const o = parseOptions(argv, {});
   if (o.positional.length !== 1) throw new Fatal("kill takes one JOB");
-  const st = loadStatus(o.positional[0]);
+  let st = loadStatus(o.positional[0]);
   if (!RUNNING.includes(st.state)) {
     process.stdout.write(`job ${st.job} already ${st.state}\n`);
     return EX_OK;
@@ -430,20 +466,24 @@ async function cmdKill(argv) {
   // the groups are killed here. A job that just started has no pid yet.
   for (let i = 0; i < 50 && !st.pid; i++) {
     await sleep(100);
-    st.pid = readJob(st.job).pid;
+    st = readJob(st.job);
   }
-  if (st.pid) signalGroup(st.pid, "SIGTERM");
+  if (RUNNING.includes(st.state)) signalGroup(st.supervisor_identity, "SIGTERM");
   const deadline = Date.now() + KILL_GRACE_MS + 5000;
   while (Date.now() < deadline && RUNNING.includes(readJob(st.job).state) && supervisorAlive(st)) await sleep(200);
   const now = readJob(st.job);
   if (RUNNING.includes(now.state)) {
-    if (st.pid) signalGroup(st.pid, "SIGKILL");
-    if (now.claude_pid) signalGroup(now.claude_pid, "SIGKILL");
-    const killed = { ...now, state: "killed", ended_at: nowIso(), exit_code: null };
-    writeJson(statusFile(st.job), killed);
-    reapLost(killed);
+    signalGroup(now.actuals_identity, "SIGKILL", now.actuals_token);
+    signalGroup(now.supervisor_identity, "SIGKILL");
+    signalGroup(now.worker_identity, "SIGKILL", now.worker_token);
+    const latest = readJob(st.job);
+    if (RUNNING.includes(latest.state)) {
+      const killed = { ...latest, state: "killed", ended_at: nowIso(), exit_code: null };
+      writeJson(statusFile(st.job), killed);
+      reapLost(killed);
+    }
   }
-  process.stdout.write(`job ${st.job} killed\n`);
+  process.stdout.write(`job ${st.job} ${readJob(st.job).state}\n`);
   return EX_OK;
 }
 
@@ -501,20 +541,33 @@ function registerWorker(job) {
 async function supervise(jobId) {
   const dir = jobDir(jobId);
   const job = JSON.parse(fs.readFileSync(path.join(dir, "job.json"), "utf8"));
-  const st = { ...readJob(jobId), pid: process.pid, state: "running" };
-  const save = () => writeJson(statusFile(jobId), st);
+  const st = { ...readJob(jobId), pid: process.pid, supervisor_identity: processIdentity(process.pid), state: "running" };
+  const save = () => {
+    const recorded = readJob(jobId);
+    if (["killed", "lost"].includes(recorded.state)) return;
+    writeJson(statusFile(jobId), st);
+  };
   save();
 
   // Signals first (registering the worker can take seconds): a kill that
   // arrives before the worker exists means it never starts.
   let child = null;
   let stopping = null;
+  let workerDone = false;
+  let escalation = null;
+  let cancelActuals = null;
+  const clearEscalation = () => { clearTimeout(escalation); escalation = null; };
   const stop = (why) => {
+    if (cancelActuals) cancelActuals();
     if (stopping) return;
     stopping = why;
-    if (!child || !child.pid) return;
-    signalGroup(child.pid, "SIGTERM");
-    setTimeout(() => signalGroup(child.pid, "SIGKILL"), KILL_GRACE_MS).unref();
+    if (workerDone || !child || !child.pid) return;
+    signalGroup(st.worker_identity, "SIGTERM", st.worker_token);
+    escalation = setTimeout(() => {
+      escalation = null;
+      if (!workerDone) signalGroup(st.worker_identity, "SIGKILL", st.worker_token);
+    }, KILL_GRACE_MS);
+    escalation.unref();
   };
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => stop("killed"));
   registerWorker(job);
@@ -550,7 +603,8 @@ async function supervise(jobId) {
   let timer = null;
   if (!stopping) {
     // Its own process group: what its tools started goes with it.
-    child = spawn(CLAUDE, claudeArgs(job), { cwd: job.dir, env: workerEnv(), detached: true, stdio: [briefFd, "pipe", stderrFd] });
+    st.worker_token = crypto.randomBytes(32).toString("hex");
+    child = spawn(CLAUDE, claudeArgs(job), { cwd: job.dir, env: { ...workerEnv(), [TOKEN_VAR]: st.worker_token }, detached: true, stdio: [briefFd, "pipe", stderrFd] });
     // Decode as a stream: a multibyte character may span two chunks.
     child.stdout.setEncoding("utf8");
     const finished = new Promise((resolve) => {
@@ -564,6 +618,9 @@ async function supervise(jobId) {
         }
       };
       child.on("error", (e) => {
+        workerDone = true;
+        clearEscalation();
+        clearTimeout(timer);
         fs.writeSync(stderrFd, `${PROG}: cannot run ${CLAUDE}: ${e.message}\n`);
         exited = { code: 127, signal: null };
         done();
@@ -583,14 +640,18 @@ async function supervise(jobId) {
       // process it left behind may hold that open, so it gets a moment to
       // drain, and whatever it left running goes with it.
       child.on("exit", (code, signal) => {
+        workerDone = true;
+        clearEscalation();
+        clearTimeout(timer);
         exited = { code, signal };
-        signalGroup(child.pid, "SIGKILL");
+        signalGroup(st.worker_identity, "SIGKILL", st.worker_token);
         if (stdoutClosed) done();
         else setTimeout(done, DRAIN_MS);
       });
     });
     if (child.pid) {
       st.claude_pid = child.pid;
+      st.worker_identity = processIdentity(child.pid);
       save();
     }
     timer = setTimeout(() => stop("timeout"), job.timeout_min * 60000);
@@ -598,10 +659,6 @@ async function supervise(jobId) {
     clearTimeout(timer);
     if (pending.trim()) onLine(pending);
   }
-  let state;
-  if (stopping) state = stopping;
-  else if (ended.code === 0 && st.result !== undefined && !st.is_error) state = "succeeded";
-  else state = "failed";
   Object.assign(st, { exit_code: ended.code, ended_at: nowIso() });
   if (ended.signal) st.signal = ended.signal;
   if (st.result !== undefined) fs.writeFileSync(path.join(dir, "result.md"), `${st.result}\n`);
@@ -610,10 +667,44 @@ async function supervise(jobId) {
     // Their transcripts name the item, so bot-actuals finds the tokens.
     // The state is recorded after, so that a wait that returns can rely on
     // the actuals field.
-    const r = spawnSync(ACTUALS, ["--open", "--since", "2d"], { encoding: "utf8", timeout: ACTUALS_TIMEOUT_MS });
-    st.actuals = r.status === 0 ? "recorded" : `failed (exit ${r.status ?? r.signal}): ${(r.stderr || "").trim().slice(0, 200)}`;
+    st.actuals = await new Promise((resolve) => {
+      st.actuals_token = crypto.randomBytes(32).toString("hex");
+      const actuals = spawn(ACTUALS, ["--open", "--since", "2d"], {
+        detached: true, env: { ...process.env, [TOKEN_VAR]: st.actuals_token }, stdio: ["ignore", "ignore", "pipe"],
+      });
+      const identity = actuals.pid ? processIdentity(actuals.pid) : null;
+      st.actuals_identity = identity;
+      // A poller must also be able to reap actuals if this supervisor dies.
+      save();
+      let stderr = "";
+      let finished = false;
+      const finish = (result) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timeout);
+        cancelActuals = null;
+        signalGroup(identity, "SIGKILL", st.actuals_token);
+        delete st.actuals_identity;
+        delete st.actuals_token;
+        actuals.stderr.destroy();
+        resolve(result);
+      };
+      const cancel = (reason) => {
+        finish(`failed (${reason})`);
+      };
+      const timeout = setTimeout(() => cancel("timeout"), ACTUALS_TIMEOUT_MS);
+      cancelActuals = () => cancel("cancelled");
+      actuals.stderr.on("data", (chunk) => { stderr = (stderr + chunk).slice(0, 200); });
+      actuals.on("error", (e) => finish(`failed: ${e.message.slice(0, 200)}`));
+      actuals.on("exit", (code, signal) => finish(code === 0 ? "recorded" : `failed (exit ${code ?? signal}): ${stderr.trim()}`));
+      // stop() may have run before finalization installed cancelActuals.
+      if (stopping) cancelActuals();
+    });
   }
-  st.state = state;
+  if (stopping) st.state = stopping;
+  else if (ended.code === 0 && st.result !== undefined && !st.is_error) st.state = "succeeded";
+  else st.state = "failed";
+  st.ended_at = nowIso();
   save();
 }
 
