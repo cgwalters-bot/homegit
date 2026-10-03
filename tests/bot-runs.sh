@@ -740,15 +740,17 @@ test_apply() {
     expect_lines "${out}" "already exists"
 }
 
-# The applied worktree can be published without repairing its configuration.
+# The applied worktree can be published and re-pushed after an amend without
+# repairing its configuration or fetching the topic branch.
 test_apply_land() {
-    local out dir
+    local out dir first amended
     make_change 1001 >/dev/null
     git clone -q --bare "${WORK}/target" "${WORK}/origin.git"
     # The bot's own repository (here by making composefs the forge org).
     printf '%s\n' '{"forge_org":"composefs"}' >"${WORK}/own-operator.json"
     out=$(BOT_OPERATOR_CONFIG="${WORK}/own-operator.json" apply_run 1001 --source "${WORK}/origin.git" --json)
     dir=$(jq -r .dir <<<"${out}")
+    first=$(git -C "${dir}" rev-parse HEAD)
     test -z "$(git --git-dir="${WORK}/origin.git" for-each-ref refs/heads/bot/)" || fail "apply pushed a branch"
     # Publish with the real, ordinary bot-land and a local bare origin;
     # only GitHub responses are faked, with no remote configuration edits.
@@ -765,7 +767,19 @@ esac
 EOF
     out=$(cd "${dir}" && "${TESTS}/../bin/bot-land" --repo composefs/composefs-rs --no-wait)
     expect_lines "${out}" '^https://github.com/composefs/composefs-rs/pull/7$'
-    expect_eq "$(git --git-dir="${WORK}/origin.git" rev-parse bot/fsck-sb)" "$(git -C "${dir}" rev-parse HEAD)" "bot-land pushed applied commit"
+    expect_eq "$(git --git-dir="${WORK}/origin.git" rev-parse refs/heads/bot/fsck-sb)" "${first}" "bot-land pushed applied commit"
+    expect_eq "$(git -C "${dir}" rev-parse refs/remotes/origin/bot/fsck-sb)" "${first}" "first land updated topic tracking"
+    # A message change guarantees a new hash even within the same second.
+    (cd "${dir}" && "${TESTS}/../bin/bot-git" commit -q --amend \
+        -m "fsck: Validate the superblock first" -m "A truncated image failed late." \
+        -m "Generated-by: AI" --trailer "Agent-run: ${RUNS_URL}/1001/attempts/1")
+    amended=$(git -C "${dir}" rev-parse HEAD)
+    test "${amended}" != "${first}" || fail "amend did not change the commit"
+    expect_eq "$(git -C "${dir}" rev-parse refs/remotes/origin/bot/fsck-sb)" "${first}" "topic tracking still names the old head before re-land"
+    out=$(cd "${dir}" && "${TESTS}/../bin/bot-land" --repo composefs/composefs-rs --no-wait)
+    expect_lines "${out}" '^https://github.com/composefs/composefs-rs/pull/7$'
+    expect_eq "$(git --git-dir="${WORK}/origin.git" rev-parse refs/heads/bot/fsck-sb)" "${amended}" "bot-land re-pushed amended commit"
+    expect_eq "$(git -C "${dir}" rev-parse refs/remotes/origin/bot/fsck-sb)" "${amended}" "second land updated topic tracking"
 }
 
 # The outputs a run hands back that are not a pull request are only listed.
