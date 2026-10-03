@@ -39,7 +39,8 @@
           "P0": "M",
           "P1": "S",
           "P2": "S"
-        }
+        },
+        "opencode_share": 0.25
       }
     }
   },
@@ -94,7 +95,8 @@
           "P0": "M",
           "P1": "S",
           "P2": "S"
-        }
+        },
+        "opencode_share": 0.25
       }
     }
   },
@@ -187,7 +189,8 @@
           "P1": "S",
           "P2": "XS",
           "P3": "XL"
-        }
+        },
+        "opencode_share": 0.25
       }
     }
   },
@@ -245,7 +248,8 @@
           "P0": "M",
           "P1": "S",
           "P2": "S"
-        }
+        },
+        "opencode_share": 0.25
       }
     }
   },
@@ -291,7 +295,8 @@
           "P0": "M",
           "P1": "S",
           "P2": "S"
-        }
+        },
+        "opencode_share": 0.25
       }
     }
   },
@@ -336,7 +341,8 @@
           "P0": "M",
           "P1": "S",
           "P2": "S"
-        }
+        },
+        "opencode_share": 0.25
       }
     }
   },
@@ -384,7 +390,8 @@
           "P0": "M",
           "P1": "S",
           "P2": "S"
-        }
+        },
+        "opencode_share": 0.25
       }
     }
   },
@@ -432,7 +439,8 @@
           "P0": "M",
           "P1": "S",
           "P2": "S"
-        }
+        },
+        "opencode_share": 0.25
       }
     }
   },
@@ -705,6 +713,79 @@
     "config": {
       "pacing": {
         "slots": 4
+      }
+    }
+  },
+  {
+    "name": "pacing: opencode share",
+    "config": {
+      "pacing": {
+        "opencode_share": 0.5
+      }
+    },
+    "expect": {
+      "operator": {
+        "login": "cgwalters",
+        "name": "Colin Walters",
+        "email": "walters@verbum.org"
+      },
+      "bot": {
+        "login": "cgwalters-bot",
+        "git_name": "Colin Walters",
+        "git_email": "walters+llm@verbum.org",
+        "issue_repo": "cgwalters-bot/cgwalters-bot",
+        "homegit_repo": "cgwalters-bot/homegit"
+      },
+      "forge_org": "cgwalters-forge",
+      "tracker_repo": "cgwalters-forge/tracker",
+      "heartbeat_issue": 176,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "cgwalters-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {
+          "composefs-stable": "users/cgwalters-bot/2"
+        }
+      },
+      "generated_by_url": "https://github.com/cgwalters/#llms",
+      "devspace": {
+        "repo": "bootc-dev/cgwalters-devspace-sandbox",
+        "host_prefix": "cgwalters-devspace-"
+      },
+      "pacing": {
+        "agents": 4,
+        "harness_agents": 2,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        },
+        "opencode_share": 0.5
+      }
+    }
+  },
+  {
+    "name": "pacing: opencode share too big",
+    "config": {
+      "pacing": {
+        "opencode_share": 1.5
+      }
+    }
+  },
+  {
+    "name": "pacing: opencode share negative",
+    "config": {
+      "pacing": {
+        "opencode_share": -0.1
+      }
+    }
+  },
+  {
+    "name": "pacing: opencode share not a number",
+    "config": {
+      "pacing": {
+        "opencode_share": "a quarter"
       }
     }
   }

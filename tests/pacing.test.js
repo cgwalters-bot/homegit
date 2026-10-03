@@ -83,6 +83,22 @@ test("budgets: Est. cost, else the priority's bucket", () => {
   assert.deepEqual([pace.num(5), pace.num("7"), pace.num({ raw: "9" }), pace.num(null), pace.num(""), pace.num("x")], [5, 7, 9, null, null, null]);
 });
 
+test("slots: the opencode share of the target, and the eligible candidates", () => {
+  const todo = (id, priority, extra = {}) => item({ id, priority, org: "cgwalters-bot", content: issue("cgwalters-bot/homegit", id.length + Number(id.slice(1))), ...extra });
+  const items = [todo("t1", "P0"), todo("t2", "P1", { labels: ["x"] }), todo("t3", "P2", { labels: ["x"] })];
+  // [agents, share, factor, remote target]
+  const targets = [[4, 0.25, 1, 1], [4, 0.25, 0.5, 1], [4, 0.25, 0.25, 1], [4, 0.5, 1, 2], [4, 0, 1, 0], [6, 0.25, 1, 2], [4, 0.25, 0, 0]];
+  for (const [agents, share, factor, want] of targets) {
+    const config = operator.resolve({ pacing: { agents, harness_agents: 2, opencode_share: share } });
+    assert.equal(pace.slotReport({ items, config, factor }).remote_target, want, `${agents} agents, share ${share}, factor ${factor}`);
+  }
+  // Only the eligible Todo items are listed as dispatch, in candidate order; without a predicate, none.
+  const r = pace.slotReport({ items, config: CONFIG, eligible: (it) => (it.labels || []).includes("x") });
+  assert.deepEqual(r.lanes.harness.dispatch.map((c) => c.id), ["t2", "t3"]);
+  assert.deepEqual(r.lanes.harness.candidates.map((c) => c.id), ["t1", "t2", "t3"]);
+  assert.deepEqual(pace.slotReport({ items, config: CONFIG }).lanes.harness.dispatch, []);
+});
+
 test("slots: busy agents per lane, candidates by priority, spread, then the operator's activity", () => {
   const busy = (id, org, repo, extra = {}) => item({ id, status: "In Progress", lead: "coordinator", org, content: issue(repo), ...extra });
   const todo = (id, priority, org, repo) => item({ id, priority, org, content: issue(repo, id.length) });

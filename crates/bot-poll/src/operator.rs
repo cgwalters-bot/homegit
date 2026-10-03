@@ -31,6 +31,9 @@ const WORKSTREAM: &str = "workstream";
 const MAX_NUMBER: u64 = 1_000_000_000;
 const DEFAULT_AGENTS: u64 = 4;
 const MAX_AGENTS: u64 = 64;
+/// The share of the agents that are devspace runs, as JSON text, so that
+/// it prints as in homegit's lib/operator.js.
+const DEFAULT_OPENCODE_SHARE: &str = "0.25";
 const DEFAULT_BUDGETS: [(&str, &str); 3] = [("P0", "M"), ("P1", "S"), ("P2", "S")];
 const BUCKETS: [&str; 5] = ["XS", "S", "M", "L", "XL"];
 
@@ -95,6 +98,7 @@ struct RawPacing {
     agents: Option<u64>,
     harness_agents: Option<u64>,
     budgets: Option<BTreeMap<String, String>>,
+    opencode_share: Option<serde_json::Number>,
 }
 
 /// The resolved config, defaults filled in.
@@ -158,6 +162,8 @@ pub struct Pacing {
     pub agents: u64,
     pub harness_agents: u64,
     pub budgets: BTreeMap<String, String>,
+    /// The share of the agents that are devspace runs (0 to 1).
+    pub opencode_share: serde_json::Number,
 }
 
 impl Operator {
@@ -329,6 +335,13 @@ fn validate(raw: &Raw) -> Result<()> {
             bucket,
         )?;
     }
+    if let Some(share) = &raw.pacing.opencode_share {
+        check(
+            share.as_f64().is_some_and(|s| (0.0..=1.0).contains(&s)),
+            "pacing.opencode_share",
+            &share.to_string(),
+        )?;
+    }
     Ok(())
 }
 
@@ -408,6 +421,10 @@ fn resolve(raw: Raw) -> Result<Config> {
         .map(|(p, b)| (p.to_string(), b.to_string()))
         .collect();
     budgets.extend(raw.pacing.budgets.unwrap_or_default());
+    let opencode_share = match raw.pacing.opencode_share {
+        Some(share) => share,
+        None => DEFAULT_OPENCODE_SHARE.parse()?,
+    };
     // The trust split: the bot must never pass for the operator.
     if operator.login.eq_ignore_ascii_case(&bot.login) {
         bail!("bot.login must differ from operator.login");
@@ -439,6 +456,7 @@ fn resolve(raw: Raw) -> Result<Config> {
             agents,
             harness_agents,
             budgets,
+            opencode_share,
         },
     })
 }
