@@ -13,7 +13,7 @@ const URL = "https://github.com/o/r/issues/1";
 const OLD_WORKER = { name: "existing", item_url: "https://github.com/o/r/pull/2", started_at: "2026-09-28T12:00:00Z", status: "testing", agent_ids: ["agent123"], devspace: "work" };
 
 for (const mode of ["assign", "dispatch"]) {
-  for (const scenario of ["append", "dedup", "no-session", "name-collision", "missing", "corrupt", "malformed", "invalid-worker", "draft", "publish-fails", "usage-fails", "board-fails", "budget-fails", "dry-run"]) {
+  for (const scenario of ["append", "replacement", "same-name", "no-session", "name-collision", "missing", "corrupt", "malformed", "invalid-worker", "draft", "publish-fails", "usage-fails", "board-fails", "budget-fails", "dry-run"]) {
     if (mode === "assign" && scenario === "budget-fails") continue;
     test(`${mode}: ${scenario}`, () => {
       const dir = fs.mkdtempSync(path.join(os.tmpdir(), "heartbeat-register-test-"));
@@ -27,7 +27,7 @@ for (const mode of ["assign", "dispatch"]) {
           coordinator: { session: "coordinator-session", loop_state: "sleeping", next_wake_at: new Date(now - 300000).toISOString() },
           workers: [OLD_WORKER],
         }, published: { updated_at: updated } };
-        if (scenario === "dedup") last.input.workers.push({ ...OLD_WORKER, name: "already-working", item_url: URL, agent_ids: ["agent456"] });
+        if (["replacement", "same-name"].includes(scenario)) last.input.workers.push({ ...OLD_WORKER, name: scenario === "replacement" ? "already-working" : mode === "assign" ? "PVTI_item" : "run-123", item_url: URL, agent_ids: ["agent456"], location: "local", engine: "claude", model: "sonnet" });
         if (scenario === "no-session") last.session = null;
         if (scenario === "name-collision") last.input.workers[0] = { ...OLD_WORKER, name: mode === "assign" ? "PVTI_item" : "run-123" };
         if (scenario === "malformed") delete last.input.coordinator;
@@ -89,8 +89,8 @@ else process.exit(1);
           assert.ok(lookups[0].includes("id=PVTI_item"));
           assert.ok(lookups[0].some((arg) => arg.includes("node(id: $id)")));
         }
-        const published = ["append", "dedup", "no-session", "publish-fails", "usage-fails", "budget-fails"].includes(scenario);
-        assert.deepEqual(publishes, published ? [["heartbeat", "publish", "--require-saved-state"]] : []);
+        const published = ["append", "replacement", "no-session", "publish-fails", "usage-fails", "budget-fails"].includes(scenario);
+        assert.deepEqual(publishes, published ? [["heartbeat", "publish", "--locked-state", "--require-saved-state"]] : []);
         if (published && scenario !== "publish-fails") {
           const saved = JSON.parse(fs.readFileSync(state, "utf8"));
           assert.equal(saved.session, last.session);
@@ -98,9 +98,21 @@ else process.exit(1);
           assert.equal(saved.input.coordinator.loop_state, "sleeping");
           assert.equal(Date.parse(saved.input.coordinator.next_wake_at) - Date.parse(saved.input.updated_at), 300000);
           assert.ok(Date.parse(saved.input.updated_at) >= now);
-          assert.deepEqual(saved.input.workers.slice(0, last.input.workers.length), last.input.workers);
+          assert.deepEqual(saved.input.workers[0], OLD_WORKER);
           assert.equal(saved.input.workers.filter((w) => w.item_url === URL).length, 1);
-          if (scenario !== "dedup") assert.equal(saved.input.workers.at(-1).name, mode === "assign" ? item.id : "run-123");
+          const worker = saved.input.workers.at(-1);
+          assert.equal(worker.name, mode === "assign" ? item.id : "run-123");
+          assert.equal(worker.location, mode === "assign" ? "local" : "remote");
+          if (mode === "dispatch") {
+            assert.equal(worker.engine, "opencode");
+            assert.ok(worker.model.includes("/"));
+          }
+          if (scenario === "replacement") {
+            assert.equal(saved.input.workers.some((w) => w.name === "already-working"), false);
+            assert.equal(worker.agent_ids, undefined);
+            assert.equal(worker.devspace, undefined);
+            assert.ok(Date.parse(worker.started_at) >= now);
+          }
         } else {
           assert.equal(fs.existsSync(state) ? fs.readFileSync(state, "utf8") : null, before);
         }

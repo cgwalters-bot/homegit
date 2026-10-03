@@ -96,6 +96,8 @@ const SESSION_ENV = "CLAUDE_CODE_SESSION_ID";
 const REFRESH_MIN_AGE_MS = 5 * 60 * 1000;
 // The board Status of a finished item, whose worker prune drops.
 const DONE_STATUS = "Done";
+const DEFAULT_STALE_HOURS = 6;
+const METADATA_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$/;
 
 const EX_ERROR = 1;
 const EX_USAGE = 2;
@@ -112,6 +114,7 @@ class Exit extends Error {
 function usage() {
   return `Usage: ${PROG} publish [--dry-run] [--no-usage] < HEARTBEAT.json
        ${PROG} refresh
+       ${PROG} done NAME
        ${PROG} prune [--dry-run] [--board-file F]
        ${PROG} show [--usage]
        ${PROG} usage
@@ -142,13 +145,17 @@ ${MAX_SLEEP_MS / 3600000} hours after updated_at; the review app doesn't call a 
 stale before then. loop_state is one of ${LOOP_STATES.join(", ")}; status one of
 ${STATUSES.join(", ")}. Names and sessions are 1-64 of [A-Za-z0-9_.-],
 a devspace is a bot-devspace NAME, item_url a github.com issue or pull
-request, devspace is optional, and no other keys are allowed: the
-comment is public, so it carries names and links only. At most
+request, devspace is optional, and only the documented keys are allowed:
+the comment is public, so metadata must be public identifiers. At most
 ${MAX_WORKERS} workers, with distinct names. A worker whose item is in a
 private (or unreadable) repository is dropped, and said so on stderr.
 agent_ids (optional, at most ${MAX_AGENT_IDS}) are the agentIds the Agent tool
 returned for the worker and its reviewer; they are only read here, to
 find their transcripts, and never published.
+Optional worker metadata: location (local or remote), engine and model
+(public identifiers, at most 128 characters), and last_activity_at (UTC).
+Advance last_activity_at only when that worker actually makes progress;
+refresh never advances it. Workers without it use started_at for expiry.
 
 Unless --no-usage, publish also writes a usage snapshot, never to the
 public heartbeat: to the one comment the bot keeps on
@@ -175,6 +182,9 @@ adds a "mentioned this" event to them.
   --no-usage  write no usage snapshot
 
 publish saves what it published, and its input, to ${LAST_PUBLISH_FILE.replace(os.homedir(), "~")}.
+All saved-state publication (including full publish) uses the same lock
+as registration, done, prune and refresh, through the remote write and
+local state save.
 
 refresh republishes that input with updated_at set to now (and
 next_wake_at, if any, moved by as much), so that the heartbeat stays
@@ -185,13 +195,21 @@ the one it wrote (the same workers and coordinator state: nobody
 published since); otherwise it changes nothing and exits ${EX_NOT_REFRESHED}. A
 heartbeat under ${REFRESH_MIN_AGE_MS / 60000} minutes old is left as it is.
 
+done NAME (also deregister NAME) explicitly removes a finished worker from
+saved input, even while its item is Draft or open. It is idempotent, needs
+no board/item lookup, and preserves the saved session owner and other
+workers' metadata. Use it when work ends, including failure or cancellation.
+
 prune republishes that input the same way, under the same conditions,
 without the workers whose item is ${DONE_STATUS} on the board (as an item or in
-one's Branch) or closed on GitHub, whatever its age; with none of those
-it publishes nothing. It never adds a worker, and keeps one whose item
-it can't read. bot-poll-loop runs it each cycle before refresh. With
+one's Branch) or closed on GitHub, whatever its age; with no finished or
+expired workers it publishes nothing. It never adds a worker, and keeps
+unreadable items until expiry. bot-poll-loop runs it each cycle before refresh. With
 --dry-run it only says whom it would drop; --board-file reads the
 board's items from F (bot-board list --json) instead of bot-board.
+It also expires workers with no activity for 6 hours (inclusive), even
+if the item is unreadable; BOT_HEARTBEAT_STALE_HOURS sets a positive number
+of hours. Successful expiration is reported with the worker name and reason.
 
 show prints the published heartbeat's JSON, or with --usage the usage
 snapshot's.
@@ -298,7 +316,7 @@ function validate(input, nowMs) {
   const agentIds = new Map();
   const workers = input.workers.map((w, i) => {
     const where = `workers[${i}]`;
-    checkKeys(w, where, ["name", "item_url", "started_at", "status"], ["devspace", "agent_ids"]);
+    checkKeys(w, where, ["name", "item_url", "started_at", "status"], ["devspace", "agent_ids", "last_activity_at", "location", "engine", "model"]);
     const worker = {
       name: checkString(w.name, `${where}.name`, WORKER_NAME_RE, "1-64 of [A-Za-z0-9_.-]"),
       item_url: checkString(w.item_url, `${where}.item_url`, ITEM_URL_RE, "a github.com issue or pull request URL"),
@@ -307,6 +325,11 @@ function validate(input, nowMs) {
     };
     if (w.devspace !== undefined && w.devspace !== null) {
       worker.devspace = checkString(w.devspace, `${where}.devspace`, DEVSPACE_RE, "a bot-devspace NAME");
+    }
+    if (w.last_activity_at !== undefined) worker.last_activity_at = checkTime(w.last_activity_at, `${where}.last_activity_at`, nowMs);
+    if (w.location !== undefined) worker.location = checkEnum(w.location, `${where}.location`, ["local", "remote"]);
+    for (const key of ["engine", "model"]) {
+      if (w[key] !== undefined) worker[key] = checkString(w[key], `${where}.${key}`, METADATA_RE, "a public engine/model identifier, at most 128 characters");
     }
     if (names.has(worker.name)) throw invalid(`${where}.name`, `'${worker.name}' is listed twice`);
     names.add(worker.name);
@@ -580,13 +603,13 @@ function usageLine(usage) {
 function render(hb) {
   const lines = [
     MARKER,
-    `Coordinator ${code(hb.coordinator.session)} is ${hb.coordinator.loop_state}, as of ${hb.updated_at}; ${hb.workers.length} local worker(s). Written by ${code(`${PROG} publish`)} in ${CONFIG.bot.homegit_repo}; the review app's ops view reads the JSON below.`,
+    `Coordinator ${code(hb.coordinator.session)} is ${hb.coordinator.loop_state}, as of ${hb.updated_at}; ${hb.workers.length} worker(s). Written by ${code(`${PROG} publish`)} in ${CONFIG.bot.homegit_repo}; the review app's ops view reads the JSON below.`,
     "",
   ];
   if (hb.workers.length) {
-    lines.push("| Worker | Item | Status | Started | Devspace |", "|---|---|---|---|---|");
+    lines.push("| Worker | Item | Status | Started | Devspace | Location | Engine | Model |", "|---|---|---|---|---|---|---|---|");
     for (const w of hb.workers) {
-      lines.push(`| ${code(w.name)} | ${code(itemRef(w.item_url))} | ${w.status} | ${w.started_at} | ${w.devspace ? code(w.devspace) : ""} |`);
+      lines.push(`| ${code(w.name)} | ${code(itemRef(w.item_url))} | ${w.status} | ${w.started_at} | ${w.devspace ? code(w.devspace) : ""} | ${w.location || "local"} | ${w.engine ? code(w.engine) : ""} | ${w.model ? code(w.model) : ""} |`);
     }
     lines.push("");
   }
@@ -801,7 +824,7 @@ function republish(last, nowMs, workers = last.input.workers) {
   const delta = nowMs - Date.parse(last.input.updated_at);
   const coordinator = { ...last.input.coordinator };
   if (coordinator.next_wake_at) coordinator.next_wake_at = iso(Date.parse(coordinator.next_wake_at) + delta);
-  publish({ ...last.input, updated_at: iso(nowMs), coordinator, workers }, { existing });
+  publish({ ...last.input, updated_at: iso(nowMs), coordinator, workers }, { existing, strictState: true });
 }
 
 function cmdRefresh(args) {
@@ -825,10 +848,9 @@ function boardItems(file) {
 
 // finishedWorkers(workers, boardFile): {name: why} of the WORKERS whose
 // item is Done on the board (as an item, or in one's Branch) or closed
-// on GitHub. One whose item can't be read is not finished: prune only
-// ever drops a worker it knows is done. An unreadable board leaves the
-// GitHub state alone to decide.
-function finishedWorkers(workers, boardFile) {
+// on GitHub, or whose own activity has expired. Unreadable items stay
+// until expiration; coordinator refreshes never extend worker activity.
+function finishedWorkers(workers, boardFile, nowMs = now(), staleHours = staleWorkerHours()) {
   const { boardKeys, normalizeItem } = require(path.join(__dirname, "..", "lib", "capacity.js"));
   const done = new Set();
   try {
@@ -836,8 +858,13 @@ function finishedWorkers(workers, boardFile) {
   } catch (e) {
     log(`cannot read the board, so only closed items count: ${String(e.stderr || e.message).trim().split("\n")[0]}`);
   }
-  const out = {};
+  const out = Object.create(null);
   for (const w of workers) {
+    const activity = Date.parse(w.last_activity_at || w.started_at);
+    if (Number.isFinite(activity) && nowMs - activity >= staleHours * HOUR_MS) {
+      out[w.name] = `stale: no activity for ${staleHours}h`;
+      continue;
+    }
     if (done.has(normalizeItem(w.item_url))) {
       out[w.name] = DONE_STATUS;
       continue;
@@ -853,6 +880,17 @@ function finishedWorkers(workers, boardFile) {
   return out;
 }
 
+function staleWorkerHours() {
+  const hours = Number(process.env.BOT_HEARTBEAT_STALE_HOURS ?? DEFAULT_STALE_HOURS);
+  if (!Number.isFinite(hours) || hours <= 0) throw new Exit(EX_USAGE, "BOT_HEARTBEAT_STALE_HOURS must be a positive number");
+  return hours;
+}
+
+function cmdDone(args) {
+  if (args.length !== 1 || !WORKER_NAME_RE.test(args[0])) throw new Exit(EX_USAGE, "done requires a worker NAME");
+  if (!require("../lib/heartbeat-register.js").deregister(args[0])) throw new Exit(EX_ERROR, `cannot remove worker ${args[0]}`);
+}
+
 function cmdPrune(args) {
   let dryRun = false;
   let boardFile = null;
@@ -866,9 +904,13 @@ function cmdPrune(args) {
   const finished = finishedWorkers(workers, boardFile);
   const names = Object.keys(finished);
   if (!names.length) return;
-  log(`${dryRun ? "would drop" : "dropping"} ${names.map((n) => `${n} (${finished[n]})`).join(", ")}`);
-  if (dryRun) return;
+  const summary = names.map((n) => `${n} (${finished[n]})`).join(", ");
+  if (dryRun) {
+    log(`would drop ${summary}`);
+    return;
+  }
   republish(last, now(), workers.filter((w) => !(w.name in finished)));
+  log(`dropping ${summary}`);
 }
 
 function cmdShow(args) {
@@ -918,7 +960,20 @@ function needIssue() {
 }
 
 function main() {
-  const [cmd, ...args] = process.argv.slice(2);
+  let [cmd, ...args] = process.argv.slice(2);
+  // All publications serialize with registration/cleanup, including a full
+  // ordinary publish. --locked-state is internal: callers already holding
+  // registration.lock (this re-exec or heartbeat-register) must not relock.
+  if (["publish", "refresh", "prune"].includes(cmd)) {
+    if (args[0] === "--locked-state") args = args.slice(1);
+    else {
+      fs.mkdirSync(STATE_DIR, { recursive: true });
+      const result = require("node:child_process").spawnSync("flock", ["--exclusive", "--timeout", "60", path.join(STATE_DIR, "registration.lock"), process.execPath, __filename, cmd, "--locked-state", ...args], { stdio: "inherit" });
+      if (result.error) throw new Exit(EX_ERROR, `cannot lock heartbeat state: ${result.error.message}`);
+      process.exitCode = result.status ?? EX_ERROR;
+      return;
+    }
+  }
   switch (cmd) {
     case "-h":
     case "--help":
@@ -934,6 +989,10 @@ function main() {
     case "prune":
       needIssue();
       return cmdPrune(args);
+    case "done":
+    case "deregister":
+      needIssue();
+      return cmdDone(args);
     case "show":
       needIssue();
       return cmdShow(args);
@@ -955,5 +1014,5 @@ if (require.main === module) {
     process.exit(e.status);
   }
 } else {
-  module.exports = { validate, render, renderUsage, usageSnapshot, parseComment, rateLimitsOf, collectUsage, SCHEMA, MARKER, USAGE_MARKER };
+  module.exports = { validate, render, renderUsage, usageSnapshot, parseComment, rateLimitsOf, collectUsage, now, SCHEMA, MARKER, USAGE_MARKER };
 }

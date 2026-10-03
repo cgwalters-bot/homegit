@@ -735,11 +735,17 @@ cmd_dispatch() {
         warn "setting the token budget of ${item} failed; run: bot-pace budget ${item}"
     node "$(dirname "$(readlink -f "$0")")/../lib/heartbeat-register.js" \
         "${BOT_BOARD}" "${item}" "run-$(jq -r '.workflow_run_id // "unknown"' <<<"${resp}")" \
-        "${BOT_RUNS_HEARTBEAT:-$(dirname "$(readlink -f "$0")")/bot-heartbeat}" ||
+        "${BOT_RUNS_HEARTBEAT:-$(dirname "$(readlink -f "$0")")/bot-heartbeat}" \
+        "$(jq -nc --arg e "${agent}" --arg m "${model}" '{location: "remote", engine: $e} + (if $m == "" then {} else {model: $m} end)')" ||
         warn "the run was dispatched, but registering its heartbeat failed; publish the workers with bot-heartbeat publish"
 }
 
 # --- reconcile ---------------------------------------------------------------
+
+heartbeat_done() {
+    "${BOT_RUNS_HEARTBEAT:-$(dirname "$(readlink -f "$0")")/bot-heartbeat}" "done" "run-$1" ||
+        warn "heartbeat cleanup for run-$1 failed; retry bot-heartbeat done run-$1"
+}
 
 # reconcile_one ITEM_JSON: prints the reconcile entry of a board item
 # with a Run, {item, title, status, run, result, set: [bot-board set
@@ -762,6 +768,10 @@ reconcile_one() {
         return 0
     fi
     meta=$(fetch_run "${run_id}") || return
+    # Completion ends activity even while artifacts or operator review wait.
+    if test "${2:-report}" = apply && test "$(jq -r .status <<<"${meta}")" = completed; then
+        heartbeat_done "${run_id}"
+    fi
     rec=$(load_record "${meta}") || return
     flat=$(jqlib -c flat <<<"${rec}")
     url=$(jq -r .url <<<"${flat}")
@@ -832,7 +842,7 @@ cmd_reconcile() {
     while IFS= read -r item; do
         test -n "${item}" || continue
         local one=0
-        entry=$(reconcile_one "${item}") || one=$?
+        entry=$(reconcile_one "${item}" "${mode}") || one=$?
         pass_ratelimit "${one}"
         if test "${one}" -ne 0; then
             warn "reading the run of item $(jq -r .id <<<"${item}") failed; a later reconcile retries"
@@ -1576,6 +1586,7 @@ ${why}"
         --trailer "${RUN_TRAILER}: ${run_url}" || refuse "committing the change failed"
     head=$(agit "${dir}" rev-parse HEAD)
     files=$(agit "${dir}" diff --name-only -z HEAD^ HEAD | jq -Rsc 'split("\u0000") | map(select(. != ""))')
+    heartbeat_done "${run_id}"
     if ${json}; then
         jq -n --argjson run "${run_id}" --arg url "${run_url}" --arg sha "$(jq -r .head_sha <<<"${run}")" \
             --arg repo "${want_repo}" --arg base "${base}" --arg commit "${commit}" --arg branch "${branch}" \

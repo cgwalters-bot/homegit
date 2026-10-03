@@ -1269,6 +1269,7 @@ test_reconcile() {
     local out want
     # Without --apply: report only.
     out=$("${BOT_RUNS}" reconcile)
+    test ! -s "${FAKE_GH}/heartbeat-calls" || fail "report removed workers"
     expect_eq "${out}" "Running [In Progress] PVTI_running: run 1005 is in_progress
 Failed [In Progress] PVTI_failed: run 1004 ended (failure): set Todo (with --apply)
 Patch [In Progress] PVTI_patch: run 1001 succeeded, patch ready: set Draft (with --apply)
@@ -1278,9 +1279,14 @@ Bad [In Progress] PVTI_bad: Run is not a run URL of bootc-dev/cgwalters-devspace
     expect_eq "$(grep -c '^set' "${FAKE_GH}/board-calls")" 0 "board changes without --apply"
     # --dry-run prints the changes instead.
     out=$("${BOT_RUNS}" reconcile --dry-run 2>&1 >/dev/null)
+    test ! -s "${FAKE_GH}/heartbeat-calls" || fail "dry-run removed workers"
     expect_lines "${out}" "^bot-board set PVTI_failed --status Todo --field Run '' --why "
     expect_eq "$(grep -c '^set' "${FAKE_GH}/board-calls")" 0 "board changes of a dry run"
     out=$("${BOT_RUNS}" reconcile --apply --json)
+    expect_eq "$(sort "${FAKE_GH}/heartbeat-calls")" 'done run-1001
+done run-1002
+done run-1003
+done run-1004' "completed workers removed including Draft patch, but not running worker"
     expect_json "$(jq -c 'map({item, result, applied})' <<<"${out}")" '[
         {"item": "PVTI_running", "result": null, "applied": null},
         {"item": "PVTI_failed", "result": "failure", "applied": "applied"},
@@ -1328,6 +1334,7 @@ test_reconcile_files_unreadable() {
     touch "${FAKE_GH}/artifacts-fail"
     local out
     out=$("${BOT_RUNS}" reconcile --apply 2>&1) && fail "succeeded without the run's files"
+    expect_eq "$(cat "${FAKE_GH}/heartbeat-calls")" 'done run-1001' "completed worker removed even without artifacts"
     expect_lines "${out}" 'the files of run 1001 could not be read'
     expect_eq "$(grep -c '^set' "${FAKE_GH}/board-calls")" 0 "board changes without the run's files"
     rm "${FAKE_GH}/artifacts-fail"
@@ -1355,6 +1362,9 @@ run_test() {
     # The fake bot-pace logs its calls with the board's.
     printf '#!/usr/bin/env bash\necho "pace $*" >>"${FAKE_GH:?}/board-calls"\n' >"${WORK}/bin/bot-pace"
     chmod +x "${WORK}/bin/bot-pace"
+    printf '#!/usr/bin/env bash\necho "$*" >>"${FAKE_GH:?}/heartbeat-calls"\n' >"${WORK}/bin/bot-heartbeat"
+    chmod +x "${WORK}/bin/bot-heartbeat"
+    export BOT_RUNS_HEARTBEAT=${WORK}/bin/bot-heartbeat
     export BOT_RUNS_BOT_BOARD=${WORK}/bin/bot-board BOT_RUNS_BOT_PACE=${WORK}/bin/bot-pace
     export FAKE_GH WORK
     # Every test applies with the stand-in checker unless it says otherwise.

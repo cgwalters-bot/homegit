@@ -23,7 +23,7 @@ function world(session = OWNER) {
   const env = { ...process.env, HOME: dir, XDG_STATE_HOME: path.join(dir, "state"), XDG_CACHE_HOME: path.join(dir, "cache"),
     BOT_OPERATOR_CONFIG: path.join(dir, "operator.json"), BOT_HEARTBEAT_PROJECTS: path.join(dir, "projects"),
     PATH: `${dir}:${process.env.PATH}`, WORLD: dir, STATE: state, CLAUDE_CODE_SESSION_ID: session };
-  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "BOT_HEARTBEAT_NOW"]) delete env[key];
+  for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "BOT_HEARTBEAT_NOW", "BOT_HEARTBEAT_STALE_HOURS"]) delete env[key];
   if (session === null) delete env.CLAUDE_CODE_SESSION_ID;
   fs.writeFileSync(path.join(dir, "gh"), `#!/usr/bin/env node
 const fs = require('node:fs');
@@ -42,7 +42,7 @@ if (args.includes('PATCH') || args.includes('POST')) {
   const active = path.join(dir, 'active');
   try { fs.writeFileSync(active, '', {flag: 'wx'}); }
   catch { console.error('overlapping publications'); process.exit(1); }
-  setTimeout(() => {
+   const finish = () => {
     fs.writeFileSync(comments, JSON.stringify({id: 9, html_url: 'https://github.com/o/r/issues/1#issuecomment-9', login: 'cgwalters-bot', body}));
     if (!usage && fs.existsSync(path.join(dir, 'fail-save'))) {
       fs.renameSync(process.env.STATE, process.env.STATE + '.backup');
@@ -50,7 +50,12 @@ if (args.includes('PATCH') || args.includes('POST')) {
     }
     fs.unlinkSync(active);
     console.log('https://github.com/o/r/issues/1#issuecomment-9');
-  }, fs.existsSync(path.join(dir, 'long-delay')) && !usage ? 11000 : fs.existsSync(path.join(dir, 'delay')) ? 200 : 0);
+   };
+   if (!usage && fs.existsSync(path.join(dir, 'hold-publish')) && !fs.existsSync(path.join(dir, 'release-publish'))) {
+     const watcher = fs.watch(dir, (_event, name) => {
+       if (name === 'release-publish') { watcher.close(); finish(); }
+     });
+   } else setTimeout(finish, fs.existsSync(path.join(dir, 'long-delay')) && !usage ? 11000 : fs.existsSync(path.join(dir, 'delay')) ? 200 : 0);
 } else if (api && api.includes('/comments?')) {
   if (fs.existsSync(comments)) console.log(fs.readFileSync(comments, 'utf8'));
   if (!usage && fs.existsSync(path.join(dir, 'fail-save-read'))) {
@@ -61,6 +66,7 @@ if (args.includes('PATCH') || args.includes('POST')) {
 else if (api === 'repos/cgwalters-forge/bot-ops') console.log('true');
 else if (api === 'repos/o/r') console.log('false');
 else if (api === 'repos/o/private') console.log('true');
+else if (api && api.startsWith('repos/o/r/issues/')) console.log('open');
 else { console.error('unexpected fake API call: ' + args.join(' ')); process.exit(1); }
 `, { mode: 0o755 });
   const input = { coordinator: { session: "coordinator-session", loop_state: "working" }, workers: [ORIGINAL] };
@@ -70,6 +76,114 @@ else { console.error('unexpected fake API call: ' + args.join(' ')); process.exi
   return { dir, state, env, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }),
     saved: () => JSON.parse(fs.readFileSync(state, "utf8")),
     calls: () => fs.readFileSync(path.join(dir, "calls"), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) };
+}
+
+for (const owner of [OWNER, null]) {
+  test(`done: explicit idempotent removal while Draft, owner ${owner}`, () => {
+    const w = world(owner);
+    try {
+      const input = w.saved().input;
+      input.workers.push({ ...ORIGINAL, name: "run-123", location: "remote", engine: "opencode", model: "openai/gpt-6.1", agent_ids: ["agent456"] });
+      input.workers[0] = { ...ORIGINAL, location: "local", engine: "claude", model: "sonnet", devspace: "work", last_activity_at: ORIGINAL.started_at };
+      const publish = spawnSync(HEARTBEAT, ["publish", "--no-usage"], { input: JSON.stringify(input), env: w.env, encoding: "utf8" });
+      assert.equal(publish.status, 0, publish.stderr);
+      // Draft must not require a board lookup, closure, or the caller's session.
+      fs.writeFileSync(path.join(w.dir, "board.json"), JSON.stringify([{ status: "Draft", content: { url: ORIGINAL.item_url } }]));
+      fs.writeFileSync(path.join(w.dir, "calls"), "");
+      const done = spawnSync(HEARTBEAT, ["done", "run-123"], { env: { ...w.env, CLAUDE_CODE_SESSION_ID: "different-session" }, encoding: "utf8" });
+      assert.equal(done.status, 0, done.stderr);
+      assert.deepEqual(w.saved().input.workers, [input.workers[0]]);
+      assert.equal(w.saved().session, owner);
+      assert.equal(w.saved().input.coordinator.session, input.coordinator.session);
+      assert.ok(w.calls().every((c) => !c.includes("graphql") && !c.some((a) => /^repos\/o\/r\/issues\//.test(a))));
+      const before = fs.readFileSync(w.state, "utf8");
+      fs.writeFileSync(path.join(w.dir, "calls"), "");
+      const again = spawnSync(HEARTBEAT, ["deregister", "run-123"], { env: w.env, encoding: "utf8" });
+      assert.equal(again.status, 0, again.stderr);
+      assert.equal(fs.readFileSync(w.state, "utf8"), before);
+      assert.deepEqual(w.calls(), []);
+      const { validate, render } = require(HEARTBEAT);
+      const body = render(validate(input, Date.now()).hb);
+      assert.match(body, /\| Location \| Engine \| Model \|/);
+      assert.match(body, /\| remote \| `opencode` \| `openai\/gpt-6.1` \|/);
+      assert.match(body, /\| local \| `claude` \| `sonnet` \|/);
+    } finally { w.cleanup(); }
+  });
+}
+
+test("cleanup and registration share the lock without losing surviving metadata", async () => {
+  const w = world();
+  try {
+    fs.writeFileSync(path.join(w.dir, "delay"), "");
+    const done = spawn(HEARTBEAT, ["done", ORIGINAL.name], { env: w.env, stdio: ["ignore", "ignore", "pipe"] });
+    let stderr = "";
+    done.stderr.on("data", (chunk) => { stderr += chunk; });
+    const [added, [status]] = await Promise.all([register(w, "PVTI_new", 1), once(done, "close")]);
+    assert.equal(added.status, 0, added.stderr);
+    assert.equal(status, 0, stderr);
+    assert.deepEqual(w.saved().input.workers.map((worker) => worker.name), ["PVTI_new"]);
+    assert.equal(w.saved().session, OWNER);
+    assert.doesNotMatch(stderr + added.stderr, /overlapping publications/);
+  } finally { w.cleanup(); }
+});
+
+test("done reports persistence failure and refuses retry from stale saved input", () => {
+  const w = world();
+  try {
+    const before = w.saved();
+    fs.writeFileSync(path.join(w.dir, "fail-save"), "");
+    const failed = spawnSync(HEARTBEAT, ["done", ORIGINAL.name], { env: w.env, encoding: "utf8" });
+    assert.equal(failed.status, 1, failed.stderr);
+    assert.match(failed.stderr, /cannot save/);
+    fs.rmdirSync(w.state);
+    fs.renameSync(w.state + ".backup", w.state);
+    fs.unlinkSync(path.join(w.dir, "fail-save"));
+    const retry = spawnSync(HEARTBEAT, ["done", ORIGINAL.name], { env: w.env, encoding: "utf8" });
+    assert.equal(retry.status, 1, retry.stderr);
+    assert.match(retry.stderr, /previous publication did not finish saving its state/);
+    assert.deepEqual(w.saved(), before);
+  } finally { w.cleanup(); }
+});
+
+for (const [hours, explicitActivity] of [[6, true], [2, true], [6, false]]) {
+  test(`stale prune: ${hours}h boundary with ${explicitActivity ? "activity" : "start fallback"}, not refreshed timestamp`, () => {
+    const w = world();
+    try {
+      const start = Date.parse(w.saved().published.updated_at);
+      const input = w.saved().input;
+      input.workers = [{ ...ORIGINAL, started_at: new Date(start - 12 * 3600000).toISOString(), last_activity_at: new Date(start).toISOString(), location: "remote", engine: "opencode", model: "openai/gpt-6.1" }];
+      if (!explicitActivity) {
+        delete input.workers[0].last_activity_at;
+        input.workers[0].started_at = new Date(start).toISOString();
+      }
+      const survivor = { ...ORIGINAL, name: "constructor", started_at: new Date(start).toISOString(), last_activity_at: new Date(start + 1000).toISOString(), agent_ids: ["agent789"] };
+      input.workers.push(survivor);
+      w.env.BOT_HEARTBEAT_NOW = new Date(start).toISOString();
+      if (hours !== 6) w.env.BOT_HEARTBEAT_STALE_HOURS = String(hours);
+      const seed = spawnSync(HEARTBEAT, ["publish", "--no-usage"], { input: JSON.stringify(input), env: w.env, encoding: "utf8" });
+      assert.equal(seed.status, 0, seed.stderr);
+      const board = path.join(w.dir, "board.json");
+      fs.writeFileSync(board, "[]");
+      w.env.BOT_HEARTBEAT_NOW = new Date(start + hours * 3600000 - 1000).toISOString();
+      const refresh = spawnSync(HEARTBEAT, ["refresh"], { env: w.env, encoding: "utf8" });
+      assert.equal(refresh.status, 0, refresh.stderr);
+      assert.deepEqual(w.saved().input.workers, input.workers);
+      const before = spawnSync(HEARTBEAT, ["prune", "--board-file", board], { env: w.env, encoding: "utf8" });
+      assert.equal(before.status, 0, before.stderr);
+      assert.equal(w.saved().input.workers.length, 2);
+      w.env.BOT_HEARTBEAT_NOW = new Date(start + hours * 3600000).toISOString();
+      const dry = spawnSync(HEARTBEAT, ["prune", "--dry-run", "--board-file", board], { env: w.env, encoding: "utf8" });
+      assert.equal(dry.status, 0, dry.stderr);
+      assert.match(dry.stderr, /would drop existing \(stale:/);
+      assert.equal(w.saved().input.workers.length, 2);
+      fs.writeFileSync(path.join(w.dir, "calls"), "");
+      const at = spawnSync(HEARTBEAT, ["prune", "--board-file", board], { env: w.env, encoding: "utf8" });
+      assert.equal(at.status, 0, at.stderr);
+      assert.match(at.stderr, new RegExp(`dropping existing \\(stale: no activity for ${hours}h\\)`));
+      assert.deepEqual(w.saved().input.workers, [survivor]);
+      assert.equal(w.saved().session, OWNER);
+    } finally { w.cleanup(); }
+  });
 }
 
 function register(w, id, number, extraEnv = {}) {
@@ -83,6 +197,169 @@ process.exit(require(${JSON.stringify(REGISTER)}).register(item, item.id, proces
   return new Promise((resolve, reject) => {
     child.on("error", reject);
     child.on("close", (status) => resolve({ status, stderr }));
+  });
+}
+
+function startHeartbeat(w, args, input, extraEnv = {}) {
+  const child = spawn(HEARTBEAT, args, { env: { ...w.env, ...extraEnv }, stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", (chunk) => { stdout += chunk; });
+  child.stderr.on("data", (chunk) => { stderr += chunk; });
+  const result = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+  child.stdin.end(input === undefined ? undefined : JSON.stringify(input));
+  return { child, result };
+}
+
+test("new run identity replaces same-item registration, same-name retry preserves it, done removes it", async () => {
+  const w = world();
+  try {
+    const now = Date.now();
+    w.env.BOT_HEARTBEAT_NOW = new Date(now).toISOString();
+    const input = w.saved().input;
+    input.workers.push({ ...ORIGINAL, name: "run-old", item_url: "https://github.com/o/r/issues/1", location: "remote", engine: "claude", model: "sonnet", agent_ids: ["oldagent"], devspace: "old", last_activity_at: ORIGINAL.started_at });
+    const seed = spawnSync(HEARTBEAT, ["publish", "--no-usage"], { env: w.env, input: JSON.stringify(input), encoding: "utf8" });
+    assert.equal(seed.status, 0, seed.stderr);
+    const code = `const hb = require(${JSON.stringify(REGISTER)});
+process.exit(hb.register({id: 'PVTI_item', content: {url: 'https://github.com/o/r/issues/1'}}, 'run-new', {location: 'remote', engine: 'opencode', model: 'openai/gpt-6.1'}) ? 0 : 1);`;
+    const added = spawnSync(process.execPath, ["-e", code], { env: w.env, encoding: "utf8" });
+    assert.equal(added.status, 0, added.stderr);
+    assert.deepEqual(w.saved().input.workers, [ORIGINAL, {
+      name: "run-new", item_url: "https://github.com/o/r/issues/1", started_at: new Date(now).toISOString(),
+      status: "starting", location: "remote", engine: "opencode", model: "openai/gpt-6.1",
+    }]);
+    const before = fs.readFileSync(w.state, "utf8");
+    fs.writeFileSync(path.join(w.dir, "calls"), "");
+    const retry = spawnSync(process.execPath, ["-e", code.replace("openai/gpt-6.1", "different/model")], { env: { ...w.env, BOT_HEARTBEAT_NOW: new Date(now + 600000).toISOString() }, encoding: "utf8" });
+    assert.equal(retry.status, 0, retry.stderr);
+    assert.equal(fs.readFileSync(w.state, "utf8"), before);
+    assert.deepEqual(w.calls(), []);
+    const done = await startHeartbeat(w, ["done", "run-new"]).result;
+    assert.equal(done.status, 0, done.stderr);
+    assert.deepEqual(w.saved().input.workers, [ORIGINAL]);
+    assert.equal(w.saved().session, OWNER);
+  } finally { w.cleanup(); }
+});
+
+for (const mutation of ["done", "register", "prune", "refresh"]) {
+  test(`ordinary publish holds shared lock against ${mutation} until remote write and state save finish`, { timeout: 15000 }, async () => {
+    const w = world();
+    let watcher, publisher, changing;
+    try {
+      const input = w.saved().input;
+      const fresh = new Date().toISOString();
+      input.workers[0].started_at = fresh;
+      const introduced = { ...ORIGINAL, name: "introduced", item_url: "https://github.com/o/r/issues/9", started_at: fresh, location: "remote", engine: "opencode", model: "openai/gpt-6.1", agent_ids: ["newagent"] };
+      input.workers.push(introduced);
+      const board = path.join(w.dir, "board.json");
+      fs.writeFileSync(board, JSON.stringify([{ status: "Done", content: { url: ORIGINAL.item_url } }]));
+      fs.writeFileSync(path.join(w.dir, "hold-publish"), "");
+      const writing = new Promise((resolve) => {
+        watcher = fs.watch(w.dir, (_event, name) => {
+          if (name === "active" && fs.existsSync(path.join(w.dir, "active"))) resolve();
+        });
+      });
+      publisher = startHeartbeat(w, ["publish", "--no-usage"], input);
+      await writing;
+      watcher.close();
+      const callsBefore = w.calls().length;
+      if (mutation === "register") changing = register(w, "PVTI_new", 1);
+      else changing = startHeartbeat(w, mutation === "done" ? ["done", ORIGINAL.name] : mutation === "prune" ? ["prune", "--board-file", board] : ["refresh"], undefined,
+        mutation === "refresh" ? { BOT_HEARTBEAT_NOW: new Date(Date.now() + 600000).toISOString() } : {}).result;
+      let finishedEarly = false;
+      changing.then(() => { finishedEarly = true; });
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      assert.equal(finishedEarly, false, "mutation must wait for the ordinary publisher's lock");
+      assert.equal(w.calls().length, callsBefore, "mutation must not read stale remote/local state while publish is pending");
+      fs.writeFileSync(path.join(w.dir, "release-publish"), "");
+      const results = await Promise.all([publisher.result, changing]);
+      assert.deepEqual(results.map((r) => r.status), [0, 0], JSON.stringify(results));
+      assert.ok(results.every((r) => !r.stderr.includes("overlapping publications")));
+      const saved = w.saved();
+      const names = ["done", "prune"].includes(mutation) ? ["introduced"] : mutation === "register" ? [ORIGINAL.name, "introduced", "PVTI_new"] : [ORIGINAL.name, "introduced"];
+      assert.deepEqual(saved.input.workers.map((worker) => worker.name), names);
+      assert.deepEqual(saved.input.workers.find((worker) => worker.name === introduced.name), introduced);
+      assert.equal(saved.session, OWNER);
+      const body = JSON.parse(fs.readFileSync(path.join(w.dir, "comment.json"), "utf8")).body;
+      assert.deepEqual(require(HEARTBEAT).parseComment(body), saved.published);
+    } finally {
+      watcher?.close();
+      fs.writeFileSync(path.join(w.dir, "release-publish"), "");
+      await Promise.allSettled([publisher?.result, changing]);
+      w.cleanup();
+    }
+  });
+}
+
+for (const mode of ["json", "text", "commit-fails"]) {
+  test(`apply cleanup with fake git operations and no fixture commits: ${mode}`, () => {
+    const w = world();
+    try {
+      const source = fs.readFileSync(path.join(ROOT, "bin", "bot-runs"), "utf8");
+      const apply = source.slice(source.indexOf("cmd_apply() {"), source.indexOf("# --- main"));
+      const cleanup = source.slice(source.indexOf("heartbeat_done() {"), source.indexOf("# reconcile_one"));
+      assert.ok(apply.startsWith("cmd_apply() {") && cleanup.startsWith("heartbeat_done() {"));
+      const input = w.saved().input;
+      input.workers.push({ ...ORIGINAL, name: "run-123", item_url: "https://github.com/o/r/issues/1", location: "remote", engine: "opencode" });
+      const seed = spawnSync(HEARTBEAT, ["publish", "--no-usage"], { env: w.env, input: JSON.stringify(input), encoding: "utf8" });
+      assert.equal(seed.status, 0, seed.stderr);
+      const scratch = path.join(w.dir, "apply");
+      fs.mkdirSync(path.join(scratch, "out"), { recursive: true });
+      fs.writeFileSync(path.join(scratch, "out", "base.json"), JSON.stringify({ commit: "base-sha" }));
+      fs.writeFileSync(path.join(w.dir, "message"), "worker: Apply change\n\nExercise completion cleanup.\n");
+      const run = { id: 123, conclusion: "success", head_sha: "workflow-sha", url: "https://github.com/o/r/actions/runs/123", attempt: 1 };
+      const record = { source: "artifact", summary: { run_id: 123, result: "success", repo: "o/r", base: "main", workflow: "branch", item: "PVTI_item" } };
+      const verdict = { items: [{ type: "create_pull_request", title: "Change", body: "Why" }], patch: { file: "change.patch" } };
+      // Exercise the real command's success/return paths; stub Git and the
+      // remote/checker boundary, so no commit or network operation can run.
+      const script = `set -euo pipefail
+scratch=$SCRATCH CACHE_DIR=$SCRATCH/cache ALL_OUTPUTS=all
+REPO_RE='^[a-z]+/[a-z]+$' BASE_RE='^[a-z]+$' RUN_META='.' RUN_ORIGIN_JQ='""'
+RUNS_REPO=o/r RUNS_WORKFLOW=agent.yml OP_DEVSPACE_REPO=o/r OP_BOT_LOGIN=bot OP_OPERATOR_LOGIN=operator OP_FORGE_ORG=forge
+OP_BOT_GIT_NAME=bot OP_BOT_GIT_EMAIL=bot@example.com NO_PUSH_URL=disabled
+AI_TRAILER='Generated-by: AI' RUN_TRAILER=Agent-Run
+fatal() { printf '%s\\n' "$*" >&2; exit 1; }
+warn() { printf '%s\\n' "$*" >&2; }
+parse_run() { printf '%s\\n' "$1"; }
+fetch_run_json() { printf '%s\\n' "$RUN"; }
+load_record() { printf '%s\\n' "$RECORD"; }
+jqlib() { printf 'o/r\\n'; }
+fetch_checker() { printf 'fake-checker\\n'; }
+apply_artifact() { :; }
+checker() {
+  if test "$2" = check; then printf '%s\\n' "$VERDICT" >"$scratch/verdict.json"; fi
+}
+apply_env() {
+  test "$1" = git || fatal 'unexpected non-git apply operation'
+  printf 'fake clone\\n' >>"$SCRATCH/git-calls"
+}
+agit() {
+  case "$2" in
+    config|merge-base|apply) : ;;
+    commit) printf 'fake commit\\n' >>"$SCRATCH/git-calls"; test "$MODE" != commit-fails ;;
+    rev-parse) printf 'head-sha\\n' ;;
+    diff) printf 'src/lib.rs\\0' ;;
+    *) fatal "unexpected fake git command: $*" ;;
+  esac
+}
+apply_worktree() { printf '%s\\n' "$SCRATCH/worktree"; }
+staged_view() { :; }
+${cleanup}
+${apply}
+cmd_apply 123 --repo o/r --slug task --message "$MESSAGE" --source fake-local ${mode === "json" ? "--json" : ""}
+`;
+      const r = spawnSync("bash", ["-c", script], { encoding: "utf8", env: { ...w.env, BOT_RUNS_HEARTBEAT: HEARTBEAT, SCRATCH: scratch,
+        MESSAGE: path.join(w.dir, "message"), MODE: mode, RUN: JSON.stringify(run), RECORD: JSON.stringify(record), VERDICT: JSON.stringify(verdict) } });
+      assert.equal(r.status, mode === "commit-fails" ? 1 : 0, r.stderr);
+      assert.equal(fs.readFileSync(path.join(scratch, "git-calls"), "utf8"), "fake clone\nfake commit\n");
+      assert.deepEqual(w.saved().input.workers, mode === "commit-fails" ? input.workers : [ORIGINAL]);
+      assert.equal(w.saved().session, OWNER);
+      if (mode === "json") assert.equal(JSON.parse(r.stdout).run_id, 123);
+      if (mode === "text") assert.match(r.stdout, /Applied run 123/);
+      if (mode === "commit-fails") assert.match(r.stderr, /committing the change failed/);
+    } finally { w.cleanup(); }
   });
 }
 
