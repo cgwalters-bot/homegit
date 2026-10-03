@@ -513,24 +513,29 @@ bot-board list --status Todo --json | jq -r '.[]
   | "\(.id) \(.priority // "-") \(.workflow // "branch") \(.title)"'
 ```
 
-The **Priority** field ranks work by cgwalters' standing rule: "p0
-priority remains composefs stability overall, other stuff like improving
-our own infra, burning down backlog issues is p1".
+The **Priority** field says how soon the operator needs to see the item,
+not how important it is eventually. In their words: "p0 is really anything
+blocking especially crosscutting; things that pop up and I want addressed
+quickly", and "most often I want to drill into a focus area for p1".
 
-- **P0** moves composefs toward stable: the bootc composefs backend,
-  sealing, UKI and Secure Boot for composefs (including sealed composefs
-  images in rhel-bootc-examples), composefs-rs (capi, varlink API v1,
-  upgrade tests, its CI), install and image-builder composefs support,
-  ostree to composefs migration, and composefs CI coverage. Everything on
-  the [Composefs Stable](https://github.com/users/cgwalters-bot/projects/2)
-  board is P0 here too, unless it is marked a stretch goal.
-- **P1** is the bot's own infrastructure (bot tooling, devspaces, the
-  review app, the promote policy gate, CI on our repositories) and
-  burning down the backlog in other repositories (rpm-ostree, ostree,
-  bootupd, bcvk, cargo-vendor-filterer, containers-image-proxy-rs, ...).
-  A direct request from the operator or their own stuck PR outside composefs
-  is P1 as well; it is still handled promptly (see `bot-notify`).
-- **P2** is genuinely nice to have or deliberately deferred.
+- **P0** blocks right now, especially across areas, or is something the
+  operator raised and wants addressed quickly. Keep the list short (aim
+  for 8 or fewer); "important eventually" is not P0. Demote an item once
+  it stops blocking.
+- **P1** is active work in a focus area. It lives under an epic (a
+  tracker issue labelled `epic`, with the item as its sub-issue) and is
+  reached by drilling into that epic, not by scanning one long P1 list.
+  An epic carries its focus's priority; its sub-issues are P1 only while
+  the epic is an active focus (composefs and the harness today).
+- **P2** is backlog or parked: nice to have, deliberately deferred, or in
+  a focus that is not active.
+
+Every open item is a sub-issue of exactly one epic. Items that are PRs
+cannot be sub-issues; they sit in the Branch of their tracking item.
+Priority propagation (see the coordinator skill) raises the Branch items
+of every P0/P1 item and puts new sub-issues at their parent's priority,
+but leaves sub-issues already on the board as they are. Its raising
+makes P0 parents inflate the P0 count, so keep them few.
 
 `bot-board list` sorts by
 priority and keeps board order within the same priority; take the first
