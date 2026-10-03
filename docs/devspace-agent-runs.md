@@ -49,7 +49,12 @@ target, the output types and their per-type maximums, the largest patch),
 before a runner is spent on the agent, and fails the run on anything
 outside it: no job after it runs. What they compile to is gh-aw's
 safe-outputs configuration (`config.json`), with its default protected-files
-policy, which the later checks use. A new type, owner or bigger limit is a
+policy, which the later checks use. For the bot's own repositories, named
+exactly in the allowlist's `unprotected_files` (homegit, the forge's devspace
+repository and review), `README.md` and `AGENTS.md` come off that policy's
+list, since docs edits are routine there; `.github/` and the other
+dot-folders, manifests and secret-shaped content stay refused everywhere, and
+upstream repositories keep the default. A new type, owner or bigger limit is a
 change to the allowlist in a reviewed commit, never a dispatch.
 
 **Public repositories only.** An agent run's logs and transcripts are
