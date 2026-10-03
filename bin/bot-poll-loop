@@ -19,6 +19,8 @@ readonly SW=${BOT_POLL_LOOP_SWEEP_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/bot
 # A sweep problem wakes at most this often; no completed sweep for this
 # long is one.
 readonly STALE_S=$((30 * 60)) SP_EVERY_S=3600
+# A heartbeat another session publishes counts as kept up while this young.
+readonly HEARTBEAT_FRESH_MIN=30
 # Cycles of FAST_S seconds after the first look (about 9 minutes), and
 # how long an unresolved action waits before it wakes again.
 readonly CYCLES=${BOT_POLL_LOOP_CYCLES:-3} FAST_S=${BOT_POLL_LOOP_FAST_S:-180}
@@ -261,12 +263,22 @@ refresh() {
     rc=0
     out=$("${TOOLS}/bot-heartbeat" refresh 2>&1) || rc=$?
     refreshed=""
-    if test "${rc}" -eq 0; then
+    if test "${rc}" -eq 0 || { test "${rc}" -eq 4 && heartbeat_fresh; }; then
         refresh_fails=0
     else
         refreshed="$(tail -n1 <<<"${out}") (exit ${rc})"
         refresh_fails=$((refresh_fails + 1))
     fi
+}
+
+# heartbeat_fresh: succeeds when the published heartbeat is under
+# HEARTBEAT_FRESH_MIN minutes old. refresh declines (exit 4) a heartbeat
+# another live session keeps publishing; that is no failure, only a
+# heartbeat nobody refreshes is.
+heartbeat_fresh() {
+    local updated
+    updated=$("${TOOLS}/bot-heartbeat" show 2>/dev/null | jq -r '.updated_at // empty') && test -n "${updated}" || return 1
+    test $(($(date +%s) - $(date -d "${updated}" +%s))) -lt $((HEARTBEAT_FRESH_MIN * 60))
 }
 
 # reconcile: runs bot-reconcile against the actions state into

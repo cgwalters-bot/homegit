@@ -42,7 +42,7 @@ EOF
 # else $FAKE/reconcile.txt (and exits with $FAKE/reconcile-N.rc, else
 # $FAKE/reconcile.rc, else 0), the fake bot-heartbeat prints
 # $FAKE/CMD.err to stderr and exits with $FAKE/CMD.rc for its command CMD
-# (prune, refresh), both
+# (prune, refresh, show; show also prints $FAKE/show.out), both
 # logging to $FAKE/order; the fake bot-board
 # lists $FAKE/board.json; the others log, and print $FAKE/NAME.out.
 cat >"${WORK}/tools/bot-reconcile" <<'EOF'
@@ -59,6 +59,7 @@ cat >"${WORK}/tools/bot-heartbeat" <<'EOF'
 #!/usr/bin/env bash
 echo "heartbeat $*" >>"${FAKE}/order"
 cat "${FAKE}/$1.err" 1>&2 2>/dev/null
+cat "${FAKE}/$1.out" 2>/dev/null
 exit "$(cat "${FAKE}/$1.rc" 2>/dev/null || echo 0)"
 EOF
 cat >"${WORK}/tools/bot-board" <<'EOF'
@@ -286,6 +287,14 @@ for c in "${fail_cases[@]}"; do
     expect_first "${out}" "${want}"
     test "$(grep -c '^reconcile$' "${FAKE}/order")" = 3 || fail "${f}: cycles before the wake: $(cat "${FAKE}/order")"
 done
+# A heartbeat that refresh declines (another session keeps publishing it)
+# is no failure while it is fresh.
+reset
+sweep 20261002-100000-000 ""
+echo 4 >"${FAKE}/refresh.rc"
+echo "bot-heartbeat: not refreshed: the last publish ran in another session" >"${FAKE}/refresh.err"
+printf '{"updated_at": "%s"}\n' "$(date -u -d '5 minutes ago' +%FT%TZ)" >"${FAKE}/show.out"
+expect_first "$(FAST_S=1 loop 0 --until-actions --max-wait 3s)" '^TIMEOUT'
 # A success in between starts the count again.
 reset
 sweep 20261002-100000-000 ""
