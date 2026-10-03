@@ -1535,6 +1535,9 @@ $(jq -r '.errors[] | "  \(.)"' "${scratch}/verdict.json" 2>/dev/null)"
     # repositories; for any other, bot-pr fork-pr pushes to an explicit URL.
     agit "${backing}" config core.hooksPath /dev/null
     agit "${backing}" config core.fsmonitor false
+    # Keep the initial clone narrow, but track topic pushes for bot-land's
+    # implicit --force-with-lease when an amended branch is re-pushed.
+    agit "${backing}" config --replace-all remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
     case "${want_repo%%/*}" in
         "${OP_BOT_LOGIN}" | "${OP_FORGE_ORG}") ;;
         *) agit "${backing}" config remote.origin.pushurl "${NO_PUSH_URL}" ;;
