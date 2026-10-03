@@ -190,7 +190,7 @@ The patch-ready action tells you to dispatch the apply worker without
 waiting for the operator (`APPLY_UNATTENDED` in `lib/reconcile.js`): it
 opens a draft PR and never merges; merging stays with the review step.
 Apply accepts workflow branches `bot/agent-run-*` (nonempty suffix) in the
-configured devspace, independently of `BOT_RUNS_REF`;
+configured devspace, dispatched by the bot or operator, independently of `BOT_RUNS_REF`;
 see docs/devspace-agent-runs.md for the checks and managed worktree paths.
 
 ## Polling

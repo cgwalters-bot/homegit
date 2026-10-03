@@ -166,7 +166,8 @@ every file) and run by `safe-outputs/safe-outputs.mjs`:
   successful `workflow_dispatch` of `.github/workflows/agent.yml` in the
   configured devspace repository, with matching head and run repository ids,
   from `bot/agent-run-*` (a nonempty suffix; `BOT_RUNS_REF` selects the
-  dispatch branch and does not widen this), for the declared repository (its title, summary and `base.json` all agreeing),
+  dispatch branch and does not widen this) and dispatched by the configured bot or operator
+  (the run's `actor`), for the declared repository (its title, summary and `base.json` all agreeing),
   all three of its jobs (`Restrictions`, `Agent`, `Safe outputs`) must have
   succeeded, and the artifact must be the only `safe-outputs` of that run
   and head, made during the `Agent` job (the one running the agent as
