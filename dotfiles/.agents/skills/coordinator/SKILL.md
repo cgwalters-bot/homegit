@@ -22,9 +22,11 @@ and contributing in `upstream-pr`.
 
 ## What we're working toward
 
-Priorities, in cgwalters' words: "p0 priority remains composefs
-stability overall, other stuff like improving our own infra, burning
-down backlog issues is p1". The concrete P0 goal is a branch of
+Priorities (see "Priority" in the workstream skill): P0 is what blocks
+right now, especially across areas, or what the operator raised and wants
+quickly (aim for 8 or fewer); P1 is active focus-area work, reached by
+drilling into its epic; P2 is backlog or parked. The long-running goal
+is composefs stability. The concrete composefs goal is a branch of
 [redhat-cop/rhel-bootc-examples](https://github.com/redhat-cop/rhel-bootc-examples)
 that builds on current c10s with bootc from git and yields a viable
 containerdisk through image-builder (forge rhel-bootc-examples#4 and
@@ -32,8 +34,7 @@ its e2e); the bootc, composefs-rs, image-builder and ostree fixes that
 path needs come first. The [Composefs Stable](https://github.com/users/cgwalters-bot/projects/2)
 board tracks it.
 
-Within P1 (see "Priority" in the workstream skill, which also counts
-backlog burn-down and the operator's direct requests), the main thread is
+Beside composefs, the main thread is
 the bot's own harness, aiming at something like GitHub Agentic
 Workflows without its inner sandbox: task definitions compiled to
 Actions, digest-pinned task containers, an ACP agent wrapper
@@ -660,8 +661,11 @@ cost when an item is far off (two buckets), and correct the table in
   (the PRs and issues implementing it) of every open P0 (then P1) item
   to that priority (never lowering one), and adds those not on the
   board, and new sub-issues not yet on it, copying the parent's Theme.
-  It never follows sub-issues already on the board: the operator sets
-  those lower than their epic deliberately, so their priority stays. Each change is a line under "Priority propagation",
+  It never follows sub-issues already on the board: those keep the
+  priority the operator or a triage run gave them. A Branch item on the
+  board is raised whoever lowered it, so keep P0 parents few: their
+  Branch items and new sub-issues become P0 too. Each change is a line
+  under "Priority propagation",
   which needs nothing more and never wakes you: set an epic's priority
   and its work follows on the next sweep.
 - **Sign-offs.** `bot-watch --apply` runs `bot-pr signoff` itself on
@@ -846,7 +850,7 @@ cost when an item is far off (two buckets), and correct the table in
   `bot-notify`, into the free slots of each lane (see "Capacity"), as
   devspace runs (`bot-runs dispatch`) unless the work is one of the local
   cases under "Devspace agent runs are the default":
-  within a lane by priority, so composefs stability (P0) comes first
+  within a lane by priority, so composefs stability (a P1 focus) comes first
   there, but a lane whose P0 work waits on a human goes on with P1 and P2
   rather than idling. The operator's asks come before the lane's Todo
   items. Run fewer when the GraphQL quota is running low.

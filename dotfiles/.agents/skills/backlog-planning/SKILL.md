@@ -267,18 +267,12 @@ Skip:
 Rank by value and assign every item a **Priority** (see the `workstream`
 skill for what each level means):
 
-- **P0**: work that moves composefs toward stable, as the `workstream`
-  skill lists it: explicit requests, the operator's blocked PRs, the bot's
-  own PRs, and new issues in that area alike.
-- **P1**: outside composefs, explicit requests to the bot from
-  the operator and their own open PRs blocked on failing CI, merge conflicts,
-  or unanswered review; the bot's own open PRs in that state; concrete
-  asks from the operator ("we should", "needs a test", a bug they confirmed)
-  in active repositories; review requests where a pre-review,
-  reproduction, or bisect would clearly help; and the bot's own
-  infrastructure.
-- **P2**: everything else worth tracking: nice-to-haves, older threads, and
-  speculative follow-ups.
+- **P0**: blocks right now (especially across areas), or the operator
+  raised it and wants it quickly. Rare; never "important eventually".
+- **P1**: active focus-area work (composefs, the harness): add it as a
+  sub-issue of its epic (`bot-board issue --parent EPIC_URL`).
+- **P2**: everything else worth tracking: nice-to-haves, older threads,
+  speculative follow-ups, and work in a focus that is not active.
 
 **Add at most about 10 items per run**, highest priority first.
 
