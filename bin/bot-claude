@@ -13,6 +13,7 @@ const path = require("node:path");
 
 const heartbeat = require(path.join(__dirname, "..", "lib", "heartbeat-register.js"));
 const { completionTracker } = require(path.join(__dirname, "..", "lib", "claude-completion.js"));
+const { processIdentity, sameIdentity } = require("../lib/process-identity");
 
 const PROG = path.basename(process.argv[1] || "bot-claude");
 const SELF = fs.realpathSync(process.argv[1] || __filename);
@@ -56,24 +57,6 @@ const DROPPED_VARS = ["CLAUDECODE", "AI_AGENT", "CLAUDE_PID", "CLAUDE_EFFORT"];
 const WORKER_SHELL = "/bin/bash";
 const BOT_IDENTITY_KEYS = { name: "bot.git_name", email: "bot.git_email" };
 const TOKEN_VAR = "BOT_CLAUDE_JOB_TOKEN";
-
-// comm may contain spaces and parentheses; fields after its final ')' have
-// fixed offsets. Keep starttime as text (it need not fit a JS integer).
-function processIdentity(pid) {
-  try {
-    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
-    if (fields.length < 20 || !/^\d+$/.test(fields[19])) return null;
-    return { pid, starttime: fields[19], pgrp: Number(fields[2]), session: Number(fields[3]),
-      boot_id: fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() };
-  } catch {
-    return null;
-  }
-}
-
-function sameIdentity(a, b) {
-  return a && b && ["pid", "starttime", "pgrp", "session", "boot_id"].every((k) => a[k] === b[k]);
-}
 
 // Never trust a numeric pgid alone. A surviving member must carry the
 // inherited random token and still belong to the recorded session/group.

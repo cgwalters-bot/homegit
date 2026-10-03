@@ -9,7 +9,11 @@ readonly TESTS
 readonly BOT_OPENCODE=${TESTS}/../bin/bot-opencode
 WORK=$(mktemp -d)
 readonly WORK
-trap 'rm -rf "${WORK}"' EXIT
+cleanup() {
+    node "${TESTS}/bot-opencode-processes.js" cleanup "${WORK}/cache/bot-work/opencode/escape/escaped.json"
+    rm -rf "${WORK}"
+}
+trap cleanup EXIT
 
 fail() {
     echo "FAIL: $*" 1>&2
@@ -28,6 +32,7 @@ mkdir "${WORK}/bin" "${WORK}/repo"
 cat >"${WORK}/bin/opencode" <<'JS'
 #!/usr/bin/env node
 const fs = require("fs");
+const { spawn } = require("child_process");
 const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
 require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
   const m = JSON.parse(line);
@@ -42,6 +47,23 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
   if (m.method === "session/prompt") {
     const text = m.params.prompt[0].text;
     if (/Task:\nhang/.test(text)) return;
+    if (/Task:\nescape/.test(text)) {
+      const child = spawn("setsid", ["sleep", "300"], { stdio: "ignore" });
+      const identity = (pid) => {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        const fields = stat.slice(stat.lastIndexOf(")") + 2).trim().split(/\s+/);
+        return { pid, starttime: fields[19], pgrp: Number(fields[2]), session: Number(fields[3]),
+          boot_id: fs.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim() };
+      };
+      // Wait for setsid to exec: recording only the PID would hide a race.
+      const timer = setInterval(() => {
+        const sleeper = identity(child.pid);
+        if (sleeper.session !== child.pid) return;
+        fs.writeFileSync("escaped.json", JSON.stringify({ agent: identity(process.pid), sleeper }));
+        clearInterval(timer);
+      }, 10);
+      return;
+    }
     if (/Task:\ndie/.test(text)) process.exit(3);
     fs.writeFileSync("out.txt", text);
     fs.writeFileSync("env.txt", [process.env.GIT_AUTHOR_EMAIL, process.env.GIT_COMMITTER_NAME, process.env.GH_TOKEN || "no-token",
@@ -93,10 +115,34 @@ echo x | run --model other/m - >/dev/null 2>&1 && fail "accepted a model off the
 echo x | run --task bad/name - >/dev/null 2>&1 && fail "accepted a bad task name"
 
 # The timeout cancels the agent and exits 124.
+cat >"${WORK}/timers.cjs" <<JS
+const fs = require('fs');
+const original = global.setTimeout, clear = global.clearTimeout;
+let escalation;
+global.setTimeout = (fn, ms, ...args) => {
+  const timer = original(fn, ms, ...args);
+  if (ms === 5000) {
+    escalation = timer;
+    fs.appendFileSync('${WORK}/timers.log', 'armed\\n');
+  }
+  return timer;
+};
+global.clearTimeout = (timer) => {
+  if (timer && timer === escalation) fs.appendFileSync('${WORK}/timers.log', 'cleared\\n');
+  return clear(timer);
+};
+JS
 rc=0
-echo "hang" | run --task hang --timeout 0.02 - >"${WORK}/hang.out" 2>&1 || rc=$?
+echo "hang" | NODE_OPTIONS="${NODE_OPTIONS:-} --require=${WORK}/timers.cjs" run --task hang --timeout 0.02 - >"${WORK}/hang.out" 2>&1 || rc=$?
 test "${rc}" -eq 124 || fail "timeout exit status ${rc}"
 expect_has "timeout result" "$(cat "${WORK}/hang.out")" '\(timeout\) ----'
+test "$(cat "${WORK}/timers.log")" = $'armed\ncleared' || fail "SIGKILL timer was not cleared"
+# A descendant in a different session/group must also be reaped on timeout.
+rc=0
+echo "escape" | run --task escape --timeout 0.02 - >"${WORK}/escape.out" 2>&1 || rc=$?
+test "${rc}" -eq 124 || fail "escaped descendant timeout exit status ${rc}"
+expect_has "escaped timeout result" "$(cat "${WORK}/escape.out")" '\(timeout\) ----'
+node "${TESTS}/bot-opencode-processes.js" assert "${XDG_CACHE_HOME}/bot-work/opencode/escape/escaped.json"
 # An agent that dies mid-prompt, and one that isn't installed, fail cleanly.
 rc=0
 echo "die" | run --task die - >"${WORK}/die.out" 2>&1 || rc=$?

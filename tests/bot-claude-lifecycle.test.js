@@ -6,6 +6,11 @@ const fs = require("node:fs");
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 const [bot, work] = process.argv.slice(2);
+// The shell harness supplies the fixtures; generic node --test discovery
+// should report a skip rather than trying to construct paths from undefined.
+if (!bot && !work) {
+  require("node:test")("bot-claude lifecycle (requires shell fixtures)", { skip: true }, () => {});
+} else {
 const out = path.join(work, "out");
 const state = path.join(work, "state", "bot-claude");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -230,3 +235,4 @@ global.clearTimeout = (timer) => {
 }
 
 main().catch((e) => { console.error(e); process.exitCode = 1; });
+}
