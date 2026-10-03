@@ -82,6 +82,8 @@ function main(argv) {
   const items = JSON.parse(run(BOARD, ["list", "--json"]));
   const todo = plan(items, tasks, mode);
   if (json) process.stdout.write(`${JSON.stringify(todo, null, 2)}\n`);
+  // Like bot-pace's Budget tokens, the field is created on a fresh board.
+  if (todo.length && !dry) run(BOARD, ["field-ensure", "--number", ACTUAL_FIELD]);
   for (const t of todo) {
     if (!json) process.stdout.write(`${dry ? "would set" : "set"} ${ACTUAL_FIELD} = ${t.tokens} on ${t.id} (${t.title})\n`);
     if (!dry) run(BOARD, ["set", t.id, "--field", ACTUAL_FIELD, String(t.tokens)]);

@@ -81,16 +81,32 @@ publish with `--no-usage`).
 
 The Workstream board is an org-owned Projects (v2) board (GitHub Apps and
 fine-grained tokens can't write a user's), with the bot able to edit it.
-The tools look fields and options up by name, so these must match:
+The tools look fields and options up by name, so these must match
+exactly. Create them in the board's settings, or with
+`bot-board field-ensure [--number] NAME`, which adds a text field (a
+number field with `--number`) unless one exists. It cannot create a
+single-select: those, with their options, are always made by hand.
 
-- `Status` (single select): Todo, In Progress, Draft, Needs human, In
-  Review, Done;
-- `Priority` (single select): P0, P1, P2;
-- `Workflow` (single select): branch, analysis, pr, manual;
-- `Org` (single select): one option per upstream org the bot works on,
-  plus one named after the bot's login and one after the forge org (its
-  own infrastructure), and `other`;
-- `Why`, `Branch` and `Gist` (text).
+| Field | Type | Options | Needed | Created | Read or written by |
+|---|---|---|---|---|---|
+| `Status` | single select | Todo, In Progress, Draft, Needs human, In Review, Done | required | by hand | everything |
+| `Priority` | single select | P0, P1, P2 | required | by hand | `bot-board`, `bot-pace`, `bot-capacity`, `bot-priority-health` |
+| `Workflow` | single select | branch, analysis, pr, manual | required | by hand | `bot-board`, the workstream skill |
+| `Org` | single select | one per upstream org the bot works on, plus one named after the bot's login, one after the forge org, and `other` | required | by hand | `bot-board` (`fill-org`) |
+| `Why`, `Branch` | text | | required | by hand | `bot-board set`, `bot-pr`, `bot-watch`, `bot-reconcile` |
+| `Gist` | text | | required | by hand | `bot-board set`, `bot-notify`, `bot-retro` |
+| `News` | text | | required | by hand | `bot-board set --news` (one dated line), `bot-watch`, `bot-runs`, the review app |
+| `Lead` | text | | required | by hand | `bot-pace assign` (`coordinator`), topic sessions, `bot-reconcile`, `bot-board` |
+| `Est. cost` | single select | `XS (<200k tok)`, `S (<1M tok)`, `M (<5M tok)`, `L (<20M tok)`, `XL (>20M tok)` | required for pacing | by hand | `bot-pace` (budgets), `bot-capacity` |
+| `Budget tokens` | number | | required for pacing | automatically, by `bot-pace` | `bot-pace`, `bot-reconcile` |
+| `Actual tokens` | number | | required for pacing | automatically, by `bot-actuals` | `bot-actuals`, `bot-reconcile`, `bot-pace` |
+| `Run` | text | | required for devspace runs | automatically, by `bot-runs dispatch` | `bot-runs`, `bot-reconcile`, `bot-pace` |
+| `Theme` | single select | one per theme you group work by | optional | by hand | `bot-priority-propagate` only |
+| `Verdict`, `Verdict target` | | | unused | not needed | nothing in homegit; legacy fields of cgwalters' board that a new board can leave out |
+
+The options of `Est. cost` are the strings in `lib/capacity.js`; a
+different spelling is not found and the item counts as unestimated.
+`Needs human` is a Status option, not a field.
 
 The views in the `workstream` skill are optional; the Projects API can't
 create them, so they are made by hand.
