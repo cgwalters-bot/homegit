@@ -69,6 +69,9 @@ trap 'rm -rf "${WORK}"' EXIT
 mkdir -p "${WORK}/.claude/skills/${names[0]}" "${WORK}/.claude/skills/synced/keep"
 echo stale >"${WORK}/.claude/skills/${names[0]}/SKILL.md"
 HOME=${WORK} ./install-dotfiles.sh >/dev/null
+jq -e '.env.CLAUDE_CODE_SHELL == "/bin/bash" and .env.DISABLE_AUTOUPDATER == "1"' \
+    "${WORK}/.claude/settings.json" >/dev/null ||
+    err "installed Claude settings must select Bash and preserve DISABLE_AUTOUPDATER"
 [[ -d ${WORK}/.claude/skills/synced/keep ]] || err "install removed ~/.claude/skills/synced"
 for name in "${names[@]}"; do
     installed=${WORK}/.agents/skills/${name}/SKILL.md

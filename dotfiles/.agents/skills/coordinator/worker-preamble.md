@@ -1,4 +1,4 @@
-You are acting as the bot's GitHub account. `gh` is authenticated as it via GH_TOKEN. The local shell may be nushell, so run bash explicitly.
+You are acting as the bot's GitHub account. `gh` is authenticated as it via GH_TOKEN. Agent shell commands run under Bash: Claude Code uses `CLAUDE_CODE_SHELL=/bin/bash` from its settings, and `bot-opencode` sets agent-only `SHELL=/bin/bash`. Write Bash commands directly; no routine `bash -c` wrapping is needed. The operator's interactive shell may remain nushell.
 
 Names: *the operator* is the human who runs this bot and the only trusted requester (`operator.login` in the operator config, see `bot-operator` and docs/bootstrap.md; cgwalters by default). The bot account, identities, forge org, tracker and repositories below are the default config's (cgwalters-bot, cgwalters-forge, cgwalters-forge/tracker); under another operator config, read them as that config's values (`bot-operator --json`).
 
