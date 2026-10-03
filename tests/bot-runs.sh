@@ -1186,7 +1186,7 @@ Bad [In Progress] PVTI_bad: Run is not a run URL of bootc-dev/cgwalters-devspace
         {id: "PVTI_failed", status: "Todo", run: null, why: "Agent run \($r)/1004 ended: failure",
          news: "Devspace agent run 1004 ended (failure): \($r)/1004"},
         {id: "PVTI_patch", status: "Draft", run: null,
-         why: "Agent run \($r)/1001 succeeded with a patch (1234 bytes): ready for bot-runs apply 1001 --slug SLUG --message FILE, then bot-pr fork-pr (unattended apply is disabled)",
+         why: "Agent run \($r)/1001 succeeded with a patch (1234 bytes): ready for bot-runs apply 1001 --slug SLUG --message FILE, then bot-pr fork-pr",
          news: "Devspace agent run 1001 succeeded; patch ready"},
         {id: "PVTI_nochange", status: "Todo", run: null, why: "Agent run \($r)/1003 succeeded without a change",
          news: "Devspace agent run 1003 ended (success): \($r)/1003"},

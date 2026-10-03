@@ -107,8 +107,8 @@ readonly RUN_FIELD=Run
 readonly RUN_STATUS='In Progress'
 readonly PATCH_STATUS=Draft
 readonly RETRY_STATUS=Todo
-# reconcile only reports a successful run's patch as ready; unattended
-# application remains disabled, so apply is an explicit reviewed step.
+# reconcile only reports a successful run's patch as ready; applying it is
+# bot-reconcile's patch-ready action (a Sonnet apply worker), which never merges.
 readonly WHY_MAX=300
 BOT_BOARD=${BOT_RUNS_BOT_BOARD:-$(dirname "$(readlink -f "$0")")/bot-board}
 readonly BOT_BOARD
@@ -771,7 +771,7 @@ reconcile_one() {
         return 0
     fi
     if test "${result}" = success && test -n "${patch}"; then
-        why="Agent run ${url} succeeded with a patch (${patch} bytes): ready for bot-runs apply ${run_id} --slug SLUG --message FILE, then bot-pr fork-pr (unattended apply is disabled)"
+        why="Agent run ${url} succeeded with a patch (${patch} bytes): ready for bot-runs apply ${run_id} --slug SLUG --message FILE, then bot-pr fork-pr"
         news="Devspace agent run ${run_id} succeeded; patch ready"
         set=$(jq -nc --arg s "${PATCH_STATUS}" --arg f "${RUN_FIELD}" --arg why "${why}" --arg news "${news}" \
             '["--status", $s, "--field", $f, "", "--why", $why, "--news", $news]')
