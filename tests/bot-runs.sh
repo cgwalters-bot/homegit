@@ -454,6 +454,37 @@ test_show_json() {
     expect_json "$(jq -c '[.source, .summary.item, .step_summary]' <<<"${out}")" '["footer","PVTI_item2",null]' "show --json of a footer run"
 }
 
+test_show_final_outcome() {
+    local out md summary=${FAKE_GH}/artifacts/1001/agent-run/summary.json
+    set_json "${summary}" '.outcome = {status: null, url: null, why: "Implemented and verified the change."}
+        | .tests = [
+            {command: "retry", exit_code: 1, duration_s: 2},
+            {command: "retry", exit_code: 2, duration_s: 3},
+            {command: "different", exit_code: 1, duration_s: 4},
+            {command: "unknown", exit_code: null, duration_s: 5},
+            {command: "retry", exit_code: 0, duration_s: 6},
+            {command: "unknown", exit_code: 0, duration_s: 7},
+            {command: "retry", exit_code: 1, duration_s: 8}]'
+    # Test evidence must be rendered even when a step summary is present.
+    for md in present absent; do
+        rm -rf "${XDG_STATE_HOME}/bot-runs"
+        test "${md}" != absent || rm "${FAKE_GH}/artifacts/1001/agent-run/summary.md"
+        out=$("${BOT_RUNS}" show 1001)
+        expect_lines "${out}" '^Outcome: +Implemented and verified the change\.$' \
+            '^Test: retry: exit 1, 2s \(superseded by later success\)$' \
+            '^Test: retry: exit 2, 3s \(superseded by later success\)$' \
+            '^Test: different: exit 1, 4s$' '^Test: unknown: exit null, 5s$' \
+            '^Test: retry: exit 0, 6s$' '^Test: unknown: exit 0, 7s$' \
+            '^Test: retry: exit 1, 8s$'
+    done
+    out=$("${BOT_RUNS}" list --limit 10)
+    expect_lines "${out}" 'Implemented and verified the change\.'
+    rm -rf "${XDG_STATE_HOME}/bot-runs"
+    set_json "${summary}" 'del(.outcome.status, .outcome.url)'
+    out=$("${BOT_RUNS}" show 1001)
+    expect_lines "${out}" '^Outcome: +Implemented and verified the change\.$'
+}
+
 test_log() {
     local out
     out=$("${BOT_RUNS}" log 1001)
@@ -702,11 +733,39 @@ test_apply() {
         https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1001/attempts/1 "run trailer"
     expect_eq "$(git -C "${dir}" show HEAD:src/lib.rs | tail -n1)" 'pub fn g() {}' "applied content"
     test -z "$(git -C "${dir}" status --porcelain)" || fail "apply left changes uncommitted"
-    # Its origin can't be pushed to, by accident or otherwise.
+    # A repository that is not the bot's own can't be pushed to, by accident or otherwise.
     git -C "${dir}" -c core.hooksPath=/dev/null push -q origin HEAD 2>/dev/null && fail "pushed to origin"
     # Never over an existing directory.
     out=$(apply_run 1001 2>&1) && fail "applied over an existing directory"
     expect_lines "${out}" "already exists"
+}
+
+# The applied worktree can be published without repairing its configuration.
+test_apply_land() {
+    local out dir
+    make_change 1001 >/dev/null
+    git clone -q --bare "${WORK}/target" "${WORK}/origin.git"
+    # The bot's own repository (here by making composefs the forge org).
+    printf '%s\n' '{"forge_org":"composefs"}' >"${WORK}/own-operator.json"
+    out=$(BOT_OPERATOR_CONFIG="${WORK}/own-operator.json" apply_run 1001 --source "${WORK}/origin.git" --json)
+    dir=$(jq -r .dir <<<"${out}")
+    test -z "$(git --git-dir="${WORK}/origin.git" for-each-ref refs/heads/bot/)" || fail "apply pushed a branch"
+    # Publish with the real, ordinary bot-land and a local bare origin;
+    # only GitHub responses are faked, with no remote configuration edits.
+    cat >"${WORK}/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+case "$*" in
+    'api repos/composefs/composefs-rs') echo '{"default_branch":"main"}' ;;
+    'api repos/composefs/composefs-rs/pulls?state=open&head='*) echo '[{"number":7,"html_url":"https://github.com/composefs/composefs-rs/pull/7","base":{"ref":"main"}}]' ;;
+    'api --paginate repos/composefs/composefs-rs/pulls/7/reviews?'*) ;;
+    'pr merge 7 --repo composefs/composefs-rs --auto --rebase') ;;
+    *) echo "unexpected fake gh call: $*" >&2; exit 1 ;;
+esac
+EOF
+    out=$(cd "${dir}" && "${TESTS}/../bin/bot-land" --repo composefs/composefs-rs --no-wait)
+    expect_lines "${out}" '^https://github.com/composefs/composefs-rs/pull/7$'
+    expect_eq "$(git --git-dir="${WORK}/origin.git" rev-parse bot/fsck-sb)" "$(git -C "${dir}" rev-parse HEAD)" "bot-land pushed applied commit"
 }
 
 # The outputs a run hands back that are not a pull request are only listed.

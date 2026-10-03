@@ -178,14 +178,16 @@ every file) and run by `safe-outputs/safe-outputs.mjs`:
   base branch (never fetched by id, since GitHub serves fork commits that
   way). The patch is applied with hooks and the caller's git configuration
   off, in a managed `bot-work` worktree backed by a fresh isolated clone whose
-  `origin` has no usable push URL, and checked again
+  `origin` pushable only for the bot's own repositories (any other has no
+  usable push URL), and checked again
   as git sees it (`checkFileProtectionPostApply` and the mode, link and
   binary checks), then committed as the bot on `bot/SLUG` with an
   `Agent-run:` trailer linking the run attempt. The agent's own title and
   body are printed (and in `--json`) for the fork PR; the other outputs
   (`noop`, `missing_tool`, `add_comment`, `missing_data`) are listed, never
   posted. Nothing is pushed: after review, `bot-pr fork-pr --from DIR`
-  opens it on the forge. A refused change's worktree and clone are removed.
+  opens it on the forge, or, for the bot's own repositories, ordinary `bot-land`
+  publishes it through `origin`. A refused change's worktree and clone are removed.
 
 Apply uses `bot-work worktree add REPO_DIR SLUG --base COMMIT`, defaulting
 to `${XDG_CACHE_HOME:-~/.cache}/bot-work/SLUG/REPO`. Its `--dir DIR` option
@@ -258,6 +260,12 @@ zero.
 | `egress_denied` | array | `{domain, count}` from the proxy log (empty while egress is open) |
 | `outcome` | object | `status` (`Draft`, `Needs human` or `null`), `url` (the forge PR or write-up, once applied, else `null`) and `why` |
 | `redactions` | integer | how many strings the redaction pass replaced |
+
+When an outcome has no status or URL yet, `bot-runs` displays its `why`
+as the final outcome. `bot-runs show` retains every reported test attempt,
+including its exit code and duration, and labels a failed attempt superseded
+only if a later attempt of the exact same command succeeds. These test lines
+are shown even when the artifact includes `summary.md`.
 
 Free text (`summary`, `message`, `why`, `command`) is redacted and cut
 to 200 characters. A `tests/fixtures/bot-runs/` summary is a complete

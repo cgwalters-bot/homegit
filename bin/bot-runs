@@ -46,7 +46,8 @@ readonly CHECKER=safe-outputs/safe-outputs.mjs
 readonly CHECKER_PATHS=(safe-outputs vendor/gh-aw agent/redact.mjs)
 # The trailer naming the run an applied change came from.
 readonly RUN_TRAILER=Agent-run
-# The push URL of an applied clone's origin: apply never pushes.
+# The push URL of an applied clone's origin when the repository is not the
+# bot's own: upstream is reached only through bot-pr, never by a plain push.
 readonly NO_PUSH_URL=no-push://bot-runs-apply-never-pushes
 # The AI trailer of the bot's commits (shared AGENTS.md).
 readonly AI_TRAILER='Generated-by: AI'
@@ -188,8 +189,9 @@ Commands:
       backed by a fresh isolated clone of GIT_URL (default: OWNER/REPO on
       GitHub), with hooks off; refusals remove it. The other outputs (noop,
       missing_tool, add_comment, missing_data) are only listed: nothing is
-      posted. Nothing is pushed, and origin has no push URL: after review,
-      bot-pr fork-pr --from DIR opens it on the forge.
+      posted. Nothing is pushed. For the bot's own repositories origin stays
+      pushable, so bot-land works; for any other origin has no push URL:
+      after review, bot-pr fork-pr --from DIR opens it on the forge.
   stats [--since AGE] [--limit N] [--by agent|model|repo|item|result]
       Aggregate the finished runs (the last ${DEFAULT_STATS_SINCE}, at most ${DEFAULT_STATS_LIMIT} by
       default): success rate, failures by kind, duration, tokens and
@@ -277,7 +279,17 @@ def flat: (.summary // {}) as $s | title_parts as $t | {
 def io_tokens: if .tokens then (.tokens.input // 0) + (.tokens.output // 0) else null end;
 def fmt_tokens: if .tokens then "\(.tokens.input | fmt_num)/\(.tokens.output | fmt_num)" else "-" end;
 def fmt_outcome: if .outcome == null then (if .status != "completed" then .status else "-" end)
-    else [.outcome.status, .outcome.url] | map(select(. != null)) | join(" ") | orblank end;
+    else .outcome as $o
+    | [$o.status, $o.url] | map(select(. != null and . != "")) | join(" ")
+    | if . == "" then ($o.why | orblank) else . end end;
+# Keep every attempt and its evidence; only a later success of the exact
+# same command supersedes a known failure (unknown exits are not failures).
+def fmt_tests: (.tests // []) as $tests | range(0; $tests | length) as $i
+    | $tests[$i] as $t
+    | "Test: \($t.command): exit \($t.exit_code), \($t.duration_s | fmt_dur)"
+      + (if $t.exit_code != null and $t.exit_code != 0
+          and any($tests[$i + 1:][]; .command == $t.command and .exit_code == 0)
+         then " (superseded by later success)" else "" end);
 def agent_model: [.agent, .model] | map(select(. != null)) | join("/") | orblank;
 def source_note: {artifact: "", footer: " (from the PR footer; partial)",
     none: " (no summary: artifact expired, no footer)", pending: ""}[.source] // "";
@@ -953,9 +965,9 @@ cmd_show() {
         # No summary.md: the essentials from summary.json.
         jqlib -r '.summary | "",
             "Tools: \(.tools // {} | to_entries | map("\(.key) \(.value.calls)\(if (.value.errors // 0) > 0 then " (\(.value.errors) errors)" else "" end)") | join(", ") | orblank)",
-            (.failures // [] | .[] | "Failure: \(.kind): \(.message)"),
-            (.tests // [] | .[] | "Test: \(.command): exit \(.exit_code), \(.duration_s | fmt_dur)")' <<<"${rec}"
+            (.failures // [] | .[] | "Failure: \(.kind): \(.message)")' <<<"${rec}"
     fi
+    jqlib -r '.summary | fmt_tests' <<<"${rec}"
 }
 
 # condensed_from_job_log RUN: the condensed transcript from the jobs'
@@ -1518,11 +1530,15 @@ $(jq -r '.errors[] | "  \(.)"' "${scratch}/verdict.json" 2>/dev/null)"
         rm -rf "${backing}"
         fatal "cloning ${base} of ${source} failed"
     }
-    # Kept in the clone for whatever runs git there next (bot-pr fork-pr
-    # pushes to an explicit URL); origin is never a push target.
+    # Kept in the clone for whatever runs git there next. Apply itself never
+    # pushes. Origin stays pushable (for bot-land) only for the bot's own
+    # repositories; for any other, bot-pr fork-pr pushes to an explicit URL.
     agit "${backing}" config core.hooksPath /dev/null
     agit "${backing}" config core.fsmonitor false
-    agit "${backing}" config remote.origin.pushurl "${NO_PUSH_URL}"
+    case "${want_repo%%/*}" in
+        "${OP_BOT_LOGIN}" | "${OP_FORGE_ORG}") ;;
+        *) agit "${backing}" config remote.origin.pushurl "${NO_PUSH_URL}" ;;
+    esac
     refuse() {
         if test -n "${managed:-}"; then
             apply_worktree rm "${slug}" --dir "${managed}" --force || {
