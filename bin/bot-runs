@@ -22,27 +22,28 @@ readonly RUNS_WORKFLOW=${BOT_RUNS_WORKFLOW:-agent.yml}
 readonly RUNS_REF=${BOT_RUNS_REF:-bot/agent-run-praxis}
 readonly SUMMARY_ARTIFACT=agent-run
 readonly TRANSCRIPT_ARTIFACT=agent-transcript
-# A branch run's change: changes.patch and base.json.
-readonly OUT_ARTIFACT=agent-out
+# What a run hands back, as gh-aw's safe outputs: outputs.jsonl, a patch and
+# base.json (see the agent runs contract).
+readonly OUT_ARTIFACT=safe-outputs
 # The job of agent.yml that runs the agent as runner-sandbox and uploads
-# OUT_ARTIFACT; apply takes a change only from it.
+# OUT_ARTIFACT; apply takes a change only from it, and only from a run in
+# which every job succeeded: Restrictions (the dispatch inputs against the
+# workflow's allowlist), Agent, and Safe outputs (gh-aw's validation).
 readonly AGENT_JOB=Agent
-readonly MAX_PATCH_BYTES=$((8 << 20))
-readonly MAX_BASE_JSON_BYTES=4096
-readonly MAX_PATCH_FILES=100
+readonly WORKFLOW_JOBS='["Agent", "Restrictions", "Safe outputs"]'
+# The zip of OUT_ARTIFACT: at most the patch cap and a little more.
+readonly MAX_ARTIFACT_BYTES=$(((8 << 20) + (1 << 20) + 8192))
 readonly REPO_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
 readonly BASE_RE='^[A-Za-z0-9_][A-Za-z0-9_./-]*$'
-# The paths a run's change may touch: relative, of plain characters (no
-# spaces, quotes or control characters; . and .. components are refused
-# separately).
-readonly APPLY_PATH_RE='^[A-Za-z0-9_.+@=,][A-Za-z0-9_.+@=,-]*(/[A-Za-z0-9_.+@=,][A-Za-z0-9_.+@=,-]*)*$'
-# Paths it may never touch: git's own files (.git, .gitmodules,
-# .gitattributes, .github/ and the like), CI and hook configuration, and
-# files editors or shells run on their own.
-readonly PROTECTED_PATH_RE='(^|/)\.git|(^|/)\.husky/|^\.pre-commit-config\.ya?ml$|^\.?lefthook\.ya?ml$|^\.circleci/|^\.travis\.yml$|^\.tekton/|^\.packit\.ya?ml$|^\.envrc$|^\.vscode/|(^|/)CODEOWNERS$'
-# Secret-shaped strings (GitHub, GitLab, Anthropic, AWS, Google, Slack
-# tokens; private keys).
-readonly SECRET_RE='gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|sk-ant-[A-Za-z0-9_-]{20,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[abprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----'
+# Every output type apply accepts unless --outputs narrows it (the
+# workflow's allowlist, safe-outputs/allowlist.json, has the final say).
+readonly ALL_OUTPUTS=all
+# The code that checks a run's outputs is the run's own: the safe-outputs/
+# and vendor/gh-aw/ directories of the commit of RUNS_REPO that ran. It is
+# kept here by commit, and BOT_RUNS_SAFE_OUTPUTS_DIR names a checkout to use
+# instead.
+readonly CHECKER=safe-outputs/safe-outputs.mjs
+readonly CHECKER_PATHS=(safe-outputs vendor/gh-aw agent/redact.mjs)
 # The trailer naming the run an applied change came from.
 readonly RUN_TRAILER=Agent-run
 # The push URL of an applied clone's origin: apply never pushes.
@@ -74,6 +75,11 @@ readonly WORKFLOWS='["branch", "analysis"]'
 readonly MAX_TIMEOUT=330
 readonly DEFAULT_TIMEOUT=120
 readonly DEFAULT_BUDGET=500
+# The output types a run may hand back (agent.yml's outputs input, checked
+# against its static allowlist) and how many: a branch run proposes a pull
+# request, an analysis run has no change to propose.
+declare -rA DEFAULT_OUTPUTS=([branch]="create_pull_request,noop,missing_tool" [analysis]="noop,missing_tool,missing_data")
+readonly DEFAULT_MAX_OUTPUTS=3
 readonly MAX_INPUTS_LEN=65535
 # The runner-side worker brief, put before every dispatched brief: the
 # agent runs without credentials, and its only outputs are the working
@@ -89,6 +95,7 @@ readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-runs
 readonly ETAG_DIR=${CACHE_DIR}/etags
 readonly ETAG_KEEP_DAYS=14
 readonly TRANSCRIPT_DIR=${CACHE_DIR}/transcripts
+readonly CHECKER_DIR=${CACHE_DIR}/safe-outputs
 readonly TRANSCRIPT_KEEP_DAYS=30
 # list --item reads at most this many runs to find LIMIT of the item's.
 readonly ITEM_SCAN_MAX=500
@@ -121,14 +128,18 @@ docs/devspace-agent-runs.md in homegit.
 Commands:
   dispatch --item ITEM --repo OWNER/REPO [--base REF] [--agent AGENT]
            [--model MODEL] [--cores N] [--timeout MIN] [--budget AIC]
-           [--workflow branch|analysis] [--no-preamble] [--dry-run] BRIEF
+           [--workflow branch|analysis] [--outputs TYPES] [--max-outputs N]
+           [--no-preamble] [--dry-run] BRIEF
       Start a run on BRIEF (a file, or - for stdin) and print its id and
       URL, then put the run URL in the item's ${RUN_FIELD} field (added to the
       board if missing), with Status ${RUN_STATUS} and a News line, and give the
       item a token budget ('bot-pace budget ITEM', unless it has one).
       Defaults: base main, agent ${DEFAULT_AGENT} (model ${DEFAULT_OPENCODE_MODEL}, as
       provider/model; BOT_RUNS_MODEL or --model changes it), 4 cores, ${DEFAULT_TIMEOUT} minutes,
-      budget ${DEFAULT_BUDGET} AIC, workflow branch. The task sent is the
+      budget ${DEFAULT_BUDGET} AIC, workflow branch, outputs create_pull_request,noop,missing_tool
+      (an analysis run: noop,missing_tool,missing_data), at most ${DEFAULT_MAX_OUTPUTS} of them: the
+      run refuses types and numbers its static allowlist doesn't have,
+      before it starts. The task sent is the
       runner-side worker brief (runner-preamble.md in the coordinator
       skill), the run's target, then BRIEF; --no-preamble sends BRIEF
       alone. --dry-run prints the request.
@@ -159,23 +170,26 @@ Commands:
       Compare two runs: result, duration, turns, tokens, AIC, tool
       calls, failures, files touched, tests and outcome.
   apply RUN --repo OWNER/REPO --slug SLUG --message FILE [--base REF]
-        [--dir DIR] [--source GIT_URL]
-      Turn a successful branch run's change (its agent-out artifact) into
-      a local commit on bot/SLUG, as the bot, with FILE as the message
-      (the AI trailer and an ${RUN_TRAILER} trailer naming the run are
-      added). Everything from the runner is checked again first: the run
+        [--outputs TYPES] [--dir DIR] [--source GIT_URL]
+      Take what a successful run handed back (its ${OUT_ARTIFACT} artifact: gh-aw
+      safe outputs, see docs/devspace-agent-runs.md). Everything from the
+      runner is checked again first, with the code of the run's own commit
+      (safe-outputs/safe-outputs.mjs, gh-aw's validation vendored): the run
       is a dispatch of ${RUNS_WORKFLOW} from bot/agent-run-* (nonempty suffix)
-      in the configured devspace for OWNER/REPO (and REF), the
-      artifact is the one its ${AGENT_JOB} job uploaded, within size and
-      file-count caps, its base commit is on the base branch, and it has
-      no secret-shaped strings, binaries, symlinks, submodules, mode
-      changes, or paths outside plain relative ones or under .git*, CI
-      or hook configuration. DIR (default the bot-work worktree for SLUG)
-      is a managed worktree backed by a fresh isolated clone of GIT_URL
-      (default: OWNER/REPO on GitHub), with hooks off; refusals remove it.
-      Nothing is pushed, and
-      origin there has no push URL: after review, bot-pr fork-pr --from
-      DIR opens it on the forge.
+      in the configured devspace for OWNER/REPO (and REF), in which all of
+      its jobs succeeded, the artifact is the one its ${AGENT_JOB} job
+      uploaded, and the outputs pass the allowlist (TYPES, comma separated,
+      narrows it), gh-aw's validation and file protection, and the checks
+      for secrets, symlinks, submodules, binaries and mode changes; the
+      base commit must be on the base branch. A create_pull_request becomes
+      a local commit on bot/SLUG, as the bot, with FILE as the message (the
+      AI trailer and an ${RUN_TRAILER} trailer naming the run are added).
+      DIR (default the bot-work worktree for SLUG) is a managed worktree
+      backed by a fresh isolated clone of GIT_URL (default: OWNER/REPO on
+      GitHub), with hooks off; refusals remove it. The other outputs (noop,
+      missing_tool, add_comment, missing_data) are only listed: nothing is
+      posted. Nothing is pushed, and origin has no push URL: after review,
+      bot-pr fork-pr --from DIR opens it on the forge.
   stats [--since AGE] [--limit N] [--by agent|model|repo|item|result]
       Aggregate the finished runs (the last ${DEFAULT_STATS_SINCE}, at most ${DEFAULT_STATS_LIMIT} by
       default): success rate, failures by kind, duration, tokens and
@@ -609,13 +623,14 @@ require_public_repo() {
 cmd_dispatch() {
     local item="" repo="" base=main agent=${DEFAULT_AGENT} model="" cores=4 timeout=${DEFAULT_TIMEOUT}
     local budget=${DEFAULT_BUDGET} workflow=branch brief_file="" dry_run=false json=false preamble=true
+    local outputs="" max_outputs=${DEFAULT_MAX_OUTPUTS}
     local inputs body len resp rc=0
     while test $# -gt 0; do
         case "$1" in
-            --item|--repo|--base|--agent|--model|--cores|--timeout|--budget|--workflow)
+            --item|--repo|--base|--agent|--model|--cores|--timeout|--budget|--workflow|--outputs|--max-outputs)
                 test $# -ge 2 || fatal "$1 requires a value"
                 local opt=${1#--}
-                printf -v "${opt}" '%s' "$2"
+                printf -v "${opt//-/_}" '%s' "$2"
                 shift 2
                 ;;
             --dry-run) dry_run=true; shift ;;
@@ -635,6 +650,9 @@ cmd_dispatch() {
         model=${DEFAULT_OPENCODE_MODEL}
     fi
     jq -e --arg v "${workflow}" 'index($v)' <<<"${WORKFLOWS}" >/dev/null || fatal "--workflow must be one of ${WORKFLOWS}"
+    test -n "${outputs}" || outputs=${DEFAULT_OUTPUTS[${workflow}]}
+    [[ "${outputs}" =~ ^[a-z_]+(,[a-z_]+)*$ ]] || fatal "--outputs must be output types separated by commas, not ${outputs}"
+    [[ "${max_outputs}" =~ ^[1-9][0-9]?$ ]] || fatal "--max-outputs must be a number, not ${max_outputs}"
     if ! [[ "${timeout}" =~ ^[0-9]+$ ]] || test "${timeout}" -lt 1 || test "${timeout}" -gt "${MAX_TIMEOUT}"; then
         fatal "--timeout must be 1 to ${MAX_TIMEOUT} minutes (the job's cap is 360)"
     fi
@@ -661,9 +679,10 @@ cmd_dispatch() {
     fi
     inputs=$(jq -nc --arg item "${item}" --arg repo "${repo}" --arg base "${base}" --arg agent "${agent}" \
         --arg model "${model}" --arg cores "${cores}" --arg timeout "${timeout}" --arg budget "${budget}" \
-        --arg workflow "${workflow}" --rawfile brief "${scratch}/brief" \
+        --arg workflow "${workflow}" --arg outputs "${outputs}" --arg max_outputs "${max_outputs}" --rawfile brief "${scratch}/brief" \
         '{item: $item, repo: $repo, base: $base, agent: $agent, model: $model, cores: $cores,
-          timeout: $timeout, budget: $budget, workflow: $workflow, brief: ($brief | rtrimstr("\n"))}')
+          timeout: $timeout, budget: $budget, workflow: $workflow, outputs: $outputs, max_outputs: $max_outputs,
+          brief: ($brief | rtrimstr("\n"))}')
     len=$(jq 'tojson | length' <<<"${inputs}")
     test "${len}" -le "${MAX_INPUTS_LEN}" ||
         fatal "the dispatch inputs are ${len} characters, over GitHub's ${MAX_INPUTS_LEN}; shorten the brief"
@@ -948,6 +967,7 @@ condensed_from_job_log() {
     test "${rc}" -ne "${EX_NOTFOUND}" || return 0
     test "${rc}" -eq 0 || fatal "listing the jobs of run $1 failed"
     for job in ${jobs}; do
+        rc=0
         ghapi "repos/${RUNS_REPO}/actions/jobs/${job}/logs" >"${scratch}/job.log" || rc=$?
         # A job's log can be gone while the run's is not.
         test "${rc}" -ne "${EX_NOTFOUND}" || continue
@@ -1258,41 +1278,90 @@ readonly RUN_ORIGIN_JQ='
     elif ((.head_sha // "") | test("^[0-9a-f]{40}$") | not) then "has no valid head_sha"
     else empty end'
 
-# Checks the jobs of a run attempt (input): exactly one, the agent job,
-# successful, of that run and head; prints why not, or nothing.
-readonly AGENT_JOB_JQ='
-    if (.jobs | length) != 1 then "has \(.jobs | length) jobs, not just \($name)"
-    else .jobs[0] |
-        if .name != $name then "has job \(.name | tostring), not \($name)"
-        elif .run_id != $run or .head_sha != $sha then "has a job of another run or head"
-        elif .conclusion != "success" then "job \($name) is \(.conclusion // .status), not success"
-        else empty end end'
+# Checks the jobs of a run attempt (input): exactly the workflow's, of that
+# run and head, all successful; prints why not, or nothing.
+readonly RUN_JOBS_JQ='
+    (.jobs | map(.name)) as $got
+    | if ($got | sort) != ($names | sort) then "has the jobs \($got | join(", ")), not \($names | join(", "))"
+      elif any(.jobs[]; .run_id != $run or .head_sha != $sha) then "has a job of another run or head"
+      elif any(.jobs[]; .conclusion != "success") then
+          "has jobs that did not succeed: \(.jobs | map(select(.conclusion != "success") | "\(.name) (\(.conclusion // .status))") | join(", "))"
+      else empty end'
 
-# apply_artifact RUN_JSON ATTEMPT DIR: finds, checks and unpacks the
-# agent-out artifact of the run's attempt into DIR, refusing one that
-# isn't exactly what the agent job of that run uploaded.
+# fetch_checker SHA: prints the directory holding the code that checks a
+# run's outputs, as of commit SHA of the runs repository (the one that ran):
+# safe-outputs/, vendor/gh-aw/ and agent/redact.mjs, kept by commit.
+fetch_checker() {
+    local sha=$1 dir=${CHECKER_DIR}/$1 rc=0
+    if test -n "${BOT_RUNS_SAFE_OUTPUTS_DIR:-}"; then
+        echo "${BOT_RUNS_SAFE_OUTPUTS_DIR}"
+        return
+    fi
+    if ! test -f "${dir}/${CHECKER}"; then
+        mkdir -p "${CHECKER_DIR}" "${scratch}/checker"
+        ghapi "repos/${RUNS_REPO}/tarball/${sha}" >"${scratch}/checker.tar.gz" || rc=$?
+        pass_ratelimit "${rc}"
+        test "${rc}" -eq 0 || fatal "downloading the code of ${sha} from ${RUNS_REPO} failed"
+        tar -xzf "${scratch}/checker.tar.gz" -C "${scratch}/checker" --strip-components=1 --no-same-owner \
+            --wildcards "${CHECKER_PATHS[@]/#/*/}" || fatal "unpacking the code of ${sha} failed"
+        test -f "${scratch}/checker/${CHECKER}" || fatal "${sha} of ${RUNS_REPO} has no ${CHECKER}"
+        # Node's permission model follows links out of the directory it allows.
+        test -z "$(find "${scratch}/checker" -type l -print -quit)" || fatal "the code of ${sha} holds a symbolic link"
+        rm -rf "${dir}"
+        mv "${scratch}/checker" "${dir}"
+    fi
+    echo "${dir}"
+}
+
+# checker CHECKER_DIR ARGS...: the safe-outputs checker. It is code of the
+# runs repository (the commit that ran, or BOT_RUNS_SAFE_OUTPUTS_DIR, which is
+# for tests and local development), so it runs with no environment but the
+# PATH and under node's permission model: it may read its own directory
+# and the scratch directory, write the scratch directory, and start no
+# process. Anyone who can push to RUNS_REF can change it, as they can
+# change the workflow itself.
+checker() {
+    local dir=$1
+    shift
+    env -i PATH="${PATH}" HOME="${scratch}" TMPDIR="${scratch}" node --permission \
+        --allow-fs-read="${dir}" --allow-fs-read="${scratch}" --allow-fs-write="${scratch}" \
+        "${dir}/${CHECKER}" "$@"
+}
+
+# staged_view DIR: git's own view of the change staged in DIR, in
+# scratch/view-*, for the checker's post-apply.
+staged_view() {
+    agit "$1" diff --cached --raw -z --no-renames --no-abbrev HEAD >"${scratch}/view-raw"
+    agit "$1" diff --cached --numstat -z --no-renames HEAD >"${scratch}/view-numstat"
+    agit "$1" diff --cached --no-renames HEAD >"${scratch}/view-diff"
+}
+
+# apply_artifact RUN_JSON ATTEMPT DIR CHECKER_DIR POLICY: finds and
+# unpacks the safe-outputs artifact of the run's attempt into DIR,
+# refusing one that isn't exactly what the agent job of that run uploaded
+# (the checker unpacks it: names, types and sizes).
 apply_artifact() {
-    local run=$1 attempt=$2 dir=$3 id sha body jobs art why rc=0
+    local run=$1 attempt=$2 dir=$3 chk=$4 policy=$5 id sha body jobs art why rc=0
     read -r id sha < <(jq -r '"\(.id) \(.head_sha)"' <<<"${run}")
     jobs=$(rest_get "repos/${RUNS_REPO}/actions/runs/${id}/attempts/${attempt}/jobs?per_page=${PER_PAGE}") || rc=$?
     pass_ratelimit "${rc}"
     test "${rc}" -eq 0 || fatal "listing the jobs of run ${id} failed"
-    why=$(jq -r --arg name "${AGENT_JOB}" --argjson run "${id}" --arg sha "${sha}" "${AGENT_JOB_JQ}" <<<"${jobs}")
-    test -z "${why}" || fatal "run ${id} ${why}; its change is taken only from the ${AGENT_JOB} job"
+    why=$(jq -r --argjson names "${WORKFLOW_JOBS}" --argjson run "${id}" --arg sha "${sha}" "${RUN_JOBS_JQ}" <<<"${jobs}")
+    test -z "${why}" || fatal "run ${id} ${why}; its outputs are taken only from a run whose jobs all succeeded"
 
     body=$(rest_get "repos/${RUNS_REPO}/actions/runs/${id}/artifacts?per_page=${PER_PAGE}") || rc=$?
     pass_ratelimit "${rc}"
     test "${rc}" -eq 0 || fatal "listing the artifacts of run ${id} failed"
-    # The job's window: an artifact made outside it came from elsewhere
-    # (another attempt, or a later upload).
-    art=$(jq -c --arg n "${OUT_ARTIFACT}" --argjson job "$(jq -c '.jobs[0] | {started_at, completed_at}' <<<"${jobs}")" \
+    # The agent job's window: an artifact made outside it came from
+    # elsewhere (another attempt, or a later upload).
+    art=$(jq -c --arg n "${OUT_ARTIFACT}" --argjson job "$(jq -c --arg n "${AGENT_JOB}" '.jobs[] | select(.name == $n) | {started_at, completed_at}' <<<"${jobs}")" \
         '[.artifacts[] | select(.name == $n)] as $a
         | if ($a | length) == 0 then null
           elif ($a | length) > 1 then {error: "has \($a | length) \($n) artifacts"}
           else $a[0] | . + {in_job: ((.created_at // "") >= $job.started_at and (.created_at // "") <= $job.completed_at)} end' <<<"${body}")
     test "${art}" != null ||
-        fatal "run ${id} has no ${OUT_ARTIFACT} artifact: it changed no files, or its change was dropped ('$(basename "$0") show ${id}' says why)"
-    why=$(jq -r --argjson run "${run}" --argjson max "$((MAX_PATCH_BYTES + MAX_BASE_JSON_BYTES))" '
+        fatal "run ${id} has no ${OUT_ARTIFACT} artifact: it handed nothing back, or its outputs were dropped ('$(basename "$0") show ${id}' says why)"
+    why=$(jq -r --argjson run "${run}" --argjson max "${MAX_ARTIFACT_BYTES}" '
         if .error then .error
         elif .expired != false then "has an expired artifact (since \(.expires_at // "?"), kept 30 days)"
         elif .workflow_run.id != $run.id or .workflow_run.head_sha != $run.head_sha
@@ -1304,24 +1373,8 @@ apply_artifact() {
 
     ghapi "repos/${RUNS_REPO}/actions/artifacts/$(jq -r .id <<<"${art}")/zip" >"${scratch}/out.zip" || rc=$?
     test "${rc}" -eq 0 || fatal "downloading the ${OUT_ARTIFACT} artifact of run ${id} failed"
-    # Exactly the two regular files, at the root, within the size caps,
-    # before anything is unpacked.
-    why=$(unzip -Z "${scratch}/out.zip" 2>/dev/null | awk -v max="${MAX_PATCH_BYTES}" -v jmax="${MAX_BASE_JSON_BYTES}" '
-        NF < 9 || $1 ~ /^(Archive|Zip)/ || $0 ~ /^[0-9]+ files?,/ { next }
-        { n++; name = $NF; size = $4 }
-        substr($1, 1, 1) != "-" { print "a non-regular file " name; next }
-        name == "changes.patch" { p++; if (size > max) print "a patch of " size " bytes, over " max; next }
-        name == "base.json" { b++; if (size > jmax) print "a base.json of " size " bytes"; next }
-        { print "an unexpected file " name }
-        END { if (p != 1 || b != 1 || n != 2) print "not exactly changes.patch and base.json" }')
-    test -z "${why}" || fatal "the ${OUT_ARTIFACT} artifact of run ${id} has ${why}"
-    unzip -q "${scratch}/out.zip" changes.patch base.json -d "${dir}" ||
-        fatal "unpacking the ${OUT_ARTIFACT} artifact of run ${id} failed"
-    # Again, as unpacked: the sizes in a zip's directory are its own say.
-    if test "$(stat -c %s "${dir}/changes.patch")" -gt "${MAX_PATCH_BYTES}" ||
-        test "$(stat -c %s "${dir}/base.json")" -gt "${MAX_BASE_JSON_BYTES}"; then
-        fatal "the ${OUT_ARTIFACT} artifact of run ${id} unpacks over its size caps"
-    fi
+    checker "${chk}" unpack --zip "${scratch}/out.zip" --dir "${dir}" --policy "${policy}" ||
+        fatal "the ${OUT_ARTIFACT} artifact of run ${id} is refused"
 }
 
 # Run apply's Git operations and worktree helper without caller Git
@@ -1347,37 +1400,12 @@ apply_worktree() {
         "$(dirname "$(readlink -f "$0")")/bot-work" worktree "$@" | tail -n1
 }
 
-# apply_refusals DIR: why the staged change in DIR may not be committed,
-# one line per path, from git's own view of it (not from parsing the
-# patch): path shape and protected paths, symlinks, submodules, modes,
-# binaries.
-apply_refusals() {
-    agit "$1" diff --cached --numstat -z --no-renames HEAD >"${scratch}/numstat"
-    agit "$1" diff --cached --raw -z --no-renames --no-abbrev HEAD >"${scratch}/raw"
-    # ENVIRON: awk -v would process the regexes' backslashes.
-    PATH_RE=${APPLY_PATH_RE} DENY_RE=${PROTECTED_PATH_RE} awk '
-        BEGIN { RS = "\0" }
-        FILENAME == ARGV[1] { if (substr($0, 1, 4) == "-\t-\t") bin[substr($0, 5)] = 1; next }
-        !inpath { split($0, f, " "); old = substr(f[1], 2); new = f[2]; st = f[5]; inpath = 1; next }
-        {
-            inpath = 0; p = $0; why = ""
-            if (p !~ ENVIRON["PATH_RE"] || p ~ /(^|\/)\.\.?(\/|$)/) why = "not a plain relative path"
-            else if (p ~ ENVIRON["DENY_RE"]) why = "protected path"
-            else if (old ~ /^1[26]0000$/ || new ~ /^1[26]0000$/) why = "symlink or submodule"
-            else if (st == "A" && new != "100644") why = "new file mode " new
-            else if (st == "M" && old != new) why = "mode change " old " to " new
-            else if (st != "A" && st != "M" && st != "D") why = "change of type " st
-            else if (p in bin) why = "binary"
-            if (why != "") { gsub(/[^[:print:]]/, "?", p); print "  " p " (" why ")" }
-        }' "${scratch}/numstat" "${scratch}/raw"
-}
-
 cmd_apply() {
-    local run_id="" slug="" dir="" source="" message_file="" json=false want_repo="" want_base=""
-    local run meta attempt run_url why rec item repo base workflow result summary_run ref commit branch files nfiles head backing managed
+    local run_id="" slug="" dir="" source="" message_file="" json=false want_repo="" want_base="" outputs=${ALL_OUTPUTS}
+    local run meta attempt run_url why rec item repo base workflow result summary_run commit branch files head backing managed chk verdict pr others
     while test $# -gt 0; do
         case "$1" in
-            --slug|--dir|--source|--message|--repo|--base)
+            --slug|--dir|--source|--message|--repo|--base|--outputs)
                 test $# -ge 2 || fatal "$1 requires a value"
                 case "$1" in
                     --slug) slug=$2 ;;
@@ -1386,6 +1414,7 @@ cmd_apply() {
                     --message) message_file=$2 ;;
                     --repo) want_repo=$2 ;;
                     --base) want_base=$2 ;;
+                    --outputs) outputs=$2 ;;
                 esac
                 shift 2
                 ;;
@@ -1432,26 +1461,39 @@ cmd_apply() {
     workflow=$(summary_field workflow) result=$(summary_field result) summary_run=$(summary_field run_id)
     test "${summary_run}" = "${run_id}" || fatal "run ${run_id}'s summary is of run ${summary_run:-?}"
     test "${result}" = success || fatal "run ${run_id}'s agent result is ${result:-unknown}, not success"
-    test "${workflow}" = branch || fatal "run ${run_id} is a ${workflow:-?} run; only branch runs hand back a change"
     test "${repo}" = "${want_repo}" || fatal "run ${run_id}'s summary names ${repo:-no repository}, not ${want_repo}"
     [[ "${base}" =~ ${BASE_RE} ]] || fatal "run ${run_id}'s summary has no valid base"
     test -z "${want_base}" || test "${base}" = "${want_base}" ||
         fatal "run ${run_id}'s base is ${base}, not ${want_base}"
 
-    # Its change, as uploaded by its agent job, checked again here: the
-    # runner's own checks ran where the agent did.
-    mkdir "${scratch}/out"
-    apply_artifact "${run}" "${attempt}" "${scratch}/out"
-    read -r ref commit < <(jq -r --arg r "${want_repo}" 'if .repo == $r then "\(.ref) \(.commit)" else "repo-mismatch -" end' "${scratch}/out/base.json")
-    test "${ref}" != repo-mismatch || fatal "run ${run_id}'s base.json names another repository than ${want_repo}"
-    [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || fatal "run ${run_id}'s base.json has no valid commit"
-    test "${ref}" = "${base}" || fatal "run ${run_id}'s base.json ref (${ref}) differs from its summary's base (${base})"
-    if grep -qaE -- "${SECRET_RE}" "${scratch}/out/changes.patch"; then
-        fatal "run ${run_id}'s change holds a secret-shaped string; not applying it"
+    # Its outputs, as uploaded by its agent job and checked in the run by
+    # gh-aw's validation, checked again here by the same code: the
+    # allowlist and the policy for this repository and base, then gh-aw's
+    # validation of every request, the patch's protection and the checks
+    # gh-aw doesn't make (safe-outputs/safe-outputs.mjs).
+    chk=$(fetch_checker "$(jq -r .head_sha <<<"${run}")")
+    checker "${chk}" compile --repo "${want_repo}" --base "${base}" --workflow "${workflow:-branch}" --outputs "${outputs}" \
+        --max-outputs max --out "${scratch}/policy.json" >/dev/null || fatal "the allowlist refuses ${want_repo} at ${base} with outputs ${outputs}"
+    apply_artifact "${run}" "${attempt}" "${scratch}/out" "${chk}" "${scratch}/policy.json"
+    checker "${chk}" check --dir "${scratch}/out" --policy "${scratch}/policy.json" --json "${scratch}/verdict.json" >/dev/null ||
+        fatal "run ${run_id}'s outputs are refused:
+$(jq -r '.errors[] | "  \(.)"' "${scratch}/verdict.json" 2>/dev/null)"
+    verdict=$(<"${scratch}/verdict.json")
+    pr=$(jq -c '[.items[] | select(.type == "create_pull_request")] | first // null' <<<"${verdict}")
+    others=$(jq -c '[.items[] | select(.type != "create_pull_request") | {type, text: (.message // .body // .reason // "")}]' <<<"${verdict}")
+    if test "${pr}" = null; then
+        # Nothing to apply: say what the run did hand back.
+        if ${json}; then
+            jq -n --argjson run "${run_id}" --arg url "${run_url}" --arg item "${item}" --argjson outputs "${others}" \
+                '{run_id: $run, run_url: $url, item: $item, applied: false, outputs: $outputs}'
+        else
+            printf 'Run %s handed back no create_pull_request, so nothing was applied.\n' "${run_id}"
+            jq -r '.[] | "  \(.type): \(.text)"' <<<"${others}"
+        fi
+        return 0
     fi
-    nfiles=$(grep -c '^diff --git ' "${scratch}/out/changes.patch" || true)
-    test "${nfiles}" -le "${MAX_PATCH_FILES}" || fatal "run ${run_id}'s change touches ${nfiles} files, over ${MAX_PATCH_FILES}"
 
+    read -r commit < <(jq -r .commit "${scratch}/out/base.json")
     # A fresh clone, its base commit on the declared base branch (never
     # fetched by id: GitHub serves forks' commits that way too).
     if test -n "${dir}"; then
@@ -1493,17 +1535,15 @@ cmd_apply() {
     test -z "${dir}" || destination_args=(--dir "${dir}")
     managed=$(apply_worktree add "${backing}" "${slug}" --base "${commit}" "${destination_args[@]}") || refuse "creating apply worktree failed"
     dir=${managed}
-    agit "${dir}" apply --index --whitespace=nowarn "${scratch}/out/changes.patch" ||
+    agit "${dir}" apply --index --whitespace=nowarn "${scratch}/out/$(jq -r .patch.file <<<"${verdict}")" ||
         refuse "run ${run_id}'s change doesn't apply to ${commit}"
-    files=$(agit "${dir}" diff --cached --name-only -z --no-renames HEAD | tr -cd '\0' | wc -c)
-    test "${files}" -gt 0 || refuse "run ${run_id}'s change is empty"
-    test "${files}" -le "${MAX_PATCH_FILES}" || refuse "run ${run_id}'s change touches ${files} files, over ${MAX_PATCH_FILES}"
-    why=$(apply_refusals "${dir}")
-    test -z "${why}" || refuse "run ${run_id}'s change touches what a run may not change:
+    # The change as git sees it, which can differ from what the patch's
+    # text says (gh-aw's post-apply check, and the checks of the text again).
+    staged_view "${dir}"
+    why=$(checker "${chk}" post-apply --raw "${scratch}/view-raw" --numstat "${scratch}/view-numstat" --diff "${scratch}/view-diff" \
+        --policy "${scratch}/policy.json" 2>&1) ||
+        refuse "run ${run_id}'s change touches what a run may not change:
 ${why}"
-    agit "${dir}" diff --cached HEAD >"${scratch}/staged.diff"
-    ! grep -qaE -- "${SECRET_RE}" "${scratch}/staged.diff" ||
-        refuse "run ${run_id}'s change holds a secret-shaped string; not applying it"
 
     cp "${message_file}" "${scratch}/message"
     grep -q '^Generated-by: ' "${scratch}/message" || printf '\n%s\n' "${AI_TRAILER}" >>"${scratch}/message"
@@ -1517,12 +1557,15 @@ ${why}"
         jq -n --argjson run "${run_id}" --arg url "${run_url}" --arg sha "$(jq -r .head_sha <<<"${run}")" \
             --arg repo "${want_repo}" --arg base "${base}" --arg commit "${commit}" --arg branch "${branch}" \
             --arg dir "${dir}" --arg head "${head}" --arg item "${item}" --argjson files "${files}" \
+            --argjson pr "$(jq -c '{title, body}' <<<"${pr}")" --argjson outputs "${others}" \
             '{run_id: $run, run_url: $url, workflow_sha: $sha, repo: $repo, base: $base, base_commit: $commit,
-              branch: $branch, dir: $dir, head: $head, item: $item, files: $files}'
+              branch: $branch, dir: $dir, head: $head, item: $item, files: $files, pull_request: $pr, outputs: $outputs}'
         return 0
     fi
     printf 'Applied run %s to %s@%s as %s in %s (%s file(s)), commit %s. Nothing was pushed.\n' \
         "${run_id}" "${want_repo}" "${commit:0:12}" "${branch}" "${dir}" "$(jq length <<<"${files}")" "${head:0:12}"
+    printf 'The agent proposed the title %s.\n' "$(jq -r '.title | @json' <<<"${pr}")"
+    jq -r '.[] | "  also handed back, not acted on: \(.type): \(.text)"' <<<"${others}"
     printf 'Review it (commit-review), then open it on the forge:\n  bot-pr fork-pr --repo %s --base %s --branch %s --item %s --from %s --title TITLE --body-file FILE\n' \
         "${want_repo}" "${base}" "${branch}" "${item:-ITEM}" "${dir}"
 }
@@ -1543,9 +1586,9 @@ require_cmd jq "install jq"
 case "${cmd}" in
     list|show|log|diff|stats|reconcile) require_cmd unzip "install unzip" ;;
     apply)
-        require_cmd unzip "install unzip"
         require_cmd git "install git"
-        require_cmd node "install Node.js for bot-work worktree"
+        require_cmd node "install Node.js 22.2 or newer (it runs gh-aw's safe-outputs validation, and bot-work worktree)"
+        require_cmd tar "install tar"
         ;;
     transcript)
         require_cmd unzip "install unzip"
