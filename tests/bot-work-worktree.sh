@@ -157,5 +157,116 @@ grep -q 'not bot/foreign' "${WORK}/err" || fail "non-bot worktree refusal lacked
 test -d "${foreign}" || fail "removed registered non-bot worktree directory"
 git -C "${repo_one}" worktree remove "${foreign}"
 
+# Default and custom destinations have the same cleanup ownership, with
+# unrelated workers and adjacent custom directories preserved.
+run add "${repo_two}" sibling >/dev/null || fail "add sibling failed"
+mkdir -p "${WORK}/destinations/precious"
+printf 'preserve me\n' >"${WORK}/destinations/precious/file"
+while IFS='|' read -r name destination; do
+    args=()
+    target=${XDG_CACHE_HOME}/bot-work/${name}/one
+    if test "${destination}" != default; then
+        target=${WORK}/destinations/${destination}
+        args=(--dir "${target}")
+    fi
+    run add "${repo_one}" "${name}" "${args[@]}" >/dev/null || fail "add ${name} failed"
+    run rm "${name}" >/dev/null || fail "remove ${name} failed"
+    test ! -e "${target}" || fail "remove ${name} left destination"
+    test ! -e "${XDG_CACHE_HOME}/bot-work/${name}" || fail "remove ${name} left registration"
+    test -f "${XDG_CACHE_HOME}/bot-work/sibling/two/.git" || fail "remove ${name} removed sibling worker"
+    test "$(cat "${WORK}/destinations/precious/file")" = 'preserve me' || fail "remove ${name} altered adjacent directory"
+done <<'EOF'
+default-cleanup|default
+custom-cleanup|custom
+custom-spaces|custom with spaces
+custom-nested|missing/parents/custom
+EOF
+
+# A normal worktree may contain a file with the registration's name. Clean
+# tracked content removes normally; tracked edits and untracked content need
+# force, but must never be interpreted as a destination registration.
+while IFS='|' read -r kind clean; do
+    name=collision-${kind}
+    run add "${repo_one}" "${name}" >/dev/null || fail "add ${name} failed"
+    target=${XDG_CACHE_HOME}/bot-work/${name}/one
+    printf 'ordinary worktree content, not JSON\n' >"${target}/.destination.json"
+    if test "${kind}" != untracked; then
+        git -C "${target}" add .destination.json
+        git -C "${target}" commit -qm 'Track ordinary destination file'
+        test "${kind}" != tracked-dirty || printf 'edit\n' >>"${target}/.destination.json"
+    fi
+    if test "${clean}" = yes; then
+        run rm "${name}" >/dev/null || fail "clean collision removal failed"
+    else
+        if run rm "${name}" >/dev/null 2>"${WORK}/err"; then
+            fail "removed dirty ${kind} collision without force"
+        fi
+        grep -q 'tracked or untracked changes' "${WORK}/err" || fail "${kind} collision was treated as registration"
+        test -f "${target}/.git" || fail "collision refusal removed worktree"
+        run rm "${name}" --force >/dev/null || fail "forced ${kind} collision removal failed"
+    fi
+    test ! -e "${target}" || fail "${kind} collision removal left worktree"
+    test ! -e "${XDG_CACHE_HOME}/bot-work/${name}" || fail "${kind} collision removal left worker entry"
+    test -f "${XDG_CACHE_HOME}/bot-work/sibling/two/.git" || fail "collision removal removed sibling worker"
+done <<'EOF'
+tracked-clean|yes
+tracked-dirty|no
+untracked|no
+EOF
+
+# Custom registrations participate in preflight and targeted removal. A
+# dirty custom destination blocks whole-worker removal before siblings change.
+custom=${WORK}/destinations/mixed
+run add "${repo_one}" mixed --dir "${custom}" --base base >/dev/null || fail "add mixed custom failed"
+run add "${repo_two}" mixed >/dev/null || fail "add mixed default failed"
+printf 'dirty\n' >>"${custom}/file"
+if run rm mixed >/dev/null 2>"${WORK}/err"; then
+    fail "removed dirty custom worktree without force"
+fi
+grep -q 'tracked or untracked changes' "${WORK}/err" || fail "dirty custom refusal lacked explanation"
+test -f "${XDG_CACHE_HOME}/bot-work/mixed/two/.git" || fail "dirty custom refusal removed default sibling"
+run rm mixed --dir "${XDG_CACHE_HOME}/bot-work/mixed/two" >/dev/null || fail "targeted default removal failed"
+test -f "${custom}/.git" || fail "targeted default removal removed custom sibling"
+repo_three=$(make_repo three)
+run add "${repo_three}" mixed >/dev/null || fail "add mixed replacement sibling failed"
+run rm mixed --dir "${custom}" --force >/dev/null || fail "targeted custom force removal failed"
+test ! -e "${custom}" || fail "targeted custom removal left destination"
+test -f "${XDG_CACHE_HOME}/bot-work/mixed/three/.git" || fail "targeted custom removal removed default sibling"
+run rm mixed >/dev/null || fail "remove mixed sibling failed"
+test ! -e "${XDG_CACHE_HOME}/bot-work/mixed" || fail "targeted custom removal left registration"
+test -f "${XDG_CACHE_HOME}/bot-work/sibling/two/.git" || fail "targeted removal removed another worker"
+
+# A custom destination deleted by hand must not wedge cleanup of its name.
+stale=${WORK}/destinations/stale
+run add "${repo_one}" stale --dir "${stale}" --base base >/dev/null || fail "add stale custom failed"
+rm -rf "${stale}"
+run rm stale >/dev/null || fail "removing a hand-deleted custom destination failed"
+test ! -e "${XDG_CACHE_HOME}/bot-work/stale" || fail "hand-deleted custom destination left its registration"
+git -C "${repo_one}" worktree list --porcelain | grep -qF "${stale}" && fail "hand-deleted custom destination left a Git registration"
+
+# A registration cannot silently redirect cleanup to a replacement repository
+# or symlink, even if that replacement has the expected bot branch.
+custom=${WORK}/destinations/unsafe
+run add "${repo_one}" unsafe --dir "${custom}" >/dev/null || fail "add unsafe destination failed"
+mv "${custom}" "${custom}-saved"
+ln -s "${custom}-saved" "${custom}"
+if run rm unsafe --force >/dev/null 2>"${WORK}/err"; then
+    fail "followed symlinked custom destination"
+fi
+grep -q 'not a regular directory' "${WORK}/err" || fail "custom symlink refusal lacked explanation"
+test -L "${custom}" || fail "removed custom destination symlink"
+rm "${custom}"
+mv "${custom}-saved" "${custom}"
+record=${XDG_CACHE_HOME}/bot-work/unsafe/one/.destination.json
+cp "${record}" "${WORK}/registration.saved"
+node -e 'const fs = require("fs"); const f = process.argv[1]; const r = JSON.parse(fs.readFileSync(f)); r.common_dir = "/wrong/repository"; fs.writeFileSync(f, JSON.stringify(r));' "${record}"
+if run rm unsafe --force >/dev/null 2>"${WORK}/err"; then
+    fail "accepted mismatched registered repository"
+fi
+grep -q 'belongs to another repository' "${WORK}/err" || fail "repository mismatch lacked explanation"
+test -f "${custom}/.git" || fail "repository mismatch removed destination"
+cp "${WORK}/registration.saved" "${record}"
+run rm unsafe >/dev/null || fail "remove restored custom registration failed"
+
 test "${failures}" -eq 0 || exit 1
 echo "all bot-work worktree tests passed"

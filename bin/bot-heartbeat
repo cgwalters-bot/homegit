@@ -87,6 +87,9 @@ const TOKEN_KEYS = ["input", "output", "cache_read", "cache_write"];
 // the Claude Code session it ran in.
 const STATE_DIR = path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "bot-heartbeat");
 const LAST_PUBLISH_FILE = path.join(STATE_DIR, "last-publish.json");
+// A strict publish leaves this until its input is saved. Even an unchanged
+// public heartbeat can have new private workers in the local-only input.
+const PENDING_PUBLISH_FILE = path.join(STATE_DIR, "publish-pending");
 const SESSION_ENV = "CLAUDE_CODE_SESSION_ID";
 // refresh leaves a heartbeat younger than this alone (the review app
 // calls it stale after 15 minutes).
@@ -411,8 +414,12 @@ function readRateLimits(nowMs) {
 function writeFileAtomic(file, data) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, data);
-  fs.renameSync(tmp, file);
+  try {
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, file);
+  } finally {
+    fs.rmSync(tmp, { force: true });
+  }
 }
 
 // The transcript helpers are bot-cost's, which prices the same transcripts.
@@ -683,22 +690,33 @@ function readInput() {
 function cmdPublish(args) {
   let dryRun = false;
   let withUsage = true;
+  let strictState = false;
   for (const a of args) {
     if (a === "--dry-run") dryRun = true;
     else if (a === "--no-usage") withUsage = false;
+    else if (a === "--require-saved-state") strictState = true;
     else throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
   }
-  publish(readInput(), { dryRun, withUsage });
+  publish(readInput(), { dryRun, withUsage, strictState });
 }
 
-// publish(input, {dryRun, withUsage, existing}): validates and publishes
+// publish(input, {dryRun, withUsage, existing, strictState}): validates and publishes
 // INPUT (see cmdPublish), and unless dryRun saves it for refresh.
 // EXISTING is the heartbeat comment, when the caller just read it.
-function publish(input, { dryRun = false, withUsage = true, existing } = {}) {
+// STRICTSTATE is for read/append registration: refuse stale local state and
+// fail if persistence fails, so another append cannot drop published workers.
+function publish(input, { dryRun = false, withUsage = true, existing, strictState = false } = {}) {
   const nowMs = now();
   const { hb: valid, agentIds } = validate(input, nowMs);
   const hb = dropPrivate(valid);
   const body = render(hb);
+  if (strictState) {
+    const last = ownLastPublish();
+    existing = botComment(HEARTBEAT);
+    if (JSON.stringify(existing && parseComment(existing.body)) !== JSON.stringify(last.published)) {
+      throw notRefreshed("the published heartbeat differs from the saved state; publish the full worker list again before registering more workers");
+    }
+  }
   let usageBody = null;
   if (withUsage) {
     // Best effort: a heartbeat without usage beats none.
@@ -713,19 +731,36 @@ function publish(input, { dryRun = false, withUsage = true, existing } = {}) {
     if (usageBody !== null) process.stdout.write(`${DRY_RUN_SEPARATOR}\n${usageBody}`);
     return;
   }
-  log(`${writeComment(HEARTBEAT, body, existing)} (${hb.workers.length} worker(s))`);
-  saveLastPublish({ ...input, updated_at: hb.updated_at }, hb);
+  if (strictState) {
+    try {
+      writeFileAtomic(PENDING_PUBLISH_FILE, "pending\n");
+    } catch (e) {
+      throw new Exit(EX_ERROR, `cannot prepare heartbeat state at ${PENDING_PUBLISH_FILE}: ${e.message}; nothing published`);
+    }
+  }
+  try {
+    log(`${writeComment(HEARTBEAT, body, existing)} (${hb.workers.length} worker(s))`);
+  } catch (e) {
+    // No local input was committed; the next strict call still compares
+    // the remote heartbeat, in case the write succeeded despite an error.
+    if (strictState) fs.rmSync(PENDING_PUBLISH_FILE, { force: true });
+    throw e;
+  }
+  saveLastPublish({ ...input, updated_at: hb.updated_at }, hb, strictState);
   if (usageBody === null) return;
   assertPrivate(USAGE_REPO);
   log(`usage: ${writeComment(USAGE, usageBody)}`);
 }
 
-// saveLastPublish(input, hb): what refresh republishes. Best effort: the
-// heartbeat is out already, and without this file refresh only declines.
-function saveLastPublish(input, hb) {
+// saveLastPublish(input, hb, strictState): what refresh republishes. Normally
+// best effort; registration needs a visible failure and a subsequent refusal
+// to append from this stale copy (strictState's public heartbeat check).
+function saveLastPublish(input, hb, strictState = false) {
   try {
     writeFileAtomic(LAST_PUBLISH_FILE, `${JSON.stringify({ session: process.env[SESSION_ENV] || null, input, published: hb })}\n`);
+    fs.rmSync(PENDING_PUBLISH_FILE, { force: true });
   } catch (e) {
+    if (strictState) throw new Exit(EX_ERROR, `heartbeat published, but cannot save ${LAST_PUBLISH_FILE}: ${e.message}; publish the full worker list again before registering more workers`);
     log(`cannot save the heartbeat for refresh: ${e.message}`);
   }
 }
@@ -737,6 +772,9 @@ const notRefreshed = (why) => new Exit(EX_NOT_REFRESHED, `not refreshed: ${why}`
 // prune; they decline (notRefreshed) when another session published
 // last, or nothing was published from here.
 function ownLastPublish() {
+  if (fs.existsSync(PENDING_PUBLISH_FILE)) {
+    throw notRefreshed("a previous publication did not finish saving its state; publish the full worker list again before registering more workers");
+  }
   let last;
   try {
     last = JSON.parse(fs.readFileSync(LAST_PUBLISH_FILE, "utf8"));

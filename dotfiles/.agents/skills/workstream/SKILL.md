@@ -581,7 +581,9 @@ below.
   appends the bot-meta section (upstream target, board item, and how to
   approve) and prints the fork PR URL. It creates the fork the first time,
   keeps every workflow there disabled (unless one is opted in with `--ci`),
-  and syncs its base with upstream:
+  and syncs its base with upstream. It also sets the item to Draft with Branch, Why (awaiting the
+  operator's review) and News, including on reuse when the existing PR's
+  recorded item matches `--item`; refine Why with the result:
 
   ```bash
   FORK_PR=$(bot-pr fork-pr --repo OWNER/REPO --base <upstream-base-branch> \

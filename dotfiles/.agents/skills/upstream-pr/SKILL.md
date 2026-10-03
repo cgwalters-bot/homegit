@@ -234,6 +234,11 @@ and body as the upstream PR (the PR description rules below apply): once
 approved they are posted upstream as they stand then, minus the bot-meta
 section.
 
+`fork-pr` sets the item to Draft, records the fork PR URL in its Branch,
+sets Why to awaiting the operator's review, and adds News. Reusing an
+existing PR does this only when its recorded item matches `--item`. Refine
+Why with the result or review context.
+
 Add `--footer <(bot-footer --item ITEM_URL)` (the item on your prompt's
 `Item:` line, or `--scratch NAME`, your scratch dir's name; a file works
 too) to end the bot-meta section with a

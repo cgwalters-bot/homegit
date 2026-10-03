@@ -9,6 +9,7 @@ const path = require("node:path");
 const cap = require(path.join(__dirname, "..", "lib", "capacity.js"));
 const pace = require(path.join(__dirname, "..", "lib", "pacing.js"));
 const operator = require(path.join(__dirname, "..", "lib", "operator.js"));
+const heartbeat = require(path.join(__dirname, "..", "lib", "heartbeat-register.js"));
 
 const PROG = path.basename(process.argv[1] || "bot-pace");
 const BOARD = process.env.BOT_PACE_BOARD || path.join(__dirname, "bot-board");
@@ -125,6 +126,7 @@ function cmdAssign(argv) {
   if (item.run) throw new Exit(1, `${item.id} is owned by the run ${item.run}`);
   const b = budgetArgs(item, opts, false);
   setItem(item.id, ["--status", pace.ACTIVE_STATUS, "--field", "Lead", lead, ...b.args], opts["dry-run"]);
+  if (!opts["dry-run"]) heartbeat.register(item, item.id, { heartbeat: process.env.BOT_PACE_HEARTBEAT });
   process.stdout.write(`${item.id}: ${pace.ACTIVE_STATUS}, Lead ${lead}; ${b.note}\n`);
 }
 

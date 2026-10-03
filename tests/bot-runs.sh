@@ -94,7 +94,7 @@ reply() { # reply JSON: with ETags and --jq, like gh
     fi
     exit 0
 }
-repo=bootc-dev/cgwalters-devspace-sandbox
+repo=${BOT_RUNS_REPO:-bootc-dev/cgwalters-devspace-sandbox}
 runs=${store}/runs.json
 # Every run is a dispatch of agent.yml from main at this commit, in a
 # repository with id 1; $FAKE_GH/filter-NAME.jq, if any, is applied to the
@@ -586,13 +586,16 @@ test_apply() {
     done
     git config --global core.hooksPath "${WORK}/hooks"
     out=$(apply_run 1001 --base main --json)
-    dir=${XDG_CACHE_HOME}/bot-runs/apply/1001-fsck-sb
+    dir=${XDG_CACHE_HOME}/bot-work/fsck-sb/composefs-rs
     expect_json "$(jq -c 'del(.head)' <<<"${out}")" "$(jq -nc --arg c "${commit}" --arg d "${dir}" '{run_id: 1001,
         run_url: "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1001/attempts/1",
         workflow_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         repo: "composefs/composefs-rs", base: "main", base_commit: $c, branch: "bot/fsck-sb", dir: $d,
         item: "PVTI_item1", files: ["src/lib.rs"]}')" "apply --json"
     test ! -e "${WORK}/hook-ran" || fail "apply ran a hook"
+    test -f "${dir}/.git" || fail "apply did not create a linked worktree"
+    expect_eq "$(git -C "${WORK}/target" branch --show-current)" main "source branch unchanged"
+    test -z "$(git -C "${WORK}/target" config --get remote.origin.pushurl || true)" || fail "changed source push URL"
     expect_eq "$(git -C "${dir}" rev-parse HEAD^)" "${commit}" "parent"
     expect_eq "$(git -C "${dir}" rev-parse --abbrev-ref HEAD)" bot/fsck-sb "branch"
     expect_eq "$(git -C "${dir}" log -1 --format='%an <%ae>|%cn <%ce>')" "${bot}|${bot}" "identity"
@@ -615,7 +618,7 @@ test_apply() {
 test_apply_refused() {
     local run repo edit setup want out OUT=${FAKE_GH}/artifacts/1001/agent-out sha
     while IFS='|' read -r run repo edit setup want; do
-        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${FAKE_GH}/artifacts/${run}/agent-out" "${FAKE_GH}"/filter-*.jq
+        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${XDG_CACHE_HOME}/bot-work" "${FAKE_GH}/artifacts/${run}/agent-out" "${FAKE_GH}"/filter-*.jq
         cp "${FIXTURES}/expired.txt" "${FAKE_GH}/expired.txt"
         cp "${FIXTURES}/artifacts/1001/agent-run/summary.json" "${FAKE_GH}/artifacts/1001/agent-run/summary.json"
         rm -rf "${XDG_STATE_HOME}/bot-runs"
@@ -626,7 +629,8 @@ test_apply_refused() {
         out=$("${BOT_RUNS}" apply "${run}" --repo "${repo}" --slug s --message "${WORK}/message" --source "${WORK}/target" 2>&1) &&
             fail "applied run ${run} (${want})"
         expect_lines "${out}" "${want}"
-        test ! -e "${XDG_CACHE_HOME}/bot-runs/apply/${run}-s" || fail "left a clone behind (${want})"
+        test ! -e "${XDG_CACHE_HOME}/bot-runs/apply/sources/${run}-s/composefs-rs" || fail "left a clone behind (${want})"
+        test ! -e "${XDG_CACHE_HOME}/bot-work/s/composefs-rs" || fail "left a worktree behind (${want})"
     done <<'EOF'
 1001|composefs/composefs-rs|mkdir -p .github/workflows && echo x >.github/workflows/ci.yml|:|\.github/workflows/ci\.yml \(protected path\)
 1001|composefs/composefs-rs|echo x >.gitmodules|:|\.gitmodules \(protected path\)
@@ -652,7 +656,7 @@ test_apply_refused() {
 1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" '.repo = "other/repo"'|summary names other/repo, not composefs/composefs-rs
 1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" '.run_id = 999'|summary is of run 999
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.event = "push"' >"${FAKE_GH}/filter-run.jq"|triggered by push, not a dispatch
-1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.head_branch = "evil"' >"${FAKE_GH}/filter-run.jq"|ran the workflow from evil, not bot/agent-run-praxis
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.head_branch = "evil"' >"${FAKE_GH}/filter-run.jq"|ran the workflow from evil, not a trusted agent branch
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.path = ".github/workflows/other.yml"' >"${FAKE_GH}/filter-run.jq"|ran \.github/workflows/other\.yml
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.head_repository.id = 9' >"${FAKE_GH}/filter-run.jq"|ran code from another repository
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.repository.full_name = "x/y"' >"${FAKE_GH}/filter-run.jq"|is in x/y, not bootc-dev/cgwalters-devspace-sandbox
@@ -674,6 +678,102 @@ test_apply_refused() {
 1002|composefs/composefs-rs|echo x >>src/lib.rs|:|agent result is failure, not success
 1004|containers/composefs|echo x >>src/lib.rs|:|run 1004 is failure, not success
 EOF
+}
+
+test_apply_branches() {
+    local branch allowed out rc dispatch_ref
+    make_change 1001 >/dev/null
+    while IFS='|' read -r branch allowed; do
+        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${XDG_CACHE_HOME}/bot-work"
+        jq -n --arg b "${branch}" '".head_branch = " + ($b | tojson)' -r >"${FAKE_GH}/filter-run.jq"
+        rc=0
+        dispatch_ref=${branch}
+        test "${allowed}" != yes || dispatch_ref=untrusted-dispatch-ref
+        out=$(BOT_RUNS_REF="${dispatch_ref}" apply_run 1001 --json 2>&1) || rc=$?
+        if test "${allowed}" = yes; then
+            expect_eq "${rc}" 0 "trusted branch ${branch}: ${out}"
+        else
+            test "${rc}" -ne 0 || fail "trusted branch ${branch} via BOT_RUNS_REF"
+            expect_lines "${out}" 'not a trusted agent branch'
+        fi
+    done <<'EOF'
+bot/agent-run-praxis|yes
+bot/agent-run-another|yes
+bot/agent-run-|no
+main|no
+bot/agent-yml|no
+evil|no
+EOF
+    echo '.head_branch = "bot/agent-run-praxis"' >"${FAKE_GH}/filter-run.jq"
+    out=$(BOT_RUNS_REPO=other/devspace apply_run 1001 2>&1) && fail "trusted another workflow repository"
+    expect_lines "${out}" 'not in the configured devspace repository'
+}
+
+test_apply_dir() {
+    make_change 1001 >/dev/null
+    local name supplied dir out
+    while IFS='|' read -r name supplied; do
+        dir=${WORK}/custom/${name}
+        supplied=${supplied/WORK/${WORK}}
+        out=$(cd "${WORK}" && apply_run 1001 --slug "${name}" --dir "${supplied}" --json)
+        expect_eq "$(jq -r .dir <<<"${out}")" "${dir}" "custom apply directory"
+        test -f "${dir}/.git" || fail "custom directory is not a worktree"
+        git -C "${dir}" worktree list --porcelain | grep -qF "worktree ${dir}" || fail "custom worktree not registered"
+    done <<'EOF'
+absolute|WORK/custom/absolute
+relative|custom/relative
+EOF
+    "${TESTS}/../bin/bot-work" worktree rm absolute
+    test ! -e "${WORK}/custom/absolute" || fail "manager left absolute custom apply worktree"
+    test -f "${WORK}/custom/relative/.git" || fail "manager removed sibling custom apply worker"
+    "${TESTS}/../bin/bot-work" worktree rm relative
+    test ! -e "${WORK}/custom/relative" || fail "manager left relative custom apply worktree"
+}
+
+test_apply_dir_refused() {
+    make_change 1001 'echo x >.gitmodules' >/dev/null
+    local out dir=${WORK}/custom/refused
+    git clone -q "${WORK}/target" "${WORK}/sibling"
+    "${TESTS}/../bin/bot-work" worktree add "${WORK}/sibling" fsck-sb >/dev/null
+    local sibling=${XDG_CACHE_HOME}/bot-work/fsck-sb/sibling
+    echo 'sibling edits' >>"${sibling}/src/lib.rs"
+    out=$(apply_run 1001 --dir "${dir}" 2>&1) && fail "accepted protected path in custom worktree"
+    expect_lines "${out}" 'protected path'
+    test ! -e "${dir}" || fail "refusal left custom worktree"
+    test ! -e "${XDG_CACHE_HOME}/bot-work/fsck-sb/composefs-rs" || fail "refusal left custom destination registration"
+    test -f "${sibling}/.git" || fail "refusal removed sibling worktree"
+    expect_eq "$(tail -n1 "${sibling}/src/lib.rs")" 'sibling edits' "refusal preserved sibling edits"
+}
+
+test_apply_isolation() {
+    make_change 1001 >/dev/null
+    local first second common
+    echo 'local edits' >>"${WORK}/target/src/lib.rs"
+    echo 'untracked' >"${WORK}/target/notes"
+    first=$(apply_run 1001 --json)
+    second=$(apply_run 1001 --slug second --json)
+    first=$(jq -r .dir <<<"${first}")
+    second=$(jq -r .dir <<<"${second}")
+    common=$(git -C "${first}" rev-parse --git-common-dir)
+    test "${common}" != "$(git -C "${second}" rev-parse --git-common-dir)" || fail "apply worktrees share configuration"
+    git -C "${first}" config example.isolation first
+    test -z "$(git -C "${second}" config --get example.isolation || true)" || fail "configuration leaked to another worker"
+    expect_eq "$(tail -n1 "${WORK}/target/src/lib.rs")" 'local edits' "source edits preserved"
+    expect_eq "$(cat "${WORK}/target/notes")" untracked "source untracked file preserved"
+    "${TESTS}/../bin/bot-work" worktree rm fsck-sb
+    test ! -e "${first}" || fail "managed apply worktree not removed"
+    test -f "${second}/.git" || fail "removed another apply worker"
+}
+
+test_apply_git_environment() {
+    make_change 1001 >/dev/null
+    local out
+    out=$(GIT_DIR="${WORK}/target/.git" GIT_WORK_TREE="${WORK}/target" \
+        GIT_INDEX_FILE="${WORK}/target/.git/index" GIT_CONFIG_COUNT=1 \
+        GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0="${WORK}/bad-hooks" \
+        GIT_CONFIG_PARAMETERS="'core.hooksPath'='${WORK}/bad-hooks'" apply_run 1001 --json)
+    expect_eq "$(git -C "$(jq -r .dir <<<"${out}")" branch --show-current)" bot/fsck-sb "isolated Git environment"
+    expect_eq "$(git -C "${WORK}/target" branch --show-current)" main "source Git environment untouched"
 }
 
 # --- diff, stats -------------------------------------------------------------
@@ -790,9 +890,11 @@ test_dispatch() {
     expect_eq "$(cat "${FAKE_GH}/board-calls")" "field-ensure Run
 set PVTI_item1 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 16 cores)
 pace budget PVTI_item1
+list --json
 field-ensure Run
 set PVTI_item2 --status In Progress --field Run ${run} --news Dispatched devspace agent run ${run} (opencode, 4 cores)
-pace budget PVTI_item2" "board calls"
+pace budget PVTI_item2
+list --json" "board calls"
     # The default model is opencode's only: --model overrides it, and the
     # fake agent has none.
     out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs --agent fake "${WORK}/brief.md")
@@ -918,7 +1020,7 @@ Bad [In Progress] PVTI_bad: Run is not a run URL of bootc-dev/cgwalters-devspace
         {id: "PVTI_failed", status: "Todo", run: null, why: "Agent run \($r)/1004 ended: failure",
          news: "Devspace agent run 1004 ended (failure): \($r)/1004"},
         {id: "PVTI_patch", status: "Draft", run: null,
-         why: "Agent run \($r)/1001 succeeded with a patch (1234 bytes): ready for bot-runs apply 1001 --slug SLUG --message FILE, then bot-pr fork-pr (not applied unattended until https://github.com/cgwalters-bot/homegit/pull/82 merges)",
+         why: "Agent run \($r)/1001 succeeded with a patch (1234 bytes): ready for bot-runs apply 1001 --slug SLUG --message FILE, then bot-pr fork-pr (unattended apply is disabled)",
          news: "Devspace agent run 1001 succeeded; patch ready"},
         {id: "PVTI_nochange", status: "Todo", run: null, why: "Agent run \($r)/1003 succeeded without a change",
          news: "Devspace agent run 1003 ended (success): \($r)/1003"},

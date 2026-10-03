@@ -100,9 +100,8 @@ readonly RUN_FIELD=Run
 readonly RUN_STATUS='In Progress'
 readonly PATCH_STATUS=Draft
 readonly RETRY_STATUS=Todo
-# reconcile only reports a successful run's patch as ready: applying it
-# unattended waits for apply's hardening (cgwalters-bot/homegit#82).
-readonly HARDENING_PR=https://github.com/cgwalters-bot/homegit/pull/82
+# reconcile only reports a successful run's patch as ready; unattended
+# application remains disabled, so apply is an explicit reviewed step.
 readonly WHY_MAX=300
 BOT_BOARD=${BOT_RUNS_BOT_BOARD:-$(dirname "$(readlink -f "$0")")/bot-board}
 readonly BOT_BOARD
@@ -165,14 +164,16 @@ Commands:
       a local commit on bot/SLUG, as the bot, with FILE as the message
       (the AI trailer and an ${RUN_TRAILER} trailer naming the run are
       added). Everything from the runner is checked again first: the run
-      is a dispatch of ${RUNS_WORKFLOW} from ${RUNS_REF} for OWNER/REPO (and REF), the
+      is a dispatch of ${RUNS_WORKFLOW} from bot/agent-run-* (nonempty suffix)
+      in the configured devspace for OWNER/REPO (and REF), the
       artifact is the one its ${AGENT_JOB} job uploaded, within size and
       file-count caps, its base commit is on the base branch, and it has
       no secret-shaped strings, binaries, symlinks, submodules, mode
       changes, or paths outside plain relative ones or under .git*, CI
-      or hook configuration. DIR (default ${CACHE_DIR}/apply/RUN-SLUG)
-      is a fresh clone of GIT_URL (default: OWNER/REPO on GitHub) with
-      hooks off; on a refusal it is removed. Nothing is pushed, and
+      or hook configuration. DIR (default the bot-work worktree for SLUG)
+      is a managed worktree backed by a fresh isolated clone of GIT_URL
+      (default: OWNER/REPO on GitHub), with hooks off; refusals remove it.
+      Nothing is pushed, and
       origin there has no push URL: after review, bot-pr fork-pr --from
       DIR opens it on the forge.
   stats [--since AGE] [--limit N] [--by agent|model|repo|item|result]
@@ -701,6 +702,10 @@ cmd_dispatch() {
     # Its budget, for pacing (the run's own spend cap is --budget AIC).
     "${BOT_PACE}" budget "${item}" >/dev/null ||
         warn "setting the token budget of ${item} failed; run: bot-pace budget ${item}"
+    node "$(dirname "$(readlink -f "$0")")/../lib/heartbeat-register.js" \
+        "${BOT_BOARD}" "${item}" "run-$(jq -r '.workflow_run_id // "unknown"' <<<"${resp}")" \
+        "${BOT_RUNS_HEARTBEAT:-$(dirname "$(readlink -f "$0")")/bot-heartbeat}" ||
+        warn "the run was dispatched, but registering its heartbeat failed; publish the workers with bot-heartbeat publish"
 }
 
 # --- reconcile ---------------------------------------------------------------
@@ -747,7 +752,7 @@ reconcile_one() {
         return 0
     fi
     if test "${result}" = success && test -n "${patch}"; then
-        why="Agent run ${url} succeeded with a patch (${patch} bytes): ready for bot-runs apply ${run_id} --slug SLUG --message FILE, then bot-pr fork-pr (not applied unattended until ${HARDENING_PR} merges)"
+        why="Agent run ${url} succeeded with a patch (${patch} bytes): ready for bot-runs apply ${run_id} --slug SLUG --message FILE, then bot-pr fork-pr (unattended apply is disabled)"
         news="Devspace agent run ${run_id} succeeded; patch ready"
         set=$(jq -nc --arg s "${PATCH_STATUS}" --arg f "${RUN_FIELD}" --arg why "${why}" --arg news "${news}" \
             '["--status", $s, "--field", $f, "", "--why", $why, "--news", $news]')
@@ -1240,13 +1245,16 @@ fetch_run_json() {
 }
 
 # Checks that a run object (input) is a dispatch of the agent workflow
-# from RUNS_REF in RUNS_REPO; prints why not, or nothing.
+# from a trusted workflow branch in the configured devspace; prints why
+# not, or nothing. RUNS_REF selects dispatches, never apply's trust policy.
 readonly RUN_ORIGIN_JQ='
     if (.repository.full_name // "") != $repo then "is in \(.repository.full_name // "?"), not \($repo)"
     elif (.head_repository.id // null) != (.repository.id // "") then "ran code from another repository than \($repo)"
     elif .path != $path then "ran \(.path // "?"), not \($path)"
     elif .event != "workflow_dispatch" then "was triggered by \(.event // "?"), not a dispatch"
-    elif .head_branch != $ref then "ran the workflow from \(.head_branch // "?"), not \($ref)"
+    elif $repo != $devspace then "is not in the configured devspace repository \($devspace)"
+    elif ((.head_branch // "") | test("^bot/agent-run-.+$") | not)
+        then "ran the workflow from \(.head_branch // "?"), not a trusted agent branch"
     elif ((.head_sha // "") | test("^[0-9a-f]{40}$") | not) then "has no valid head_sha"
     else empty end'
 
@@ -1316,14 +1324,27 @@ apply_artifact() {
     fi
 }
 
-# agit DIR ARGS...: git in the clone apply makes, with no system or
-# global configuration (so no filters, hooks or fsmonitor of the
-# caller's), and no hooks at all.
+# Run apply's Git operations and worktree helper without caller Git
+# configuration or repository redirects, and with hooks and fsmonitor off.
+apply_env() {
+    env -u GIT_CONFIG_PARAMETERS -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+        -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+        GIT_CONFIG_COUNT=2 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null \
+        GIT_CONFIG_KEY_1=core.fsmonitor GIT_CONFIG_VALUE_1=false "$@"
+}
+
 agit() {
     local dir=$1
     shift
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
-        git -C "${dir}" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+    apply_env git -C "${dir}" -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"
+}
+
+# The helper spawns Git itself: keep checkout hooks and fsmonitor disabled
+# there too, regardless of the caller's global configuration.
+apply_worktree() {
+    apply_env \
+        "$(dirname "$(readlink -f "$0")")/bot-work" worktree "$@" | tail -n1
 }
 
 # apply_refusals DIR: why the staged change in DIR may not be committed,
@@ -1353,7 +1374,7 @@ apply_refusals() {
 
 cmd_apply() {
     local run_id="" slug="" dir="" source="" message_file="" json=false want_repo="" want_base=""
-    local run meta attempt run_url why rec item repo base workflow result summary_run ref commit branch files nfiles head
+    local run meta attempt run_url why rec item repo base workflow result summary_run ref commit branch files nfiles head backing managed
     while test $# -gt 0; do
         case "$1" in
             --slug|--dir|--source|--message|--repo|--base)
@@ -1393,9 +1414,9 @@ cmd_apply() {
     meta=$(jq -c "${RUN_META}" <<<"${run}")
     test "$(jq -r '.conclusion // .status' <<<"${meta}")" = success ||
         fatal "run ${run_id} is $(jq -r '.conclusion // .status' <<<"${meta}"), not success; only a successful run's change is applied"
-    why=$(jq -r --arg repo "${RUNS_REPO}" --arg path ".github/workflows/${RUNS_WORKFLOW}" --arg ref "${RUNS_REF}" \
+    why=$(jq -r --arg repo "${RUNS_REPO}" --arg path ".github/workflows/${RUNS_WORKFLOW}" --arg devspace "${OP_DEVSPACE_REPO}" \
         "${RUN_ORIGIN_JQ}" <<<"${run}")
-    test -z "${why}" || fatal "run ${run_id} ${why}; only dispatches of ${RUNS_WORKFLOW} from ${RUNS_REF} are applied"
+    test -z "${why}" || fatal "run ${run_id} ${why}; only dispatches of ${RUNS_WORKFLOW} from trusted agent branches are applied"
     test "$(jqlib -r '{run: .} | title_parts | .repo // ""' <<<"${meta}")" = "${want_repo}" ||
         fatal "run ${run_id} was dispatched for $(jqlib -r '{run: .} | title_parts | .repo // "?"' <<<"${meta}"), not ${want_repo}"
     attempt=$(jq -r .attempt <<<"${meta}")
@@ -1433,22 +1454,45 @@ cmd_apply() {
 
     # A fresh clone, its base commit on the declared base branch (never
     # fetched by id: GitHub serves forks' commits that way too).
-    test -n "${dir}" || dir=${CACHE_DIR}/apply/${run_id}-${slug}
-    ! test -e "${dir}" || fatal "${dir} already exists; remove it or pass --dir"
+    if test -n "${dir}"; then
+        dir=$(realpath -m -- "${dir}")
+        if test -e "${dir}" || test -L "${dir}"; then
+            fatal "${dir} already exists; remove it or pass --dir"
+        fi
+    fi
     test -n "${source}" || source=https://github.com/${want_repo}
-    mkdir -p "$(dirname "${dir}")"
-    GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
-        git -c core.hooksPath=/dev/null clone -q --no-checkout --template= --single-branch --branch "${base}" -- "${source}" "${dir}" ||
+    # Never share Git configuration or refs with a worker's existing clone.
+    # Keep this backing clone for as long as the linked worktree exists.
+    backing=${CACHE_DIR}/apply/sources/${run_id}-${slug}/${want_repo##*/}
+    if test -e "${backing}" || test -L "${backing}"; then
+        fatal "${backing} already exists; choose another slug"
+    fi
+    mkdir -p "$(dirname "${backing}")"
+    apply_env git -c core.hooksPath=/dev/null clone -q --no-checkout --template= --single-branch --branch "${base}" -- "${source}" "${backing}" || {
+        rm -rf "${backing}"
         fatal "cloning ${base} of ${source} failed"
+    }
     # Kept in the clone for whatever runs git there next (bot-pr fork-pr
     # pushes to an explicit URL); origin is never a push target.
-    agit "${dir}" config core.hooksPath /dev/null
-    agit "${dir}" config core.fsmonitor false
-    agit "${dir}" config remote.origin.pushurl "${NO_PUSH_URL}"
-    refuse() { rm -rf "${dir}"; fatal "$@"; }
-    agit "${dir}" merge-base --is-ancestor "${commit}" "refs/remotes/origin/${base}" 2>/dev/null ||
+    agit "${backing}" config core.hooksPath /dev/null
+    agit "${backing}" config core.fsmonitor false
+    agit "${backing}" config remote.origin.pushurl "${NO_PUSH_URL}"
+    refuse() {
+        if test -n "${managed:-}"; then
+            apply_worktree rm "${slug}" --dir "${managed}" --force || {
+                warn "removing worktree ${managed} failed; preserving its backing clone ${backing}"
+                fatal "$@"
+            }
+        fi
+        rm -rf "${backing}"
+        fatal "$@"
+    }
+    agit "${backing}" merge-base --is-ancestor "${commit}" "refs/remotes/origin/${base}" 2>/dev/null ||
         refuse "run ${run_id}'s base commit ${commit} is not on ${base} of ${source}"
-    agit "${dir}" checkout -q -b "${branch}" "${commit}" || refuse "checking out ${commit} failed"
+    local destination_args=()
+    test -z "${dir}" || destination_args=(--dir "${dir}")
+    managed=$(apply_worktree add "${backing}" "${slug}" --base "${commit}" "${destination_args[@]}") || refuse "creating apply worktree failed"
+    dir=${managed}
     agit "${dir}" apply --index --whitespace=nowarn "${scratch}/out/changes.patch" ||
         refuse "run ${run_id}'s change doesn't apply to ${commit}"
     files=$(agit "${dir}" diff --cached --name-only -z --no-renames HEAD | tr -cd '\0' | wc -c)
@@ -1501,6 +1545,7 @@ case "${cmd}" in
     apply)
         require_cmd unzip "install unzip"
         require_cmd git "install git"
+        require_cmd node "install Node.js for bot-work worktree"
         ;;
     transcript)
         require_cmd unzip "install unzip"

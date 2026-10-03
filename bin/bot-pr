@@ -116,7 +116,7 @@ readonly SIGNOFF_RECORD='<!-- bot-pr signoff'
 readonly SIGNOFF_RECORD_RE='<!-- bot-pr signoff approved=(?<approved>[0-9a-f]{40}) signed=(?<signed>[0-9a-f]{40}) approval=(?<approval>[^ ]+) review=(?<review>[^ ]+) -->[[:space:]]*$'
 # Returned by add_signoff() when commits by others lack the sign-off.
 readonly EX_OTHERS=11
-BOT_BOARD=$(dirname "$(readlink -f "$0")")/bot-board
+BOT_BOARD=${BOT_PR_BOT_BOARD:-$(dirname "$(readlink -f "$0")")/bot-board}
 readonly BOT_BOARD
 # The contribution policy gate that promote and signoff pass first. The
 # override is for tests only: the gate is homegit's upstream-policy.
@@ -1311,6 +1311,18 @@ check_item_free() {
         fatal "board item ${item} is already recorded as the item of the open fork PR(s) ${others}. A PR split off another needs its own board item (bot-board add or draft). Pass --force if this PR belongs to ${item} as well, or fix the other PR's recorded item with '$(basename "$0") set-item FORK_PR_URL PVTI_...'"
 }
 
+# record_fork_pr ITEM URL [--status Draft]: Status only for a new PR; a
+# reused one's item may have moved on (In Review after a promote).
+record_fork_pr() {
+    local item=$1 url=$2
+    shift 2
+    local args=(set "${item}" "$@" --branch "${url}"
+        --why "Fork PR ${url}; awaiting review by ${REVIEWER}"
+        --news "Fork PR ready for review: ${url}")
+    "${BOT_BOARD}" "${args[@]}" >/dev/null ||
+        fatal "the fork PR is open, but updating the board failed; retry: bot-board$(printf ' %q' "${args[@]}")"
+}
+
 cmd_fork_pr() {
     local upstream="" base="" branch="" item="" title="" body_file="" footer_file="" from=. force=false ci=()
     while test $# -gt 0; do
@@ -1407,6 +1419,7 @@ cmd_fork_pr() {
             warn "--footer is not added to an existing fork PR; run '$(basename "$0") set-body ${existing_url} --footer FILE'"
         test "${recorded}" = "${item}" ||
             warn "${existing_url} records board item ${recorded:-(none)}, not ${item}; if --item is right, run '$(basename "$0") set-item ${existing_url} ${item}'"
+        test "${recorded}" != "${item}" || record_fork_pr "${item}" "${existing_url}"
         echo "${existing_url}"
         return 0
     fi
@@ -1428,6 +1441,7 @@ cmd_fork_pr() {
         save_state "$(jq -c --arg u "${url}" --arg h "${hash}" --arg now "$(date -u +%FT%TZ)" \
             '.prs[$u] = {body: $h, seen: $now, bot_body: $h}' <<<"${state}")"
     ) || warn "recording ${url} in the inbox state failed; inbox will pick it up without its original body"
+    record_fork_pr "${item}" "${url}" --status Draft
 
     local perm
     perm=$(ghapi "repos/${fork}/collaborators/${REVIEWER}/permission" --jq .permission 2>/dev/null) || perm=unknown
