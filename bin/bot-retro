@@ -498,7 +498,11 @@ function scanCommand(agent, cmd, cwd, sig, out) {
       }
       const gdir = g.dir ? (/^\$/.test(g.dir) ? null : g.dir.startsWith("/") || g.dir.startsWith("~") ? g.dir : dir && path.join(dir, g.dir)) : dir;
       const clone = gdir && sharedClone(gdir);
-      if (clone && !agent.remote && CLONE_CHANGING.has(g.sub) && !(g.sub === "checkout" && g.args[0] === "--") && !g.args.includes("--ff-only")) {
+      // Stash inspection and the standalone patch-display modes do not change the clone.
+      const inspection = (g.sub === "stash" && ["list", "show"].includes(g.args[0])) ||
+        (g.args.length === 1 && ((g.sub === "rebase" && g.args[0] === "--show-current-patch") ||
+          (g.sub === "am" && /^--show-current-patch(?:=(raw|diff))?$/.test(g.args[0]))));
+      if (clone && !agent.remote && CLONE_CHANGING.has(g.sub) && !inspection && !(g.sub === "checkout" && g.args[0] === "--") && !g.args.includes("--ff-only")) {
         sig("policy", "shared_clone", `${line} (in ${clone.replace(HOME, "~")})`);
       }
     }
@@ -920,5 +924,5 @@ if (require.main === module) {
     process.exit(e.status);
   }
 } else {
-  module.exports = { segments, stripQuotes, classifyError, redact, quote, template, categorizeFinding, reviewOf, parseTime, render, scan };
+  module.exports = { segments, stripQuotes, classifyError, redact, quote, template, categorizeFinding, reviewOf, parseTime, render, scanCommand, scan };
 }
