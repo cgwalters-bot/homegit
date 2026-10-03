@@ -1,6 +1,6 @@
 ---
 name: coordinator
-description: Run the bot (cgwalters-bot) as the top-level coordinator session - poll bot-notify, bot-pr inbox and bot-watch on a loop, promote approved fork PRs, dispatch devspace agent runs (bot-runs) and local worker subagents for Todo items and the operator's asks, apply the runs' patches, have an independent reviewer check every result, and post the morning brief. Load this when asked to run or coordinate the bot; workers and reviewers read the preambles next to it instead.
+description: Run the bot (cgwalters-bot) as the top-level coordinator session - poll bot-notify, bot-pr inbox and bot-watch on a loop, promote approved fork PRs, dispatch devspace agent runs (bot-runs) and local workers (bot-claude jobs) for Todo items and the operator's asks, apply the runs' patches, have an independent reviewer check every result, and post the morning brief. Load this when asked to run or coordinate the bot; workers and reviewers read the preambles next to it instead.
 ---
 
 # coordinator — Running the bot as a coordinator
@@ -14,7 +14,7 @@ that config's values (`bot-operator --json`). The goals in the next section
 are cgwalters'.
 
 The coordinator is the long-lived top-level session. It does little work
-itself: it watches for news, keeps the board moving, and briefs subagents
+itself: it watches for news, keeps the board moving, and briefs workers
 that do the work. The other skills say how the work is done; this one
 says how to drive it. The board semantics are in the `workstream` skill,
 routing pings in `bot-notify`, building and testing in `devspace-work`,
@@ -58,9 +58,53 @@ Keep that in mind when changing this skill: put state on the board, in
 tracker issues and in git rather than in the session, and keep what the
 coordinator needs to know here or in the files next to this one.
 
-## Briefing subagents
+## Local Claude workers: bot-claude, not subagents
 
-Every subagent's prompt starts by telling it to read one of the files next
+A local worker or reviewer is a separate process, not an in-session
+subagent: `bin/bot-claude start` runs `claude -p` detached from this
+session (its own process group, a job id, state under
+`~/.local/state/bot-claude/JOB/`), so it can be polled, waited on with a
+clean exit status, timed out and killed, and it spends its own context
+and budget rather than this session's. The operator, on moving off
+in-session agents: "Let's get away from that local agent entirely ... a
+separate Claude code subprocess here not subagents should be easier to
+poll". It is the Claude counterpart of `bot-opencode`; see `bot-claude
+--help`. The model is Opus by default (`--model` overrides it); the job
+does its cheap steps (reading, first-pass reviews, lint and log triage,
+mechanical edits) through homegit's `sonnet-worker` subagent
+(`dotfiles/.claude/agents/`, `model: sonnet`), which is where subagents stay. Use `--model sonnet` for a worker whose whole task is
+mechanical.
+
+```
+WT=$(bin/bot-work worktree add ~/src/github/cgwalters-bot/REPO TASK | tail -1)
+bin/bot-claude start --dir "$WT" --item ITEM_URL --job TASK BRIEF
+```
+
+The brief is a file (or `-`): the line "Read .../worker-preamble.md and
+follow it", the `Item:` line (added when missing), the scratch dir and
+the task, as below. `start` prints the job id and returns. Then wait for
+it as one background command, `bin/bot-claude wait --timeout SEC JOB`
+(exit 0 succeeded, 1 failed, 3 the job's own timeout hit, 4 killed or
+lost, 124 still running when SEC ran out), whose stdout is the worker's
+final report; `bot-claude status [JOB]`, `log JOB` and `kill JOB` look in
+and stop it. `bot-claude run` is `start` plus `wait`. The job registers
+in the heartbeat (unless `bot-pace assign` already did) and leaves it when
+it ends, and `bot-actuals` records its tokens on the item (its transcript
+names the `Item:`). Its default timeout is 60 minutes, then the process
+group is killed. Read a failed job's `bot-claude log JOB` before starting
+it again.
+
+Reviewers get a worktree of their own too (or a detached one at the PR
+head); they report on stdout and the PR, never on the branch. A job needs
+a worktree from `bot-work worktree add`, never the shared clone.
+
+An in-session subagent (the Agent tool) is for what a process can't do:
+a lookup that needs this session's own context for a moment, or a
+`sonnet-worker` or `builder` called by a job. Everything else is a job.
+
+## Briefing workers
+
+Every worker's prompt starts by telling it to read one of the files next
 to this one, by path in the homegit checkout
 (`~/src/github/cgwalters-bot/homegit/dotfiles/.agents/skills/coordinator/`):
 
@@ -68,7 +112,7 @@ to this one, by path in the homegit checkout
   ask, turning Drafts into forge PRs);
 - `reviewer-preamble.md` for a reviewer;
 - `policy-check.md` for a policy check (see "Promote" below);
-- `apply-preamble.md` for the Sonnet worker that applies, reviews and
+- `apply-preamble.md` for the worker that applies, reviews and
   proposes a devspace run's patch (see "Applying a run's patch").
 
 A worker dispatched to a devspace runner (`bin/bot-runs dispatch`) gets
@@ -82,7 +126,7 @@ devspace, name it after the task and give it 16 cores or fewer (16 is
 the default) and the shortest duration that fits; brief 64 cores only
 when a 16-core run has proven too slow for this work, and say why.
 Put the board item on a line of its own, `Item: ITEM_URL` (or the
-`PVTI_` id), in every subagent's prompt, reviewers' and policy checks'
+`PVTI_` id), in every worker's prompt, reviewers' and policy checks'
 too: `bot-cost` joins transcripts to board items on it, and
 `bot-actuals` writes the sum to the item's Actual tokens. The preambles
 tell the agent to repeat it in the prompts of its own subagents
@@ -107,7 +151,7 @@ For purely mechanical work (loop until a branch compiles, clippy/fmt
 fix-ups, a named failing test with a local fix, bisecting a build
 break, first-pass classification of CI failures), dispatch the
 `builder` agent type, or have a worker dispatch it: it is pinned to
-Sonnet 5.5 and costs about half as much. It never commits or pushes (a
+Sonnet 5.5 and costs about half as much; a job calls it as a subagent. It never commits or pushes (a
 hook refuses it); it leaves its changes uncommitted and reports the
 diff, which the caller reviews and commits through `bin/bot-git`. Don't pass `model`, which
 would override the pin. Reviews, design, security and root-causing a
@@ -143,7 +187,7 @@ GHA runners on my personal machines as a Kube cluster or so". The
 self-hosted plan is tracked in cgwalters-forge/tracker#287; don't build
 long-term dependence on these runners for non-CNCF work.
 
-A **local subagent is only for**:
+A **local worker (a `bot-claude` job) is only for**:
 
 - GitHub I/O: posting replies and reviews, `bot-pr promote`, the board and
   question issues, applying and proposing a run's patch (below), anything
@@ -170,9 +214,10 @@ set: that run still owns it.
 
 A run's patch comes back to the board as a Draft item whose Why says
 "ready for bot-runs apply RUN". The reconcile rule **patch-ready** names
-it. Dispatch a local
-Sonnet worker (Agent with `model: sonnet`) on `apply-preamble.md`, with
-`Item:` and `Run:` lines. It reads the run, applies the patch with `bot-runs
+it. Start a local
+Sonnet worker, `bin/bot-claude start --model sonnet --dir WT --item ITEM
+--job apply-RUN BRIEF` (a brief of `apply-preamble.md` with the `Item:`
+and `Run:` lines), and wait for it. It reads the run, applies the patch with `bot-runs
 apply` (which re-checks it), reviews the diff as a reviewer would, and
 opens or updates the fork PR with the run as its CI evidence, leaving the
 item Draft with the PR as its Branch. What the run hands back is gh-aw's
@@ -684,7 +729,7 @@ cost when an item is far off (two buckets), and correct the table in
   (`upstream-policy/OWNER/REPO.md`) whose sources are unchanged upstream
   and whose verdict is bot-ok. Before promoting, run that check yourself;
   if the record is missing or stale, dispatch a separate policy-check
-  subagent (brief it with `policy-check.md` and OWNER/REPO; it only reads
+  job (`bot-claude`; brief it with `policy-check.md` and OWNER/REPO; it only reads
   upstream, and lands the record on homegit main with `bot-land`), never
   the worker who wrote the change. Once it's merged (bot-land
   fast-forwards the shared clone; otherwise `git -C
@@ -721,7 +766,7 @@ cost when an item is far off (two buckets), and correct the table in
   praxis-credential-broker among them) and the bot's own cgwalters-forge
   repositories: review, workflow-compiler, agentic-job,
   harness-coordination, actions and tracker. There a bot pull request
-  merges (rebase) once its CI is green and a separate reviewer subagent
+  merges (rebase) once its CI is green and a separate reviewer job (`bot-claude`)
   (never the worker that wrote it) has approved that exact head, with
   its verdict posted on the pull request. The operator set this as one
   standing rule ("You can auto merge most stuff to our harness for now
@@ -755,7 +800,7 @@ cost when an item is far off (two buckets), and correct the table in
     devspace-sandbox stack that improve remote sandboxing or run work
     remotely (egress proxy, runner-sandbox user, run tokens, toolchain,
     homegit as input, opencode model default) merge after real testing
-    plus an independent subagent review, without the operator. Anything
+    plus an independent reviewer job, without the operator. Anything
     that widens what credentials the bot holds, or who can authorize
     actions (sign-off, operator trust), is still flagged and not merged.
   Upstream (non-harness) repositories are unchanged: their pull requests,
@@ -813,7 +858,7 @@ cost when an item is far off (two buckets), and correct the table in
   is linked in the PR, turn it off again with `bot-pr fork-setup REPO
   --no-ci`, since until then it runs for every PR on that fork.
 - **Review every result.** When a worker reports back, start an
-  independent reviewer subagent on its branch or gist, and send the
+  independent reviewer job (`bot-claude`) on its branch or gist, and send the
   findings to the same worker (resuming it, so it keeps its context) to
   fix. Repeat until the reviewer's report starts with `Verdict: APPROVE`
   (see `reviewer-preamble.md`; a report without that line is no

@@ -39,7 +39,29 @@ cd ~/src/github/cgwalters-bot/homegit && claude --model sonnet 'Load the dispatc
    wrong: escalate it, don't act again.
 3. Start the loop again.
 
+## Workers are `bot-claude` jobs
+
+Every local worker and reviewer is a separate `claude -p` process, never
+an in-session subagent (the coordinator skill's "Local Claude workers"):
+make a worktree (`bin/bot-work worktree add REPO_DIR TASK`), write the
+brief to a file (the preamble line, the `Item:` line, the scratch dir, the
+task), then
+
+```
+bin/bot-claude start --dir WT --item ITEM_URL --job TASK BRIEF
+bin/bot-claude wait --timeout 3600 TASK     # as one background command
+```
+
+`wait` exits 0 when the job succeeded, 1 failed, 3 timed out, 4 killed or
+lost, and prints the final report on stdout; `bot-claude status`, `log`
+and `kill` look in and stop it. Jobs run Opus by default and call the
+Sonnet `sonnet-worker` subagent for cheap steps; pass `--model sonnet`
+for mechanical apply workers and reviewers of small changes. A failed
+job is read (`bin/bot-claude log JOB`) before it is started again; the
+same job failing twice is an escalation.
+
 ## Handling each kind
+
 
 Mechanical, do it:
 
@@ -57,8 +79,8 @@ Mechanical, do it:
   comments into a run's brief, and a text that quotes third parties is
   an escalation, not a label. A
   candidate that needs GitHub I/O, a private repository or judgment gets
-  a local worker (`bin/bot-pace assign ITEM`, then the worker preamble,
-  see the coordinator skill's "Briefing subagents"); without any
+  a local worker (`bin/bot-pace assign ITEM`, then a `bot-claude` job on
+  the worker preamble, see the coordinator skill's "Local Claude workers"); without any
   candidates, or a plan for what to file, escalate.
 - `dispatch-failed`: read why. A missing target or a label outside the
   bot's repositories is fixed on the issue. A failed attempt (its Why
@@ -66,9 +88,7 @@ Mechanical, do it:
   is plain (an issue body, a label), clear its Why once to retry
   (`bin/bot-board set ITEM --why ""`, relabel). A second failure of the
   same item: escalate.
-- `patch-ready`: when the action says to, dispatch a Sonnet worker (Agent
-  with `model: sonnet`) on `coordinator/apply-preamble.md`, with `Item:`
-  and `Run:` lines. It reads the run, applies the patch, opens or updates
+- `patch-ready`: when the action says to, start a Sonnet worker (`bin/bot-claude start --model sonnet --dir WT --item ITEM --job apply-RUN BRIEF`) on `coordinator/apply-preamble.md`, with `Item:` and `Run:` lines in the brief. It reads the run, applies the patch, opens or updates
   the draft PR (a fork PR, or a homegit PR via `bot-land --no-auto
   --no-review`), and never merges. Then the review step below.
 - `approval`: run the command the action prints (`bot-pr promote URL`),
@@ -99,9 +119,7 @@ Mechanical, do it:
 ## Reviews and merges
 
 A result is never reviewed by the worker that wrote it. For each PR a
-worker or the apply step opened, start a Sonnet reviewer (Agent,
-`model: sonnet`) on `coordinator/reviewer-preamble.md` with the `Item:`
-line; its report must start with `Verdict:`. Then, by where the PR is:
+worker or the apply step opened, start a Sonnet reviewer (`bin/bot-claude start --model sonnet --dir WT --item ITEM --job review-N BRIEF`, WT a worktree at the PR head) on `coordinator/reviewer-preamble.md` with the `Item:` line in the brief; its report (`bot-claude wait`'s stdout) must start with `Verdict:`. Then, by where the PR is:
 
 - **homegit and the bot's other harness repositories, and the devspace
   sandbox stack:** on `Verdict: APPROVE` of the PR's current head and
