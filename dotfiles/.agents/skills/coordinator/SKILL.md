@@ -175,7 +175,14 @@ Sonnet worker (Agent with `model: sonnet`) on `apply-preamble.md`, with
 `Item:` and `Run:` lines. It reads the run, applies the patch with `bot-runs
 apply` (which re-checks it), reviews the diff as a reviewer would, and
 opens or updates the fork PR with the run as its CI evidence, leaving the
-item Draft with the PR as its Branch. A separate reviewer then checks that
+item Draft with the PR as its Branch. What the run hands back is gh-aw's
+safe outputs (docs/devspace-agent-runs.md), checked by gh-aw's own
+validation code in the run and again by `apply`: a refusal names the
+check, and the fix is a new run, never a looser check. The agent's own PR
+title and body (`apply --json`'s `pull_request`) are a starting point for
+the fork PR's, and the run's other outputs (`noop`, `missing_tool`) are
+only listed: `missing_tool` is a tool the next run's brief should
+provide. A separate reviewer then checks that
 PR, like any worker's result. A patch the worker can't vouch for goes back
 as a new run with the feedback in its brief, not as a local rewrite.
 

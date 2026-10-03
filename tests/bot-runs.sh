@@ -127,7 +127,7 @@ case "${method} ${path%%\?*}" in
         # Artifacts are uploaded at the end of the run (its latest attempt).
         created=$(jq -r --argjson id "${id}" '.workflow_runs[] | select(.id == $id) | .updated_at' "${runs}")
         # Artifact ids are RUN * 10 + 1, 2, 3 in this order.
-        reply "$(k=0; for a in agent-run agent-transcript agent-out; do
+        reply "$(k=0; for a in agent-run agent-transcript safe-outputs; do
                 k=$((k + 1)) n=$(( id * 10 + k ))
                 if grep -qx "${id} ${a}" "${store}/expired.txt"; then
                     jq -nc --argjson n "${n}" --arg a "${a}" --arg c "${created}" '{id: $n, name: $a, expired: true, created_at: $c, expires_at: "2026-09-24T10:45:00Z"}'
@@ -140,9 +140,9 @@ case "${method} ${path%%\?*}" in
     "GET repos/${repo}/actions/runs/"*/jobs)
         id=${path#repos/"${repo}"/actions/runs/}
         id=${id%%/*}
-        reply "$(jq -c --argjson id "${id}" --arg sha "${head_sha}" '.workflow_runs[] | select(.id == $id)
-            | {total_count: 1, jobs: [{id: $id, name: "Agent", run_id: $id, head_sha: $sha, status, conclusion,
-                started_at: .run_started_at, completed_at: .updated_at}]}' "${runs}" | filtered jobs)"
+        reply "$(jq -c --argjson id "${id}" --arg sha "${head_sha}" '.workflow_runs[] | select(.id == $id) | . as $r
+            | {total_count: 3, jobs: ["Restrictions", "Agent", "Safe outputs"] | map({id: (if . == "Agent" then $id else $id * 10 + 7 end), name: ., run_id: $id, head_sha: $sha,
+                status: $r.status, conclusion: $r.conclusion, started_at: $r.run_started_at, completed_at: $r.updated_at})}' "${runs}" | filtered jobs)"
         ;;
     "GET repos/${repo}/actions/runs/"*)
         id=${path#repos/"${repo}"/actions/runs/}
@@ -156,11 +156,16 @@ case "${method} ${path%%\?*}" in
         n=${path#repos/"${repo}"/actions/artifacts/}
         n=${n%/zip}
         id=$((n / 10))
-        case $((n % 10)) in 1) a=agent-run ;; 2) a=agent-transcript ;; *) a=agent-out ;; esac
+        case $((n % 10)) in 1) a=agent-run ;; 2) a=agent-transcript ;; *) a=safe-outputs ;; esac
         ! grep -qx "${id} ${a}" "${store}/expired.txt" || fail_http 410 "Artifact has expired"
         test -d "${store}/artifacts/${id}/${a}" || fail_http 404 "Not Found"
         cd "${store}/artifacts/${id}/${a}"
         zip -q -r -y - .
+        ;;
+    # The code that ran, as the checker: $FAKE_GH/checker-source is a tree.
+    "GET repos/${repo}/tarball/${head_sha}")
+        test -d "${store}/checker-source" || fail_http 404 "Not Found"
+        tar -czf - -C "${store}" --transform "s,^checker-source,owner-repo-${head_sha:0:7}," checker-source
         ;;
     "GET repos/${repo}/actions/jobs/"*/logs)
         id=${path#repos/"${repo}"/actions/jobs/}
@@ -527,12 +532,77 @@ test_transcript_link() {
 
 # --- apply -------------------------------------------------------------------
 
+# bot-runs apply checks a run's outputs with the safe-outputs code of the
+# run's own commit (gh-aw's validation, vendored in the devspace repository;
+# its tests are there). These tests use a stand-in for it that logs its
+# calls and refuses on demand ($CHECKER/safe-outputs/mode: COMMAND-fail),
+# and so check bot-runs' side: the run's provenance, the artifact, the
+# contract with the checker, and the clone. With BOT_RUNS_REAL_CHECKER set
+# to a checkout of the devspace repository, test_apply_real_checker runs
+# the real one too.
+
+# make_checker DIR: the stand-in, laid out like the repository (DIR holds
+# safe-outputs/safe-outputs.mjs).
+make_checker() {
+    mkdir -p "$1/safe-outputs"
+    cat >"$1/safe-outputs/safe-outputs.mjs" <<'EOF'
+// The stand-in runs under node's permission model like the real checker:
+// no process, no writes outside the scratch directory (so it logs its calls
+// to stderr, "stub-call: JSON"), and it reads zips itself.
+import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { inflateRawSync } from "node:zlib";
+const here = dirname(fileURLToPath(import.meta.url));
+const [command, ...args] = process.argv.slice(2);
+const flag = (name) => args[args.indexOf(`--${name}`) + 1];
+const mode = existsSync(join(here, "mode")) ? readFileSync(join(here, "mode"), "utf8").trim() : "";
+console.error(`stub-call: ${JSON.stringify([command, ...args])}`);
+const refuse = (what) => { console.error(`stub: ${what} refused`); process.exit(1); };
+if (command === "compile") {
+  if (mode === "compile-fail") refuse("compile");
+  writeFileSync(flag("out"), "{}\n");
+} else if (command === "unpack") {
+  if (mode === "unpack-fail") refuse("unpack");
+  const zip = readFileSync(flag("zip"));
+  let eocd = zip.length - 22;
+  while (zip.readUInt32LE(eocd) !== 0x06054b50) eocd--;
+  let at = zip.readUInt32LE(eocd + 16);
+  mkdirSync(flag("dir"));
+  for (let i = zip.readUInt16LE(eocd + 10); i > 0; i--) {
+    const [method, compressed] = [zip.readUInt16LE(at + 10), zip.readUInt32LE(at + 20)];
+    const nameLength = zip.readUInt16LE(at + 28);
+    const name = zip.toString("utf8", at + 46, at + 46 + nameLength);
+    const local = zip.readUInt32LE(at + 42);
+    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+    const data = zip.subarray(start, start + compressed);
+    writeFileSync(join(flag("dir"), name), method === 8 ? inflateRawSync(data) : data);
+    at += 46 + nameLength + zip.readUInt16LE(at + 30) + zip.readUInt16LE(at + 32);
+  }
+} else if (command === "check") {
+  const dir = flag("dir");
+  const file = join(dir, "outputs.jsonl");
+  const items = existsSync(file) ? readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l)) : [];
+  const patch = readdirSync(dir).find((n) => n.startsWith("aw-"));
+  const ok = mode !== "check-fail";
+  writeFileSync(flag("json"), JSON.stringify({ ok, errors: ok ? [] : ["stub refusal"], items, patch: patch ? { file: patch } : null }));
+  process.exit(ok ? 0 : 1);
+} else if (command === "post-apply") {
+  if (mode === "post-apply-fail") { console.error("  src/lib.rs: stub says no"); process.exit(1); }
+  // The staged change, as git's view of it.
+  if (!readFileSync(flag("raw"), "utf8").includes("src/lib.rs")) refuse("post-apply (an unexpected change)");
+}
+EOF
+}
+
 # make_change RUN [EDIT]: a target repository in $WORK/target (made once,
-# with a commit on a side branch too) and RUN's agent-out artifact
-# holding the diff that the shell code EDIT (default: editing src/lib.rs)
-# makes in it. Prints the base commit.
+# with a commit on a side branch too) and RUN's safe-outputs artifact: the
+# patch the shell code EDIT (default: editing src/lib.rs) makes in it, as
+# the agent step makes it (one format-patch commit against the base, with
+# gh-aw's X-GH-AW-Base-Commit header), a create_pull_request for it and
+# base.json. Prints the base commit.
 make_change() {
-    local target=${WORK}/target out=${FAKE_GH}/artifacts/$1/agent-out commit
+    local target=${WORK}/target out=${FAKE_GH}/artifacts/$1/safe-outputs commit
     if ! test -d "${target}"; then
         git init -q -b main "${target}"
         mkdir -p "${target}/src"
@@ -544,27 +614,42 @@ make_change() {
         git -C "${target}" reset -q --hard HEAD^
     fi
     commit=$(git -C "${target}" rev-parse HEAD)
-    (cd "${target}" && eval "${2:-echo 'pub fn g() {}' >>src/lib.rs}" && git add -A -N &&
-        git diff --binary HEAD) >"${WORK}/changes.patch"
-    git -C "${target}" reset -q --hard
+    (cd "${target}" && eval "${2:-echo 'pub fn g() {}' >>src/lib.rs}" && git add -A &&
+        git -c user.name=agent -c user.email=agent@localhost commit -q -m "Check the superblock first" &&
+        git format-patch --stdout --no-renames --no-signature -1 HEAD | sed "1a X-GH-AW-Base-Commit: ${commit}") >"${WORK}/change.patch"
+    git -C "${target}" reset -q --hard "${commit}"
     git -C "${target}" clean -q -fdx
+    rm -rf "${out}"
     mkdir -p "${out}"
-    cp "${WORK}/changes.patch" "${out}/changes.patch"
+    cp "${WORK}/change.patch" "${out}/aw-agent-run-$1.patch"
+    jq -nc --arg b "agent-run-$1" '{type: "create_pull_request", title: "fsck: Check the superblock first", body: "A truncated image failed late.", branch: $b}' >"${out}/outputs.jsonl"
     jq -nc --arg c "${commit}" '{repo: "composefs/composefs-rs", ref: "main", commit: $c}' >"${out}/base.json"
     printf 'fsck: Check the superblock first\n\nA truncated image failed late.\n' >"${WORK}/message"
     echo "${commit}"
 }
 
-# put_patch TEXT: replaces run 1001's change with TEXT, for patches git
-# diff wouldn't write.
-put_patch() {
-    mkdir -p "${FAKE_GH}/artifacts/1001/agent-out"
-    printf '%s\n' "$1" >"${FAKE_GH}/artifacts/1001/agent-out/changes.patch"
-}
-
 # set_json FILE FILTER: FILE through jq FILTER.
 set_json() {
     jq -c "$2" "$1" >"$1.new" && mv "$1.new" "$1"
+}
+
+# use_stub_checker: apply uses the stand-in in $WORK/checker (as every test
+# does from the start; for after a test has used another).
+use_stub_checker() {
+    export BOT_RUNS_SAFE_OUTPUTS_DIR=${WORK}/checker
+}
+
+# apply_logged RUN [ARGS...]: apply_run, with the stand-in's calls
+# (stub-call lines of stderr) in $WORK/calls; its output is stdout's.
+apply_logged() {
+    local rc=0
+    apply_run "$@" 2>"${WORK}/stderr" || rc=$?
+    grep '^stub-call: ' "${WORK}/stderr" | sed 's/^stub-call: //' >"${WORK}/calls" || true
+    return "${rc}"
+}
+
+checker_calls() { # checker_calls: the commands the stand-in ran, one per line
+    jq -r '.[0]' "${WORK}/calls"
 }
 
 apply_run() { # apply_run RUN [ARGS...]: bot-runs apply of RUN to the fake target
@@ -577,6 +662,7 @@ apply_run() { # apply_run RUN [ARGS...]: bot-runs apply of RUN to the fake targe
 test_apply() {
     local commit out dir bot
     bot=$("${TESTS}/../bin/bot-operator" --json | jq -r '"\(.bot.git_name) <\(.bot.git_email)>"')
+    use_stub_checker
     commit=$(make_change 1001)
     # No hook of the caller's runs.
     mkdir -p "${WORK}/hooks"
@@ -585,20 +671,29 @@ test_apply() {
         chmod +x "${WORK}/hooks/${h}"
     done
     git config --global core.hooksPath "${WORK}/hooks"
-    out=$(apply_run 1001 --base main --json)
+    out=$(apply_logged 1001 --base main --json)
     dir=${XDG_CACHE_HOME}/bot-work/fsck-sb/composefs-rs
     expect_json "$(jq -c 'del(.head)' <<<"${out}")" "$(jq -nc --arg c "${commit}" --arg d "${dir}" '{run_id: 1001,
         run_url: "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1001/attempts/1",
         workflow_sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         repo: "composefs/composefs-rs", base: "main", base_commit: $c, branch: "bot/fsck-sb", dir: $d,
-        item: "PVTI_item1", files: ["src/lib.rs"]}')" "apply --json"
+        item: "PVTI_item1", files: ["src/lib.rs"],
+        pull_request: {title: "fsck: Check the superblock first", body: "A truncated image failed late."}, outputs: []}')" "apply --json"
     test ! -e "${WORK}/hook-ran" || fail "apply ran a hook"
     test -f "${dir}/.git" || fail "apply did not create a linked worktree"
     expect_eq "$(git -C "${WORK}/target" branch --show-current)" main "source branch unchanged"
     test -z "$(git -C "${WORK}/target" config --get remote.origin.pushurl || true)" || fail "changed source push URL"
+    # The checker ran, in order, on the policy for this repository and base,
+    # with the allowlist's maximum (post-apply's stderr is what apply shows on
+    # a refusal, so it doesn't reach the log; test_apply_refused has its
+    # refusal).
+    expect_eq "$(checker_calls | tr '\n' ' ')" "compile unpack check " "checker commands"
+    expect_json "$(jq -c 'select(.[0] == "compile") | .[1:] | . as $a | [range(0; length; 2)] | map({($a[.]): $a[. + 1]}) | add | del(.["--out"])' "${WORK}/calls")" \
+        '{"--repo": "composefs/composefs-rs", "--base": "main", "--workflow": "branch", "--outputs": "all", "--max-outputs": "max"}' "compile arguments"
     expect_eq "$(git -C "${dir}" rev-parse HEAD^)" "${commit}" "parent"
     expect_eq "$(git -C "${dir}" rev-parse --abbrev-ref HEAD)" bot/fsck-sb "branch"
     expect_eq "$(git -C "${dir}" log -1 --format='%an <%ae>|%cn <%ce>')" "${bot}|${bot}" "identity"
+    expect_eq "$(git -C "${dir}" log -1 --format='%s')" "fsck: Check the superblock first" "subject is the message file's"
     expect_eq "$(git -C "${dir}" log -1 --format='%(trailers:key=Generated-by,valueonly)' | head -n1)" AI "AI trailer"
     expect_eq "$(git -C "${dir}" log -1 --format='%(trailers:key=Agent-run,valueonly)' | head -n1)" \
         https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1001/attempts/1 "run trailer"
@@ -611,20 +706,66 @@ test_apply() {
     expect_lines "${out}" "already exists"
 }
 
+# The outputs a run hands back that are not a pull request are only listed.
+test_apply_other_outputs() {
+    use_stub_checker
+    make_change 1001 >/dev/null
+    printf '%s\n' '{"type":"noop","message":"Nothing else to do."}' >>"${FAKE_GH}/artifacts/1001/safe-outputs/outputs.jsonl"
+    local out
+    out=$(apply_run 1001 --json)
+    expect_json "$(jq -c .outputs <<<"${out}")" '[{"type": "noop", "text": "Nothing else to do."}]' "other outputs"
+    out=$(apply_run 1001 --slug again 2>&1)
+    expect_lines "${out}" 'also handed back, not acted on: noop: Nothing else to do\.' 'The agent proposed the title "fsck: Check the superblock first"'
+    # Without a pull request there is nothing to apply, and no clone.
+    rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${FAKE_GH}/artifacts/1001/safe-outputs/aw-"*
+    printf '%s\n' '{"type":"noop","message":"Nothing to do."}' >"${FAKE_GH}/artifacts/1001/safe-outputs/outputs.jsonl"
+    out=$(apply_run 1001)
+    expect_lines "${out}" 'handed back no create_pull_request, so nothing was applied' '  noop: Nothing to do\.'
+    test ! -e "${XDG_CACHE_HOME}/bot-runs/apply" || fail "cloned for a run without a pull request"
+    out=$(apply_run 1001 --json)
+    expect_json "$(jq -c '{applied, outputs}' <<<"${out}")" '{"applied": false, "outputs": [{"type": "noop", "text": "Nothing to do."}]}' "no pull request, --json"
+}
+
+# Without an override, the checker is the run's own commit, fetched from
+# the runs repository once and kept by commit.
+test_apply_fetches_checker() {
+    unset BOT_RUNS_SAFE_OUTPUTS_DIR
+    make_checker "${FAKE_GH}/checker-source"
+    mkdir -p "${FAKE_GH}/checker-source/vendor/gh-aw" "${FAKE_GH}/checker-source/agent" "${FAKE_GH}/checker-source/other"
+    touch "${FAKE_GH}/checker-source/vendor/gh-aw/UPSTREAM.json" "${FAKE_GH}/checker-source/agent/redact.mjs" "${FAKE_GH}/checker-source/other/not-fetched"
+    make_change 1001 >/dev/null
+    local out dir=${XDG_CACHE_HOME}/bot-runs/safe-outputs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    apply_run 1001 >/dev/null
+    test -f "${dir}/safe-outputs/safe-outputs.mjs" || fail "the checker was not kept"
+    test -f "${dir}/vendor/gh-aw/UPSTREAM.json" || fail "vendor/gh-aw was not kept"
+    test -f "${dir}/agent/redact.mjs" || fail "agent/redact.mjs was not kept"
+    test ! -e "${dir}/other" || fail "kept what the checker doesn't need"
+    expect_eq "$(calls 'tarball')" 1 "tarball downloads"
+    rm -rf "${XDG_CACHE_HOME}/bot-runs/apply"
+    apply_run 1001 --slug again >/dev/null
+    expect_eq "$(calls 'tarball')" 1 "tarball downloads after a second apply"
+    # A commit without the checker is refused.
+    rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${dir}" "${FAKE_GH}/checker-source/safe-outputs"
+    out=$(apply_run 1001 2>&1) && fail "applied with a checker that isn't there"
+    expect_lines "${out}" 'unpacking the code of a+ failed'
+}
+
 # Each refusal: RUN, the declared repository, the change's EDIT (- for
-# none), extra setup (in which $OUT is run 1001's agent-out), and the
-# expected error. Nothing is left behind.
-# shellcheck disable=SC2034 # OUT and sha are for the setups' eval
+# none), extra setup (in which $OUT is run 1001's safe-outputs and $CHK the
+# stand-in checker's mode file), and the expected error. Nothing is left
+# behind. What the change may contain is the checker's to refuse (tested
+# with gh-aw's validation in the devspace repository).
+# shellcheck disable=SC2034 # OUT and CHK are for the setups' eval
 test_apply_refused() {
-    local run repo edit setup want out OUT=${FAKE_GH}/artifacts/1001/agent-out sha
+    local run repo edit setup want out OUT=${FAKE_GH}/artifacts/1001/safe-outputs CHK=${WORK}/checker/safe-outputs/mode
+    use_stub_checker
     while IFS='|' read -r run repo edit setup want; do
-        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${XDG_CACHE_HOME}/bot-work" "${FAKE_GH}/artifacts/${run}/agent-out" "${FAKE_GH}"/filter-*.jq
+        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${XDG_CACHE_HOME}/bot-work" "${FAKE_GH}/artifacts/${run}/safe-outputs" "${FAKE_GH}"/filter-*.jq "${CHK}"
         cp "${FIXTURES}/expired.txt" "${FAKE_GH}/expired.txt"
         cp "${FIXTURES}/artifacts/1001/agent-run/summary.json" "${FAKE_GH}/artifacts/1001/agent-run/summary.json"
         rm -rf "${XDG_STATE_HOME}/bot-runs"
         echo 'A subject' >"${WORK}/message"
         test "${edit}" = - || make_change "${run}" "${edit}" >/dev/null
-        sha=$(git -C "${WORK}/target" rev-parse HEAD)
         eval "${setup}"
         out=$("${BOT_RUNS}" apply "${run}" --repo "${repo}" --slug s --message "${WORK}/message" --source "${WORK}/target" 2>&1) &&
             fail "applied run ${run} (${want})"
@@ -632,26 +773,12 @@ test_apply_refused() {
         test ! -e "${XDG_CACHE_HOME}/bot-runs/apply/sources/${run}-s/composefs-rs" || fail "left a clone behind (${want})"
         test ! -e "${XDG_CACHE_HOME}/bot-work/s/composefs-rs" || fail "left a worktree behind (${want})"
     done <<'EOF'
-1001|composefs/composefs-rs|mkdir -p .github/workflows && echo x >.github/workflows/ci.yml|:|\.github/workflows/ci\.yml \(protected path\)
-1001|composefs/composefs-rs|echo x >.gitmodules|:|\.gitmodules \(protected path\)
-1001|composefs/composefs-rs|echo '* filter=x' >.gitattributes|:|\.gitattributes \(protected path\)
-1001|composefs/composefs-rs|mkdir -p src/.githooks && echo x >src/.githooks/pre-commit|:|src/\.githooks/pre-commit \(protected path\)
-1001|composefs/composefs-rs|mkdir .husky && echo x >.husky/pre-commit|:|\.husky/pre-commit \(protected path\)
-1001|composefs/composefs-rs|echo 'repos: []' >.pre-commit-config.yaml|:|\.pre-commit-config\.yaml \(protected path\)
-1001|composefs/composefs-rs|ln -s /etc/passwd leak|:|leak \(symlink or submodule\)
-1001|composefs/composefs-rs|-|put_patch "$(printf 'diff --git a/sub b/sub\nnew file mode 160000\nindex 0000000..%s\n--- /dev/null\n+++ b/sub\n@@ -0,0 +1 @@\n+Subproject commit %s' "${sha}" "${sha}")"; jq -nc --arg c "${sha}" '{repo: "composefs/composefs-rs", ref: "main", commit: $c}' >"${OUT}/base.json"|sub \(symlink or submodule\)
-1001|composefs/composefs-rs|chmod +x src/lib.rs|:|src/lib\.rs \(mode change 100644 to 100755\)
-1001|composefs/composefs-rs|echo x >run.sh && chmod +x run.sh|:|run\.sh \(new file mode 100755\)
-1001|composefs/composefs-rs|printf '\0\1\2' >blob.bin|:|blob\.bin \(binary\)
-1001|composefs/composefs-rs|echo x >'a b'|:|a b \(not a plain relative path\)
-1001|composefs/composefs-rs|echo x >-rf|:|-rf \(not a plain relative path\)
-1001|composefs/composefs-rs|echo x >x|put_patch "$(sed 's,\([ab]\)/x,\1/../x,g' "${WORK}/changes.patch")"|doesn't apply
-1001|composefs/composefs-rs|for i in $(seq 101); do echo "${i}" >"f${i}"; done|:|touches 101 files, over 100
-1001|composefs/composefs-rs|echo "t=ghp_$(printf 'a%.0s' $(seq 36))" >>src/lib.rs|:|secret-shaped string
-1001|composefs/composefs-rs|echo "k=AIza$(printf 'b%.0s' $(seq 35))" >>src/lib.rs|:|secret-shaped string
-1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${OUT}/base.json" '.repo = "other/repo"'|base\.json names another repository
-1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${OUT}/base.json" '.ref = "release"'|base\.json ref \(release\) differs
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo compile-fail >"${CHK}"|the allowlist refuses composefs/composefs-rs at main with outputs all
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo unpack-fail >"${CHK}"|stub: unpack refused
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo check-fail >"${CHK}"|stub refusal
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo post-apply-fail >"${CHK}"|src/lib\.rs: stub says no
 1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${OUT}/base.json" ".commit = \"$(git -C "${WORK}/target" rev-parse side)\""|is not on main of
+1001|composefs/composefs-rs|echo x >x|sed -i 's,^+++ b/x,+++ b/../x,; s,^diff --git a/x b/x,diff --git a/../x b/../x,' "${OUT}"/aw-*.patch|doesn't apply
 1001|other/repo|echo x >>src/lib.rs|:|dispatched for composefs/composefs-rs, not other/repo
 1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" '.repo = "other/repo"'|summary names other/repo, not composefs/composefs-rs
 1001|composefs/composefs-rs|echo x >>src/lib.rs|set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" '.run_id = 999'|summary is of run 999
@@ -660,23 +787,54 @@ test_apply_refused() {
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.path = ".github/workflows/other.yml"' >"${FAKE_GH}/filter-run.jq"|ran \.github/workflows/other\.yml
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.head_repository.id = 9' >"${FAKE_GH}/filter-run.jq"|ran code from another repository
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.repository.full_name = "x/y"' >"${FAKE_GH}/filter-run.jq"|is in x/y, not bootc-dev/cgwalters-devspace-sandbox
-1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs += [.jobs[0] + {name: "Other"}]' >"${FAKE_GH}/filter-jobs.jq"|has 2 jobs, not just Agent
-1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs[0].name = "Other"' >"${FAKE_GH}/filter-jobs.jq"|has job Other, not Agent
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs += [.jobs[0] + {name: "Other"}]' >"${FAKE_GH}/filter-jobs.jq"|has the jobs Restrictions, Agent, Safe outputs, Other, not Agent, Restrictions, Safe outputs
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo 'del(.jobs[2])' >"${FAKE_GH}/filter-jobs.jq"|has the jobs Restrictions, Agent, not
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs[1].name = "Other"' >"${FAKE_GH}/filter-jobs.jq"|has the jobs Restrictions, Other, Safe outputs, not
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs[0].head_sha = "b"' >"${FAKE_GH}/filter-jobs.jq"|job of another run or head
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs[2].conclusion = "failure"' >"${FAKE_GH}/filter-jobs.jq"|did not succeed: Safe outputs \(failure\)
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.jobs[0].conclusion = "skipped"' >"${FAKE_GH}/filter-jobs.jq"|did not succeed: Restrictions \(skipped\)
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts[-1].workflow_run.head_sha = "b"' >"${FAKE_GH}/filter-artifacts.jq"|artifact of another run or head
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts[-1].workflow_run.id = 1002' >"${FAKE_GH}/filter-artifacts.jq"|artifact of another run or head
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts[-1].created_at = "2026-09-20T11:00:00Z"' >"${FAKE_GH}/filter-artifacts.jq"|artifact made outside its agent job
-1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts += [.artifacts[-1]]' >"${FAKE_GH}/filter-artifacts.jq"|has 2 agent-out artifacts
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts += [.artifacts[-1]]' >"${FAKE_GH}/filter-artifacts.jq"|has 2 safe-outputs artifacts
 1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '.artifacts[-1].size_in_bytes = 99999999' >"${FAKE_GH}/filter-artifacts.jq"|artifact of 99999999 bytes
-1001|composefs/composefs-rs|echo x >>src/lib.rs|head -c $((9 << 20)) /dev/zero >"${OUT}/changes.patch"|patch of 9437184 bytes, over 8388608
-1001|composefs/composefs-rs|echo x >>src/lib.rs|echo x >"${OUT}/extra"|unexpected file extra
-1001|composefs/composefs-rs|echo x >>src/lib.rs|ln -s base.json "${OUT}/link"|non-regular file link
-1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '1001 agent-out' >>"${FAKE_GH}/expired.txt"|expired artifact
+1001|composefs/composefs-rs|echo x >>src/lib.rs|echo '1001 safe-outputs' >>"${FAKE_GH}/expired.txt"|expired artifact
 1001|composefs/composefs-rs|echo x >>src/lib.rs|printf 'x\n\nSigned-off-by: A <a@b>\n' >"${WORK}/message"|has a Signed-off-by
 1001|composefs/composefs-rs|echo x >>src/lib.rs|printf 'x\n\nAgent-run: https://example.com\n' >"${WORK}/message"|has an Agent-run trailer
-1001|composefs/composefs-rs|-|:|has no agent-out artifact
+1001|composefs/composefs-rs|-|:|has no safe-outputs artifact
 1002|composefs/composefs-rs|echo x >>src/lib.rs|:|agent result is failure, not success
 1004|containers/composefs|echo x >>src/lib.rs|:|run 1004 is failure, not success
+EOF
+}
+
+# With BOT_RUNS_REAL_CHECKER set to a checkout of the devspace repository:
+# gh-aw's validation, end to end, on the artifact the agent step writes.
+test_apply_real_checker() {
+    if test -z "${BOT_RUNS_REAL_CHECKER:-}"; then
+        echo "skipped: BOT_RUNS_REAL_CHECKER is not set" 1>&2
+        return 0
+    fi
+    export BOT_RUNS_SAFE_OUTPUTS_DIR=${BOT_RUNS_REAL_CHECKER}
+    local out dir=${XDG_CACHE_HOME}/bot-work/fsck-sb/composefs-rs
+    make_change 1001 >/dev/null
+    out=$(apply_run 1001 --json)
+    expect_eq "$(jq -r .pull_request.title <<<"${out}")" "fsck: Check the superblock first" "title, validated by gh-aw's collector"
+    expect_eq "$(git -C "${dir}" show HEAD:src/lib.rs | tail -n1)" 'pub fn g() {}' "applied content"
+    # What the real checker refuses (the full table is in the devspace repository).
+    local edit want
+    while IFS='|' read -r edit want; do
+        rm -rf "${XDG_CACHE_HOME}/bot-runs/apply" "${XDG_CACHE_HOME}/bot-work"
+        make_change 1001 "${edit}" >/dev/null
+        out=$(apply_run 1001 2>&1) && fail "applied a change that ${want}"
+        expect_lines "${out}" "${want}"
+        test ! -e "${dir}" || fail "left a clone behind (${want})"
+    done <<'EOF'
+echo x >README.md|protected files.*README\.md
+mkdir -p .github/workflows && echo x >.github/workflows/ci.yml|\.github
+ln -s /etc/passwd leak|symlink
+printf '\0\1\2' >blob.bin|binary
+echo "t=ghp_$(printf 'a%.0s' $(seq 36))" >>src/lib.rs|secret-shaped string
+echo x >run.sh && chmod +x run.sh|new symlink, submodule, executable
 EOF
 }
 
@@ -738,7 +896,7 @@ test_apply_dir_refused() {
     local sibling=${XDG_CACHE_HOME}/bot-work/fsck-sb/sibling
     echo 'sibling edits' >>"${sibling}/src/lib.rs"
     out=$(apply_run 1001 --dir "${dir}" 2>&1) && fail "accepted protected path in custom worktree"
-    expect_lines "${out}" 'protected path'
+    expect_lines "${out}" 'touches what a run may not change'
     test ! -e "${dir}" || fail "refusal left custom worktree"
     test ! -e "${XDG_CACHE_HOME}/bot-work/fsck-sb/composefs-rs" || fail "refusal left custom destination registration"
     test -f "${sibling}/.git" || fail "refusal removed sibling worktree"
@@ -874,7 +1032,8 @@ test_dispatch() {
     expect_eq "${out}" "Dispatched run 1006: https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006" "dispatch output"
     expect_json "$(jq -c '.inputs.brief = null' "${FAKE_GH}/dispatch-body.json")" '{"ref": "bot/agent-run-praxis", "return_run_details": true, "inputs": {
         "item": "PVTI_item1", "repo": "composefs/composefs-rs", "base": "main", "agent": "opencode", "model": "praxis/gpt-6.1-sol",
-        "cores": "16", "timeout": "120", "budget": "250", "workflow": "branch", "brief": null}}' "dispatch request"
+        "cores": "16", "timeout": "120", "budget": "250", "workflow": "branch",
+        "outputs": "create_pull_request,noop,missing_tool", "max_outputs": "3", "brief": null}}' "dispatch request"
     # The runner brief, the run's target, then the task.
     jq -e --rawfile p "${TESTS}/../dotfiles/.agents/skills/coordinator/runner-preamble.md" \
         '.inputs.brief == $p + "\n---\n\nThis run: a `branch` run on composefs/composefs-rs at `main`.\n\nThe task:\n\nFix the fsck bug."' \
@@ -883,8 +1042,13 @@ test_dispatch() {
         --agent opencode --model gpt-5-codex --workflow analysis --timeout 330 --no-preamble -)
     expect_json "${out}" '{"run_id": 1006, "url": "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006",
         "api_url": "https://api.github.com/repos/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006"}' "dispatch --json"
-    expect_json "$(jq -c '.inputs | {agent, model, workflow, timeout, brief}' "${FAKE_GH}/dispatch-body.json")" \
-        '{"agent": "opencode", "model": "gpt-5-codex", "workflow": "analysis", "timeout": "330", "brief": "Write up the bisect."}' "dispatch from stdin"
+    expect_json "$(jq -c '.inputs | {agent, model, workflow, timeout, outputs, max_outputs, brief}' "${FAKE_GH}/dispatch-body.json")" \
+        '{"agent": "opencode", "model": "gpt-5-codex", "workflow": "analysis", "timeout": "330", "outputs": "noop,missing_tool,missing_data",
+          "max_outputs": "3", "brief": "Write up the bisect."}' "dispatch from stdin"
+    out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs --outputs create_pull_request,add_comment \
+        --max-outputs 5 --no-preamble "${WORK}/brief.md")
+    expect_json "$(jq -c '.inputs | {outputs, max_outputs}' <<<"$(sed 1d <<<"${out}")")" \
+        '{"outputs": "create_pull_request,add_comment", "max_outputs": "5"}' "dispatch with outputs"
     # Each dispatch put its run on its item.
     local run=${RUNS_URL}/1006
     expect_eq "$(cat "${FAKE_GH}/board-calls")" "field-ensure Run
@@ -934,6 +1098,8 @@ test_dispatch_invalid() {
         "--budget 0|--budget must be a positive number"
         "--agent gemini|--agent must be one of"
         "--workflow pr|--workflow must be one of"
+        "--outputs create_pull_request;rm|--outputs must be output types separated by commas"
+        "--max-outputs many|--max-outputs must be a number"
         "--item nope|--item must be a board item id"
         "--repo nope|--repo must be OWNER/REPO"
         "BRIEF=${WORK}/long.md|over GitHub's 65535; shorten the brief"
@@ -1084,6 +1250,9 @@ run_test() {
     chmod +x "${WORK}/bin/bot-pace"
     export BOT_RUNS_BOT_BOARD=${WORK}/bin/bot-board BOT_RUNS_BOT_PACE=${WORK}/bin/bot-pace
     export FAKE_GH WORK
+    # Every test applies with the stand-in checker unless it says otherwise.
+    make_checker "${WORK}/checker"
+    export BOT_RUNS_SAFE_OUTPUTS_DIR=${WORK}/checker
     export PATH=${WORK}/bin:${PATH}
     export HOME=${WORK}/home XDG_STATE_HOME=${WORK}/home/state XDG_CACHE_HOME=${WORK}/home/cache
     unset GH_TOKEN GITHUB_TOKEN BOT_RUNS_REPO BOT_RUNS_WORKFLOW BOT_RUNS_REF BOT_RUNS_AGE_IDENTITY

@@ -34,10 +34,23 @@ so no polling is needed to find the run. The inputs are all strings:
 | `timeout`  | minutes, at most 330 |
 | `budget`   | the spend cap in AIC (1 AIC = $0.01) |
 | `workflow` | `branch` or `analysis` |
+| `outputs`  | the output types the run may hand back, comma separated (`create_pull_request`, `add_comment`, `noop`, `missing_tool`, `missing_data`; `all` for every type allowed to this workflow): `bot-runs dispatch` sends `create_pull_request,noop,missing_tool` for a branch run and `noop,missing_tool,missing_data` for an analysis run |
+| `max_outputs` | the most outputs of all types the run may hand back (`bot-runs dispatch` sends `3`) |
 | `brief`    | the task text: `bot-runs dispatch` sends the runner-side worker brief (`dotfiles/.agents/skills/coordinator/runner-preamble.md`), the run's target, then the given brief, unless `--no-preamble` |
 
 Dispatch inputs are public in a public repository and capped at 65,535
 characters in total, so a brief follows the board's no-private-data rule.
+
+**The restrictions are the inputs.** `repo`, `base`, `outputs` and
+`max_outputs` are the run's restrictions. The workflow's first job,
+`Restrictions`, checks them against a static allowlist in the devspace
+repository (`safe-outputs/allowlist.json`: the owners and bases a run may
+target, the output types and their per-type maximums, the largest patch),
+before a runner is spent on the agent, and fails the run on anything
+outside it: no job after it runs. What they compile to is gh-aw's
+safe-outputs configuration (`config.json`), with its default protected-files
+policy, which the later checks use. A new type, owner or bigger limit is a
+change to the allowlist in a reviewed commit, never a dispatch.
 
 **Public repositories only.** An agent run's logs and transcripts are
 public, so `repo` must be a public repository (devspaces are for
@@ -106,36 +119,73 @@ maximum), holds small, unencrypted files at its root:
   (`{command, exit_code, duration_s}`, copied into `summary.json`),
   `questions` and `stopped_early`, as the runner-side worker brief asks.
 
-**`agent-out`**, with `retention-days: 30`, is uploaded only by a
-`branch` run that changed files. It holds `changes.patch`, the change as
-a binary `git diff` against the run's starting commit (new files
-included, nothing committed, at most 8 MiB), and `base.json`
-(`{repo, ref, commit}`). The runner has no credentials, so it can't push.
-The patch isn't redacted, because that would corrupt it; a
-secret-shaped string in it fails the upload instead.
-`bot-runs apply RUN --repo OWNER/REPO --slug SLUG --message FILE`
-treats all of it as untrusted and checks it again locally. The run must
-be a successful `workflow_dispatch` of `.github/workflows/agent.yml` in the
-configured devspace repository, with matching head and run repository ids,
-from `bot/agent-run-*` (a nonempty suffix), for the
-declared repository (its title, summary and `base.json` all agreeing),
-and the artifact must be the only `agent-out` of that run and head,
-made during its one job, `Agent` (the one running the agent as
-`runner-sandbox`). The artifact must hold just the two files, within
-8 MiB and 100 files; the base commit must be on the base branch of
-the target (never fetched by id, since GitHub serves fork commits that
-way). The change, as git sees it once applied, may hold no
-secret-shaped strings, binaries, symlinks, submodules, mode changes or
-new executables, and may touch only plain relative paths outside `.git*`
-(including `.github/` and `.gitattributes`) and CI or hook
-configuration. `BOT_RUNS_REF` selects the dispatch branch; changing it does
-not expand this apply allowlist (including to `main`). It is applied with
-hooks, fsmonitor and the caller's git configuration off, in a managed
-`bot-work` worktree backed by a fresh isolated clone whose `origin` has no
-usable push URL, and committed as the bot on `bot/SLUG` with an `Agent-run:`
-trailer linking the run attempt. Nothing is pushed: after review,
-`bot-pr fork-pr --from DIR` opens it on the forge and records Branch, Why
-and News on the item and sets it Draft.
+**`safe-outputs`**, with `retention-days: 30`, is uploaded when the run
+handed anything back. It is [gh-aw's safe
+outputs](https://github.github.com/gh-aw/reference/safe-outputs/), so that
+swapping the interim runner for the gh-aw fork's sandbox mode changes who
+applies the output, not its format:
+
+- `outputs.jsonl`: one JSON object per line, each a request with a `type`
+  (the agent wrote them to `~/out/safe-outputs.jsonl`): `create_pull_request`
+  (`title`, `body`, and the `branch` the supervisor sets to
+  `agent-run-RUNID`), `add_comment`, `noop`, `missing_tool`, `missing_data`,
+  with the fields gh-aw's validation rules name. A branch run that changed
+  files without asking for a pull request gets one made from
+  `outcome.json`'s `summary`.
+- `aw-agent-run-RUNID.patch`, for a `create_pull_request`: the supervisor's
+  own `git format-patch` of one commit of the working tree against the
+  run's starting commit (new files included, nothing the agent committed
+  lost, at most 8 MiB), with gh-aw's `X-GH-AW-Base-Commit` header. The
+  agent doesn't make it, as gh-aw's safeoutputs server makes it from the
+  git state.
+- `base.json`: `{repo, ref, commit}`.
+
+The runner has no credentials, so it can't create anything. The patch isn't
+redacted, because that would corrupt it; a secret-shaped string in the
+artifact fails the upload instead. Two checks follow, both by gh-aw's own
+code, vendored in the devspace repository (`vendor/gh-aw/`, whose
+`UPSTREAM.json` names the cgwalters-forge/gh-aw commit and the sha256 of
+every file) and run by `safe-outputs/safe-outputs.mjs`:
+
+- the last job of the run, `Safe outputs`, on a fresh runner that never ran
+  the agent: `collect_ndjson_output.cjs` parses, validates and sanitizes
+  the requests under the policy of the inputs, the protected-files policy
+  (`manifest_file_helpers.cjs`: README.md, AGENTS.md, manifests, CODEOWNERS
+  and top-level dot-folders such as `.github/` can't be changed) runs on
+  the patch, and the checks gh-aw doesn't make: secret-shaped strings,
+  symlinks, submodules, binaries, mode changes and new executables, plain
+  relative paths, git, CI and hook configuration anywhere;
+- `bot-runs apply RUN --repo OWNER/REPO --slug SLUG --message FILE`, which
+  treats all of it as untrusted and does it again with the code of the
+  commit that ran (fetched from the runs repository by `head_sha`; the
+  checkout `BOT_RUNS_SAFE_OUTPUTS_DIR` names replaces it, for tests and
+  development). That code is as trusted as the workflow, since whoever
+  can push to such a branch can change both, and it runs with an empty
+  environment under node's permission model (reads its own directory and
+  a scratch directory, writes only the scratch directory, starts no
+  process: git's view of the applied change is handed to it as files). The run must be a
+  successful `workflow_dispatch` of `.github/workflows/agent.yml` in the
+  configured devspace repository, with matching head and run repository ids,
+  from `bot/agent-run-*` (a nonempty suffix; `BOT_RUNS_REF` selects the
+  dispatch branch and does not widen this), for the declared repository (its title, summary and `base.json` all agreeing),
+  all three of its jobs (`Restrictions`, `Agent`, `Safe outputs`) must have
+  succeeded, and the artifact must be the only `safe-outputs` of that run
+  and head, made during the `Agent` job (the one running the agent as
+  `runner-sandbox`). The checker unpacks it (regular files with the three
+  names at the root, within their caps as declared and as unpacked) and
+  checks it under the allowlist for that repository and base
+  (`--outputs TYPES` narrows the types); the base commit must be on the
+  base branch (never fetched by id, since GitHub serves fork commits that
+  way). The patch is applied with hooks and the caller's git configuration
+  off, in a managed `bot-work` worktree backed by a fresh isolated clone whose
+  `origin` has no usable push URL, and checked again
+  as git sees it (`checkFileProtectionPostApply` and the mode, link and
+  binary checks), then committed as the bot on `bot/SLUG` with an
+  `Agent-run:` trailer linking the run attempt. The agent's own title and
+  body are printed (and in `--json`) for the fork PR; the other outputs
+  (`noop`, `missing_tool`, `add_comment`, `missing_data`) are listed, never
+  posted. Nothing is pushed: after review, `bot-pr fork-pr --from DIR`
+  opens it on the forge. A refused change's worktree and clone are removed.
 
 Apply uses `bot-work worktree add REPO_DIR SLUG --base COMMIT`, defaulting
 to `${XDG_CACHE_HOME:-~/.cache}/bot-work/SLUG/REPO`. Its `--dir DIR` option
@@ -151,6 +201,11 @@ slug's managed worktrees), then remove the backing clone once nothing
 needs its commits. The helper prunes Git registrations and preserves
 branches in the backing clone; it refuses tracked or untracked changes
 unless `--force` is given after verifying they can be discarded.
+
+Before this, a branch run uploaded `agent-out` with `changes.patch` and
+`bot-runs apply` checked it in shell. That format is gone: runs from before
+the change have no `safe-outputs` artifact, so `apply` refuses them, and
+their artifacts expire after 30 days.
 
 **`agent-transcript`**, with `retention-days: 30`, holds one file,
 `transcript.tar.zst`: a zstd-compressed tar, public like the rest, since the
@@ -199,7 +254,7 @@ zero.
 | `failures` | array | `{kind, message}`, `kind` one of `tool_error`, `timeout`, `budget`, `validation`, `agent_exit` |
 | `tests` | array | `{command, exit_code, duration_s}` from `outcome.json` |
 | `files` | array | paths the agent changed, relative to the repository |
-| `patch` | object | branch runs that changed files: `base` (the commit the change is against), and `bytes` (of `changes.patch`) or `error` (why no change was handed back); else `null` |
+| `patch` | object | branch runs that changed files: `base` (the commit the change is against), and `bytes` (of the patch) or `error` (why no change was handed back); else `null` |
 | `egress_denied` | array | `{domain, count}` from the proxy log (empty while egress is open) |
 | `outcome` | object | `status` (`Draft`, `Needs human` or `null`), `url` (the forge PR or write-up, once applied, else `null`) and `why` |
 | `redactions` | integer | how many strings the redaction pass replaced |
