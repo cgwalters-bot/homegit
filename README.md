@@ -19,6 +19,27 @@ the operator config (`~/.config/bot-harness/operator.json`, printed by
 `bot-operator`); another operator sets up their own as
 [docs/bootstrap.md](docs/bootstrap.md) describes.
 
+### Principles and direction
+
+The forge board and issues are the control plane, rather than
+Paperclip.ing's built-in tracker: we need the forge for collaboration
+anyway, so coordination belongs alongside the work and its review.
+Agent identity remains an [open question](https://github.com/cgwalters-forge/tracker/issues/304):
+a GitHub App per role (coordinator, engineer), or labels on the board
+to enforce access control. Paperclip avoids the question with its own
+identity system.
+
+The direction is sandboxed, forge-native devspace runners with
+separately validated and applied safe-outputs, moving toward gh-aw.
+[Devspace agent runs](docs/devspace-agent-runs.md) describe the current
+contract; the [scheduled dispatcher](docs/scheduled-dispatcher.md) is the
+planned move from a local controller session to scheduled and event-driven
+Actions jobs. Which runners may be used for what is
+[the CNCF-runner rule](docs/devspace-agent-runs.md#dispatch).
+
+Longer term, a standalone Forgejo + Actions deployment with a
+control-plane UI could run on Podman Quadlets or Kubernetes.
+
 Install with `make install` as usual. The shared agent prompt is still
 [AGENTS.md](AGENTS.md). The skills are plain [Agent Skills](https://agentskills.io)
 in `dotfiles/.agents/skills`, installed as `~/.agents/skills` where
@@ -68,8 +89,9 @@ while one by anyone else is filed as an issue for cgwalters and never
 acted on. GitHub doesn't reliably notify the bot, so it also checks
 cgwalters' public events and searches for mentions. Its poll state lives
 on the board itself, in an archived draft item (`bot-state:
-notifications`), so any machine can pick up where the last run stopped. Agents run it at the start of each session and planning
-pass for now; running it on a schedule comes later.
+notifications`), so any machine can pick up where the last run stopped.
+Agents run it at the start of each session and planning pass, and
+`bot-sweep.timer` runs it on a schedule as described below.
 
 Pings are only part of it: `bot-watch` sweeps the issues and PRs of the
 items on the board and reports what changed on each since it last
@@ -127,8 +149,9 @@ saved Claude session with the original options. Resume rejects running
 or successful jobs and jobs without a session id; it archives prior
 evidence under the job's `attempts/N/` and resets current results.
 
-The agents run on a trusted machine that holds the clones and the bot's
-credentials, and borrow compute for building and testing. `bot-devspace`
+Local agent sessions run on a trusted machine that holds the clones and
+the bot's credentials, and borrow compute for building and testing;
+dispatched agent runs use sandboxed devspaces instead. `bot-devspace`
 (installed by `make install` like the rest of `bin/`) dispatches an
 ephemeral RHEL 10 runner from
 [bootc-dev/cgwalters-devspace-sandbox](https://github.com/bootc-dev/cgwalters-devspace-sandbox),
@@ -144,7 +167,7 @@ own (see the `devspace-work` skill); `tests/bot-devspace.sh` tests which
 user `bot-devspace` picks and how jobs end. `bot-devspace stop` cancels the runner, since
 they're billed while they run.
 
-The next step moves the agents themselves onto devspaces: an `agent.yml`
+Dispatched runs put the agents themselves on devspaces: an `agent.yml`
 workflow runs an agent on one board item, with its condensed transcript
 in the Actions log and a summary artifact per run
 ([plan](https://gist.github.com/cgwalters-bot/3d0b10312e6d6170f8e07967b7795bed)).
