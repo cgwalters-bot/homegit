@@ -33,13 +33,31 @@ a `budget` action.
 What it can't decide it reports as an action, which the dispatcher
 handles by kind, or escalates.
 
+The board is the operator's primary interface. Periodic summaries are
+native project status updates, and chat replies are one line plus the
+update URL. Today `bot-sweep` ends with `bot-board status-update --auto`
+(two-minute timeout), after watch/notify/inbox and gc/actuals/fill-org;
+earlier failures do not gate the posting phase. It posts only after the
+four-hour throttle and material-change check pass. An unfinished P0 stale
+for at least `BOT_BOARD_STATUS_P0_HOURS` (24 hours by default) derives
+`at-risk`; otherwise the status is `on-track`. Explicit `--status`,
+`--since` and `--body` posts bypass those auto checks, and cannot be
+combined with `--auto`. See [Project status updates](../README.md#project-status-updates)
+for the flags, observation baseline and recovery behavior. The current
+per-project lock is local: use one publishing machine per project.
+The current publisher returns the project URL, not an update-specific
+permalink. The status-update schema was checked by introspection; exact
+review-app parity remains outstanding.
+
 State lives in three kinds of places. The shared, durable state is
 already GitHub's: the board (Status, Lead, Run, Why, News, budgets),
+project status updates (including their recovery markers),
 issues and their labels (`dispatch`, `escalate`), PRs, and the run
 artifacts of `agent.yml` (`summary.json`, `agent-out`). The per-loop state
 is local files: `bot-reconcile --state FILE` (which actions fired and
 when, the edge-triggering), `bot-poll-loop`'s seen-sets, the sweeps under
-`~/.local/state/bot-sweep`, and the heartbeat's local input. Those are
+`~/.local/state/bot-sweep`, the heartbeat's local input, and the per-project
+status-update snapshot under `~/.local/state/bot-board`. Those are
 the only state to move: `--state FILE` is already the whole interface for
 the actions (read it at the start, write it at the end), so a job can
 keep it as a file on a state branch of a repository, or an artifact of

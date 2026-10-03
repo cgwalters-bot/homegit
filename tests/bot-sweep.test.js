@@ -20,6 +20,12 @@ const LOCK_MSG = "error: another bot-notify run holds /x/bot-notify/lock";
 // exits $FAKE_<NAME>_EXIT; its calls are counted in WORK/NAME.calls.
 function fake(name, envName) {
   fs.writeFileSync(path.join(BIN, name), `#!/bin/bash
+if [ "${name}" = bot-board ] && [ "$1" = status-update ]; then
+  test "$2" = --auto || exit 99
+  test -e "${WORK}/ACTUALS.calls" && test -e "${WORK}/GC.calls" && test -e "${WORK}/BOARD.calls" || exit 98
+  printf '%s' "\${FAKE_STATUS_OUT-}"
+  exit "\${FAKE_STATUS_EXIT:-0}"
+fi
 echo x >>"${WORK}/${envName}.calls"
 n=$(wc -l <"${WORK}/${envName}.calls")
 printf '%s' "\${FAKE_${envName}_OUT-}"
@@ -72,14 +78,14 @@ test("a clean sweep publishes its outputs and a complete status", () => {
   assert.deepEqual(s.last_complete.run, s.run);
   assert.match(s.run, /^[0-9]{8}-[0-9]{6}-[0-9]{3}$/);
   assert.ok(s.duration_s >= 0 && s.ended_at >= s.started_at);
-  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "fill-org", "git", "inbox", "notify", "tmt-gc", "watch"]);
+  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "fill-org", "git", "inbox", "notify", "status-update", "tmt-gc", "watch"]);
   assert.deepEqual(s.org_filled, []);
   assert.doesNotMatch(r.stdout, /Org filled/);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-notify.txt"), "utf8"), "notify says\n");
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-inbox.txt"), "utf8"), "inbox says\n");
   // The run, in bot-poll's layout.
-  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0, "fill-org": 0 });
+  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0, "fill-org": 0, "status-update": 0 });
   assert.equal(fs.readFileSync(path.join(r.stateDir, "runs", s.run, "watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.ok(!fs.existsSync(path.join(r.stateDir, "running.json")));
   assert.deepEqual(fs.readdirSync(path.join(r.stateDir, "runs")), [s.run]);
@@ -148,7 +154,15 @@ case "$1 $2" in
   "api -i") exec "${path.join(__dirname, "fixtures", "bot-board", "fake-rest")}" "${store}/items.json" "$3" ;;
   "project view") echo PVT_fake ;;
   "api rate_limit") echo 5000 ;;
-  "api graphql") printf '%s\n' "$*" >>"${store}/mutations"; echo '{}' ;;
+  "api graphql")
+    if test "\${3:-}" = --input; then
+      cat >/dev/null
+      printf '{"data":{"node":{"items":{"nodes":[],"pageInfo":{"hasNextPage":false}},"statusUpdates":{"nodes":[{"id":"U_external","body":"Existing report","createdAt":"%s"}],"pageInfo":{"hasNextPage":false}}}}}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      # This fixture tests Org filling; throttle the final publisher via
+      # an existing external status update instead of emulating mutations.
+    else
+      printf '%s\n' "$*" >>"${store}/mutations"; echo '{}'
+    fi ;;
   *) echo "fake gh: unexpected call: $*" >&2; exit 1 ;;
 esac
 `, { mode: 0o755 });
@@ -165,10 +179,30 @@ test("a step whose lock is held only for a while is retried", () => {
   assert.deepEqual(r.st.problems, []);
 });
 
+test("the final status publisher's output and failure are recorded without losing sweep news", () => {
+  const r = sweep({ FAKE_STATUS_OUT: "error: publishing failed\n", FAKE_STATUS_EXIT: "1" });
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.equal(r.st.complete, true);
+  assert.equal(r.st.steps["status-update"].exit, 1);
+  assert.ok(r.st.problems.some((p) => /status-update exited 1: error: publishing failed/.test(p)));
+  assert.equal(fs.readFileSync(path.join(r.st.dir, "status-update.txt"), "utf8"), "error: publishing failed\n");
+});
+
 test("a step that fails otherwise is not retried", () => {
   const r = sweep({ FAKE_NOTIFY_EXIT: "1" });
   assert.equal(r.st.steps.notify.attempts, 1);
   assert.equal(r.st.complete, false);
+});
+
+test("successful final publisher URL reaches subprocess stdout, while skips and failures do not", () => {
+  const url = "https://github.com/orgs/example/projects/7";
+  for (const [output, exit, visible] of [[`${url}\n`, "0", true],
+    ["status-update: skipped (no material change)\n", "0", false], [`${url}\nerror: failed\n`, "1", false]]) {
+    const r = sweep({ FAKE_STATUS_OUT: output, FAKE_STATUS_EXIT: exit });
+    assert.equal(r.code, Number(exit), r.stdout + r.stderr);
+    assert.equal(r.stdout.includes(`Project status update: ${url}\n`), visible);
+    assert.equal(fs.readFileSync(path.join(r.st.dir, "status-update.txt"), "utf8"), output);
+  }
 });
 
 test("a step that times out is killed with everything it started", () => {

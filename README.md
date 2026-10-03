@@ -24,6 +24,10 @@ the operator config (`~/.config/bot-harness/operator.json`, printed by
 The forge board and issues are the control plane, rather than
 Paperclip.ing's built-in tracker: we need the forge for collaboration
 anyway, so coordination belongs alongside the work and its review.
+The board is the operator's primary interface. Periodic summaries belong
+in its project status updates; chat replies are one line of status plus
+the update URL. Keep item fields and asks current on the board so the
+summary points to the work and the decisions where they can be acted on.
 Agent identity remains an [open question](https://github.com/cgwalters-forge/tracker/issues/304):
 a GitHub App per role (coordinator, engineer), or labels on the board
 to enforce access control. Paperclip avoids the question with its own
@@ -52,7 +56,7 @@ opencode, Codex, Gemini CLI and Cursor look; Claude Code reads only
 `upstream-pr` (how to contribute as the bot, with `bot-pr`), `devspace-work` (building
 and testing on a remote runner), `coordinator` (running a top-level
 session that polls, dispatches worker and reviewer subagents, and writes
-the morning brief; the preambles it briefs them with live next to it),
+project status updates; the preambles it briefs them with live next to it),
 `topic-lead` (a session of its own for one topic, which owns the board items
 whose Lead field names it and coordinates with the coordinator only through
 the board and issues), plus the upstream ones like
@@ -239,6 +243,91 @@ says what the bot delivers: a tested branch proposed as a draft PR on a
 forge fork (`branch`, the default), a write-up in a secret gist (`analysis`), a
 draft PR straight upstream (`pr`, set only by a human), or nothing
 (`manual`). In the morning, Draft items link to what's ready for review.
+
+### Project status updates
+
+`bot-board status-update` creates a native GitHub project status update
+and prints the project's URL. It defaults to Workstream; put `--project BOARD`
+before `status-update` to target another board. The generated report has
+**Changed**, **In progress**, and **Waiting on the operator** sections:
+merges, closes, completions, promotions and changed News; active items
+with agents or runs and upstream review; Draft reviews and Needs human
+decisions/actions with Why and Branch/Gist links. Worker names and states
+come only from the local heartbeat's privacy-filtered publication, with
+activity (or start time) less than six hours old and an exact association
+to an unfinished item in this project (item URL/ID or a Run/Branch URL).
+Unmatched workers are omitted; Lead is the fallback for an In Progress
+item without a matching worker. Waiting asks follow the documented board
+statuses and labels, not exact review-app parity: that app is unavailable
+locally. An open Needs human ask with a first-line `Blocks: ITEM` link
+replaces its Needs human parent in the waiting section.
+
+Explicit posts can combine these flags:
+
+- `--status on-track|at-risk|off-track` overrides the derived project status.
+- `--since ISO` chooses the change window; use a full ISO timestamp with
+  seconds and a timezone, e.g. `2026-10-03T00:00:00Z`. By default the window
+  starts at the last project post (or the successful local post if newer),
+  or 24 hours ago when there is no post. Completion/promotion transitions
+  and News comparisons also use the saved observation baseline; `--since`
+  applies timestamp filtering instead of the usual baseline-only checks.
+- `--body FILE` replaces the generated text with a nonempty UTF-8 file,
+  for a curated periodic summary. Status is still derived unless overridden,
+  and the tool still appends its recovery marker and saves the observation.
+
+Flags, the P0 threshold, and custom body readability, UTF-8 encoding,
+nonempty content and the standalone size limit are checked locally before
+project resolution or any API call. The full body size, including the
+recovery marker, is checked after reading the board and before posting.
+
+Without `--status`, an unfinished P0 is stale after 24 hours without observed
+material movement: Status, Priority, Lead, Branch, Why/Gist or News content,
+title/body/state changes, or the latest comment's content. Token counters,
+Run changes, timestamps and News date-prefix churn do not reset this clock.
+On first observation (or recovery from an older marker), project/content
+timestamps provide the initial evidence; bookkeeping before that observation
+cannot be distinguished from real activity and can delay risk detection.
+Once a material baseline exists, generic `updatedAt` never overrides it.
+Changes between observations that revert before the next read are not seen;
+comment activity is limited to the latest comment, not all PR review activity.
+Any stale item makes the project `at-risk`; otherwise it is `on-track`.
+Done, closed and merged items are finished. `BOT_BOARD_STATUS_P0_HOURS`
+changes this threshold
+and must be a positive number. `off-track` requires an explicit override.
+
+`bot-sweep` runs `bot-board status-update --auto` as its final phase after
+the watch/notify/inbox and gc/actuals/fill-org phases, with a two-minute
+timeout. Earlier step failures do not gate that phase. `--auto` cannot be
+combined with `--status`, `--since` or `--body`: it skips if the latest
+project update or successful local post was less than four hours ago,
+including a human's project update, then skips if the material observation
+is unchanged. The digest covers item fields, state, ask class, worker
+names/item URLs/states and derived status; timestamps and the News date
+prefix alone do not count. Aging a P0 into `at-risk` therefore counts as a
+change. A skip prints `status-update: skipped (four-hour throttle)` or
+`status-update: skipped (no material change)` and succeeds. Explicit posts
+bypass both checks. A failed status-update step is a sweep problem but
+does not by itself make the watch/notify/inbox news incomplete; its output
+is in `runs/ID/status-update.txt`, not a `latest-*.txt` news feed. A successful
+publisher's project URL is also printed in the sweep's final stdout.
+
+Run one publisher on one machine per project. `bot-board` serializes local
+posts with a per-project `flock` and stores `status-update.json` under
+`${XDG_STATE_HOME:-~/.local/state}/bot-board/KIND/OWNER/NUMBER/`. Project
+updates carry an HTML recovery marker with the digest and minimal item
+baseline, including material fingerprints and movement times. A separate
+`status-update.json.observations.json` records movement on every observation,
+including auto skips, without losing the last posted transition baseline.
+The marker lets the next run recover after a post succeeded but saving
+the local snapshot failed. Reading those updates does not provide a
+cross-machine lock or an atomic check-and-post: concurrent publishers on
+different machines can still duplicate a post.
+
+The GraphQL payload uses `createProjectV2StatusUpdate` with `projectId`,
+`status` and `body`, returning `statusUpdate { id body createdAt creator
+{ login } project { url } }`. These fields and the enum were checked against
+the live schema by introspection.
+The project URL avoids assuming a status-update `url` field or deep-link format.
 
 `bot-tmt-number` hands out bootc's tmt test numbers (the `# number: N`
 header that becomes plan-N and test-N), which concurrent bot branches

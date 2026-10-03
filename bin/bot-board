@@ -198,6 +198,13 @@ Read and update the Workstream board, or another of the bot's boards
 (${BOARD_URL} here).
 
 Commands:
+  status-update [--status on-track|at-risk|off-track] [--since ISO] [--body FILE]
+                              Publish a status update; prints the project URL.
+                              Default: deterministic board summary since the
+                              last post; stale unfinished P0 means at-risk
+                              (BOT_BOARD_STATUS_P0_HOURS, default 24 hours).
+                              --auto skips unchanged summaries and posts less
+                              than four hours apart. One local publisher only.
   list [--status S] [--org O] [--field NAME=VALUE]... [--json]
                               List items by priority (P0 first): item id,
                               priority, status, workflow, org, title, url.
@@ -748,6 +755,19 @@ cmd_list() {
                 (.title | if length > $width then .[:$width - 3] + "..." else . end),
                 .content.url // "(draft)"])
         | @tsv' <<<"${sorted}" | column -t -s $'\t'
+}
+
+cmd_status_update() {
+    require_cmd node "install Node.js"
+    require_cmd flock "install util-linux"
+    local id publisher
+    publisher="$(dirname "$(readlink -f "$0")")/../lib/board-status-update.js"
+    node "${publisher}" --validate "$@" || return $?
+    id=$(project_id) || fail_after $? "reading the project id failed"
+    mkdir -p "${STATE_MIRROR_DIR}/${PROJECT}"
+    flock "${STATE_MIRROR_DIR}/${PROJECT}/status-update.lock" node \
+        "${publisher}" \
+        "${id}" "${STATE_MIRROR_DIR}/${PROJECT}/status-update.json" "$@"
 }
 
 cmd_show() {
@@ -1911,6 +1931,7 @@ case "${command}" in
     list|show|add|archive|draft|set|issue|resolve) ;;
     question) workstream_only "${command}" ;;
     fill-org) command=fill_org ;;
+    status-update) command=status_update ;;
     field-ensure) command=field_ensure ;;
     labels) workstream_only "${command}" ;;
     state-get) workstream_only "${command}"; command=state_get ;;
