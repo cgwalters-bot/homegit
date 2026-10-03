@@ -166,6 +166,17 @@ config's. `dotfiles/.claude/agents/builder.md` defines the builder
 subagent. Headless runs (`bot-work --agent claude`) need a token from
 `claude setup-token` as `CLAUDE_CODE_OAUTH_TOKEN`.
 
+Agent shell commands use Bash without changing the operator's interactive
+shell (which may be nushell). The installed `~/.claude/settings.json` sets
+`env.CLAUDE_CODE_SHELL` to `/bin/bash`, Claude Code's dedicated shell
+override (see [environment variables](https://code.claude.com/docs/en/env-vars)). For a
+manual installation, merge `"CLAUDE_CODE_SHELL": "/bin/bash"` into the
+existing `env` object in that file, creating the object or file if absent;
+preserve all other settings and environment entries. Restart Claude Code
+after updating it. `bot-opencode` already sets `SHELL=/bin/bash` only for
+its agent subprocess. Write Bash commands directly rather than routinely
+wrapping them in `bash -c`.
+
 ## Upstream policy
 
 `bot-pr promote` only opens an upstream PR for a repository with a
