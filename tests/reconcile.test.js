@@ -97,17 +97,17 @@ test("capacity: lanes against the target, paced by the week's capacity", () => {
     }
   }
   const [free] = rec.capacity(obs({ items: oneFree }));
-  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1 via bot-runs dispatch \(a devspace run, the default for implementation and test work; bot-pace assign only for a local worker that does GitHub I\/O, or where a remote run is impossible\); 2 P0 wait on a human$/);
+  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1, as a devspace run \(bot-runs dispatch\) while the remote runs are under their opencode share \(1 of 1\), else as a local worker \(bot-pace assign\), which is also for work that does GitHub I\/O or can't run remotely; 2 P0 wait on a human$/);
   assert.equal(free.detail[0], "P0 https://github.com/cgwalters-forge/tracker/issues/30 image-builder analysis (osbuild/image-builder, budget 5M by P0)");
   const a = rec.capacity(obs({ items: oneFree.filter((it) => !/^PVTI_c/.test(it.id)) }))[0];
   assert.match(a.do, /no Todo candidates: triage the backlog or file upstream work; 2 P0 wait on a human$/);
   // A lane's shortfall with the total at the target is only noted.
   // [case, changes, the Observed line's agents part]
   const noted = [
-    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote, 3 local (drifting local: dispatch via bot-runs))"],
-    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 1 remote, 2 local (drifting local: dispatch via bot-runs))"],
+    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote (opencode share target 1), 3 local)"],
+    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 1 remote (opencode share target 1), 2 local)"],
     ["mostly remote", { items: setItem(setItem(read("board.json"), "PVTI_h1", { lead: undefined, run: "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/6" }), "PVTI_o1", { status: "Draft" }) },
-      "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 2 remote, 1 local)"],
+      "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 2 remote (opencode share target 1, over it), 1 local)"],
   ];
   for (const [name, changes, want] of noted) {
     assert.ok(rec.render(rec.observed(obs(changes)), []).startsWith(`Observed: ${want}; budgets `), name);
@@ -334,7 +334,7 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
     ["approval", "closed-not-done", "drive", "health", "heartbeat", "lead-orphan"]);
   // The rules that didn't run keep theirs too.
   assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: null, sweep: {}, questions: [], contentStates: {} }, ["capacity", "drive"])].sort(),
-    ["answer-unapplied", "closed-not-done", "heartbeat", "lead-orphan", "patch-ready", "stale-lead"]);
+    ["answer-unapplied", "closed-not-done", "dispatch", "dispatch-failed", "escalate", "heartbeat", "lead-orphan", "patch-ready", "stale-lead"]);
 });
 
 test("patch-ready: operator-released by default, with explicit false/true overrides", () => {
@@ -403,7 +403,7 @@ function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) 
 
 test("bot-reconcile: the report, and --json", () => {
   const out = cli([]);
-  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote, 3 local \(drifting local: dispatch via bot-runs\)\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(14\):\n/);
+  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote \(opencode share target 1\), 3 local\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(14\):\n/);
   assert.doesNotMatch(out, /^. capacity /m);
   const j = JSON.parse(cli(["--json"]));
   assert.deepEqual(j.actions.map((a) => a.key), ALL_KEYS);

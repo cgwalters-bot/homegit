@@ -21,6 +21,7 @@ const rec = require(path.join(ROOT, "lib", "reconcile.js"));
 const cap = require(path.join(ROOT, "lib", "capacity.js"));
 const pace = require(path.join(ROOT, "lib", "pacing.js"));
 const operator = require(path.join(ROOT, "lib", "operator.js"));
+const disp = require(path.join(ROOT, "lib", "dispatch.js"));
 
 const tool = (name) => process.env[`BOT_RECONCILE_${name.replace(/^bot-/, "").toUpperCase()}`] || path.join(BIN_DIR, name);
 const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
@@ -35,6 +36,8 @@ const STATE_VERSION = 1;
 // prs follows from the sweep, and children from the board.
 const RULE_INPUTS = {
   capacity: ["items", "capacity", "activity", "children"],
+  dispatch: ["items", "capacity", "activity", "children"],
+  escalate: ["items"],
   heartbeat: ["items", "heartbeat", "children"],
   "lead-orphan": ["items", "heartbeat", "children"],
   drive: ["sweep", "prs", "items", "epicItems"],
@@ -44,20 +47,24 @@ const RULE_INPUTS = {
   "stale-lead": ["items"],
 };
 const MAX_BUFFER = 256 << 20;
+const GH = process.env.BOT_RECONCILE_GH || "gh";
 const EX_ERROR = 1;
 const EX_USAGE = 2;
+// bot-runs' exit status for an exhausted GitHub quota (EX_TEMPFAIL).
+const EX_RATELIMIT = 75;
 
 function usage() {
   const rules = Object.keys(rec.RULES).join(", ");
   return `Usage: ${PROG} [--json] [--apply] [--state FILE [--resync MIN]] [--rule NAME]...
        [--board-file F] [--epic-board-file F] [--sweep-dir D] [--prs-file F]
        [--heartbeat-file F] [--children-file F] [--capacity-file F]
-       [--questions-file F] [--activity-file F] [--watch-state F] [--now TIME]
+       [--questions-file F] [--activity-file F] [--issues-file F] [--watch-state F]
+       [--now TIME]
 
 Reconciles like a Kubernetes controller: reads the observed state, compares
 it with the desired one, and prints the actions that would close the gap,
 each with a stable key, a kind, the item's URL and what to do. It changes
-nothing itself, except with --apply (see closed-not-done and stale-lead). Run it on each
+nothing itself, except with --apply (see closed-not-done, stale-lead and dispatch). Run it on each
 wake, do the actions, then run it again to confirm they converged
 ("Actions: none").
 
@@ -84,6 +91,24 @@ Rules (${rules}):
                     week's capacity: half, P0 only, at bot-capacity's P0-only
                     mark; none once it is used up. A busy task whose Actual
                     tokens passed its Budget tokens is a 'budget' action.
+  dispatch          auto-dispatch: a lane with a free slot, while the remote
+                    runs are under their share of the agents (pacing.opencode_share,
+                    1 in 4 by default: agent.yml runs only opencode),
+                    gets its top Todo issue labeled '${disp.DISPATCH_LABEL}' (the opt-in, on
+                    issues in the bot's own repositories) as one
+                    'bot-runs dispatch'. The target is its repository, else a
+                    'Repo: OWNER/REPO' line in the issue body (and an optional
+                    'Base: REF'). --apply builds the brief from the issue: its
+                    title, body, the operator's comments and its acceptance
+                    criteria (text of the operator's or the bot's issues only),
+                    removes the label (one dispatch per label: a run that fails
+                    returns the item to Todo, unlabeled), then dispatches. A failure
+                    leaves 'auto-dispatch failed: ...' in the item's Why, which
+                    keeps the rule off it. A labeled item that can't be dispatched
+                    is a dispatch-failed action.
+  escalate          an open issue labeled '${disp.ESCALATE_LABEL}', which the dispatcher filed
+                    for the coordinator's judgment (see the dispatcher skill):
+                    read it, decide or ask the operator, answer on it, close it.
   heartbeat         the heartbeat is fresh (${rec.HEARTBEAT_MAX_AGE_MS / 60e3} min, or until its next
                     wake) and lists a worker for each busy item
                     (bot-poll-loop drops the workers of Done items
@@ -149,7 +174,7 @@ class Exit extends Error {
 function parseArgs(argv) {
   const opts = { json: false, apply: false, rules: [], resync: rec.RESYNC_MS };
   const values = ["state", "resync", "rule", "board-file", "epic-board-file", "sweep-dir", "prs-file", "heartbeat-file", "children-file", "capacity-file",
-    "questions-file", "activity-file", "watch-state", "now"];
+    "questions-file", "activity-file", "issues-file", "watch-state", "now"];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") throw new Exit(0, null);
@@ -327,9 +352,81 @@ function writeState(file, actions, now) {
   fs.renameSync(tmp, file);
 }
 
-// apply(actions, errors): carries out the actions that have an `apply`,
-// recording the result in each.
-async function apply(actions, errors) {
+// readIssue(url, opts): {author, body, state, comments: [{author, at, body}]}
+// of the issue a dispatch action is for, from --issues-file ({URL: issue},
+// tests) or GitHub's REST API.
+async function readIssue(url, opts) {
+  if (opts["issues-file"]) {
+    const it = readJsonFile(opts["issues-file"])[url];
+    if (!it) throw new Error(`${url} is not in ${opts["issues-file"]}`);
+    return it;
+  }
+  const m = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)$/.exec(url);
+  if (!m) throw new Error(`${url} is not an issue URL`);
+  const { restGet, pages } = require(path.join(BIN_DIR, "bot-priority-health"));
+  const issue = await restGet(`repos/${m[1]}/issues/${m[2]}`);
+  if (!issue) throw new Error(`${url} does not exist`);
+  const comments = await pages(`repos/${m[1]}/issues/${m[2]}/comments`);
+  return { author: issue.user && issue.user.login, body: issue.body || "", state: issue.state,
+    comments: comments.map((c) => ({ author: c.user && c.user.login, at: c.created_at, body: c.body })) };
+}
+
+// setDispatchLabel(url, on): adds or removes the dispatch label of an issue.
+async function setDispatchLabel(url, on) {
+  const repoIssue = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)$/.exec(url);
+  const base = `repos/${repoIssue[1]}/issues/${repoIssue[2]}/labels`;
+  const args = on ? ["api", "-X", "POST", base, "-f", `labels[]=${disp.DISPATCH_LABEL}`] : ["api", "-X", "DELETE", `${base}/${disp.DISPATCH_LABEL}`];
+  await execFileP(GH, args, { maxBuffer: MAX_BUFFER });
+}
+
+// The text bot-runs dispatch prints once the run exists: any failure after
+// it leaves the run running, so the dispatch must not be tried again.
+const STARTED_RE = /^Dispatched run \d+:/m;
+const NOT_FOUND_RE = /HTTP 404|Not Found/;
+
+// dispatchOne(a, opts, config): carries out a dispatch action: checks the
+// issue is still open and the operator's or the bot's, takes the target from
+// its live text, consumes its label (so that a run that fails and returns
+// the item to Todo isn't dispatched again unlabeled; a label already gone
+// means another run of this took it), and runs bot-runs dispatch with the
+// brief built from the issue. Throws Error with the reason; err.deferred
+// when only a rate limit stopped it before any run started (the label is
+// back), err.skipped when someone else took the label.
+async function dispatchOne(a, opts, config) {
+  const d = a.dispatch;
+  const issue = await readIssue(d.url, opts);
+  if (issue.state && issue.state !== "open") throw new Error("the issue is closed");
+  if (!disp.trusted(issue, config)) throw new Error(`the issue was written by ${issue.author}, neither the operator nor the bot, so its text can't brief a run unread`);
+  const live = disp.target({ content: { body: issue.body } }, d.from_body ? null : d.repo);
+  if (!live.repo) throw new Error("the issue no longer names a target repository: its Repo: line is gone");
+  const brief = disp.buildBrief({ item: { title: d.title, content: { url: d.url } }, repo: live.repo, base: live.base, issue, comments: issue.comments, config });
+  try {
+    await setDispatchLabel(d.url, false);
+  } catch (e) {
+    if (!NOT_FOUND_RE.test(`${e.stderr}${e.message}`)) throw new Error(`removing the ${disp.DISPATCH_LABEL} label: ${firstLine(e)}`);
+    const err = new Error(`the ${disp.DISPATCH_LABEL} label was already gone: someone else took it`);
+    err.skipped = true;
+    throw err;
+  }
+  const p = execFileP(tool("bot-runs"), ["dispatch", "--item", d.id, "--repo", live.repo, "--base", live.base, "-"], { maxBuffer: MAX_BUFFER });
+  p.child.stdin.end(brief);
+  try {
+    await p;
+  } catch (e) {
+    if (STARTED_RE.test(e.stdout || "")) throw new Error(`the run started, but bot-runs failed after: ${firstLine(e)}`);
+    if (e.code !== EX_RATELIMIT) throw new Error(firstLine(e));
+    await setDispatchLabel(d.url, true);
+    const err = new Error(`GitHub's rate limit: ${firstLine(e)}`);
+    err.deferred = true;
+    throw err;
+  }
+}
+
+// apply(actions, errors, opts, config): carries out the actions that have an
+// `apply` (a board change) or a `dispatch`, recording the result in each. A
+// failed dispatch leaves its reason in the item's Why, so that the rule
+// leaves the item alone until someone looks.
+async function apply(actions, errors, opts, config) {
   for (const a of actions.filter((x) => x.apply)) {
     try {
       await execFileP(tool("bot-board"), ["set", a.apply.id, ...a.apply.set], { maxBuffer: MAX_BUFFER });
@@ -337,6 +434,21 @@ async function apply(actions, errors) {
     } catch (e) {
       a.applied = `failed: ${firstLine(e)}`;
       errors.push(`applying ${a.key}: ${firstLine(e)}`);
+    }
+  }
+  for (const a of actions.filter((x) => x.dispatch)) {
+    try {
+      await dispatchOne(a, opts, config);
+      a.applied = "dispatched";
+    } catch (e) {
+      a.applied = e.deferred ? `deferred: ${e.message}` : e.skipped ? `skipped: ${e.message}` : `failed: ${e.message}`;
+      if (e.deferred || e.skipped) continue;
+      errors.push(`applying ${a.key}: ${e.message}`);
+      try {
+        await execFileP(tool("bot-board"), ["set", a.dispatch.id, "--why", disp.failure(e.message)], { maxBuffer: MAX_BUFFER });
+      } catch (e2) {
+        errors.push(`recording that ${a.key} failed: ${firstLine(e2)}`);
+      }
     }
   }
 }
@@ -347,7 +459,7 @@ async function main(argv) {
   const previous = opts.state ? readState(opts.state) : {};
   obs.previous = Object.keys(previous);
   let actions = rec.reconcile(obs, opts.rules).map((a) => ({ ...a, fired: null }));
-  if (opts.apply) await apply(actions, errors);
+  if (opts.apply) await apply(actions, errors, opts, obs.config);
   if (opts.state) {
     const r = rec.edge(previous, actions, opts.now, opts.resync, rec.unreadKinds(obs, opts.rules));
     actions = r.actions;

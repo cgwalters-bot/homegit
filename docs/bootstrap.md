@@ -51,6 +51,7 @@ forge org, and the rest is derived:
 | `pacing.agents` | 4 | how many work agents the coordinator keeps busy (`bot-pace slots`) |
 | `pacing.harness_agents` | half of `pacing.agents`, rounded down | how many of them work on the harness (the bot's and the forge org's repositories); the rest on upstream work |
 | `pacing.budgets` | `{"P0": "M", "P1": "S", "P2": "S"}` | the Est. cost bucket (XS to XL) an item without one is budgeted at, by priority; merged over the defaults |
+| `pacing.opencode_share` | `0.25` | the share of the agents that are devspace runs (`agent.yml` runs only opencode today, so the opencode share of the mix, 1 in 4), as a number from 0 to 1; the target is rounded up, so one remote run is allowed while any agent is. `bot-reconcile`'s dispatch rule auto-dispatches only while the remote runs are under it |
 
 Node tools load it with `lib/operator.js`, shell tools by sourcing
 `bin/operator.sh` (which runs `bot-operator --shell`), and `bot-poll`
@@ -107,6 +108,11 @@ single-select: those, with their options, are always made by hand.
 The options of `Est. cost` are the strings in `lib/capacity.js`; a
 different spelling is not found and the item counts as unestimated.
 `Needs human` is a Status option, not a field.
+
+Two labels drive the dispatcher (create them in the tracker and in each
+of the bot's repositories whose issues are on the board): `dispatch`, which
+opts an issue in to `bot-reconcile`'s auto-dispatch of a devspace run, and
+`escalate`, which marks an issue the dispatcher filed for the coordinator.
 
 The views in the `workstream` skill are optional; the Projects API can't
 create them, so they are made by hand.
