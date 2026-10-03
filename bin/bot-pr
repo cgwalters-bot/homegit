@@ -137,6 +137,7 @@ reviews it, and only his approval opens the upstream PR.
 Commands:
   fork-pr --repo OWNER/REPO --base BRANCH --branch ${BRANCH_PREFIX}SLUG --item PVTI_...
           --title TITLE --body-file FILE [--footer FILE] [--from DIR] [--force] [--ci WORKFLOW]...
+          [--upstream-base BRANCH]
         Fork OWNER/REPO into ${FORGE_ORG} if needed, set up its Actions
         (see fork-setup; --ci is passed on), fast-forward the fork's
         BRANCH with upstream, push
@@ -150,7 +151,13 @@ Commands:
         one, into its branch (so its diff is only its own commits), its
         bot-meta section records it ('Stacked on:') with that one's
         upstream base, and promote waits until that one is merged
-        upstream. Any other BRANCH only the fork has is refused. TITLE and FILE are the future upstream PR: why, what was
+        upstream. Any other BRANCH only the fork has is refused, unless
+        --upstream-base UPBRANCH says BRANCH is the fork's own mirror of
+        upstream's UPBRANCH (e.g. 'upstream-main' when the fork's main
+        carries fork-only commits): fork-pr then neither syncs nor
+        stacks, opens the PR into the fork's BRANCH, and records UPBRANCH
+        as the upstream base. Keep the mirror current with a plain
+        fast-forward push. TITLE and FILE are the future upstream PR: why, what was
         tested, caveats, ending with '${LLMS_TRAILER}'.
         A trailing ${META_START} section records the upstream target
         and board item, with instructions for the reviewer, and ends with
@@ -1324,11 +1331,11 @@ record_fork_pr() {
 }
 
 cmd_fork_pr() {
-    local upstream="" base="" branch="" item="" title="" body_file="" footer_file="" from=. force=false ci=()
+    local upstream="" base="" branch="" item="" title="" body_file="" footer_file="" from=. force=false ci=() mirror_of=""
     while test $# -gt 0; do
         case "$1" in
             --force) force=true; shift ;;
-            --repo|--base|--branch|--item|--title|--body-file|--footer|--from|--ci)
+            --repo|--base|--branch|--item|--title|--body-file|--footer|--from|--ci|--upstream-base)
                 test $# -ge 2 || fatal "$1 requires an argument"
                 case "$1" in
                     --repo) upstream=$2 ;;
@@ -1340,6 +1347,7 @@ cmd_fork_pr() {
                     --footer) footer_file=$2 ;;
                     --from) from=$2 ;;
                     --ci) ci+=("$2") ;;
+                    --upstream-base) mirror_of=$2 ;;
                 esac
                 shift 2
                 ;;
@@ -1375,17 +1383,26 @@ cmd_fork_pr() {
     # A valid stack parent always wins over an upstream same-name branch:
     # syncing that branch could discard the parent's reviewed commits.
     local STACK_PARENT="" STACK_UPSTREAM_BASE="" upstream_base=${base} compare_repo=${upstream}
-    find_stack_parent "${upstream}" "${fork}" "${base}"
-    if test -n "${STACK_PARENT}"; then
-        upstream_base=${STACK_UPSTREAM_BASE}
+    if test -n "${mirror_of}"; then
+        test -n "$(ref_sha "${upstream}" "${mirror_of}")" || fatal "${upstream} has no branch '${mirror_of}'"
+        test -n "$(ref_sha "${fork}" "${base}")" ||
+            fatal "${fork} has no branch '${base}', which --upstream-base says mirrors ${upstream}:${mirror_of}; push it first"
+        upstream_base=${mirror_of}
         compare_repo=${fork}
-        info "Stacking on ${STACK_PARENT} (${base}); upstream base ${upstream_base}"
-    elif test -z "$(ref_sha "${upstream}" "${base}")"; then
-        fatal "${upstream} has no branch '${base}', and no open fork PR in ${fork} is from it; to stack on another fork PR, pass its branch as --base: it must be the head of an open fork PR in ${fork} that fork-pr opened"
+        info "Basing on ${fork}:${base}, the fork's mirror of ${upstream}:${mirror_of}"
+    else
+        find_stack_parent "${upstream}" "${fork}" "${base}"
+        if test -n "${STACK_PARENT}"; then
+            upstream_base=${STACK_UPSTREAM_BASE}
+            compare_repo=${fork}
+            info "Stacking on ${STACK_PARENT} (${base}); upstream base ${upstream_base}"
+        elif test -z "$(ref_sha "${upstream}" "${base}")"; then
+            fatal "${upstream} has no branch '${base}', and no open fork PR in ${fork} is from it; to stack on another fork PR, pass its branch as --base: it must be the head of an open fork PR in ${fork} that fork-pr opened (or pass --upstream-base for the fork's mirror of an upstream branch)"
+        fi
     fi
     # Before sync_base, whose push to the fork would start its CI.
     fork_setup "${fork}" false "${ci[@]}"
-    test -n "${STACK_PARENT}" || sync_base "${upstream}" "${fork}" "${base}"
+    test -n "${STACK_PARENT}${mirror_of}" || sync_base "${upstream}" "${fork}" "${base}"
     push_branch "${from}" "${fork}" "${branch}"
 
     local head_sha compare ahead behind
@@ -1398,7 +1415,7 @@ cmd_fork_pr() {
         fatal "cannot compare ${branch} with ${compare_repo}:${base}"
     read -r ahead behind <<<"${compare}"
     test "${ahead}" -gt 0 || fatal "${branch} has no commits on top of ${compare_repo}:${base}"
-    if test "${behind}" -gt 0 && test -n "${STACK_PARENT}"; then
+    if test "${behind}" -gt 0 && test -n "${STACK_PARENT}${mirror_of}"; then
         info "note: ${branch} is ${behind} commit(s) behind ${base}; rebase it with '$(basename "$0") rebase' once the PR is open"
     elif test "${behind}" -gt 0; then
         info "note: ${branch} is ${behind} commit(s) behind ${upstream}:${base}; promote rebases it"
