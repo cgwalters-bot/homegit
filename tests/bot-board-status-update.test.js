@@ -11,6 +11,7 @@ const status = require("../lib/board-status-update.js");
 const NOW = Date.parse("2026-10-03T12:00:00Z");
 const SINCE = NOW - 8 * 3600000;
 const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "board-status-test-"));
+const BOARD_URL = "https://github.com/orgs/example/projects/2";
 let serial = 0;
 
 function item(id, extra = {}) {
@@ -54,7 +55,7 @@ function fixture(items = [], updates = []) {
     onPost: (fn) => { afterPost = fn; },
     publish: (opts = {}, more = {}) => {
       clock = more.now ?? NOW;
-      return status.publish({ id: "PVT_test", stateFile, request, now: clock, opts, ...more });
+      return status.publish({ id: "PVT_test", stateFile, request, now: clock, opts, boardURL: BOARD_URL, ...more });
     } };
 }
 
@@ -107,7 +108,7 @@ test("clean neutralizes mentions, HTML and leading markdown in item text", () =>
 
 test("first observation uses available timestamp evidence for P0 risk", () => {
   assert.equal(status.generate([], { now: NOW, since: SINCE }).body,
-    "## Changed\n- None.\n\n## In progress\n- None.\n\n## Waiting on the operator\n- None.");
+    "## Changed\n- None.\n\n## In progress\n- None.\n\n## Waiting on the operator\n- None.\n\nFull board: see project.");
   const old = new Date(NOW - 24 * 3600000).toISOString();
   const stale = item("stale", { priority: "P0", updatedAt: old, contentUpdatedAt: old });
   assert.equal(status.generate([stale], { now: NOW, since: SINCE }).status, "at-risk");
@@ -137,6 +138,169 @@ test("explicit since overrides the saved News baseline and respects field timest
   assert.equal(status.normalize(node(i)).newsUpdatedAt, i.newsUpdatedAt);
 });
 
+test("explicit cutoff conservatively filters day-only News, preserving default fallback", () => {
+  const midnight = Date.parse("2026-10-03T00:00:00Z");
+  const i = item("news", { news: "2026-10-03: Day-only event" });
+  const report = (since, extra = {}, changes = {}) => status.generate([{ ...i, ...changes }],
+    { now: NOW, since, explicitSince: true, ...extra }).body;
+  assert.match(report(midnight), /Day-only event/);
+  for (const newsUpdatedAt of [undefined, "invalid", "2026-10-03T03:00:00Z"]) {
+    assert.doesNotMatch(report(SINCE, {}, { newsUpdatedAt }), /Day-only event/);
+    assert.doesNotMatch(report(SINCE, { previous: [item("news", { news: "Older text" })] }, { newsUpdatedAt }), /Day-only event/);
+  }
+  assert.match(report(SINCE, {}, { newsUpdatedAt: "2026-10-03T05:00:00Z" }), /Day-only event/);
+  assert.doesNotMatch(report(SINCE, {}, { newsUpdatedAt: "2026-10-03T04:00:00Z" }), /Day-only event/);
+  assert.match(report(SINCE, { explicitSince: false }), /Day-only event/);
+  assert.match(report(SINCE, { explicitSince: false, previous: [item("news", { news: "Older text" })] }), /Day-only event/);
+  assert.doesNotMatch(report(midnight, {}, { news: "2026-10-02: Day-only event" }), /Day-only event/);
+  assert.match(report(SINCE, {}, { news: "Undated event" }), /Undated event/);
+});
+
+// Generated rather than a checked-in large JSON fixture; all fields remain
+// available to digest/observation logic even when their rendering is omitted.
+function largeBoard() {
+  const old = new Date(NOW - 48 * 3600000).toISOString();
+  return Array.from({ length: 300 }, (_, n) => item(String(n).padStart(3, "0"), {
+    title: `Item ${String(n).padStart(3, "0")} ${"long @name <title> ** 😀 ".repeat(30)}`,
+    status: n < 100 ? "In Progress" : n < 200 ? "Draft" : "Needs human", priority: "P0",
+    updatedAt: old, contentUpdatedAt: old, newsUpdatedAt: new Date(NOW).toISOString(),
+    news: `2026-10-03: ${"News detail\n".repeat(100)}`,
+    why: "Why @operator <ask>\n".repeat(100), branch: "https://example/" + "branch".repeat(100),
+    gist: "https://example/" + "gist".repeat(100), lead: "worker\n".repeat(100), run: "run\n".repeat(100),
+  }));
+}
+
+test("300-item generated report bounds sections, long fields and stale footer with accurate counts", () => {
+  const items = largeBoard();
+  const opts = { now: NOW, since: SINCE, boardURL: BOARD_URL };
+  const result = status.generate(items, opts);
+  assert.deepEqual(status.generate([...items].reverse(), opts), result);
+  const sections = result.body.split(/## (?:Changed|In progress|Waiting on the operator)\n/).slice(1);
+  for (const [n, section] of sections.entries()) {
+    const lines = section.split("\n").filter((line) => line.startsWith("- "));
+    assert.equal(lines.length, 10);
+    assert.ok(lines.every((line) => line.length <= 96));
+    assert.match(section, new RegExp(`\\+${[290, 90, 190][n]} more`));
+  }
+  assert.match(result.body, /At risk:.*Item 000.*Item 001.*Item 002.*\+297 more/);
+  assert.match(result.body, /\[Full board\]\(https:\/\/github.com\/orgs\/example\/projects\/2\)/);
+  assert.ok(result.body.length <= 3500, result.body.length);
+  const omitted = items.map((i) => ({ ...i }));
+  omitted[299].why += "Material change outside the displayed slice";
+  const changed = status.generate(omitted, opts);
+  assert.equal(changed.body, result.body);
+  assert.notEqual(changed.digest, result.digest);
+  assert.equal(result.observations.length, 300);
+});
+
+test("long and unsafe URLs never create truncated or injected Markdown destinations", () => {
+  for (const url of ["https://example/" + "x".repeat(500), "https://example/a)\n- injected", "javascript:alert(1)", "https://example/(a)"]) {
+    const result = status.generate([item("url", { url, status: "Draft", why: "x".repeat(500) })],
+      { now: NOW, since: SINCE, boardURL: "https://example/" + "(".repeat(180) });
+    assert.doesNotMatch(result.body, /injected|javascript:|\[Full board\]/);
+    assert.ok(result.body.split("\n").filter((line) => line.startsWith("- ")).every((line) => line.length <= 96));
+    if (url === "https://example/(a)") assert.match(result.body, /\[url\]\(https:\/\/example\/%28a%29\)/);
+    else assert.doesNotMatch(result.body, /\[url\]/);
+  }
+  for (const title of ["\\".repeat(100), "x".repeat(26) + "😀".repeat(100)]) {
+    const result = status.generate([item("title", { title, url: "https://e.test/1", status: "Draft" })], { now: NOW, since: SINCE });
+    assert.doesNotMatch(result.body, /\\…|[\uD800-\uDBFF]…/);
+    assert.match(result.body, /\[.*…\]\(https:\/\/e.test\/1\)/);
+  }
+});
+
+test("typical tracker links stay linked; only over-long destinations fall back to plain titles", () => {
+  const tracker = "https://github.com/cgwalters-forge/tracker/issues/339";
+  const cases = [
+    [tracker, "Fix flaky test", /\[Fix flaky test\]\(https:\/\/github.com\/cgwalters-forge\/tracker\/issues\/339\)/],
+    [tracker, "x".repeat(40), /\[x{27}…\]\(https:\/\/github.com\/cgwalters-forge\/tracker\/issues\/339\)/],
+    ["https://github.com/example/repo/pull/" + "9".repeat(40), "Long url", /- Long url/],
+  ];
+  for (const [url, title, want] of cases) {
+    const result = status.generate([item("t", { url, title, status: "Draft", why: "x".repeat(200) })], { now: NOW, since: SINCE });
+    assert.match(result.body, want);
+    assert.ok(result.body.split("\n").filter((line) => line.startsWith("- ")).every((line) => line.length <= 96));
+  }
+  assert.doesNotMatch(status.generate([item("t", { url: cases[2][0], title: "Long url", status: "Draft" })], { now: NOW, since: SINCE }).body, /\]\(/);
+});
+
+test("300-item posts use compact recovery but keep local fidelity, throttle and omitted-item dedup", () => {
+  const items = largeBoard();
+  // A P1 change tests dedup independently of the documented loss of P0
+  // movement evidence after digest-only recovery.
+  items[299].priority = "P1";
+  const f = fixture(items);
+  f.publish({ auto: true });
+  assert.ok(f.updates[0].body.length <= 3800, f.updates[0].body.length);
+  assert.ok(f.updates[0].body.length < 4000);
+  const local = JSON.parse(fs.readFileSync(f.stateFile, "utf8"));
+  assert.equal(local.items.length, 300);
+  assert.equal(local.observations.length, 300);
+  assert.equal(local.items.find((i) => i.id === items[299].id).news, items[299].news);
+  const remote = status.recover(f.updates[0]);
+  assert.equal(remote.recovery, "digest-only");
+  assert.equal(remote.digest, local.digest);
+  assert.equal(remote.items, undefined);
+  assert.equal(remote.observations, undefined);
+  assert.equal(f.publish({ auto: true }, { now: NOW + 3600000 }).skipped, "four-hour throttle");
+  assert.equal(f.publish({ auto: true }, { now: NOW + 4 * 3600000 }).skipped, "no material change");
+  items[299].why += "Omitted material change";
+  assert.ok(f.publish({ auto: true }, { now: NOW + 4 * 3600000 }).url);
+  fs.rmSync(f.stateFile);
+  fs.rmSync(`${f.stateFile}.observations.json`);
+  assert.equal(f.publish({ auto: true }, { now: NOW + 5 * 3600000 }).skipped, "four-hour throttle");
+  assert.equal(f.publish({ auto: true }, { now: NOW + 8 * 3600000 }).skipped, "no material change");
+  items[100].status = "In Review";
+  assert.ok(f.publish({ auto: true }, { now: NOW + 8 * 3600000 }).url);
+  assert.doesNotMatch(f.updates[0].body, /promoted upstream|closed \/ completed/);
+  assert.equal(JSON.parse(fs.readFileSync(f.stateFile, "utf8")).items.length, 300);
+  // With local fidelity restored, transitions resume even though remote
+  // markers continue to be compact.
+  items[100].status = "Draft";
+  f.publish({}, { now: NOW + 9 * 3600000 });
+  items[100].status = "In Review";
+  for (const i of items) { i.news = ""; i.newsUpdatedAt = undefined; }
+  f.publish({}, { now: NOW + 10 * 3600000 });
+  assert.match(f.updates[0].body, /promoted upstream/);
+});
+
+test("compact crash recovery deduplicates and never fabricates a transition baseline", () => {
+  const items = largeBoard();
+  const f = fixture(items);
+  f.onPost(() => fs.mkdirSync(f.stateFile, { recursive: true }));
+  assert.throws(() => f.publish(), /saving the snapshot failed/);
+  assert.equal(status.recover(f.updates[0]).recovery, "digest-only");
+  fs.rmSync(f.stateFile, { recursive: true });
+  fs.rmSync(`${f.stateFile}.observations.json`);
+  assert.equal(f.publish({ auto: true }, { now: NOW + 4 * 3600000 }).skipped, "no material change");
+  f.onPost(() => {});
+  items[0].status = "Done";
+  items[0].news = "";
+  assert.ok(f.publish({ auto: true }, { now: NOW + 4 * 3600000 }).url);
+  assert.doesNotMatch(f.updates[0].body, /closed \/ completed/);
+});
+
+test("small reports retain complete remote recovery; custom reports retain the GitHub limit", () => {
+  const f = fixture([item("one", { status: "Draft" })]);
+  f.publish();
+  const recovered = status.recover(f.updates[0]);
+  assert.equal(recovered.recovery, undefined);
+  assert.equal(recovered.items.length, 1);
+  assert.equal(recovered.observations.length, 1);
+  const file = path.join(WORK, "large-custom.md");
+  fs.writeFileSync(file, "x".repeat(5000));
+  const large = fixture(largeBoard());
+  large.publish({ body: file });
+  assert.match(large.updates[0].body, /^x{5000}\n\n/);
+  assert.ok(large.updates[0].body.length > 4000);
+  assert.ok(large.updates[0].body.length <= 65536);
+  assert.equal(status.recover(large.updates[0]).recovery, "digest-only");
+  fs.writeFileSync(file, "x".repeat(65535));
+  const before = large.updates.length;
+  assert.throws(() => large.publish({ body: file }), /GitHub's 65536-character body limit/);
+  assert.equal(large.updates.length, before);
+});
+
 test("active worker names are attached to their item exactly once", () => {
   const i = item("working", { status: "In Progress", lead: "coordinator" });
   const result = status.generate([i], { now: NOW, since: SINCE,
@@ -164,7 +328,10 @@ test("only associated unfinished project workers enter the report or digest", ()
   const opts = { now: NOW, since: SINCE, workers };
   const base = status.generate(items, opts);
   assert.deepEqual(status.generate(items, { ...opts, workers: [...workers, ...excluded] }), base);
-  for (const w of workers) assert.equal(base.body.split(w.name).length - 1, 1, base.body);
+  assert.equal(status.scopedWorkers(items, workers).length, workers.length);
+  for (const w of workers) assert.ok(base.body.split(w.name).length - 1 <= 1, base.body);
+  assert.match(base.body, /id-worker/);
+  assert.match(base.body, /branch-worker/);
   assert.deepEqual(status.generate([...items].reverse(), { ...opts, workers: [...workers].reverse() }), base);
 });
 
@@ -243,7 +410,7 @@ test("waiting asks use documented Blocks links to avoid repeating a blocked pare
   const report = (extra = {}) => status.generate([parent, { ...ask, ...extra }], { now: NOW, since: SINCE }).body;
   assert.doesNotMatch(report().split("## Waiting on the operator")[1], /\[parent\]/);
   assert.match(report(), /\[question\].*decision: Choose A or B/);
-  assert.match(report({ state: "CLOSED" }), /\[parent\].*Answer the question/);
+  assert.match(report({ state: "CLOSED" }), /\[parent\].*Answer the quest/);
   assert.match(report({ blocks: "https://github.com/example/repo/issues/other" }), /\[parent\]/);
 });
 
@@ -419,6 +586,8 @@ test("shell resolves the selected project, prints mutation URL and auto skips", 
   const calls = fs.readFileSync(f.calls, "utf8").trim().split("\n").map(JSON.parse);
   assert.deepEqual(calls[0], ["project", "view", "7", "--owner", "example", "--format", "json", "--jq", ".id"]);
   assert.equal(calls.find((c) => c.query === status.MUTATION).variables.project, "PVT_selected");
+  assert.match(calls.find((c) => c.query === status.MUTATION).variables.body,
+    /\[Full board\]\(https:\/\/github.com\/orgs\/example\/projects\/7\)/);
   assert.match(f.run(["--auto"]).stdout, /four-hour throttle/);
 });
 

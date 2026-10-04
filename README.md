@@ -262,6 +262,13 @@ statuses and labels, not exact review-app parity: that app is unavailable
 locally. An open Needs human ask with a first-line `Blocks: ITEM` link
 replaces its Needs human parent in the waiting section.
 
+Each section shows at most ten one-line items in deterministic priority/title
+order, followed by an accurate `+N more` count and a full-board link. Titles
+and details are shortened; long or unsafe item URLs are omitted rather than
+truncated (follow the board link). The stale-P0 footer shows at most three
+titles and the remaining count. Generated posts, including their hidden
+recovery marker, are limited to 3,800 characters, below 4,000.
+
 Explicit posts can combine these flags:
 
 - `--status on-track|at-risk|off-track` overrides the derived project status.
@@ -271,6 +278,9 @@ Explicit posts can combine these flags:
   or 24 hours ago when there is no post. Completion/promotion transitions
   and News comparisons also use the saved observation baseline; `--since`
   applies timestamp filtering instead of the usual baseline-only checks.
+  Day-only News without a reliable News field timestamp is excluded if the
+  date's UTC midnight predates the explicit cutoff. The default window still
+  retains same-day News without a baseline and compares text with one.
 - `--body FILE` replaces the generated text with a nonempty UTF-8 file,
   for a curated periodic summary. Status is still derived unless overridden,
   and the tool still appends its recovery marker and saves the observation.
@@ -279,6 +289,8 @@ Flags, the P0 threshold, and custom body readability, UTF-8 encoding,
 nonempty content and the standalone size limit are checked locally before
 project resolution or any API call. The full body size, including the
 recovery marker, is checked after reading the board and before posting.
+Custom `--body` posts retain GitHub's 65,536-character limit, including the
+marker; the generated-post budget does not apply to curated text.
 
 Without `--status`, an unfinished P0 is stale after 24 hours without observed
 material movement: Status, Priority, Lead, Branch, Why/Gist or News content,
@@ -315,7 +327,16 @@ Run one publisher on one machine per project. `bot-board` serializes local
 posts with a per-project `flock` and stores `status-update.json` under
 `${XDG_STATE_HOME:-~/.local/state}/bot-board/KIND/OWNER/NUMBER/`. Project
 updates carry an HTML recovery marker with the digest and minimal item
-baseline, including material fingerprints and movement times. A separate
+baseline, including material fingerprints and movement times, when that fits
+the posted-body budget. Otherwise the marker contains only the digest (marked
+`digest-only`). The local snapshot always retains the full baseline. If local
+state is lost after a compact-marker post, remote recovery still provides
+automatic deduplication and throttling, but cannot infer completion/promotion
+transitions or compare News against that post's per-item baseline. It uses
+timestamp evidence for News and initial P0 inactivity, and never manufactures
+transitions. Losing movement history can delay stale-risk detection after
+timestamp-only activity. A subsequent successful local post restores the full
+local baseline. A separate
 `status-update.json.observations.json` records movement on every observation,
 including auto skips, without losing the last posted transition baseline.
 The marker lets the next run recover after a post succeeded but saving

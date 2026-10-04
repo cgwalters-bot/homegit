@@ -765,7 +765,7 @@ cmd_status_update() {
     node "${publisher}" --validate "$@" || return $?
     id=$(project_id) || fail_after $? "reading the project id failed"
     mkdir -p "${STATE_MIRROR_DIR}/${PROJECT}"
-    flock "${STATE_MIRROR_DIR}/${PROJECT}/status-update.lock" node \
+    BOARD_URL="${BOARD_URL}" flock "${STATE_MIRROR_DIR}/${PROJECT}/status-update.lock" node \
         "${publisher}" \
         "${id}" "${STATE_MIRROR_DIR}/${PROJECT}/status-update.json" "$@"
 }
