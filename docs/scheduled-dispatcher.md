@@ -1,9 +1,9 @@
 # The dispatcher as a scheduled job
 
-Today the controller loop is a session: `bin/bot-poll-loop --until-actions`
-wakes a Sonnet "dispatcher" (the `dispatcher` skill) when
-`bin/bot-reconcile` has something to do, and the Opus coordinator is
-needed only for what the dispatcher escalates. The goal the operator set
+Today the controller loop is deterministic: `node bin/bot-supervisor`
+runs `bot-poll-loop --until-actions` and starts a short Sonnet "dispatcher"
+(the `dispatcher` skill) only for configured actionable reports. The Opus
+coordinator is needed only for what the dispatcher escalates. The goal the operator set
 is to move this to a scheduled job that edge-activates on events ("don't
 block on me, improve dispatch, bear in mind our goal is to move this to a
 scheduled job alongside edge activation on events"). Nothing hosted
@@ -62,6 +62,104 @@ the only state to move: `--state FILE` is already the whole interface for
 the actions (read it at the start, write it at the end), so a job can
 keep it as a file on a state branch of a repository, or an artifact of
 its previous run, and the rest is recomputable from GitHub.
+
+## Local supervisor
+
+Launch from the checkout with an interpreter:
+
+```
+node bin/bot-supervisor --dir /path/to/dedicated/dispatcher-worktree
+```
+
+The supervisor is a nonexecutable (100644), Node standard-library script;
+do not chmod it, install executable aliases, or add skill symlinks. It
+invokes the existing poller through Bash and bot-claude through Node.
+The canonical dispatcher skill and `supervisor-brief.md` are read directly
+from `dotfiles/.agents/skills/dispatcher` and inlined into each job's brief.
+The checkout must remain available at runtime.
+
+`--action-kinds CSV` (or `BOT_SUPERVISOR_ACTION_KINDS`) replaces the default
+allowlist shown by `--help`; an empty value disables model dispatch. Only
+fired `* KIND [URL or board-item ID]: ...` reconcile payload lines and event wake kinds are
+selected. The header's `actions:` summary alone cannot start a model.
+Defaults exclude completed deterministic work (`closed-not-done`,
+`stale-lead`, `midstream-pr`, `dispatch`) and coordinator-only `escalate`.
+Quiet/timeouts and ignored wakes loop without model calls. Reports are
+passed intact as data, with selected kinds explicitly listed.
+
+Jobs use `--model sonnet --effort low`, a 10-minute timeout and 20-turn
+limit (configurable with `--job-timeout-min` and `--max-turns`). The
+supervisor starts one job and waits before polling again. A wait timeout
+(124) retains the pending ID and waits again. Only wait exit 0 acknowledges
+and removes the pending batch. Failed, timed-out, lost, killed or incomplete
+jobs retain the entire batch with a failure marker and exit with a recovery
+error. Subsequent starts fail closed on that marker, without polling,
+waiting again, or launching another model. Exit 1 is confirmed with status
+first, since CLI errors also use that code; an unconfirmed failure retains
+the pending ID for another status/wait attempt.
+The dispatcher dispatches long workers and records
+their IDs instead of waiting through them. Poll/start/status errors back
+off too (`--retry-delay-ms`, default 30 seconds). Idle reports have a
+one-second backoff (`--idle-delay-ms`) to avoid spinning on short windows.
+
+State defaults to `$XDG_STATE_HOME/bot-supervisor` or
+`~/.local/state/bot-supervisor` (`--state-dir` overrides). Atomic
+`pending.json` records the brief and a preselected unique job ID before
+start. After restart, status checks recover a started job and wait on it;
+only an explicit "no such job" permits starting that same ID. Malformed
+state or ambiguous start/status failures retain the state and fail closed.
+An incomplete bot-claude job directory may need manual inspection and
+repair. There is no automatic resume or retry of failed model sessions. Use one
+supervisor per state directory and publishing host; do not run a manual
+instance alongside the service. Poller state remains owned by bot-poll-loop;
+a crash between poll completion and saving pending can delay persistent
+reconcile actions until resync. Event-only wakes have already been marked
+seen and may never be delivered again: recover those manually from the
+poller state and referenced sweep/event reports. Saved batches survive
+dispatcher failures, but the edge-trigger handoff gap means this is not
+reliable batch delivery or exactly-once writes.
+
+### Repairing a blocked batch
+
+Stop the service (or manual supervisor) first; `Restart=always` otherwise
+repeats the recovery error. Keep `pending.json` and the failed bot-claude
+job's evidence. Inspect `node bin/bot-claude status --json JOB` and
+`node bin/bot-claude log JOB`, plus the saved `brief` in pending.json.
+Check which writes already happened before repeating anything.
+
+Repair the cause and handle the remaining actions manually, or extract
+the saved `brief` into a regular file outside the checkout and explicitly
+replay it using `node bin/bot-claude start --dir DISPATCHER_WORKTREE
+--model sonnet --timeout 10 --max-turns 20 --effort low BRIEF_FILE`.
+Alternatively, `node bin/bot-claude resume JOB` can continue an unsuccessful
+job that has a resumable session. Follow the chosen job with
+`node bin/bot-claude wait JOB` and verify successful handling of the batch.
+The failure marker deliberately blocks automatic recovery even if an
+operator later resumes that job successfully.
+
+Only after successful handling, archive pending.json to a unique filename
+outside the active state path, preserving the brief, failure marker and
+original job ID, then restart the supervisor. Do not merely delete pending
+or clear its failure marker to get polling running again; an event-only
+action would otherwise be lost. There is no automatic retry/reset command.
+
+The supplied `dotfiles/.config/systemd/user/bot-supervisor.service` uses
+`Restart=always`. Before enabling it, create the dedicated dispatcher
+worktree named by `--dir` and install the regular unit file into the user
+unit directory. Its default checkout paths match bot-sweep's; use a user
+drop-in replacing ExecStart for other checkout/worktree or Node paths.
+`~/.config/bot-supervisor.env` should set `BOT_SUPERVISOR_TOOLBOX` (the
+toolbox holding `gh`, which the host PATH lacks; the supervisor re-executes
+itself there, like bot-sweep's `BOT_SWEEP_TOOLBOX`) and
+`BOT_SUPERVISOR_GH_TOKEN_FILE` (the bot's existing gh token file, read into
+`GH_TOKEN` when that is unset). It may also set the action-kind allowlist and JSON
+argv arrays `BOT_SUPERVISOR_POLL_COMMAND` / `BOT_SUPERVISOR_CLAUDE_COMMAND`
+for interpreter-based tool overrides (also used by offline tests).
+No symlink or executable installation is required. Then reload user units
+and enable/start `bot-supervisor.service`; keep `bot-sweep.timer` enabled
+to provide observations. Stop kills the unit's cgroup, including jobs it
+started; restart recovers their terminal/lost state. Service installation
+and live enabling are operator steps, not part of checkout-only changes.
 
 ## The workflow
 

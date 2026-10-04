@@ -1,0 +1,23 @@
+# gh lives only in the toolbox, and the bot's token in a file. Set both in
+# ~/.config/bot-supervisor.env (no ~ or %h expansion there, except the ~/
+# prefix of the token file):
+#   BOT_SUPERVISOR_TOOLBOX=NAME           run inside that toolbox
+#   BOT_SUPERVISOR_GH_TOKEN_FILE=~/PATH   the bot's existing gh token file
+[Unit]
+Description=Deterministic bot controller with short Sonnet dispatcher jobs
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/bot-supervisor.env
+Environment=TERM=dumb
+# --dir must be a dedicated dispatcher worktree, created before enabling.
+ExecStart=/usr/bin/node %h/src/github/cgwalters-bot/homegit/bin/bot-supervisor --dir %h/src/github/cgwalters-bot/homegit-dispatcher
+Restart=always
+RestartSec=30
+# bot-claude jobs detach, but remain in the unit's cgroup on this host.
+KillMode=control-group
+TimeoutStopSec=30
+Nice=5
+
+[Install]
+WantedBy=default.target
