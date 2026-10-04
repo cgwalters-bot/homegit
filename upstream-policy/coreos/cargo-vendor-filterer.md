@@ -5,7 +5,7 @@ dco: no (no branch rules on main, and no DCO check on any of the 8 recent PR hea
 sources:
   - repo: coreos/cargo-vendor-filterer
     path: README.md
-    sha: ca359dab9cae1351a5b4a4b6f038c5ebe47ea43b
+    sha: e0e8254bc0a39680fa8225acd4500a9c6dcdba6c
   - repo: coreos/.github
     path: README.md
     sha: a46ae92d6be3af621898326ec6d32d78dafa5854
@@ -15,7 +15,7 @@ sources:
   - repo: coreos/.github
     path: profile/README.md
     sha: 3022b18e4dee0a57b61261cbbc19f2a5b858af52
-checked: 2026-09-25 by the policy-check subagent (coordinator session 929c7a64, converted from an earlier read-only survey and re-read against current upstream)
+checked: 2026-10-04 by the policy-check subagent (re-read after README.md changed)
 ---
 
 The repository has no CONTRIBUTING, AGENTS.md, AI policy or PR template, and
