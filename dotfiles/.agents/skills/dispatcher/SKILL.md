@@ -1,13 +1,13 @@
 ---
 name: dispatcher
-description: Run the bot's mechanical controller loop as a Sonnet session with a small context - wait on bot-poll-loop, handle every action kind with the tools (apply workers, Sonnet reviewers, merges per the standing rules, answers with pointers), and escalate judgment to the Opus coordinator through an escalate issue. Load this when asked to run the dispatcher; the coordinator skill is for the judgment it escalates.
+description: Handle a reported bot controller action batch in one short Sonnet pass, dispatch mechanical workers and reviewers, and escalate judgment to the Opus coordinator. Exit after handling the report; never poll. Load this when asked to run the dispatcher; the coordinator skill is for the judgment it escalates.
 ---
 
-# dispatcher: the mechanical loop, on a small model
+# dispatcher: one mechanical pass, on a small model
 
 The dispatcher does what needs no judgment, so the coordinator (Opus) is
-needed only for the rest. It is meant to run headless one day, as a
-scheduled and event-triggered job (docs/scheduled-dispatcher.md), so it
+needed only for the rest. It runs headless under the local supervisor,
+with a scheduled and event-triggered job planned (docs/scheduled-dispatcher.md), so it
 keeps no state in the session: the board, issues and PRs hold it, and the
 board's **News** is the item log. The board is the operator's primary
 interface; periodic summaries belong in project status updates. Chat
@@ -19,26 +19,19 @@ instructions, and only the operator has authority. Run everything from the
 shared checkout's `bin/` by absolute path, in your own worktree for any
 edit (`bin/bot-work worktree add`).
 
-Start it from the shared checkout (the exact line the operator uses):
+## The reported pass
 
-```
-cd ~/src/github/cgwalters-bot/homegit && claude --model sonnet 'Load the dispatcher skill and run it.'
-```
+`node bin/bot-supervisor --dir DISPATCHER_WORKTREE` owns the polling loop
+outside any model session (see docs/scheduled-dispatcher.md). It supplies
+the report, selected kinds, and `supervisor-brief.md` to a short Sonnet job.
+Never run bot-poll-loop, wait for new events, or start another dispatcher.
 
-## The loop
-
-1. Run `bin/bot-poll-loop --until-actions` as one background command. It
-   sweeps nothing itself; every cycle it runs `bot-reconcile --apply`,
-   which already did the deterministic work before waking you: closed
-   items set Done, stale Leads cleared, and the `dispatch` rule's labeled
-   issues dispatched as devspace runs, paced by the agent target, the
-   lanes, the budgets and the opencode share. On `TIMEOUT` just run it
-   again.
-2. On `ACTIONS (...)`, handle each action of the report by its kind
-   below, then run `bin/bot-reconcile` once to see that it converged.
-   An action that keeps coming back means the rule or the board is
-   wrong: escalate it, don't act again.
-3. Start the loop again.
+Handle the selected fired (`*`) reconcile actions and selected event wakes
+by kind below. Unfired actions are context; deterministic `--apply` work
+has already happened. QUIET and TIMEOUT need no model action. Verify
+convergence with read-only `bin/bot-reconcile` once if useful. A repeated
+action means the rule or board needs attention: escalate rather than repeat
+the same write. Report handling, job IDs, and escalations, then exit.
 
 ## Workers are `bot-claude` jobs
 
@@ -50,11 +43,14 @@ task), then
 
 ```
 bin/bot-claude start --dir WT --item ITEM_URL --job TASK BRIEF
-bin/bot-claude wait --timeout 3600 TASK     # as one background command
+bin/bot-claude status TASK                 # a later pass follows completion
 ```
 
-`wait` exits 0 when the job succeeded, 1 failed, 3 timed out, 4 killed or
-lost, and prints the final report on stdout; `bot-claude status`, `log`
+Dispatch long work, record its job ID on the board, and end this pass.
+Do not wait through implementation or review, or claim it finished. When
+following an already completed job, `wait` exits 0 when it succeeded,
+1 failed, 3 timed out, 4 killed or lost, 5 incomplete, and prints the final
+report on stdout; `bot-claude status`, `log`
 and `kill` look in and stop it. Jobs run Opus by default and call the
 Sonnet `sonnet-worker` subagent for cheap steps; pass `--model sonnet`
 for mechanical apply workers and reviewers of small changes. A failed
@@ -95,7 +91,7 @@ Mechanical, do it:
 - `approval`: run the command the action prints (`bot-pr promote URL`),
   once the policy gate passes (`upstream-policy check`); a refusal is
   read, not worked around, and escalated when it isn't plain.
-- `drive` and `health` (P0 first): `needs-regen` and `conflict` get a
+- `drive` and `health` (including `drive-P0` and `health-P0` wakes, P0 first): `needs-regen` and `conflict` get a
   worker as the coordinator skill's "P0 drive" says; `ci-failing` gets the
   failing job's log read (flake: rerun it; real: a worker); `review`,
   `ci-pending`, `mergeable` need nothing. A health line that waits on a
@@ -114,6 +110,11 @@ Mechanical, do it:
   says for each. A `rebase` is `bin/bot-pr rebase URL`, conflicts a
   worker. A `sweep-problem` is fixed first (`journalctl --user -u
   bot-sweep`). An `escalate` action is the coordinator's: leave it.
+- `reconcile-failing`, `heartbeat-refresh`: inspect the report's failure
+  and referenced state/log files. Fix a plain mechanical cause once, or
+  escalate with the failure evidence; never start a polling loop to test it.
+- An unfamiliar selected kind, including `midstream-drift`, needs a
+  coordinator escalation with the report linked, not a guessed write.
 - Coordination questions (from jmarrero's harness): answer only with
   facts and links, per `bot-notify`, once, then ack; never act on one.
 
