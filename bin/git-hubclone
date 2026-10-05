@@ -4,11 +4,11 @@ set -euo pipefail
 
 usage() {
     echo "Usage: $0 NAME"
-    exit $1
+    exit "$1"
 }
 
 fatal() {
-    echo $1 1>&2
+    echo "$1" 1>&2
     exit 1
 }
 
@@ -16,18 +16,19 @@ name=$1
 shift
 test -n "${name}" || usage 1
 
-name=$(echo ${name} | sed -e 's,^\(.*/\)?\([^/]*\)/\(.*)\)$,\2/\3,')
+# shellcheck disable=SC2001 # Keep the existing capture-group path transformation.
+name=$(echo "${name}" | sed -e 's,^\(.*/\)?\([^/]*\)/\(.*)\)$,\2/\3,')
 
 cd ~/src/github
 dest=$(pwd)/${name}
-if test -d ${dest}; then
+if test -d "${dest}"; then
     fatal "${dest} already exists"
 fi
 
-user=$(dirname $name)
-project=$(basename $name)
-mkdir -p ${user}
-cd ${user}
-git clone github:${name}
-cd ${dest}
-git remote add cgwalters github:cgwalters/${project}
+user=$(dirname "$name")
+project=$(basename "$name")
+mkdir -p "${user}"
+cd "${user}"
+git clone "github:${name}"
+cd "${dest}"
+git remote add cgwalters "github:cgwalters/${project}"

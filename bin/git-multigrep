@@ -3,11 +3,11 @@
 pattern=$1
 shift
 
-for x in $@; do
+for x in "$@"; do
     if ! test -d "$x/.git"; then
 	continue
     fi
-    (cd $x; git grep -e "$pattern" | sed -e "s,^,${x}/,")
+    (cd "$x" || exit; git grep -e "$pattern" | sed -e "s,^,${x}/,")
 done
     
 	
