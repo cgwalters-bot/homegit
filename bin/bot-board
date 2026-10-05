@@ -223,6 +223,11 @@ Commands:
                               views and listings (GitHub lists no
                               archived items) but keeps its fields, and
                               can be restored from the board's archive
+  archive-done [--days N] [--dry-run | --apply]
+                              Archive Done items closed more than N days
+                              ago (default 3), at most 100 per run.
+                              Defaults to dry-run; skips epics and
+                              issues with open sub-issues.
   issue [--parent ITEM] [--org O] [--priority P] TITLE BODY
                               Open an issue in ${TRACKER_REPO} and add it
                               to the board (no Status: triage); prints
@@ -847,6 +852,12 @@ cmd_archive() {
     ghq project item-archive "${NUMBER}" --owner "${OWNER}" --id "${id}" >/dev/null ||
         fail_after $? "archiving ${id} failed"
     echo "archived ${id}"
+}
+
+cmd_archive_done() {
+    require_cmd node "install Node.js"
+    node "$(dirname "$(readlink -f "$0")")/../lib/board-archive-done.js" \
+        "$(readlink -f "$0")" "${PROJECT}" "$@"
 }
 
 cmd_draft() {
@@ -1932,6 +1943,7 @@ case "${command}" in
     question) workstream_only "${command}" ;;
     fill-org) command=fill_org ;;
     status-update) command=status_update ;;
+    archive-done) command=archive_done ;;
     field-ensure) command=field_ensure ;;
     labels) workstream_only "${command}" ;;
     state-get) workstream_only "${command}"; command=state_get ;;

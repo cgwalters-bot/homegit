@@ -1,0 +1,15 @@
+[
+  {"name":"old issue", "state":"closed", "closed_at":"2026-01-01T00:00:00Z", "expected":true},
+  {"name":"merged PR", "state":"closed", "closed_at":"2026-01-01T00:00:00Z", "merged":true, "expected":true},
+  {"name":"boundary", "state":"closed", "closed_at":"2026-01-29T00:00:00Z", "expected":false},
+  {"name":"recent", "state":"closed", "closed_at":"2026-01-31T00:00:00Z", "expected":false},
+  {"name":"reopened", "state":"open", "closed_at":"2026-01-01T00:00:00Z", "expected":false},
+  {"name":"missing time", "state":"closed", "expected":false},
+  {"name":"invalid time", "state":"closed", "closed_at":"bad", "expected":false},
+  {"name":"epic label", "state":"closed", "closed_at":"2026-01-01T00:00:00Z", "labels":[{"name":"epic"}], "expected":false},
+  {"name":"epic title", "title":"Epic: work", "state":"closed", "closed_at":"2026-01-01T00:00:00Z", "expected":false},
+  {"name":"epic type", "type":{"name":"Epic"}, "state":"closed", "closed_at":"2026-01-01T00:00:00Z", "expected":false},
+  {"name":"open child", "state":"closed", "closed_at":"2026-01-01T00:00:00Z", "children":[{"state":"open"}], "expected":false},
+  {"name":"closed children", "state":"closed", "closed_at":"2026-01-01T00:00:00Z", "children":[{"state":"closed"}], "expected":true},
+  {"name":"unknown child", "state":"closed", "closed_at":"2026-01-01T00:00:00Z", "children":[{}], "expected":false}
+]
