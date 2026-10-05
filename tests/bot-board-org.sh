@@ -61,7 +61,7 @@ EOF
 chmod +x "${WORK}/bin/gh"
 
 jq -n '{fields: [{id: "F_org", name: "Org", options: [
-    "bootc-dev", "coreos", "osbuild", "redhat-cop", "cgwalters-forge", "cgwalters-bot", "other"
+    "bootc-dev", "coreos", "osbuild", "redhat-cop", "cgwalters-forge", "cgwalters-bot", "cgwalters", "other"
     | {id: "O_\(.)", name: .}]}, {id: "F_lead", name: "Lead"}, {id: "F_news", name: "News"},
     {id: "F_status", name: "Status", options: ["Todo", "In Progress", "Draft", "In Review", "Needs human", "Done"
     | {id: "S_\(.)", name: .}]}]}' >"${FAKE_GH}/fields.json"
@@ -83,8 +83,8 @@ readonly CASES=(
     "osbuild|||https://github.com/cgwalters-forge/image-builder/pull/2|x|"
     "redhat-cop|other|https://github.com/redhat-cop/rhel-bootc-examples/issues/19|||"
     "cgwalters-forge|cgwalters-bot|https://github.com/cgwalters-forge/review/issues/1|||"
-    "cgwalters-bot||https://github.com/cgwalters-bot/homegit/issues/3|||"
-    "cgwalters-bot|other||https://github.com/cgwalters/cgwalters/pull/1|x|"
+    "cgwalters||https://github.com/cgwalters-bot/homegit/issues/3|||"
+    "cgwalters|other||https://github.com/cgwalters/cgwalters/pull/1|x|"
     "cgwalters-bot|bootc-dev|https://github.com/bootc-dev/cgwalters-devspace-sandbox/issues/4|||"
     "cgwalters-bot|||https://github.com/cgwalters-forge/cgwalters-devspace-sandbox/pull/3|x|"
     "bootc-dev|||https://github.com/bootc-dev/bootc/compare/main...cgwalters-bot:bot/x|x|"
@@ -135,6 +135,16 @@ for want in "POST labels" "POST issues/5/labels" "POST issues/6/labels" "POST is
 done
 test "$(grep -c '/labels$' "${FAKE_GH}/labels")" -eq 3 || fail "label calls for non-tracker items: $(cat "${FAKE_GH}/labels")"
 echo "all ${#CASES[@]} fill-org cases passed, tracker labels synced"
+
+# The post-merge migration must not touch deliberately assigned Orgs.
+out=$("${BIN}/bot-board" fill-org --all --org other --dry-run 2>/dev/null)
+while IFS=$'\t' read -r id _; do
+    test -n "${id}" || continue
+    i=${id#PVTI_}
+    IFS='|' read -r _ org _ <<<"${CASES[i]}"
+    test "${org}" = other || fail "--org other selected ${id} with Org '${org}'"
+done <<<"${out}"
+grep -q $'PVTI_6\tcgwalters\t' <<<"${out}" || fail "--org other missed cgwalters migration"
 
 # With every item's Org set (as on most of bot-sweep's runs), fill-org
 # reads only the REST listing: no GraphQL at all, and no edits.
@@ -230,3 +240,5 @@ for c in "${STATUS_CASES[@]}"; do
     test "${got}" = "${want}" || fail "set ${name}: got '${got}', want '${want}'"
 done
 echo "set --status Lead cases passed"
+
+node --test "${BIN}/../tests/bot-board-option-add.test.js"

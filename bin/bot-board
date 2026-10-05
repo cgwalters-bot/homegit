@@ -64,8 +64,6 @@ readonly COORDINATOR_LEAD=coordinator
 # personal forks. Their other repositories are their own: the forge
 # org's review app is the forge org's.
 readonly FORK_OWNERS=("${OP_FORGE_ORG}" "${OP_BOT_LOGIN}" "${OP_OPERATOR_LOGIN}")
-# Owners with an Org other than their name.
-readonly -A OWNER_ORGS=(["${OP_OPERATOR_LOGIN}"]="${OP_BOT_LOGIN}")
 # Repositories with an Org other than their owner's, lowercase.
 readonly -A REPO_ORGS=(
     # The bot's runner setup, which may live elsewhere for its runners
@@ -286,13 +284,14 @@ Commands:
                               clears Lead '${COORDINATOR_LEAD}' (a worker's
                               claim, from bot-pace assign) unless --field
                               ${LEAD_FIELD} is given; other Leads stay.
-  fill-org [--all] [--dry-run]
+  fill-org [--all] [--org O] [--dry-run]
                               Set Org on items that have none (--all:
                               also correct every other item), from the
                               Branch URLs, else the content URL, else the
                               title's first word, else the body
                               links; '${ORG_OTHER}' when nothing matches
-                              and the item has no Org yet
+                              and the item has no Org yet. --org limits
+                              updates to items currently assigned O
   labels [--dry-run]          Make every ${TRACKER_REPO} issue's labels
                               match its item's Priority and Org ('P0',
                               '${TARGET_LABEL_PREFIX}bootc-dev'); 'set', 'issue',
@@ -302,6 +301,11 @@ Commands:
                               to the board unless it has one (bot-runs
                               keeps an item's agent run in a 'Run' field,
                               bot-pace its token budget in 'Budget tokens')
+  option-add FIELD NAME [--color C] [--dry-run]
+                              Append a single-select option, preserving
+                              existing options and restoring item values
+                              by name if GitHub changes their option ids.
+                              Default color: GRAY. Run without other writers.
   state-get [--track] NAME    Print the JSON state kept in the archived
                               draft item '${STATE_PREFIX}NAME' ({} if it
                               doesn't exist yet). --track records it as
@@ -1472,7 +1476,7 @@ org_of_url() {
     if test -n "${REPO_ORGS[${repo}]:-}"; then
         echo "${REPO_ORGS[${repo}]}"
     else
-        org_option "${OWNER_ORGS[${owner}]:-${owner}}"
+        org_option "${owner}"
     fi
 }
 
@@ -1515,10 +1519,11 @@ set_org() {
 }
 
 cmd_fill_org() {
-    local all=false dry_run=false
+    local all=false dry_run=false only_org=""
     while test $# -gt 0; do
         case "$1" in
             --all) all=true; shift ;;
+            --org) test $# -ge 2 || fatal "--org requires an argument"; only_org=$2; shift 2 ;;
             --dry-run) dry_run=true; shift ;;
             *) fatal "unknown argument for fill-org: $1 (see --help)" ;;
         esac
@@ -1548,7 +1553,8 @@ cmd_fill_org() {
         test "${current}" = "${org}" && continue
         printf '%s\t%s\t%s\n' "${id}" "${org}" "${title:0:${TITLE_WIDTH}}"
         updates+=("${id} $(option_id Org "${org}") ${org} $(jq -r '.content.url // "-"' <<<"${item}")")
-    done < <(jq -c --argjson all "${all}" '.items[] | select($all or .org == null)' <<<"${ITEMS_JSON}")
+    done < <(jq -c --argjson all "${all}" --arg org "${only_org}" '
+        .items[] | select(($all or .org == null) and ($org == "" or .org == $org))' <<<"${ITEMS_JSON}")
     if test "${#leftovers[@]}" -gt 0; then
         echo "No org derivable for these, so they get '${ORG_OTHER}':" 1>&2
         printf '  %s\n' "${leftovers[@]}" 1>&2
@@ -1633,6 +1639,15 @@ cmd_labels() {
 }
 
 # --- Fields ----------------------------------------------------------------
+
+cmd_option_add() {
+    require_cmd node "install Node.js"
+    local id
+    id=$(project_id) || fail_after $? "reading the project id failed"
+    # Never leave stale option ids or item values after even a partial write.
+    rm -f "${BOARD_CACHE}/fields.json" "${BOARD_CACHE}/items.json"
+    node "$(dirname "$(readlink -f "$0")")/../lib/board-option-add.js" "${id}" "$@"
+}
 
 cmd_field_ensure() {
     local type=TEXT
@@ -1933,6 +1948,7 @@ case "${command}" in
     fill-org) command=fill_org ;;
     status-update) command=status_update ;;
     field-ensure) command=field_ensure ;;
+    option-add) command=option_add ;;
     labels) workstream_only "${command}" ;;
     state-get) workstream_only "${command}"; command=state_get ;;
     state-put) workstream_only "${command}"; command=state_put ;;
