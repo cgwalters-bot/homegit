@@ -73,14 +73,18 @@ Pushed history never contains `fixup!` or `squash!` commits, nor a standalone "A
 
 ## Agent workflow and self-check
 
-Unless the task is truly "trivial", *by default* you should spawn a subagent to do the task, and another subagent to review the first's work; you are coordinating their work.
+In interactive sessions, unless the task is truly "trivial", *by default* you should spawn a subagent to do the task, and another subagent to review the first's work; you are coordinating their work. Interactive opencode keeps its architect/implementation/review chain.
+
+With the opencode runner profile (`opencode-runner.json`), the primary worker implements and tests directly, as permitted by the task brief. It may use explore/fast for read-only investigation and at most one optional general subagent for a read-only review; no architect or recursive delegation. The primary owns fixes, verification and the final report.
 
 ### Enhanced Workflow Requirements
 
-When coordinating subagents:
+When coordinating implementation and review subagents in interactive sessions:
 - **Implementation subagent**: Must include testing requirements in their task completion criteria
 - **Review subagent**: Must independently verify that all testing requirements were met before approving
 - **Both subagents must confirm** successful test execution and verification before the overall task is considered complete
+
+In runner sessions, the primary must confirm actual successful execution of the required checks before declaring completion. An optional reviewer may execute permitted tests and must report what it verified; a reviewer is not required for completion. A task brief that assigns testing elsewhere takes precedence.
 
 ### Self-Verification Protocol
 

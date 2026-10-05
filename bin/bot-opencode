@@ -47,6 +47,7 @@ const INHERITED_ENV = ["PATH", "LANG", "LANGUAGE", "TERM", "TZ", "TMPDIR", "USER
 const AGENT_HOME = path.join(WORK_ROOT, "home");
 // What the bot's own configuration is, in homegit's checkout (next to bin/).
 const BOT_DOTFILES = path.join(__dirname, "..", "dotfiles");
+const RUNNER_CONFIG = path.resolve(BOT_DOTFILES, ".config/opencode/opencode-runner.json");
 const BOT_HOME_LINKS = { ".config/opencode": ".config/opencode", ".agents/skills": ".agents/skills" };
 const TASK_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 // A tool call's title is cut to this many characters in the progress lines.
@@ -94,7 +95,9 @@ It runs as the bot, not as you: HOME is ${AGENT_HOME}, holding only
 homegit's own dotfiles/.config/opencode (its AGENTS.md and the praxis
 provider: a base URL and a placeholder key, never a login) and
 dotfiles/.agents/skills, and the environment is cut to ${INHERITED_ENV.join(" ")} and LC_*
-(no token, no SSH agent, no XDG or OPENCODE_* override). Your own
+(no token, no SSH agent, no inherited XDG or OPENCODE_* override). The
+wrapper selects homegit's opencode-runner.json overlay: the primary worker
+implements directly, with at most one optional read-only review. Your own
 ~/.config/opencode, ~/.config/AGENTS.md, ~/.claude, ~/.gitconfig and
 opencode logins are not read.
 
@@ -318,6 +321,11 @@ async function main() {
   const opts = parseArgs(process.argv.slice(2));
   const brief = readBrief(opts);
   if (!brief.trim()) throw new Fatal("the brief is empty", EX_USAGE);
+  try {
+    fs.accessSync(RUNNER_CONFIG, fs.constants.R_OK);
+  } catch (e) {
+    throw new Fatal(`cannot read the runner profile ${RUNNER_CONFIG}: ${e.message} (is ${PROG} run from homegit's bin/?)`);
+  }
   const say = (s) => { if (!opts.quiet) process.stderr.write(`${s}\n`); };
   const wt = makeWorktree(opts);
   say(`worktree ${wt.dir} at ${wt.start.slice(0, 12)}`);
@@ -337,6 +345,7 @@ async function main() {
     // whatever the operator's login shell is.
     env: {
       ...inherited, ...botIdentityEnv(), HOME: makeAgentHome(), SHELL: "/bin/bash",
+      OPENCODE_CONFIG: RUNNER_CONFIG,
       OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_CLAUDE_CODE: "1",
       GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hooksDir,
       [TOKEN_VAR]: jobToken,
