@@ -1,5 +1,5 @@
 ---
-verdict: human-text
+verdict: bot-ok
 ai-trailer: default (Generated-by: AI); nothing written, though recent commits on main carry Assisted-by and Co-Authored-By AI trailers
 dco: no (no branch rules or protection on main, and no DCO check on any of the 8 recent PR heads sampled)
 sources:
@@ -74,3 +74,11 @@ lines, so a case for loosening exists if cgwalters wants to make it. PR titles
 are expected to reference a Jira ticket (checked by the pr-best-practices CI
 action), and new stages need unit and integration tests. No merge queue
 (no workflow runs on merge_group, no branch rules), so no rebase setting.
+
+## Operator default for silent repositories (2026-10-05)
+
+The sources say nothing that forbids AI-written text or bot accounts. The
+verdict was human-text only as a conservative default. cgwalters set the
+standing default in cgwalters-forge/tracker#245: when he accepts a forge PR,
+it is posted upstream under the bot identity, and upstream rules on LLMs are
+an advisory warning unless they clearly disallow bot accounts.

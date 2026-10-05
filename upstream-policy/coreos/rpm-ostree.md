@@ -1,5 +1,5 @@
 ---
-verdict: human-text
+verdict: bot-ok
 ai-trailer: default (Generated-by: AI); nothing written, and precedent on main is Assisted-by (28 of the last 100 commits)
 dco: no (no branch rules on main, and no DCO check on any of the 8 recent PR heads sampled)
 sources:
@@ -56,3 +56,11 @@ routine here (28 of the last 100 commits on main carry Assisted-by, from three
 authors, more than the 14 with a Signed-off-by), so this is the likeliest
 repository to move to bot-ok, for example by adopting the bootc-dev common
 AGENTS.md.
+
+## Operator default for silent repositories (2026-10-05)
+
+The sources say nothing that forbids AI-written text or bot accounts. The
+verdict was human-text only as a conservative default. cgwalters set the
+standing default in cgwalters-forge/tracker#245: when he accepts a forge PR,
+it is posted upstream under the bot identity, and upstream rules on LLMs are
+an advisory warning unless they clearly disallow bot accounts.
