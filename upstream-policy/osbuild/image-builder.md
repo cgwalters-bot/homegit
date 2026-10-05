@@ -1,5 +1,5 @@
 ---
-verdict: human-text
+verdict: bot-ok
 ai-trailer: default (Generated-by: AI); nothing written, and main already has three merged commits by cgwalters with "Generated-by: AI" and one with "Co-authored-by: Cursor"
 dco: no (no branch rules on main, and no DCO check run on main's head)
 sources:
@@ -116,3 +116,11 @@ merge queue (workflows run on merge_group), and every push from an
 outside contributor needs its CI approved again. A maintainer asked for
 this in https://github.com/osbuild/image-builder/pull/2719#issuecomment-5844231608,
 and CONTRIBUTING.md now says so too ("Maintaining a PR", quoted above).
+
+## Operator default for silent repositories (2026-10-05)
+
+The sources say nothing that forbids AI-written text or bot accounts. The
+verdict was human-text only as a conservative default. cgwalters set the
+standing default in cgwalters-forge/tracker#245: when he accepts a forge PR,
+it is posted upstream under the bot identity, and upstream rules on LLMs are
+an advisory warning unless they clearly disallow bot accounts.

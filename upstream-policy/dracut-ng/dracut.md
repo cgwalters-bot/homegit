@@ -1,5 +1,5 @@
 ---
-verdict: human-text
+verdict: bot-ok
 ai-trailer: default (Generated-by: AI)
 dco: no (main's ruleset requires two approving reviews and linear history but no status checks; no DCO check runs on main's head or on recent PR heads; recent commits carry no Signed-off-by)
 sources:
@@ -64,3 +64,11 @@ everyone" and nothing excludes AI-written code. Practical notes for the bot:
 commit titles must be Conventional Commits (`type(scope): description`,
 scope the module name without its number), enforced by Commisery in CI; main
 needs two approvals and merges by rebase only.
+
+## Operator default for silent repositories (2026-10-05)
+
+The sources say nothing that forbids AI-written text or bot accounts. The
+verdict was human-text only as a conservative default. cgwalters set the
+standing default in cgwalters-forge/tracker#245: when he accepts a forge PR,
+it is posted upstream under the bot identity, and upstream rules on LLMs are
+an advisory warning unless they clearly disallow bot accounts.

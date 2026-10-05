@@ -1,5 +1,5 @@
 ---
-verdict: human-text
+verdict: bot-ok
 ai-trailer: default (Generated-by: AI); nothing written, and precedent on main is Assisted-by or Generated-by (12 of the last 100 commits, four authors)
 dco: no (docs/CONTRIBUTING.md says Signed-off-by is not required, the main ruleset has no status checks, and no DCO check ran on the 8 recent PR heads sampled)
 sources:
@@ -47,3 +47,11 @@ AI-assisted commits (12 of the last 100 on main carry Assisted-by or
 Generated-by, from four authors), but none of it speaks to bot-written PR text.
 cgwalters is an ostree maintainer; landing the bootc-dev common AGENTS.md here
 would make it bot-ok on re-check.
+
+## Operator default for silent repositories (2026-10-05)
+
+The sources say nothing that forbids AI-written text or bot accounts. The
+verdict was human-text only as a conservative default. cgwalters set the
+standing default in cgwalters-forge/tracker#245: when he accepts a forge PR,
+it is posted upstream under the bot identity, and upstream rules on LLMs are
+an advisory warning unless they clearly disallow bot accounts.
