@@ -135,6 +135,12 @@ readonly UPSTREAM_POLICY
 # a human-text verdict.
 readonly EX_POLICY_MISSING=3 EX_POLICY_STALE=4 EX_POLICY_HUMAN_TEXT=5
 
+# The Actions variable of a fork that lists the workflows opted in to run
+# there (see fork_setup), separated by spaces. On the fork itself, so that
+# every fork-pr run and every machine sees the same list, and the
+# operator can change it in the fork's settings.
+readonly CI_VARIABLE=BOT_PR_CI
+
 usage() {
     cat <<EOF
 Usage: $(basename "$0") COMMAND [ARGS...]
@@ -386,6 +392,11 @@ BOT_PR_FORGE overrides the organization (${FORGE_ORG}), and BOT_PR_GIT_URL
 the prefix of the URLs git uses (${GIT_URL_PREFIX}, then OWNER/REPO).
 EOF
 }
+
+# Help needs neither temporary state nor external commands beyond its formatter.
+case "${1:-}" in
+    -h|--help|help) usage; exit 0 ;;
+esac
 
 # rate_limited() usually runs in a command substitution, so it can't exit
 # the script itself; it leaves this flag, and fatal() passes EX_RATELIMIT on.
@@ -700,11 +711,6 @@ declare -rA WORKFLOW_OVERRIDES=(
     [infra/renovate.yml]=disable
 )
 
-# The Actions variable of a fork that lists the workflows opted in to run
-# there (see fork_setup), separated by spaces. On the fork itself, so that
-# every fork-pr run and every machine sees the same list, and the
-# operator can change it in the fork's settings.
-readonly CI_VARIABLE=BOT_PR_CI
 # What --ci takes: a file name in .github/workflows.
 readonly WORKFLOW_FILE_RE='^[A-Za-z0-9_.-]+\.ya?ml$'
 

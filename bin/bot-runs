@@ -314,6 +314,11 @@ jqlib() {
     jq "${@:1:$#-1}" "${JQ_LIB} ${prog}"
 }
 
+# Answer help before allocating command scratch space.
+case "${1:-}" in
+    -h|--help|help) usage; exit 0 ;;
+esac
+
 scratch=$(mktemp -d)
 trap 'rm -rf "${scratch}"' EXIT
 
