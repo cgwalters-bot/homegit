@@ -154,6 +154,19 @@ Commands:
       board; --dry-run prints the bot-board calls. FILE is a 'bot-board
       list --json' array (default: the board). Prints one line per item
       with a ${RUN_FIELD} (--json: an array of {item, run, line, ...}).
+  watch [--apply | --dry-run] [--board-file FILE] [--json]
+        [--observations-file FILE | --read-url URL] [--state-file FILE]
+        [--stall-minutes N] [--grace-minutes N] [--execution-step NAME]
+      Evaluate active Agent execution steps using sanitized attempt telemetry.
+      Defaults: stall 10 minutes, suspicion grace 5 minutes, step 'Run agent'
+      (BOT_RUNS_EXECUTION_STEP overrides it). Unknown telemetry never cancels.
+      --apply freshly revalidates ownership, attempt, step and telemetry,
+      requests cancellation once, then sets Todo/Why and clears Run only
+      after GitHub confirms cancellation. Failed board updates retry.
+      Read URL: BOT_RUNS_WATCH_URL; offline telemetry array:
+      BOT_RUNS_WATCH_OBSERVATIONS. Contract: lib/run-health.js.
+      --runs-file FILE and --now TIME support deterministic offline reports.
+      Dry runs keep suspicion state unchanged; reports advance it.
   list [--item ITEM] [--since AGE] [--status STATUS] [--limit N]
       Recent runs, newest first (at most ${DEFAULT_LIST_LIMIT} by default): item, target
       repository, agent, result, duration, tokens (in/out), estimated AIC
@@ -740,6 +753,27 @@ cmd_dispatch() {
         warn "the run was dispatched, but registering its heartbeat failed; publish the workers with bot-heartbeat publish"
 }
 
+# --- watch -------------------------------------------------------------------
+
+cmd_watch() {
+    require_cmd node "install Node.js 22 or newer"
+    require_cmd flock "install util-linux"
+    local state=${BOT_RUNS_WATCH_STATE:-${STATE_DIR}/watch.json} arg previous=""
+    for arg in "$@"; do
+        test "${previous}" != --state-file || state=${arg}
+        previous=${arg}
+    done
+    mkdir -p "$(dirname "${state}")"
+    local fd
+    # Keep the inode: unlinking a lock file could let simultaneous callers
+    # acquire different locks. flock is released by the kernel on exit/crash.
+    exec {fd}>"${state}.lock"
+    flock -n "${fd}" || fatal "another bot-runs watch holds ${state}.lock"
+    BOT_RUNS_REPO=${RUNS_REPO} BOT_RUNS_WORKFLOW=${RUNS_WORKFLOW} \
+        BOT_RUNS_BOT_BOARD=${BOT_BOARD} BOT_RUNS_WATCH_STATE=${state} \
+        node "$(dirname "$(readlink -f "$0")")/../lib/run-watch.js" --locked-watch "$@"
+}
+
 # --- reconcile ---------------------------------------------------------------
 
 heartbeat_done() {
@@ -751,7 +785,7 @@ heartbeat_done() {
 # with a Run, {item, title, status, run, result, set: [bot-board set
 # arguments] or null, line}. Fails only when the run can't be read.
 reconcile_one() {
-    local item=$1 id title status run run_id meta rec flat result patch url why news set=null
+    local item=$1 id title status run run_id meta rec flat result patch url why news set=null recovery_board fresh_meta attempt
     read -r id status < <(jq -r '"\(.id) \(.status // "")"' <<<"${item}")
     title=$(jq -r '.title // ""' <<<"${item}")
     run=$(jq -r .run <<<"${item}")
@@ -768,6 +802,31 @@ reconcile_one() {
         return 0
     fi
     meta=$(fetch_run "${run_id}") || return
+    # Keep the watch's diagnostic if cancellation completed between sweeps or
+    # its board update failed. Cancellation needs no summary artifact.
+    if test "$(jq -r '.status + "/" + (.conclusion // "")' <<<"${meta}")" = completed/cancelled; then
+        why=$(node "$(dirname "$(readlink -f "$0")")/../lib/run-watch.js" reason \
+            "${BOT_RUNS_WATCH_STATE:-${STATE_DIR}/watch.json}" "${RUNS_REPO}" "${run_id}" \
+            "$(jq -r .attempt <<<"${meta}")" "${id}")
+        if test -n "${why}"; then
+            attempt=$(jq -r .attempt <<<"${meta}")
+            recovery_board=$3
+            fresh_meta=${meta}
+            if test "${2:-report}" = apply; then
+                recovery_board=$("${BOT_BOARD}" --refresh list --json) || return
+                fresh_meta=$(fetch_run "${run_id}") || return
+            fi
+            if ! jq -nc --argjson board "${recovery_board}" --argjson item "${item}" --argjson run "${fresh_meta}" \
+                '{board: $board, item: $item, run: $run}' | node "$(dirname "$(readlink -f "$0")")/../lib/run-watch.js" recovery-check "${RUNS_REPO}" "${attempt}"; then
+                entry cancelled "watch recovery refused: ownership or run attempt changed"
+                return 0
+            fi
+            test "${2:-report}" != apply || heartbeat_done "${run_id}"
+            set=$(jq -nc --arg why "${why}" '["--status", "Todo", "--field", "Run", "", "--why", $why]')
+            entry cancelled "${why}"
+            return 0
+        fi
+    fi
     # Completion ends activity even while artifacts or operator review wait.
     if test "${2:-report}" = apply && test "$(jq -r .status <<<"${meta}")" = completed; then
         heartbeat_done "${run_id}"
@@ -835,14 +894,14 @@ cmd_reconcile() {
         pass_ratelimit "${rc}"
         test "${rc}" -eq 0 || fatal "listing the board failed"
     fi
-    items=$(jq -c --arg f "${RUN_FIELD,,}" '.[] | select((.[$f] // "") != "") | {id, title, status, run: .[$f]}' <<<"${board}")
+    items=$(jq -c --arg f "${RUN_FIELD,,}" '.[] | select((.[$f] // "") != "") | .run = .[$f]' <<<"${board}")
     entries=${scratch}/reconcile
     : >"${entries}"
     rc=0
     while IFS= read -r item; do
         test -n "${item}" || continue
         local one=0
-        entry=$(reconcile_one "${item}" "${mode}") || one=$?
+        entry=$(reconcile_one "${item}" "${mode}" "${board}") || one=$?
         pass_ratelimit "${one}"
         if test "${one}" -ne 0; then
             warn "reading the run of item $(jq -r .id <<<"${item}") failed; a later reconcile retries"
@@ -1611,7 +1670,7 @@ cmd=$1
 shift
 case "${cmd}" in
     -h|--help|help) usage; exit 0 ;;
-    dispatch|reconcile|list|show|log|transcript|diff|stats|apply) ;;
+    dispatch|reconcile|watch|list|show|log|transcript|diff|stats|apply) ;;
     *) fatal "unknown command: ${cmd} (see --help)" ;;
 esac
 

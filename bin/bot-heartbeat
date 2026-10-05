@@ -98,6 +98,9 @@ const REFRESH_MIN_AGE_MS = 5 * 60 * 1000;
 const DONE_STATUS = "Done";
 const DEFAULT_STALE_HOURS = 6;
 const METADATA_RE = /^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,127}$/;
+const RUN_REPO_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
+const RUN_HEALTHS = ["unknown", "healthy", "stalled", "failing", "runaway"];
+const RUN_HEALTH_MAX_AGE_MS = 5 * 60 * 1000;
 
 const EX_ERROR = 1;
 const EX_USAGE = 2;
@@ -156,6 +159,13 @@ Optional worker metadata: location (local or remote), engine and model
 (public identifiers, at most 128 characters), and last_activity_at (UTC).
 Advance last_activity_at only when that worker actually makes progress;
 refresh never advances it. Workers without it use started_at for expiry.
+Remote workers may include run_health: repo, run_id, attempt, evaluated_at,
+health, last_activity_at and tokens (a nonnegative integer or null), plus
+optional observed_at (the producer's UTC observation time, or null). Both
+evaluation and observation age are bounded to five minutes. Only
+sanitized watch results belong here; no reasons, event text or private IDs.
+tokens stays in saved input and the private usage snapshot, never in the
+public heartbeat. Missing or stale run health is unknown, never healthy.
 
 Unless --no-usage, publish also writes a usage snapshot, never to the
 public heartbeat: to the one comment the bot keeps on
@@ -293,6 +303,37 @@ function checkTime(v, where, nowMs, maxMs = MAX_SKEW_MS) {
   return new Date(Math.floor(t / 1000) * 1000).toISOString().replace(".000Z", "Z");
 }
 
+// The watch evaluation time is separate from execution activity. Refreshes
+// cannot make old evidence fresh. Tokens are private, like transcript usage.
+function validateRunHealth(raw, where, nowMs) {
+  checkKeys(raw, where, ["repo", "run_id", "attempt", "evaluated_at", "health", "last_activity_at", "tokens"], ["observed_at"]);
+  const result = { repo: checkString(raw.repo, `${where}.repo`, RUN_REPO_RE, "OWNER/REPO") };
+  for (const key of ["run_id", "attempt"]) {
+    if (!Number.isSafeInteger(raw[key]) || raw[key] < 1) throw invalid(`${where}.${key}`, "must be a positive safe integer");
+    result[key] = raw[key];
+  }
+  result.evaluated_at = checkTime(raw.evaluated_at, `${where}.evaluated_at`, nowMs, 0);
+  if (raw.observed_at !== undefined) result.observed_at = raw.observed_at === null ? null :
+    checkTime(raw.observed_at, `${where}.observed_at`, Date.parse(raw.evaluated_at), 0);
+  result.health = checkEnum(raw.health, `${where}.health`, RUN_HEALTHS);
+  result.last_activity_at = raw.last_activity_at === null ? null : checkTime(raw.last_activity_at, `${where}.last_activity_at`, Date.parse(raw.evaluated_at), 0);
+  if (raw.tokens !== null && (!Number.isSafeInteger(raw.tokens) || raw.tokens < 0)) throw invalid(`${where}.tokens`, "must be a nonnegative safe integer or null");
+  result.tokens = raw.tokens;
+  if (result.health === "unknown" && (result.tokens !== null || result.last_activity_at !== null)) throw invalid(where, "unknown health must have null activity and tokens");
+  if (result.health !== "unknown" && (result.tokens === null || result.last_activity_at === null)) throw invalid(where, "known health requires activity and tokens");
+  return result;
+}
+
+function publicRunHealth(raw, nowMs) {
+  const { tokens: _tokens, ...result } = raw;
+  if (nowMs - Date.parse(result.evaluated_at) > RUN_HEALTH_MAX_AGE_MS ||
+      (result.observed_at !== undefined && (result.observed_at === null || nowMs - Date.parse(result.observed_at) > RUN_HEALTH_MAX_AGE_MS))) {
+    result.health = "unknown";
+    result.last_activity_at = null;
+  }
+  return result;
+}
+
 // validate(input, nowMs): {hb, agentIds}: the heartbeat, normalized,
 // with the schema tag, and each worker's agent ids (local only: they are
 // not part of the heartbeat), by name.
@@ -316,7 +357,7 @@ function validate(input, nowMs) {
   const agentIds = new Map();
   const workers = input.workers.map((w, i) => {
     const where = `workers[${i}]`;
-    checkKeys(w, where, ["name", "item_url", "started_at", "status"], ["devspace", "agent_ids", "last_activity_at", "location", "engine", "model"]);
+    checkKeys(w, where, ["name", "item_url", "started_at", "status"], ["devspace", "agent_ids", "last_activity_at", "location", "engine", "model", "run_health"]);
     const worker = {
       name: checkString(w.name, `${where}.name`, WORKER_NAME_RE, "1-64 of [A-Za-z0-9_.-]"),
       item_url: checkString(w.item_url, `${where}.item_url`, ITEM_URL_RE, "a github.com issue or pull request URL"),
@@ -330,6 +371,11 @@ function validate(input, nowMs) {
     if (w.location !== undefined) worker.location = checkEnum(w.location, `${where}.location`, ["local", "remote"]);
     for (const key of ["engine", "model"]) {
       if (w[key] !== undefined) worker[key] = checkString(w[key], `${where}.${key}`, METADATA_RE, "a public engine/model identifier, at most 128 characters");
+    }
+    if (w.run_health !== undefined) {
+      const run = validateRunHealth(w.run_health, `${where}.run_health`, nowMs);
+      if (w.location !== "remote" || w.name !== `run-${run.run_id}`) throw invalid(`${where}.run_health`, "must match a remote run-ID worker");
+      worker.run_health = publicRunHealth(run, nowMs);
     }
     if (names.has(worker.name)) throw invalid(`${where}.name`, `'${worker.name}' is listed twice`);
     names.add(worker.name);
@@ -369,8 +415,8 @@ function publicRepos(repos) {
 // dropPrivate(hb): HB without the workers on items in non-public
 // repositories.
 function dropPrivate(hb) {
-  const visible = publicRepos(new Set(hb.workers.map((w) => repoOf(w.item_url).toLowerCase())));
-  const workers = hb.workers.filter((w) => visible.has(repoOf(w.item_url).toLowerCase()));
+  const visible = publicRepos(new Set(hb.workers.flatMap((w) => [repoOf(w.item_url).toLowerCase(), ...(w.run_health ? [w.run_health.repo.toLowerCase()] : [])])));
+  const workers = hb.workers.filter((w) => visible.has(repoOf(w.item_url).toLowerCase()) && (!w.run_health || visible.has(w.run_health.repo.toLowerCase())));
   const dropped = hb.workers.length - workers.length;
   if (dropped) log(`left out ${dropped} worker(s) on items in private repositories`);
   return { ...hb, workers };
@@ -565,14 +611,20 @@ function collectUsage(nowMs, session = null, agentIds = new Map()) {
 // usageSnapshot(hb, agentIds, nowMs): what goes to USAGE_REPO: the
 // usage, and the tokens of each worker (all of them: the repository is
 // private) whose subagents' transcripts were found.
-function usageSnapshot(hb, agentIds, nowMs) {
+function usageSnapshot(hb, agentIds, nowMs, inputWorkers = []) {
   const { usage, workerTokens } = collectUsage(nowMs, hb.coordinator.session, agentIds);
+  const runs = inputWorkers.filter((w) => w.run_health).map((w) => {
+    const run = validateRunHealth(w.run_health, `worker ${w.name}.run_health`, nowMs);
+    const current = publicRunHealth(run, nowMs);
+    return { name: w.name, ...current, tokens: current.health === "unknown" ? null : run.tokens };
+  });
   return {
     schema: USAGE_SCHEMA,
     updated_at: hb.updated_at,
     session: hb.coordinator.session,
     ...usage,
     workers: [...workerTokens].map(([name, tokens]) => ({ name, tokens })),
+    ...(runs.length ? { runs } : {}),
   };
 }
 
@@ -612,6 +664,10 @@ function render(hb) {
       lines.push(`| ${code(w.name)} | ${code(itemRef(w.item_url))} | ${w.status} | ${w.started_at} | ${w.devspace ? code(w.devspace) : ""} | ${w.location || "local"} | ${w.engine ? code(w.engine) : ""} | ${w.model ? code(w.model) : ""} |`);
     }
     lines.push("");
+    for (const w of hb.workers.filter((w) => w.run_health)) {
+      const r = w.run_health;
+      lines.push(`${code(w.name)}: run ${code(`${r.repo}/${r.run_id}/${r.attempt}`)} ${r.health}; last execution activity ${r.last_activity_at || "unknown"}; evaluated ${r.evaluated_at}.`);
+    }
   }
   return finish(lines, hb);
 }
@@ -625,6 +681,7 @@ function renderUsage(snap) {
     for (const w of snap.workers) lines.push(`| ${code(w.name)} | ${fmtTokens(totalTokens(w.tokens))} |`);
     lines.push("");
   }
+  for (const r of snap.runs || []) lines.push(`${code(r.name)}: attempt ${r.attempt}, ${r.health}, fresh tokens ${r.tokens === null ? "unknown" : fmtTokens(r.tokens)} (input + output + cache write; cache read excluded).`);
   return finish(lines, snap);
 }
 
@@ -744,7 +801,7 @@ function publish(input, { dryRun = false, withUsage = true, existing, strictStat
   if (withUsage) {
     // Best effort: a heartbeat without usage beats none.
     try {
-      usageBody = renderUsage(usageSnapshot(valid, agentIds, nowMs));
+      usageBody = renderUsage(usageSnapshot(valid, agentIds, nowMs, input.workers));
     } catch (e) {
       log(`no usage snapshot: ${e.message}`);
     }
@@ -1014,5 +1071,5 @@ if (require.main === module) {
     process.exit(e.status);
   }
 } else {
-  module.exports = { validate, render, renderUsage, usageSnapshot, parseComment, rateLimitsOf, collectUsage, now, SCHEMA, MARKER, USAGE_MARKER };
+  module.exports = { validate, validateRunHealth, render, renderUsage, usageSnapshot, parseComment, rateLimitsOf, collectUsage, now, SCHEMA, MARKER, USAGE_MARKER };
 }

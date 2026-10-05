@@ -105,6 +105,222 @@ produces a warning; the claim or dispatch remains in effect. Publish the
 full current worker list to recover, rather than rebuilding input from
 the public heartbeat, which omits private fields.
 
+## Live run observation and health (consumer implemented, producers missing)
+
+`lib/run-health.js` evaluates sanitized attempt-scoped observations;
+`lib/run-watch.js` and `bot-runs watch` consume them. This is a **proposed
+`run-observation/v1` producer/consumer contract**, not evidence that telemetry
+is deployed. The praxis broker, runner `run.mjs`, and review application
+are absent from this checkout. Their producer, transport, and UI changes
+still need implementation and deployment. This work does not complete
+the end-to-end run-health issue.
+
+The broker must meter actual inference requests and cumulative usage,
+bound to the Actions repository, run ID and attempt at registration. The
+runner must supply sanitized tool outcomes and actual execution activity
+for that same identity. A broker-only inference stream cannot establish
+that a tool-only workload is idle. A producer or aggregation service must
+combine these sources, expose a complete rolling event window, and update
+observation timestamps even during silence without advancing activity.
+There is currently no deployed endpoint specified here, no runner emitter,
+and no review-app rendering verified by this checkout. Do not infer live
+health from old artifacts, Actions log volume, elapsed job time, workflow
+start time, or a heartbeat refresh.
+
+### Proposed observation payload
+
+The consumer accepts a JSON **array**, either from a sanitized read-only
+endpoint or a local file. There must be exactly one matching observation
+per `(repo, run_id, attempt)`; duplicates are unknown, not last-writer-wins.
+An example (numbers are illustrative, not observed usage):
+
+```json
+[
+  {
+    "schema": "run-observation/v1",
+    "repo": "bootc-dev/cgwalters-devspace-sandbox",
+    "run_id": 123456789,
+    "attempt": 1,
+    "observed_at": "2026-10-05T12:00:00Z",
+    "last_activity_at": "2026-10-05T11:59:58Z",
+    "window_started_at": "2026-10-05T11:55:00Z",
+    "tokens": {"input": 1200, "output": 300, "cache_write": 100},
+    "events": [
+      {"at": "2026-10-05T11:59:58Z", "kind": "request", "error": false}
+    ]
+  }
+]
+```
+
+`repo` is the Actions repository, compared case-insensitively, not the
+task's target repository. `run_id` and `attempt` must numerically match the
+Actions run and its `run_attempt`. Reruns start new counters and never
+inherit suspicion or cancellation intent. All times are UTC strings with
+`Z`, optionally fractional seconds. `observed_at` is the producer's
+snapshot time, no later than evaluation time and no more than five minutes
+old. `last_activity_at` is actual execution activity, at or after the active
+execution step's start and no later than `observed_at`. Before the producer
+has a usable activity time, omit the observation or report unusable/null
+fields; the result is unknown, not zero usage or healthy.
+
+`window_started_at` asserts complete coverage from that time through the
+snapshot, including periods with no events. It must be no later than
+`max(execution step start, evaluation time minus five minutes)`. Every
+event is an object with `at`, `kind` (`request` or `tool`) and Boolean
+`error`. Events must be within the current execution step and no later
+than `last_activity_at`; older events may be retained but only those at or
+after evaluation time minus five minutes count. Producers must record
+each relevant request/tool outcome once, including errors, and must not
+label partial coverage as complete. Activity during a long-running tool
+needs a genuine execution-progress signal; an observation refresh alone
+is not one. No prompt, response, tool arguments/output, error text, session
+ID, credential, or broker-private identifier belongs in this payload.
+Consumers ignore extra fields; producers should emit only this allowlist.
+
+`tokens.input`, `.output`, and `.cache_write` are nonnegative safe integers,
+cumulative **actual metered usage for this attempt**, not estimates,
+reservations, a rate-limit percentage, or a rolling-window count. Input is
+uncached input, output includes reasoning already counted within output,
+and cache write counts written tokens once. Their safe-integer sum is the
+watch's `tokens` scalar, called **fresh tokens**. Cache-read tokens are
+excluded; do not substitute praxis `tokens.total`, whose cap accounting
+may include cache reads, or add reasoning a second time. Missing/unmetered
+usage is unknown, never a fabricated zero. If a provider cannot supply
+these semantics, its producer must leave telemetry unusable until a
+versioned accounting contract resolves it. This scalar differs from local
+heartbeat transcript usage, which reports four token categories including
+cache read, and from dispatch `budget` in AIC.
+
+### Eligibility, thresholds and cancellation
+
+Watch considers only unique board-owned runs on In Progress items, with
+workflow other than `manual` and Lead absent or `coordinator`, whose Run
+URL belongs to the configured Actions repository. Runs must be
+`in_progress`, with exactly one active step named `Run agent` in an active
+job named `Agent`. Queueing, checkout/setup, artifacts, validation, an
+ambiguous step, missing metadata, stale/malformed/duplicate observations,
+or incomplete counters/window coverage produce `unknown`. Unknown never
+authorizes cancellation and breaks continuous suspicion.
+
+Default stall threshold is ten minutes since execution activity
+(inclusive). Failing means at least five request/tool events in the
+rolling five-minute window, at least half errors (inclusive). Runaway
+means fresh tokens strictly exceed a positive board **Budget tokens**
+field; no positive value means no token-health cap. Precedence is runaway,
+then failing, then stalled, then healthy. Healthy means usable evidence
+below those thresholds, not proof of task quality or completion. The
+evaluator can return partial activity/counters with an unknown result;
+heartbeat deliberately clears these per-run unknown fields.
+
+The same suspect health class must persist across evaluations for five
+minutes before cancellation is eligible. Recovery, unknown evidence or a
+change in class resets the grace; a different attempt has a separate key.
+This is sweep-observed continuity, not continuous monitoring between
+sweeps. After grace, apply rechecks fresh board ownership, run attempt,
+execution step and fresh telemetry before POSTing cancellation. Durable
+intent is saved before the POST, so an ambiguous transport failure is not
+retried as another cancellation request. Watch polls a pending request
+even if the run leaves the active listing. Only confirmed `completed` /
+`cancelled` on the same attempt permits setting the still-owned item to
+Todo, recording Why/News, and clearing Run. An ownership change refuses
+that board write. Other terminal outcomes go through reconcile. There is
+no separate cancellation-confirmation deadline or automatic retry of an
+ambiguous POST; the grace knob is **before** cancellation, not an allowance
+for a process to terminate after it.
+
+`bot-runs watch` supports `--stall-minutes` (default 10),
+`--grace-minutes` (default 5), and `--execution-step` (default `Run agent`,
+also `BOT_RUNS_EXECUTION_STEP`). Nonnegative minutes, including zero, are
+accepted. Freshness and event-window length are fixed at five minutes in
+the CLI; library callers can pass `freshnessMs` and `windowMs`. The error
+minimum/fraction are fixed at five/one-half. Source knobs are `--read-url`
+or `BOT_RUNS_WATCH_URL`, and `--observations-file` or
+`BOT_RUNS_WATCH_OBSERVATIONS`; a file wins if both are set. Read URLs accept
+HTTP(S), refuse embedded credentials and redirects, and time out after
+ten seconds. Read errors degrade to unknown without echoing transport
+details. Endpoint reachability and deployment remain producer work.
+
+`--board-file`, `--runs-file`, `--now` and `--state-file` support offline
+evaluation; offline run fixtures refuse real apply. State defaults to
+`${XDG_STATE_HOME:-~/.local/state}/bot-runs/watch.json`
+(`BOT_RUNS_WATCH_STATE` overrides it). A nonblocking state lock prevents
+concurrent watchers. Report mode can persist suspicion but does not
+cancel or change the board; `--dry-run` changes neither persistent state
+nor the board and reports eligible actions; `--apply` permits the guarded
+writes. `bot-watch` runs watch before reconcile on each sweep, uses its
+Lead-filtered board scope, refreshes that board between the two for live
+apply, combines both reports into `devspace_runs`, and marks the section
+failed if either fails. Without telemetry, ordinary completion reconcile
+still works while live health remains unknown. No background sampling is
+implied; cancellation can occur only on a subsequent eligible sweep.
+
+### Heartbeat publication
+
+`lib/heartbeat-register.js` exports a locked updater for existing remote
+`run-ID` workers. Live `bot-runs watch --apply` calls it after fresh
+evaluation and ownership checks, using the unique board owner (including
+its content URL):
+
+```js
+const { updateRun } = require("./heartbeat-register.js");
+// Only live --apply, never report, --dry-run, or offline fixtures.
+// Refresh ownership before calling; do not update a cleared/reassigned Run.
+const ok = updateRun(freshItem, result, {
+  evaluatedAt: new Date(evaluationTimeMs).toISOString(),
+  // Optional: heartbeat: process.env.BOT_RUNS_HEARTBEAT
+});
+```
+
+`evaluationTimeMs` must be the time used for that result, not publication
+time. `result` is a watch result containing `repo`, `run_id`, `attempt`,
+`item`, `run`, `health`, `observed_at`, `last_activity_at` and `tokens`. A metadata-error
+result without identity cannot update a worker; leave it alone to age to
+unknown. Pass post-revalidation evidence if cancellation revalidation
+changed the evaluation. Prefer calling before a successful cancellation
+clears board ownership; existing reconcile/apply cleanup removes finished
+workers. A false return is a best-effort publication failure to report,
+not grounds to undo cancellation or a board claim. The helper returns true
+for a no-op (no matching worker, changed ownership, or older evaluation).
+It never creates a worker or looks up board ownership itself; the caller
+must enforce unique fresh ownership and provide trustworthy watch output.
+Watch reports publication failures without suppressing cancellation. Confirmed
+cancellation removes the worker; failed cleanup is durably retried on later
+live applies, even after Run is cleared, while protecting newer attempts.
+
+The helper merges from saved private input under the same registration
+lock through remote publication and state save, preserves `agent_ids`,
+other worker metadata and the saved session owner (including null), and
+uses the existing strict published-state comparison. It updates only the
+remote worker whose name and item URL match. Older attempts/evaluations
+are ignored. A new attempt clears prior attempt activity. Unknown clears
+per-run activity/tokens and does not advance worker activity; previous
+genuine activity can remain for expiry within the same attempt.
+
+The additive worker `run_health` input holds `repo`, `run_id`, `attempt`,
+`evaluated_at`, optional producer `observed_at`, `health`, `last_activity_at`, and scalar `tokens`. Public
+`bot-heartbeat/v1` exposes those fields **except tokens**, filtering both
+item and run repositories for public visibility. Private `bot-usage/v1`
+adds `runs` entries with the worker name and all those fields, including
+fresh tokens; these are separate from local transcript `workers` sums.
+Neither publication includes watch reasons/events or private agent IDs.
+`bot-heartbeat show`/`show --usage` return the corresponding JSON, and
+comment text renders the run state. This makes status available to a
+consumer but does not implement the absent review UI.
+
+Refresh never advances execution activity, `evaluated_at`, or `observed_at`.
+On a publication more than five minutes after either evaluation or producer
+observation, per-run public health/activity and private run tokens become
+unknown/null; saved input retains the original evidence. A null observation
+is unknown; older inputs without that optional field use the evaluation-age
+bound. A review consumer must also apply these bounds at read time, even if
+heartbeat `updated_at` is fresh; absent `run_health` is unknown.
+Worker expiry is separate: prune drops
+workers after six hours (inclusive) without genuine activity, falling back
+to `started_at`, configurable via positive `BOT_HEARTBEAT_STALE_HOURS`.
+Prune also drops Done/closed items and keeps unreadable items until expiry.
+Prune does not cancel Actions runs; a heartbeat refresh does not postpone
+expiry. `done run-ID` explicitly removes a finished/cancelled worker.
+
 ## Artifacts
 
 Each run uploads two artifacts. Everything in them has been through the

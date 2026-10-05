@@ -166,7 +166,7 @@ refused; with --dry-run (or --board-file), the command it would run;
 otherwise they are only listed. Approved fork PRs for a human-text
 repository are never promoted: they are listed under "Needs your text".
 
-Then "Devspace runs" ('bot-runs reconcile', see 'bot-runs --help'):
+Then "Devspace runs" ('bot-runs watch', then 'bot-runs reconcile', see 'bot-runs --help'):
 the items whose Run field names a devspace agent run, and with --apply
 the In Progress ones whose run is over move on (a patch ready to Draft,
 anything else back to Todo).
@@ -945,8 +945,26 @@ step_start promote "${PROMOTE_DUE}" "${due_args[@]}"
 # bot-poll, which ignores the section).
 printf '%s\n' "${board}" >"${scratch}/full-board.json"
 step_start propagate "${PRIORITY_PROPAGATE}" "${due_args[@]}" --board-file "${scratch}/full-board.json"
-# The items whose devspace agent run is over move on (--apply only).
-step_start runs "${RUNS}" reconcile "${due_args[@]}" --board-file "${scratch}/board.json"
+# Watch must precede reconcile: cancellation's diagnostic survives completion.
+# Apply uses fresh board ownership inside watch; Lead filters bound its scope.
+printf '%s\n' "${swept_board}" >"${scratch}/runs-board.json"
+runs_watch_then_reconcile() {
+    local watch_rc=0 reconcile_rc=0
+    "${RUNS}" watch "${due_args[@]}" --board-file "${scratch}/runs-board.json" \
+        ${now:+--now "${now}"} >"${scratch}/runs-watch.json" || watch_rc=$?
+    if ${apply} && ! ${dry_run} && test -z "${board_file}"; then
+        # Watch may have cleared Run. Reconcile must not replay that stale item
+        # or overwrite a changed owner/status after the watch's fresh check.
+        local fresh_board
+        fresh_board=$("${BOT_BOARD}" --refresh list --json) || return $?
+        filter_leads "${fresh_board}" >"${scratch}/runs-board.json"
+    fi
+    "${RUNS}" reconcile "${due_args[@]}" --board-file "${scratch}/runs-board.json" \
+        >"${scratch}/runs-reconcile.json" || reconcile_rc=$?
+    jq -s 'add' "${scratch}/runs-watch.json" "${scratch}/runs-reconcile.json"
+    test "${watch_rc}" -eq 0 && test "${reconcile_rc}" -eq 0
+}
+step_start runs runs_watch_then_reconcile
 # What the operator did that the bot should act on (by event, so
 # bot-poll wakes once per event however often a sweep lists it).
 step_start activity "${OPERATOR_ACTIVITY}" "${due_args[@]}" --board-file "${scratch}/board.json" ${now:+--now "${now}"}

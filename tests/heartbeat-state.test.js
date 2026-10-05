@@ -78,7 +78,111 @@ else { console.error('unexpected fake API call: ' + args.join(' ')); process.exi
     calls: () => fs.readFileSync(path.join(dir, "calls"), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) };
 }
 
+test("run health validates sanitized identities, fractional times, counters and age boundaries", () => {
+  const { validate } = require(HEARTBEAT);
+  const t = Date.parse("2026-10-05T12:00:00.123Z");
+  const run = { repo: "o/r", run_id: 42, attempt: 1, evaluated_at: new Date(t).toISOString(),
+    health: "healthy", last_activity_at: new Date(t).toISOString(), tokens: 0 };
+  const input = { coordinator: { session: OWNER, loop_state: "working" }, workers: [{ ...ORIGINAL, name: "run-42", location: "remote", run_health: run }] };
+  const hb = validate(input, t).hb;
+  assert.equal(hb.workers[0].run_health.health, "healthy");
+  assert.equal(hb.workers[0].run_health.tokens, undefined);
+  const normalizedTime = Date.parse(hb.workers[0].run_health.evaluated_at);
+  assert.equal(validate(input, normalizedTime + 300000).hb.workers[0].run_health.health, "healthy");
+  assert.equal(validate(input, normalizedTime + 300001).hb.workers[0].run_health.health, "unknown");
+  const sourced = structuredClone(input);
+  sourced.workers[0].run_health.observed_at = new Date(normalizedTime - 240000).toISOString();
+  assert.equal(validate(sourced, normalizedTime + 60000).hb.workers[0].run_health.health, "healthy");
+  const expired = validate(sourced, normalizedTime + 60001).hb.workers[0].run_health;
+  assert.equal(expired.health, "unknown");
+  assert.equal(expired.last_activity_at, null);
+  assert.equal(Date.parse(expired.observed_at), Date.parse(sourced.workers[0].run_health.observed_at));
+  for (const patch of [{ tokens: -1 }, { tokens: Number.MAX_SAFE_INTEGER + 1 }, { attempt: 0 }, { run_id: "42" },
+    { health: "unknown" }, { health: "arbitrary text" }, { private_id: "secret" },
+    { evaluated_at: new Date(t + 1).toISOString() }, { observed_at: new Date(t + 1).toISOString() },
+    { last_activity_at: new Date(t + 1).toISOString() }]) {
+    const bad = structuredClone(input);
+    Object.assign(bad.workers[0].run_health, patch);
+    assert.throws(() => validate(bad, t), /invalid heartbeat/);
+  }
+});
+
 for (const owner of [OWNER, null]) {
+  test(`watch heartbeat updates preserve owner ${owner}, private IDs and activity semantics`, () => {
+    const w = world(owner);
+    try {
+      const t = Math.floor(Date.now() / 1000) * 1000;
+      w.env.BOT_HEARTBEAT_NOW = new Date(t).toISOString();
+      const input = w.saved().input;
+      input.workers.push({ ...ORIGINAL, name: "run-42", location: "remote", item_url: "https://github.com/o/r/issues/1", agent_ids: ["private456"] });
+      const seed = spawnSync(HEARTBEAT, ["publish", "--no-usage"], { input: JSON.stringify(input), env: w.env, encoding: "utf8" });
+      assert.equal(seed.status, 0, seed.stderr);
+      const item = { id: "PVTI_item", status: "In Progress", content: { url: input.workers[1].item_url }, run: "https://github.com/o/r/actions/runs/42" };
+      const result = { repo: "o/r", run_id: 42, attempt: 1, item: item.id, run: item.run, health: "healthy", last_activity_at: new Date(t - 1000).toISOString().replace(".000Z", "Z"), tokens: 1234,
+        observed_at: new Date(t - 240000).toISOString().replace(".000Z", "Z"),
+        reasons: ["never publish this"], private_id: "secret-id" };
+      const update = (it = item, r = result, at = t) => spawnSync(process.execPath, ["-e", `const fs = require('node:fs'); const x = JSON.parse(fs.readFileSync(0, 'utf8'));
+process.exit(require(${JSON.stringify(REGISTER)}).updateRun(x.item, x.result, {evaluatedAt: x.at}) ? 0 : 1);`], {
+        env: { ...w.env, CLAUDE_CODE_SESSION_ID: "watch-session", BOT_HEARTBEAT_NOW: new Date(at).toISOString() }, encoding: "utf8",
+        input: JSON.stringify({ item: it, result: r, at: new Date(at).toISOString() }),
+      });
+      const first = update();
+      assert.equal(first.status, 0, first.stderr);
+      const saved = w.saved();
+      assert.equal(saved.session, owner);
+      assert.deepEqual(saved.input.coordinator, input.coordinator);
+      assert.deepEqual(saved.input.workers[0], ORIGINAL);
+      assert.deepEqual(saved.input.workers[1].agent_ids, ["private456"]);
+      assert.equal(saved.input.workers[1].run_health.tokens, 1234);
+      assert.equal(saved.input.workers[1].run_health.observed_at, result.observed_at);
+      assert.equal(saved.published.workers[1].run_health.observed_at, result.observed_at);
+      assert.equal(saved.input.workers[1].last_activity_at, result.last_activity_at);
+      const body = JSON.parse(fs.readFileSync(path.join(w.dir, "comment.json"), "utf8")).body;
+      assert.match(body, /healthy; last execution activity/);
+      assert.doesNotMatch(body, /tokens|private456|secret-id|never publish this/);
+      const usageBody = JSON.parse(fs.readFileSync(path.join(w.dir, "usage-comment.json"), "utf8")).body;
+      assert.equal(require(HEARTBEAT).parseComment(usageBody).runs[0].tokens, 1234);
+      assert.doesNotMatch(usageBody, /private456|secret-id|never publish this/);
+      const before = fs.readFileSync(w.state, "utf8");
+      for (const [it, r, at] of [
+        [item, result, t], // idempotent / out-of-order evaluation
+        [{ ...item, lead: "topic" }, result, t + 1000],
+        [{ ...item, status: "Draft" }, result, t + 1000],
+        [{ ...item, content: { url: ORIGINAL.item_url } }, result, t + 1000],
+        [item, { ...result, run_id: 99 }, t + 1000],
+      ]) {
+        const ignored = update(it, r, at);
+        assert.equal(ignored.status, 0, ignored.stderr);
+        assert.equal(fs.readFileSync(w.state, "utf8"), before);
+      }
+      const unknown = update(item, { ...result, health: "unknown", tokens: 9999 }, t + 1000);
+      assert.equal(unknown.status, 0, unknown.stderr);
+      assert.equal(w.saved().input.workers[1].last_activity_at, result.last_activity_at);
+      assert.equal(w.saved().published.workers[1].run_health.last_activity_at, null);
+      assert.equal(w.saved().input.workers[1].run_health.tokens, null);
+      const rerun = update(item, { ...result, attempt: 2, health: "unknown" }, t + 2000);
+      assert.equal(rerun.status, 0, rerun.stderr);
+      assert.equal(w.saved().input.workers[1].last_activity_at, undefined);
+      const rerunState = fs.readFileSync(w.state, "utf8");
+      assert.equal(update(item, result, t + 3000).status, 0);
+      assert.equal(fs.readFileSync(w.state, "utf8"), rerunState);
+      const invalid = update(item, { ...result, attempt: 2, tokens: -1 }, t + 3000);
+      assert.equal(invalid.status, 1);
+      assert.equal(fs.readFileSync(w.state, "utf8"), rerunState);
+      // A fresh evaluation cannot renew already expired producer evidence.
+      assert.equal(update(item, { ...result, attempt: 2 }, t + 61000).status, 0);
+      assert.equal(w.saved().input.workers[1].run_health.health, "healthy");
+      assert.equal(w.saved().published.workers[1].run_health.health, "unknown");
+      // Ordinary refresh also keeps evidence unknown without moving activity.
+      const refresh = spawnSync(HEARTBEAT, ["refresh"], { env: { ...w.env, BOT_HEARTBEAT_NOW: new Date(t + 362000).toISOString() }, encoding: "utf8" });
+      assert.equal(refresh.status, 0, refresh.stderr);
+      assert.equal(w.saved().published.workers[1].run_health.health, "unknown");
+      assert.equal(w.saved().input.workers[1].last_activity_at, result.last_activity_at);
+      const refreshedUsage = require(HEARTBEAT).parseComment(JSON.parse(fs.readFileSync(path.join(w.dir, "usage-comment.json"), "utf8")).body);
+      assert.equal(refreshedUsage.runs[0].tokens, null);
+    } finally { w.cleanup(); }
+  });
+
   test(`done: explicit idempotent removal while Draft, owner ${owner}`, () => {
     const w = world(owner);
     try {
