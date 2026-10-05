@@ -17,7 +17,15 @@ const BIN_DIR = process.env.BOT_SWEEP_BIN_DIR || path.dirname(SELF);
 const REPO_DIR = path.dirname(path.dirname(SELF));
 const GIT = process.env.BOT_SWEEP_GIT || "git";
 const STATUS_VERSION = 1;
+const { DEFAULT_DAYS: ARCHIVE_DAYS } = require(path.join(REPO_DIR, "lib", "board-archive-done.js"));
 const MINUTE_MS = 60 * 1000;
+// Retention looks up every Done item's issue or PR, and nothing needs an
+// item gone the minute it is due: not on every sweep.
+const ARCHIVE_STEP = "archive-done";
+const ARCHIVE_EVERY_MS = 6 * 60 * MINUTE_MS;
+// A run that failed is tried again after this long, not on every sweep:
+// what failed it (an unreadable issue, say) rarely passes in minutes.
+const ARCHIVE_RETRY_MS = 60 * MINUTE_MS;
 // A sweep's steps must be done well before the unit's TimeoutStartSec
 // (25 min), so that systemd never has to kill it: in a toolbox the
 // steps run in the container's cgroup, out of the unit's reach.
@@ -42,6 +50,7 @@ const PHASES = [
     // With none to set, it reads only the REST listing: no GraphQL.
     { name: "fill-org", tool: "bot-board", args: ["fill-org"], timeoutMin: 2 },
   ],
+  [{ name: ARCHIVE_STEP, tool: "bot-board", args: ["archive-done"], timeoutMin: 6 }],
   [{ name: "status-update", tool: "bot-board", args: ["status-update", "--auto"], timeoutMin: 2 }],
 ];
 // What 'bot-board fill-org' prints for each item it sets: ID, Org, title.
@@ -80,7 +89,7 @@ class Exit extends Error {
 }
 
 function usage() {
-  return `Usage: ${PROG} [--state-dir DIR]
+  return `Usage: ${PROG} [--state-dir DIR] [--archive-days N] [--archive-dry-run]
 
 Runs one full sweep for the coordinator and publishes its results, for
 'bot-poll --from-sweep DIR' to read. The bot-sweep.timer user unit runs
@@ -94,10 +103,18 @@ never killed halfway by a poll's timeout:
   bot-tmt-number --gc                    \\
   bot-actuals --open                      > at once
   bot-board fill-org                     /
+  bot-board archive-done --days N --apply   (every ${ARCHIVE_EVERY_MS / (60 * MINUTE_MS)}h)
   bot-board status-update --auto
 
+Done items whose issue or PR closed more than N days ago (--archive-days,
+default ${ARCHIVE_DAYS}) are archived off the board; epics and issues with open
+sub-issues are skipped. That step runs once its last finished run is
+${ARCHIVE_EVERY_MS / (60 * MINUTE_MS)}h old, not on every sweep, unless that left a backlog (it archives a
+limited number per run). One that failed is tried again after ${ARCHIVE_RETRY_MS / (60 * MINUTE_MS)}h. --archive-dry-run only reports what it would
+archive (the other steps still run normally).
+
 Each step has a timeout (git 2, bot-watch 20, bot-notify 5, inbox 10,
-gc 2, actuals 3, fill-org 2, status-update 2 minutes) and runs in its own process group,
+gc 2, actuals 3, fill-org 2, archive-done 6, status-update 2 minutes) and runs in its own process group,
 all of which is killed when it times out, so no orphan keeps holding
 bot-watch's lock. A step that finds another run holding its lock is
 retried ${LOCK_RETRIES} times.
@@ -114,7 +131,7 @@ renamed into place:
                                         signal, timed_out, attempts,
                                         duration_s, bytes}}, problems,
                                         complete, last_complete,
-                                        org_filled}
+                                        org_filled, archive_done}
 
 problems lists what went wrong (a step that failed, timed out or found
 its lock held; bot-watch's report empty or without its closing "Swept"
@@ -123,6 +140,9 @@ and inbox succeeded; last_complete is the newest complete run {run,
 ended_at}; org_filled lists the items fill-org gave an Org ([{id, org,
 title}]), which the report ends with under "Org filled". A failing
 fill-org is a problem like any step's, but leaves the run complete.
+archive_done reports the last finished retention run: archived and
+eligible counts, dry_run and at (when), plus failed_at if a later run
+failed; null if none ran yet. Its failure is also a problem.
 While a sweep runs, DIR/running.json holds its pid, and another sweep
 refuses to start. Runs are kept ${KEEP_DAYS} days.
 
@@ -140,7 +160,7 @@ sweep is running.`;
 }
 
 function parseArgs(argv) {
-  const opts = { stateDir: null };
+  const opts = { stateDir: null, archiveDays: ARCHIVE_DAYS, archiveApply: true };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") {
@@ -149,6 +169,12 @@ function parseArgs(argv) {
     } else if (a === "--state-dir") {
       if (i + 1 >= argv.length) throw new Exit(EX_USAGE, "--state-dir requires a directory");
       opts.stateDir = argv[++i];
+    } else if (a === "--archive-days") {
+      const value = argv[++i];
+      if (!/^\d+$/.test(value || "") || !Number.isSafeInteger(Number(value))) throw new Exit(EX_USAGE, "--archive-days requires a nonnegative integer");
+      opts.archiveDays = Number(value);
+    } else if (a === "--archive-dry-run") {
+      opts.archiveApply = false;
     } else {
       throw new Exit(EX_USAGE, `unknown argument: ${a} (see --help)`);
     }
@@ -174,7 +200,8 @@ function maybeReexec(opts) {
   // The guard inside watches this process: the one inside keeps conmon
   // as its parent when 'toolbox run' is killed.
   settings.push(`${PARENT_ENV}=${process.pid}`);
-  const r = spawnSync("toolbox", ["run", "-c", box, "env", ...settings, SELF, "--state-dir", opts.stateDir],
+  const r = spawnSync("toolbox", ["run", "-c", box, "env", ...settings, SELF, "--state-dir", opts.stateDir,
+    "--archive-days", String(opts.archiveDays), ...(opts.archiveApply ? [] : ["--archive-dry-run"])],
     { stdio: "inherit" });
   if (r.error) throw new Exit(EX_ERROR, `cannot run 'toolbox run -c ${box}': ${r.error.message}`);
   return r.status ?? EX_ERROR;
@@ -443,9 +470,20 @@ async function sweep(opts) {
     fs.mkdirSync(partial);
     const sweepDeadline = started.getTime() + DEADLINE_MS;
     const steps = {};
-    for (const phase of PHASES) {
+    const statusFile = path.join(dir, "status.json");
+    const prev = readStatus(statusFile);
+    const lastArchive = prev?.archive_done ?? null;
+    // older(at, ms): whether the time at is unknown, or at least ms ago.
+    const older = (at, ms) => !Number.isFinite(Date.parse(at)) || started.getTime() - Date.parse(at) >= ms;
+    const backlog = (a) => !a.dry_run && a.archived < a.eligible;
+    const archiveDue = lastArchive?.failed_at ? older(lastArchive.failed_at, ARCHIVE_RETRY_MS) :
+      !lastArchive || lastArchive.dry_run !== !opts.archiveApply || backlog(lastArchive) || older(lastArchive.at, ARCHIVE_EVERY_MS);
+    for (const all of PHASES) {
       if (stopping) break;
-      const results = await Promise.all(phase.map((s) => runStep(s, partial, env, sweepDeadline)));
+      const phase = all.filter((s) => s.name !== ARCHIVE_STEP || archiveDue);
+      const results = await Promise.all(phase.map((s) => runStep(s.name === ARCHIVE_STEP ?
+        { ...s, args: [...s.args, "--days", String(opts.archiveDays), opts.archiveApply ? "--apply" : "--dry-run"] } : s,
+      partial, env, sweepDeadline)));
       phase.forEach((s, i) => {
         steps[s.name] = results[i];
       });
@@ -461,8 +499,7 @@ async function sweep(opts) {
     if (stopping) problems.unshift(`the sweep was stopped (${stopping})`);
     const ended = new Date();
     for (const n of NEWS_STEPS) writeAtomic(path.join(dir, `latest-${n}.txt`), outputs[n] ?? "");
-    const statusFile = path.join(dir, "status.json");
-    const prev = readStatus(statusFile);
+    const archiveMatch = /^Archive Done: (\d+) archived, (\d+) eligible/m.exec(outputs[ARCHIVE_STEP] || "");
     const status = {
       version: STATUS_VERSION, run: id, dir: runDir,
       started_at: started.toISOString(), ended_at: ended.toISOString(),
@@ -470,6 +507,9 @@ async function sweep(opts) {
       steps, problems, complete,
       last_complete: complete ? { run: id, ended_at: ended.toISOString() } : (prev?.last_complete ?? null),
       org_filled: [...(outputs["fill-org"] || "").matchAll(ORG_SET_RE)].map(([, itemId, org, title]) => ({ id: itemId, org, title })),
+      archive_done: archiveMatch ?
+        { archived: Number(archiveMatch[1]), eligible: Number(archiveMatch[2]), dry_run: !opts.archiveApply, at: ended.toISOString() } :
+        (steps[ARCHIVE_STEP] ? { ...lastArchive, failed_at: ended.toISOString() } : lastArchive),
     };
     writeAtomic(statusFile, `${JSON.stringify(status, null, 1)}\n`);
     prune(runsDir, Date.now());
@@ -480,6 +520,7 @@ async function sweep(opts) {
       const url = (outputs["status-update"] || "").split("\n").find((line) => /^https:\/\/github\.com\/\S+$/.test(line));
       if (url) process.stdout.write(`Project status update: ${url}\n`);
     }
+    if (archiveMatch) process.stdout.write(`Archive Done: ${status.archive_done.archived} archived, ${status.archive_done.eligible} eligible${status.archive_done.dry_run ? " (dry-run)" : ""}\n`);
     return problems.length ? EX_ERROR : 0;
   } finally {
     if (killed) await killed;

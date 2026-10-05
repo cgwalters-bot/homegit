@@ -26,6 +26,11 @@ if [ "${name}" = bot-board ] && [ "$1" = status-update ]; then
   printf '%s' "\${FAKE_STATUS_OUT-}"
   exit "\${FAKE_STATUS_EXIT:-0}"
 fi
+if [ "${name}" = bot-board ] && [ "$1" = archive-done ]; then
+  printf '%s' "\${FAKE_ARCHIVE_OUT-Archive Done: 0 archived, 0 eligible}"
+  printf '%s\\n' "$*" >"${WORK}/archive.args"
+  exit "\${FAKE_ARCHIVE_EXIT:-0}"
+fi
 echo x >>"${WORK}/${envName}.calls"
 n=$(wc -l <"${WORK}/${envName}.calls")
 printf '%s' "\${FAKE_${envName}_OUT-}"
@@ -54,10 +59,10 @@ function gone(pid) {
 }
 
 let caseNo = 0;
-function sweep(env = {}, dir = null) {
+function sweep(env = {}, dir = null, args = []) {
   const stateDir = dir || path.join(WORK, `state-${caseNo++}`);
   for (const f of fs.readdirSync(WORK).filter((f) => f.endsWith(".calls"))) fs.rmSync(path.join(WORK, f));
-  const r = spawnSync(TOOL, ["--state-dir", stateDir], {
+  const r = spawnSync(TOOL, ["--state-dir", stateDir, ...args], {
     encoding: "utf8",
     env: {
       PATH: process.env.PATH, HOME: WORK, BOT_SWEEP_BIN_DIR: BIN, BOT_SWEEP_GIT: path.join(BIN, "git"),
@@ -78,14 +83,14 @@ test("a clean sweep publishes its outputs and a complete status", () => {
   assert.deepEqual(s.last_complete.run, s.run);
   assert.match(s.run, /^[0-9]{8}-[0-9]{6}-[0-9]{3}$/);
   assert.ok(s.duration_s >= 0 && s.ended_at >= s.started_at);
-  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "fill-org", "git", "inbox", "notify", "status-update", "tmt-gc", "watch"]);
+  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "archive-done", "fill-org", "git", "inbox", "notify", "status-update", "tmt-gc", "watch"]);
   assert.deepEqual(s.org_filled, []);
   assert.doesNotMatch(r.stdout, /Org filled/);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-notify.txt"), "utf8"), "notify says\n");
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-inbox.txt"), "utf8"), "inbox says\n");
   // The run, in bot-poll's layout.
-  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0, "fill-org": 0, "status-update": 0 });
+  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0, "fill-org": 0, "archive-done": 0, "status-update": 0 });
   assert.equal(fs.readFileSync(path.join(r.stateDir, "runs", s.run, "watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.ok(!fs.existsSync(path.join(r.stateDir, "running.json")));
   assert.deepEqual(fs.readdirSync(path.join(r.stateDir, "runs")), [s.run]);
@@ -119,7 +124,7 @@ for (const c of [
 for (const c of [
   { name: "sets two items' Org", env: { FAKE_BOARD_OUT: "PVTI_a\tbootc-dev\tcomposefs: x\nPVTI_b\tother\tSomething\n" },
     code: 0, filled: [{ id: "PVTI_a", org: "bootc-dev", title: "composefs: x" }, { id: "PVTI_b", org: "other", title: "Something" }],
-    stdout: /\nOrg filled:\n {2}PVTI_a bootc-dev: composefs: x\n {2}PVTI_b other: Something\n$/ },
+    stdout: /\nOrg filled:\n {2}PVTI_a bootc-dev: composefs: x\n {2}PVTI_b other: Something\n/ },
   { name: "fails", env: { FAKE_BOARD_RUN: "echo 'error: listing board items failed' >&2", FAKE_BOARD_EXIT: "1" },
     code: 1, filled: [], problem: /^fill-org exited 1: error: listing board items failed$/ },
 ]) {
@@ -143,7 +148,8 @@ test("fill-org with the real bot-board gives an Org-less item its Org", () => {
   for (const f of fs.readdirSync(BIN)) if (f !== "bot-board") fs.copyFileSync(path.join(BIN, f), path.join(bin, f));
   fs.symlinkSync(path.join(__dirname, "..", "bin", "bot-board"), path.join(bin, "bot-board"));
   fs.writeFileSync(path.join(store, "fields.json"), JSON.stringify({ fields: [{ id: "F_org", name: "Org",
-    options: ["bootc-dev", "other"].map((n) => ({ id: `O_${n}`, name: n })) }] }));
+    options: ["bootc-dev", "other"].map((n) => ({ id: `O_${n}`, name: n })) },
+    { id: "F_status", name: "Status", options: [{ id: "S_done", name: "Done" }] }] }));
   fs.writeFileSync(path.join(store, "items.json"), JSON.stringify({ items: [
     { id: "PVTI_new", title: "bootc: auto-added", content: { type: "Issue", url: "https://github.com/bootc-dev/bootc/issues/1", body: "" } },
     { id: "PVTI_old", title: "Has one", org: "other", content: { type: "Issue", url: "https://github.com/example/x/issues/2", body: "" } },
@@ -177,6 +183,65 @@ test("a step whose lock is held only for a while is retried", () => {
   assert.equal(r.code, 0, r.stdout + r.stderr);
   assert.equal(r.st.steps.notify.attempts, 3);
   assert.deepEqual(r.st.problems, []);
+});
+
+test("retention archives after 3 days by default, every 6h, takes another age or a dry run, and reports archival failures", () => {
+  const archiveArgs = path.join(WORK, "archive.args");
+  const applied = sweep({ FAKE_ARCHIVE_OUT: "Archive Done: 2 archived, 2 eligible\n" });
+  assert.equal(applied.code, 0);
+  assert.equal(fs.readFileSync(archiveArgs, "utf8"), "archive-done --days 3 --apply\n");
+  const { at, ...counts } = applied.st.archive_done;
+  assert.deepEqual(counts, { archived: 2, eligible: 2, dry_run: false });
+  assert.equal(at, applied.st.ended_at);
+  assert.match(applied.stdout, /Archive Done: 2 archived, 2 eligible\n/);
+  // The next sweeps leave it be, and keep its report, until it is 6h old.
+  fs.rmSync(archiveArgs);
+  const soon = sweep({}, applied.stateDir);
+  assert.equal(soon.code, 0);
+  assert.ok(!fs.existsSync(archiveArgs), "not run again within 6h");
+  assert.ok(!("archive-done" in soon.st.steps));
+  assert.deepEqual(soon.st.archive_done, applied.st.archive_done);
+  assert.doesNotMatch(soon.stdout, /Archive Done/);
+  const statusFile = path.join(applied.stateDir, "status.json");
+  const old = { ...soon.st, archive_done: { ...soon.st.archive_done, at: new Date(Date.now() - 6 * 3600 * 1000 - 1000).toISOString() } };
+  fs.writeFileSync(statusFile, JSON.stringify(old));
+  const later = sweep({}, applied.stateDir);
+  assert.equal(fs.readFileSync(archiveArgs, "utf8"), "archive-done --days 3 --apply\n");
+  assert.deepEqual({ ...later.st.archive_done, at: null }, { archived: 0, eligible: 0, dry_run: false, at: null });
+  const dry = sweep({ FAKE_ARCHIVE_OUT: "Archive Done: 0 archived, 2 eligible (dry-run)\n" }, null,
+    ["--archive-days", "30", "--archive-dry-run"]);
+  assert.equal(dry.code, 0);
+  assert.equal(fs.readFileSync(archiveArgs, "utf8"), "archive-done --days 30 --dry-run\n");
+  assert.deepEqual({ ...dry.st.archive_done, at: null }, { archived: 0, eligible: 2, dry_run: true, at: null });
+  // A run that left a backlog is followed up by the next sweep.
+  const backlog = sweep({ FAKE_ARCHIVE_OUT: "Archive Done: 100 archived, 259 eligible\n" });
+  fs.rmSync(archiveArgs);
+  sweep({}, backlog.stateDir);
+  assert.ok(fs.existsSync(archiveArgs), "run again at once after a backlog");
+  // A dry run doesn't put off the real one.
+  sweep({}, dry.stateDir);
+  assert.equal(fs.readFileSync(archiveArgs, "utf8"), "archive-done --days 3 --apply\n");
+  const failed = sweep({ FAKE_ARCHIVE_EXIT: "1", FAKE_ARCHIVE_OUT: "error: child lookup failed\n" });
+  assert.equal(failed.code, 1);
+  assert.equal(failed.st.complete, true);
+  assert.ok(failed.st.problems.some((p) => /archive-done exited 1/.test(p)));
+  // A failed run is not tried again on the next sweep, only after 1h.
+  assert.equal(failed.st.archive_done.failed_at, failed.st.ended_at);
+  fs.rmSync(archiveArgs);
+  const after = sweep({}, failed.stateDir);
+  assert.equal(after.code, 0);
+  assert.ok(!fs.existsSync(archiveArgs), "not retried within 1h");
+  assert.equal(after.st.archive_done.failed_at, failed.st.archive_done.failed_at);
+  fs.writeFileSync(path.join(failed.stateDir, "status.json"),
+    JSON.stringify({ ...after.st, archive_done: { failed_at: new Date(Date.now() - 3600 * 1000 - 1000).toISOString() } }));
+  const retried = sweep({}, failed.stateDir);
+  assert.ok(fs.existsSync(archiveArgs), "retried after 1h");
+  assert.equal(retried.st.archive_done.failed_at, undefined);
+  // An unreadable time doesn't switch retention off.
+  fs.rmSync(archiveArgs);
+  fs.writeFileSync(path.join(failed.stateDir, "status.json"), JSON.stringify({ ...retried.st, archive_done: { ...retried.st.archive_done, at: "bad" } }));
+  sweep({}, failed.stateDir);
+  assert.ok(fs.existsSync(archiveArgs), "run with an unreadable time");
 });
 
 test("the final status publisher's output and failure are recorded without losing sweep news", () => {
