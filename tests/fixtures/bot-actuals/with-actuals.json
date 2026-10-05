@@ -1,0 +1,7 @@
+[
+  { "id": "PVTI_item1", "title": "By id and issue URL", "status": "Done", "actual tokens": 100, "content": { "url": "https://github.com/O/R/issues/1" } },
+  { "id": "PVTI_item2", "title": "By issue URL", "status": "Done", "actual tokens": 0, "content": { "url": "https://github.com/O/R/issues/2" } },
+  { "id": "PVTI_item3", "title": "By Branch PR URL", "status": "Done", "actual tokens": 900, "branch": "topic https://github.com/O/R/pull/3" },
+  { "id": "PVTI_todo", "title": "Not Done", "status": "Todo" },
+  { "id": "PVTI_unmarked", "title": "No Item line", "status": "Done", "content": { "url": "https://github.com/O/R/issues/9" } }
+]

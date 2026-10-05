@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-09-20T12:00:00Z","agentId":"alias","message":{"role":"user","content":"Review the focused tests.\nItem: https://github.com/O/R/issues/1/\nRead AGENTS.md."}}
+{"type":"assistant","timestamp":"2026-09-20T12:01:00Z","agentId":"alias","message":{"id":"msg_alias","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":100,"output_tokens":200}}}
