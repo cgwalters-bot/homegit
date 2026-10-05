@@ -1,0 +1,35 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "default_agent": "build",
+  "agent": {
+    "build": {
+      "prompt": "You are the primary runner worker. Implement the task directly and run the checks permitted by the task brief. Do not use the interactive architect/implementation/review chain. You may use explore or fast for read-only investigation, and at most one optional general subagent for a read-only review. You own implementation, fixes, testing and the final report.",
+      "options": { "reasoningEffort": "low" },
+      "permission": {
+        "task": { "*": "deny", "explore": "allow", "fast": "allow", "general": "allow" }
+      }
+    },
+    "general": {
+      "description": "Optional read-only runner reviewer; may execute checks allowed by the task brief.",
+      "mode": "subagent",
+      "model": "praxis/gpt-6.1-sol",
+      "options": { "reasoningEffort": "medium" },
+      "prompt": "Review the primary worker's changes without editing source or delegating further. You may execute tests and checks permitted by the task brief, including generating their normal test/build artifacts. Report findings and actual verification results to the primary worker; leave all fixes to it.",
+      "permission": { "edit": "deny", "bash": "allow", "task": "deny" }
+    },
+    "explore": {
+      "description": "Fast read-only runner codebase exploration.",
+      "mode": "subagent",
+      "model": "praxis/gpt-6-luna",
+      "permission": { "edit": "deny", "bash": "deny", "task": "deny" }
+    },
+    "fast": {
+      "description": "Cheap read-only runner investigation for simple questions.",
+      "mode": "subagent",
+      "model": "praxis/gpt-6-luna",
+      "prompt": "Investigate read-only using the reading and search tools. Do not edit files, execute shell commands or delegate.",
+      "permission": { "edit": "deny", "bash": "deny", "task": "deny" }
+    },
+    "architect": { "disable": true }
+  }
+}

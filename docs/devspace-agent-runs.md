@@ -15,6 +15,28 @@ needs the change), and keep both sides to it. `tests/bot-runs.sh`
 checks `bot-runs` against fixtures in `tests/fixtures/bot-runs/` that
 follow it.
 
+## Opencode runner profile
+
+`dotfiles/.config/opencode/opencode-runner.json` is an overlay on the shared
+opencode configuration. Its build agent implements and tests directly (as
+permitted by the task brief), with low reasoning effort and at most one
+optional read-only general reviewer at medium effort. Explore and fast use
+Luna with read-only tools and no shell execution; architect is disabled.
+The reviewer can execute permitted checks but cannot edit source or delegate.
+The one-review limit is an agent instruction, not a task-call quota.
+Interactive opencode retains the architect/implementation/review chain in
+`opencode.json`; shared policy is in `dotfiles/.config/AGENTS.md`.
+
+`bin/bot-opencode` selects the overlay with a wrapper-owned absolute
+`OPENCODE_CONFIG` after filtering inherited overrides, and reports an
+unreadable or missing profile before creating a worktree. Its local-worker
+brief still assigns builds and tests to the caller's devspace.
+
+The remote `agent.yml` launcher lives outside this repository and needs a
+separate change to select this overlay explicitly after filtering inherited
+configuration overrides. Changing homegit does not select it for remote
+runs automatically. Restart opencode to pick up configuration changes.
+
 ## Dispatch
 
 `bot-runs dispatch` calls the REST

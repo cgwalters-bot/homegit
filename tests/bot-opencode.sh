@@ -32,7 +32,34 @@ mkdir "${WORK}/bin" "${WORK}/repo"
 cat >"${WORK}/bin/opencode" <<'JS'
 #!/usr/bin/env node
 const fs = require("fs");
+const path = require("path");
+const assert = require("assert/strict");
 const { spawn } = require("child_process");
+// The wrapper owns profile selection; inherited config injections must go.
+assert.equal(process.env.OPENCODE_CONFIG, fs.realpathSync(path.join(process.env.HOME, ".config/opencode/opencode-runner.json")));
+assert.equal(process.env.OPENCODE_CONFIG_CONTENT, undefined);
+assert.equal(process.env.OPENCODE_CONFIG_DIR, undefined);
+assert.equal(process.env.OPENCODE_DISABLE_PROJECT_CONFIG, "1");
+assert.equal(process.env.OPENCODE_DISABLE_MODELS_FETCH, "1");
+const profile = JSON.parse(fs.readFileSync(process.env.OPENCODE_CONFIG, "utf8"));
+assert.equal(profile.$schema, "https://opencode.ai/config.json");
+assert.equal(profile.default_agent, "build");
+assert.equal(profile.agent.build.options.reasoningEffort, "low");
+assert.equal(profile.agent.general.options.reasoningEffort, "medium");
+assert.equal(profile.agent.architect.disable, true);
+assert.match(profile.agent.build.prompt, /at most one optional general/);
+assert.match(profile.agent.general.prompt, /without editing source or delegating further/);
+assert.equal(profile.agent.build.permission.task["*"], "deny");
+for (const name of ["general", "explore", "fast"]) {
+  assert.equal(profile.agent.build.permission.task[name], "allow");
+  assert.equal(profile.agent[name].permission.edit, "deny");
+  assert.equal(profile.agent[name].permission.task, "deny");
+}
+assert.equal(profile.agent.general.permission.bash, "allow");
+for (const name of ["explore", "fast"]) {
+  assert.equal(profile.agent[name].model, "praxis/gpt-6-luna");
+  assert.equal(profile.agent[name].permission.bash, "deny");
+}
 const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
 require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
   const m = JSON.parse(line);
@@ -87,6 +114,10 @@ export XDG_CACHE_HOME=${WORK}/cache
 echo '{"bot": {"git_name": "Test Bot", "git_email": "bot+llm@example.org"}}' >"${WORK}/operator.json"
 export BOT_OPERATOR_CONFIG=${WORK}/operator.json
 export GH_TOKEN=secret-token-value SSH_AUTH_SOCK=/run/ssh-agent XDG_CONFIG_HOME=${WORK}/xdg
+export OPENCODE_CONFIG=${WORK}/operator-profile.json
+export OPENCODE_CONFIG_CONTENT='{"agent":{"architect":{"disable":false}}}'
+export OPENCODE_CONFIG_DIR=${WORK}/operator-config
+export OPENCODE_DISABLE_PROJECT_CONFIG=0 OPENCODE_DISABLE_MODELS_FETCH=0
 # The operator's own opencode configuration, which must not be seen.
 mkdir -p "${WORK}/xdg/opencode"
 echo "OPERATOR AGENTS" >"${WORK}/xdg/opencode/AGENTS.md"
@@ -113,6 +144,16 @@ echo "again" | run --task rm --rm - >/dev/null 2>&1
 test ! -e "${XDG_CACHE_HOME}/bot-work/opencode/rm" || fail "--rm kept the worktree"
 echo x | run --model other/m - >/dev/null 2>&1 && fail "accepted a model off the broker"
 echo x | run --task bad/name - >/dev/null 2>&1 && fail "accepted a bad task name"
+
+# A checkout without its overlay fails before worktree creation or agent launch.
+mkdir -p "${WORK}/checkout/bin" "${WORK}/checkout/lib"
+cp "${BOT_OPENCODE}" "${WORK}/checkout/bin/bot-opencode"
+cp "${TESTS}/../lib/process-identity.js" "${WORK}/checkout/lib/"
+rc=0
+node "${WORK}/checkout/bin/bot-opencode" --repo "${WORK}/repo" --task no-profile "${WORK}/brief" >"${WORK}/no-profile.out" 2>&1 || rc=$?
+test "${rc}" -eq 1 || fail "missing profile exit status ${rc}"
+expect_has "missing profile" "$(cat "${WORK}/no-profile.out")" 'cannot read the runner profile .*/opencode-runner.json'
+test ! -e "${XDG_CACHE_HOME}/bot-work/opencode/no-profile" || fail "missing profile created a worktree"
 
 # The timeout cancels the agent and exits 124.
 cat >"${WORK}/timers.cjs" <<JS
