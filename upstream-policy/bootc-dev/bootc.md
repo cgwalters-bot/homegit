@@ -26,7 +26,7 @@ sources:
     sha: 62a5861815eb4e5a267bd54a0354bab5f3f0af2c
   - repo: bootc-dev/bootc
     path: CONTRIBUTING.md
-    sha: 4d8b5e6ea16b0a427921acc737a815cb1edecf02
+    sha: 298b76cf4d9f07c33cf6b9084ed689ef2a6e7cde
   - repo: bootc-dev/bootc
     path: GOVERNANCE.md
     sha: 13e8ab007ade5e6b7f5412d12360d4f0f9b4707c
@@ -45,7 +45,7 @@ sources:
   - repo: bootc-dev/infra
     path: common/REVIEW.md
     sha: 3068dd57b2c3ef45cb1c3147442e8d63505bb643
-checked: 2026-09-29 by the policy-check subagent (coordinator session 929c7a64, re-read after CONTRIBUTING.md changed)
+checked: 2026-10-05 by the policy-check subagent (coordinator policy-check for cgwalters-forge/bootc#41, re-read after CONTRIBUTING.md changed)
 rebase: any
 ---
 
@@ -100,10 +100,10 @@ CODE_OF_CONDUCT.md and SECURITY.md have nothing on AI, bots or sign-off.
 
 > "The podman project has some [generic useful guidance](https://github.com/containers/podman/blob/main/CONTRIBUTING.md#submitting-pull-requests);
 > like that project, a "Developer Certificate of Origin" is required."
-> — bootc-dev/bootc CONTRIBUTING.md (4d8b5e6ea16b), "Submitting a patch"
+> — bootc-dev/bootc CONTRIBUTING.md (298b76cf4d9f), "Submitting a patch"
 
 > "You may use `Signed-off-by`, but we're not requiring it."
-> — bootc-dev/bootc CONTRIBUTING.md (4d8b5e6ea16b), "Git commit style"
+> — bootc-dev/bootc CONTRIBUTING.md (298b76cf4d9f), "Git commit style"
 
 CONTRIBUTING.md contradicts itself on DCO; the org ruleset requiring the DCO
 check settles it (and promote decides DCO live anyway).
