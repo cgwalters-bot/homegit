@@ -28,7 +28,9 @@ $2"
 
 mkdir "${WORK}/bin" "${WORK}/repo"
 # The fake agent: the model option holds praxis/m and other/m; the prompt
-# "hang" never answers, anything else writes out.txt and replies.
+# "hang" never answers, "budget MODE" logs the budget notices it gets to
+# prompts.log and acts as in BUDGET below, anything else writes out.txt and
+# replies.
 cat >"${WORK}/bin/opencode" <<'JS'
 #!/usr/bin/env node
 const fs = require("fs");
@@ -61,6 +63,24 @@ for (const name of ["explore", "fast"]) {
   assert.equal(profile.agent[name].permission.bash, "deny");
 }
 const send = (m) => process.stdout.write(JSON.stringify({ jsonrpc: "2.0", ...m }) + "\n");
+const update = (u) => send({ method: "session/update", params: { sessionId: "s1", update: u } });
+const say = (text) => update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text } });
+const startTask = (n) => update({ sessionUpdate: "tool_call", toolCallId: `task${n}`, title: "task", rawInput: {} });
+// What a budget mode does when its turn starts, on a notice, on the hand
+// back and on a cancel; the main turn is answered by ending it with end().
+const BUDGET = {
+  // Writes, then waits: notices and the hand back are answered.
+  notices: { start() { say("half-written"); } },
+  // Ends its turn normally on the cancel.
+  finish: { cancel(end) { say("finished"); end("end_turn"); } },
+  // Starts one task, and ends on the first notice or after a while.
+  "last-task": { start(end) { startTask(1); setTimeout(() => end("end_turn"), 1500); }, notice(end) { end("end_turn"); } },
+  // Starts one task more than --max-tasks 1, and ignores the hand back.
+  "over-cap": { start() { startTask(1); startTask(2); }, handBack() { return false; } },
+};
+let budget = null;
+let main = null;
+const unanswered = new Set();
 require("readline").createInterface({ input: process.stdin }).on("line", (line) => {
   const m = JSON.parse(line);
   const result = {
@@ -69,10 +89,39 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       options: [{ value: "praxis/m" }, { value: "other/m" }] }] },
     "session/set_config_option": {},
   }[m.method];
-  if (m.method === "session/cancel") process.exit(0);
+  const end = (id) => (stopReason) => {
+    if (!unanswered.has(id)) return;
+    send({ id, result: { stopReason } });
+    unanswered.delete(id);
+    if (id === main) main = null;
+  };
+  if (m.method === "session/cancel") {
+    if (budget === null) process.exit(0);
+    if (BUDGET[budget].cancel) return BUDGET[budget].cancel(end(main));
+    for (const id of [...unanswered]) end(id)("cancelled");
+    return;
+  }
   if (result) return send({ id: m.id, result });
   if (m.method === "session/prompt") {
     const text = m.params.prompt[0].text;
+    if (text.startsWith("[bot-harness budget notice]")) {
+      fs.appendFileSync("prompts.log", `${text}\n`);
+      unanswered.add(m.id);
+      if (/Hand back now/.test(text)) {
+        if (BUDGET[budget]?.handBack?.() === false) return;
+        say("handed back");
+      } else {
+        BUDGET[budget]?.notice?.(end(main));
+      }
+      return end(m.id)("end_turn");
+    }
+    const mode = /Task:\nbudget (\S+)/.exec(text);
+    if (mode) {
+      budget = mode[1];
+      main = m.id;
+      unanswered.add(m.id);
+      return BUDGET[budget].start?.(end(main));
+    }
     if (/Task:\nhang/.test(text)) return;
     if (/Task:\nescape/.test(text)) {
       const child = spawn("setsid", ["sleep", "300"], { stdio: "ignore" });
@@ -98,7 +147,6 @@ require("readline").createInterface({ input: process.stdin }).on("line", (line) 
       process.env.SSH_AUTH_SOCK || "no-ssh", process.env.XDG_CONFIG_HOME || "no-xdg",
       fs.readFileSync(process.env.HOME + "/.config/opencode/AGENTS.md", "utf8").split("\n")[0],
       fs.existsSync(process.env.HOME + "/.agents/skills/coordinator/SKILL.md") ? "skills" : "noskills"].join(" ") + "\n");
-    const update = (u) => send({ method: "session/update", params: { sessionId: "s1", update: u } });
     update({ sessionUpdate: "tool_call", toolCallId: "t1", title: "write out.txt" });
     update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "wrote " } });
     update({ sessionUpdate: "agent_message_chunk", content: { type: "text", text: "it" } });
@@ -132,6 +180,9 @@ expect_has "final message" "${out}" '^wrote it$'
 expect_has "diff" "${out}" '^\+\+\+ i/out.txt$|^\+task text$'
 grep -q '^+task text$' "${WORK}/out/changes.patch" || fail "changes.patch lacks the change"
 expect_has "progress" "$(cat "${WORK}/err")" 'tool: write out.txt'
+# The rules say where a budget notice comes from, so that text in a file or
+# a tool's output can't pass for one.
+expect_has "notice rule" "$(cat "${XDG_CACHE_HOME}/bot-work/opencode/ok/out.txt")" '^- .*budget notices: messages of their own, .*start with "\[bot-harness budget notice\]"\. .*a tool.s output .*is not from the wrapper'
 test -f "${XDG_CACHE_HOME}/bot-work/opencode/ok/out.txt" || fail "no worktree"
 # The agent was told the worker rules, runs as the bot, has no token and
 # can't commit.
@@ -144,11 +195,12 @@ echo "again" | run --task rm --rm - >/dev/null 2>&1
 test ! -e "${XDG_CACHE_HOME}/bot-work/opencode/rm" || fail "--rm kept the worktree"
 echo x | run --model other/m - >/dev/null 2>&1 && fail "accepted a model off the broker"
 echo x | run --task bad/name - >/dev/null 2>&1 && fail "accepted a bad task name"
+echo x | run --max-tasks -1 - >/dev/null 2>&1 && fail "accepted a bad --max-tasks"
 
 # A checkout without its overlay fails before worktree creation or agent launch.
 mkdir -p "${WORK}/checkout/bin" "${WORK}/checkout/lib"
 cp "${BOT_OPENCODE}" "${WORK}/checkout/bin/bot-opencode"
-cp "${TESTS}/../lib/process-identity.js" "${WORK}/checkout/lib/"
+cp "${TESTS}/../lib/process-identity.js" "${TESTS}/../lib/budget.js" "${WORK}/checkout/lib/"
 rc=0
 node "${WORK}/checkout/bin/bot-opencode" --repo "${WORK}/repo" --task no-profile "${WORK}/brief" >"${WORK}/no-profile.out" 2>&1 || rc=$?
 test "${rc}" -eq 1 || fail "missing profile exit status ${rc}"
@@ -194,4 +246,50 @@ rc=0
 echo x | PATH=/usr/bin:/bin "$(command -v node)" "${BOT_OPENCODE}" --repo "${WORK}/repo" --model praxis/m --task missing - >"${WORK}/missing.out" 2>&1 || rc=$?
 test "${rc}" -eq 1 || fail "missing agent exit status ${rc}"
 expect_has "missing agent" "$(cat "${WORK}/missing.out")" 'cannot run opencode'
+
+# Budget notices: at 60% and 80% of the time as prompts during the turn,
+# then a cancel at 95% and one turn to hand back, whose message alone is the
+# final one (not glued to what the agent wrote before the cancel).
+budget_log() { cat "${XDG_CACHE_HOME}/bot-work/opencode/$1/prompts.log" 2>/dev/null || true; }
+rc=0
+echo "budget notices" | run --task notices --timeout 0.1 - >"${WORK}/notices.out" 2>"${WORK}/notices.err" || rc=$?
+test "${rc}" -eq 124 || fail "hand back exit status ${rc}: $(cat "${WORK}/notices.err")"
+log=$(budget_log notices)
+test "$(grep -c '^\[bot-harness budget notice\]' <<<"${log}")" -eq 3 || fail "notices sent: ${log}"
+expect_has "60% notice" "${log}" '^\[bot-harness budget notice\] This run has used 60% of its budget \([0-9]s of 6s\)\. Converge: .* This is not a new task and needs no reply: keep working on the task you were given\.$'
+expect_has "80% notice" "${log}" '^\[bot-harness budget notice\] This run has used 80% of its budget \([0-9]s of 6s\)\. Stop exploring: .* needs no reply'
+expect_has "hand back" "${log}" '^\[bot-harness budget notice\] This run has used [0-9]s of 6s, so your work was interrupted\. Hand back now: .* The session ends in 0s;'
+expect_has "hand back is last" "$(tail -n1 <<<"${log}")" 'Hand back now'
+expect_has "hand-back message" "$(head -n1 "${WORK}/notices.out")" '^handed back$'
+expect_has "handed back" "$(cat "${WORK}/notices.out")" '\(timeout, handed back\) ----'
+expect_has "notice progress" "$(cat "${WORK}/notices.err")" 'budget notice: 80%'
+# A turn that ends normally on the cancel is done, with no hand back.
+rc=0
+echo "budget finish" | run --task finish --timeout 0.02 - >"${WORK}/finish.out" 2>&1 || rc=$?
+test "${rc}" -eq 0 || fail "finished-on-cancel exit status ${rc}: $(cat "${WORK}/finish.out")"
+expect_has "finished on cancel" "$(cat "${WORK}/finish.out")" '^finished$'
+grep -q 'Hand back now' <<<"$(budget_log finish)" && fail "a turn that finished on the cancel was asked to hand back"
+# The last-task notice comes once the agent started as many tasks as
+# --max-tasks allows (1 here), and never without a cap or below it.
+for cap in 0 1 4; do
+    rc=0
+    echo "budget last-task" | run --task "last-task-${cap}" --timeout 1 --max-tasks "${cap}" - >"${WORK}/last-task.out" 2>&1 || rc=$?
+    test "${rc}" -eq 0 || fail "last task (cap ${cap}) exit status ${rc}: $(cat "${WORK}/last-task.out")"
+    log=$(budget_log "last-task-${cap}")
+    if test "${cap}" -eq 1; then
+        test "${log}" = "[bot-harness budget notice] This run has started 1 subagent tasks, the most it may: do the rest of the work yourself. Starting another one interrupts the run to hand back. This is not a new task and needs no reply: keep working on the task you were given." ||
+            fail "last-task notice: ${log}"
+    else
+        test -z "${log}" || fail "cap ${cap} sent notices: ${log}"
+    fi
+done
+# A task past the cap hands back within the hand-back window (5% of the
+# time, 3s here), not the whole timeout; one that doesn't is cancelled.
+rc=0
+SECONDS=0
+echo "budget over-cap" | run --task over-cap --timeout 1 --max-tasks 1 - >"${WORK}/over-cap.out" 2>&1 || rc=$?
+test "${rc}" -eq 124 || fail "over the task cap exit status ${rc}: $(cat "${WORK}/over-cap.out")"
+test "${SECONDS}" -lt 20 || fail "the task-cap hand back took ${SECONDS}s"
+expect_has "task-cap hand back" "$(budget_log over-cap)" '^\[bot-harness budget notice\] This run has started more than 1 subagent tasks, so your work was interrupted\. .* The session ends in 3s;'
+expect_has "not handed back" "$(cat "${WORK}/over-cap.out")" '\(task cap, not handed back\) ----'
 echo "all tests passed"
