@@ -25,10 +25,12 @@ deterministic part with no model: it sets finished items Done, clears
 stale Leads, and dispatches the top Todo issue of each lane that carries
 the `dispatch` label as a devspace run (its brief built from the issue's
 text, the operator's comments and its acceptance criteria), within the
-agent target, the lanes, the week's capacity scope and the opencode share
+agent target, the lanes, the pace of the openai pool (the Codex
+subscription's, from the praxis broker's `/usage`; the Claude pool's pace
+holds no run back, see `bot-capacity`) and the opencode share
 of the mix (`pacing.opencode_share`, 1 in 4, rounded up so that at least
 one remote run is allowed while any agent is; `agent.yml` runs only
-opencode). Each dispatch also gets its token budget, and a task past it is
+opencode; never more than `pacing.opencode_runs` at once). Each dispatch also gets its token budget, and a task past it is
 a `budget` action.
 What it can't decide it reports as an action, which the dispatcher
 handles by kind, or escalates.

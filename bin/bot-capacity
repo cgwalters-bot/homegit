@@ -1,7 +1,9 @@
 #!/usr/bin/env node
-// Planning by capacity: this week's usage and burn rate, the projection at
-// the reset, and the open P0/P1 estimates by bucket. See --help. Node's
-// standard library only, plus bot-cost and bot-board.
+// Planning by capacity: the pace of each inference pool (the Claude
+// subscription, OpenAI's Codex one through the praxis broker), the Claude
+// week's usage, burn rate and projection at the reset, and the open P0/P1
+// estimates by bucket. See --help. Node's standard library only, plus
+// bot-cost and bot-board.
 "use strict";
 
 const { execFileSync } = require("node:child_process");
@@ -10,6 +12,9 @@ const os = require("node:os");
 const path = require("node:path");
 
 const cap = require(path.join(__dirname, "..", "lib", "capacity.js"));
+const pace = require(path.join(__dirname, "..", "lib", "pacing.js"));
+const pools = require(path.join(__dirname, "..", "lib", "pools.js"));
+const operator = require(path.join(__dirname, "..", "lib", "operator.js"));
 
 const PROG = path.basename(process.argv[1] || "bot-capacity");
 const COST = process.env.BOT_CAPACITY_COST || path.join(__dirname, "bot-cost");
@@ -21,18 +26,57 @@ const BUDGET_ENV = "BOT_CAPACITY_WEEKLY_TOKENS";
 // A reading older than this is not trusted: the status line runs after
 // every assistant message, so an older one means it stopped running.
 const RATE_MAX_AGE_MS = 3600e3;
+// The praxis broker's usage endpoint (schema praxis-broker-usage/v1), which
+// has the Codex subscription's windows: a URL, or a file with its answer
+// (tests); empty for none. By default it is /usage at the root of the
+// broker that opencode's praxis provider is configured for (its baseURL,
+// whose own path is the API's /v1). That config is JSON with comments, so
+// the provider's block is matched rather than parsed.
+const PRAXIS_ENV = "BOT_CAPACITY_PRAXIS_USAGE";
+const OPENCODE_CONFIG = path.join(process.env.XDG_CONFIG_HOME || path.join(os.homedir(), ".config"), "opencode", "opencode.json");
+const PRAXIS_BASE_RE = /"praxis"\s*:\s*\{[^}]*?"baseURL"\s*:\s*"(https?:\/\/[^"]+)"/;
+const PRAXIS_USAGE_PATH = "/usage";
+const PRAXIS_TIMEOUT_MS = 5000;
+// The windows of Claude Code's rate_limits, as the status line names them.
+const CLAUDE_WINDOWS = { five_hour: 5 * pools.HOUR_MS, seven_day: cap.WEEK_MS };
+// The windows of the broker's codex usage.
+const CODEX_WINDOWS = ["primary", "secondary"];
+// What a run costs each pool, as observed across runs of this (see
+// trackCost in lib/pools.js).
+const STATE_FILE = process.env.BOT_CAPACITY_STATE
+  || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "bot-capacity", "pools.json");
+const STATE_VERSION = 1;
 const MAX_BUFFER = 256 * 1024 * 1024;
 const EX_USAGE = 2;
+
+const warn = (msg) => process.stderr.write(`${PROG}: ${msg}\n`);
 
 function usage() {
   return `Usage: ${PROG} [--budget TOKENS] [--json]
 
-Shows the week's capacity: usage and burn rate, the projected percent at
-the reset, and the open (Todo, In Progress) P0 and P1 items' Est. cost
-buckets summed, with what may be dispatched: all, P0 only above
-${cap.P0_ONLY_PERCENT}% projected, nothing at 100%.
+Shows the pace of each inference pool, which is what decides whether new
+work is dispatched on it, and the Claude week's capacity: usage and burn
+rate, the projected percent at the reset, and the open (Todo, In Progress)
+P0 and P1 items' Est. cost buckets summed against the headroom it leaves.
 
-The percent is the seven_day.used_percentage that \`bot-heartbeat
+A pool is paced on its own: it aims to have used its target share of its
+window by the reset (pacing.pools.NAME.target in the operator config, 95%
+by default; the rest is the operator's reserve), evenly, so at any time
+the pace allows target * elapsed / window, plus pacing.pools.NAME.burst
+percent points (3) so that work can start right after a reset. A pool
+whose usage is above that holds new work routed to it, and only that:
+claude (local workers, the apply and review steps) is read from the
+seven_day window \`bot-heartbeat statusline\` saves, until that window
+resets; openai (devspace runs, which run opencode) from the praxis
+broker's /usage (\$${PRAXIS_ENV}: a URL or a file, by default the broker
+of ${OPENCODE_CONFIG.replace(os.homedir(), "~")}). A shorter window that is used up
+holds its pool too. A pool without a reading isn't paced: only the agent
+target limits it. What a run costs each pool (percent points, requests,
+tokens) is kept in ${STATE_FILE.replace(os.homedir(), "~")}, from the
+usage between runs of this and the busy items, and says how many more
+runs fit.
+
+The week's percent is the seven_day.used_percentage that \`bot-heartbeat
 statusline\` saves (${RATE_FILE.replace(os.homedir(), "~")}), if it is under an hour old and
 its window hasn't reset. Otherwise, with --budget (fresh tokens per week;
 or \$${BUDGET_ENV}), it is the trailing 7 days' fresh tokens (input, output
@@ -60,11 +104,135 @@ function readRate(now) {
   return { usedPercent: w.used_percent, resetsAt: resets };
 }
 
+// claudeReading(): the saved status line windows as a pool reading (see
+// poolPace in lib/pools.js), or null. Unlike readRate, a reading isn't
+// dropped for its age: until the window resets it is a lower bound.
+function claudeReading() {
+  let saved;
+  try {
+    saved = JSON.parse(fs.readFileSync(RATE_FILE, "utf8"));
+  } catch {
+    return null;
+  }
+  const observed = Date.parse(saved && saved.observed_at);
+  if (Number.isNaN(observed)) return null;
+  const windows = Object.entries(CLAUDE_WINDOWS).map(([name, ms]) => {
+    const w = saved[name];
+    return w && typeof w.used_percent === "number" ? { used_percent: w.used_percent, window_ms: ms, resets_at: Date.parse(w.resets_at) } : null;
+  }).filter(Boolean);
+  return { source: "statusline", observed_at: observed, windows };
+}
+
+// praxisSource(): where the broker's usage is read: a URL or a file, or
+// null for nowhere.
+function praxisSource() {
+  if (process.env[PRAXIS_ENV] !== undefined) return process.env[PRAXIS_ENV] || null;
+  let text;
+  try {
+    text = fs.readFileSync(OPENCODE_CONFIG, "utf8");
+  } catch {
+    return null;
+  }
+  const m = PRAXIS_BASE_RE.exec(text);
+  return m ? new URL(PRAXIS_USAGE_PATH, m[1]).href : null;
+}
+
+// openaiReading(): the broker's codex windows as a pool reading, with its
+// request and token counters (which restart with the broker: epoch), or
+// null when there is none; a broker that can't be read is a warning.
+async function openaiReading() {
+  const src = praxisSource();
+  if (!src) return null;
+  let usage;
+  try {
+    if (/^https?:\/\//.test(src)) {
+      const res = await fetch(src, { signal: AbortSignal.timeout(PRAXIS_TIMEOUT_MS) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      usage = await res.json();
+    } else usage = JSON.parse(fs.readFileSync(src, "utf8"));
+  } catch (e) {
+    warn(`no openai reading: cannot read ${src}: ${e.cause ? e.cause.message : e.message}`);
+    return null;
+  }
+  const codex = usage && usage.codex;
+  if (!codex) return null;
+  const windows = CODEX_WINDOWS.map((name) => codex[name]).filter((w) => w && [w.used_percent, w.window_minutes, w.reset_after_seconds, w.observed_at].every(Number.isFinite) && w.window_minutes > 0)
+    .map((w) => ({ used_percent: w.used_percent, window_ms: w.window_minutes * pools.MINUTE_MS, resets_at: (w.observed_at + w.reset_after_seconds) * 1e3, observed_at: w.observed_at * 1e3 }));
+  if (!windows.length) return null;
+  const counts = codex.counts || {};
+  return { source: "praxis", observed_at: Math.max(...windows.map((w) => w.observed_at)), windows,
+    counters: { epoch: usage.started_at ?? null, requests: (counts.requests || 0) + (counts.unmetered || 0), tokens: (counts.tokens && counts.tokens.total) || 0 } };
+}
+
+function readState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const ok = s && s.version === STATE_VERSION && s.pools && typeof s.pools === "object" && !Array.isArray(s.pools);
+    return ok ? s.pools : {};
+  } catch (e) {
+    if (e.code !== "ENOENT") warn(`ignoring ${STATE_FILE}: ${e.message}`);
+    return {};
+  }
+}
+
+function writeState(state) {
+  try {
+    fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
+    const tmp = `${STATE_FILE}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, `${JSON.stringify({ version: STATE_VERSION, pools: state })}\n`);
+    fs.renameSync(tmp, STATE_FILE);
+  } catch (e) {
+    warn(`cannot save ${STATE_FILE}: ${e.message}`);
+  }
+}
+
+// poolReport(readings, items, config, now): {POOL: its pace (poolPace) with
+// what a run costs it (cost) and how many more fit (fits), or null without
+// a reading}, updating the cost records with this reading and the busy
+// items (a devspace run by its Run, a local worker by its item).
+function poolReport(readings, items, config, now) {
+  const busy = items.filter(pace.isActive);
+  const state = readState();
+  const out = {};
+  for (const [engine, name] of Object.entries(pools.ENGINE_POOL)) {
+    const reading = readings[name];
+    const p = pools.poolPace(reading, config.pacing.pools[name], now);
+    if (!p) {
+      out[name] = null;
+      continue;
+    }
+    const runs = busy.filter((it) => pools.engineOf(it) === engine).map((it) => it.run || it.id);
+    state[name] = pools.trackCost(state[name], { resets_at: Date.parse(p.resets_at), used_percent: p.used_percent, runs, ...reading.counters });
+    const cost = pools.costOf(state[name]);
+    out[name] = { ...p, cost, fits: pools.runsThatFit(p, cost) };
+  }
+  writeState(state);
+  return out;
+}
+
 const pct = (n) => (n === null || n === undefined ? "?" : `${n.toFixed(1)}%`);
 const tok = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : `${Math.round(n / 1e3)}k`);
 
-function render(r) {
-  const out = [];
+// paceLines(r, now): the Pace section: a line per pool.
+function paceLines(r, now) {
+  const out = ["Pace (each pool on its own; a pool over its pace holds only the work routed to it):"];
+  for (const [name, p] of Object.entries(r.pools)) {
+    let line = `  ${pools.describe(name, p, now)}`;
+    if (p) {
+      line += `; ${p.target_percent}% by the reset, burst ${p.burst}`;
+      if (p.cost) {
+        const c = p.cost;
+        const per = [c.requests_per_run ? `${Math.round(c.requests_per_run)} requests` : null, c.tokens_per_run ? `${tok(c.tokens_per_run)} tokens` : null].filter(Boolean).join(", ");
+        line += `; a run costs ${c.points_per_run.toFixed(1)} points${per ? ` (${per})` : ""} over ${c.runs} run${c.runs === 1 ? "" : "s"} ${c.window === "previous" ? "last" : "this"} window, ${p.fits} more fit`;
+      }
+    }
+    out.push(line);
+  }
+  return out;
+}
+
+function render(r, now) {
+  const out = [...paceLines(r, now), ""];
   const src = { statusline: "plan usage (statusline)", budget: "tokens over the budget", tokens: "tokens only (no statusline reading, no budget)" }[r.source];
   out.push(`Week (${src}): ${tok(r.used_tokens)} fresh tokens${r.used_percent === null ? "" : `, ${pct(r.used_percent)} used`}`);
   if (r.burn_per_day !== null) out.push(`Burn: ${pct(r.burn_per_day)}/day, ${tok(r.burn_tokens_per_day)} tokens/day`);
@@ -81,13 +249,11 @@ function render(r) {
   }
   const w = rows[0].map((_, i) => Math.max(...rows.map((x) => String(x[i]).length)));
   for (const x of rows) out.push("  " + x.map((c, i) => (i ? String(c).padStart(w[i]) : String(c).padEnd(w[i]))).join("  "));
-  const scope = { all: "P0 and P1", p0: `P0 only (projected at or above ${cap.P0_ONLY_PERCENT}%)`, none: "nothing (the week's capacity is used up)",
-    unknown: "unknown (no percent: pass --budget or run bot-heartbeat statusline)" }[r.dispatch.scope];
-  out.push("", `Dispatch: ${scope}${r.dispatch.headroom === null ? "" : `; headroom after projection ${pct(r.dispatch.headroom)}`}`);
+  out.push("", r.headroom === null ? "Headroom: unknown (no percent: pass --budget or run bot-heartbeat statusline)" : `Headroom after projection: ${pct(r.headroom)}`);
   return `${out.join("\n")}\n`;
 }
 
-function main(argv) {
+async function main(argv) {
   let budget = Number(process.env[BUDGET_ENV]) || null, json = false;
   for (let i = 0; i < argv.length; i++) {
     switch (argv[i]) {
@@ -106,9 +272,17 @@ function main(argv) {
   const weekTokens = JSON.parse(run(COST, ["--since", since, "--no-compute", "--tasks", "0", "--json"])).totals.fresh_tokens;
   const items = JSON.parse(run(BOARD, ["list", "--json"]));
   const report = cap.capacityReport({ rate, weekTokens, budget, items, now });
-  process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : render(report));
+  const claude = claudeReading();
+  // The Claude pool's tokens: this week's, when its window is the one summed.
+  if (claude && rate) claude.counters = { epoch: rate.resetsAt, tokens: weekTokens };
+  report.pools = poolReport({ claude, openai: await openaiReading() }, items, operator.loadOrExit(PROG), now);
+  process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : render(report, now));
   return 0;
 }
 
-if (require.main === module) process.exit(main(process.argv.slice(2)));
-else module.exports = { readRate, render };
+if (require.main === module) {
+  main(process.argv.slice(2)).then((code) => process.exit(code), (e) => {
+    process.stderr.write(`${PROG}: error: ${e.stack || e.message}\n`);
+    process.exit(1);
+  });
+} else module.exports = { readRate, render };

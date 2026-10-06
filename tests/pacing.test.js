@@ -86,11 +86,13 @@ test("budgets: Est. cost, else the priority's bucket", () => {
 test("slots: the opencode share of the target, and the eligible candidates", () => {
   const todo = (id, priority, extra = {}) => item({ id, priority, org: "cgwalters-bot", content: issue("cgwalters-bot/homegit", id.length + Number(id.slice(1))), ...extra });
   const items = [todo("t1", "P0"), todo("t2", "P1", { labels: ["x"] }), todo("t3", "P2", { labels: ["x"] })];
-  // [agents, share, factor, remote target]
-  const targets = [[4, 0.25, 1, 1], [4, 0.25, 0.5, 1], [4, 0.25, 0.25, 1], [4, 0.5, 1, 2], [4, 0, 1, 0], [6, 0.25, 1, 2], [4, 0.25, 0, 0]];
-  for (const [agents, share, factor, want] of targets) {
-    const config = operator.resolve({ pacing: { agents, harness_agents: 2, opencode_share: share } });
-    assert.equal(pace.slotReport({ items, config, factor }).remote_target, want, `${agents} agents, share ${share}, factor ${factor}`);
+  // [agents, share, the most runs at once (default 2), remote target]
+  const targets = [[4, 0.25, undefined, 1], [4, 0.5, undefined, 2], [4, 0, undefined, 0], [6, 0.25, undefined, 2],
+    [12, 0.5, undefined, 2], [12, 0.5, 4, 4], [4, 0.5, 1, 1], [4, 0.5, 0, 0]];
+  for (const [agents, share, runs, want] of targets) {
+    const config = operator.resolve({ pacing: { agents, harness_agents: 2, opencode_share: share, ...(runs === undefined ? {} : { opencode_runs: runs }) } });
+    const r = pace.slotReport({ items, config });
+    assert.deepEqual([r.remote_target, r.remote_limit], [want, runs ?? 2], `${agents} agents, share ${share}, runs ${runs}`);
   }
   // Only the eligible Todo items are listed as dispatch, in candidate order; without a predicate, none.
   const r = pace.slotReport({ items, config: CONFIG, eligible: (it) => (it.labels || []).includes("x") });
@@ -135,9 +137,9 @@ test("slots: busy agents per lane, candidates by priority, spread, then the oper
   // Budgets: b1 S by P1 (spent 3M: over), b3 S by default.
   assert.deepEqual(r.over_budget.map((a) => [a.id, a.budget, a.spent]), [["b1", 1e6, 3e6]]);
   assert.deepEqual([r.budget_tokens, r.spent_tokens], [2e6, 3e6]);
-  // Paced: half the targets, P0 only.
-  r = report({ factor: 0.5, priorities: ["P0"] });
-  assert.deepEqual([r.target, r.lanes.harness.target, r.lanes.upstream.target], [2, 1, 1]);
+  // Only the items a predicate accepts are candidates; the targets stay.
+  r = report({ only: (it) => it.priority === "P0" });
+  assert.deepEqual([r.target, r.lanes.harness.target, r.lanes.upstream.target], [4, 2, 2]);
   assert.deepEqual(r.lanes.upstream.candidates.map((c) => c.id), ["t5"]);
   assert.deepEqual(r.lanes.harness.candidates, []);
 });

@@ -23,6 +23,7 @@ const pace = require(path.join(ROOT, "lib", "pacing.js"));
 const operator = require(path.join(ROOT, "lib", "operator.js"));
 const disp = require(path.join(ROOT, "lib", "dispatch.js"));
 const ms = require(path.join(ROOT, "lib", "midstream.js"));
+const pools = require(path.join(ROOT, "lib", "pools.js"));
 
 const tool = (name) => process.env[`BOT_RECONCILE_${name.replace(/^bot-/, "").toUpperCase()}`] || path.join(BIN_DIR, name);
 const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
@@ -42,7 +43,7 @@ const RULE_INPUTS = {
   heartbeat: ["items", "heartbeat", "children"],
   "lead-orphan": ["items", "heartbeat", "children"],
   drive: ["sweep", "prs", "items", "epicItems"],
-  "patch-ready": ["items"],
+  "patch-ready": ["items", "capacity"],
   "answer-unapplied": ["questions"],
   "closed-not-done": ["items", "contentStates"],
   "stale-lead": ["items"],
@@ -74,7 +75,8 @@ Observed: the board (bot-board list) and the P0 epic's, the sub-issues of
 the coordinator's In Progress issues, the latest complete bot-sweep run
 (${SWEEP_DIR.replace(os.homedir(), "~")}) and the PRs of its P0 health lines (their
 author, and when ${operator.loadOrExit(PROG).operator.login}'s review was requested), the heartbeat
-(bot-heartbeat show), the week's capacity (bot-capacity --json), and the
+(bot-heartbeat show), the pace of each inference pool (bot-capacity
+--json), and the
 question issues of ${operator.loadOrExit(PROG).tracker_repo} answered in the last ${rec.ANSWER_WINDOW_MS / 3600e3}h, and
 bot-watch's last-seen state of the board's issues and PRs
 (${WATCH_STATE.replace(os.homedir(), "~")}). Only the inputs of the rules run are read.
@@ -89,13 +91,22 @@ Rules (${rules}):
                     human-text repository; an umbrella, see lead-orphan,
                     isn't busy), but only while the total is under its
                     target: a lane short while the other runs over is only
-                    noted in the Observed line. The targets shrink with the
-                    week's capacity: half, P0 only, at bot-capacity's P0-only
-                    mark; none once it is used up. A busy task whose Actual
-                    tokens passed its Budget tokens is a 'budget' action.
+                    noted in the Observed line. Each inference pool is paced
+                    on its own (bot-capacity): one over its pace holds only
+                    the new work of its engine, claude's the local workers,
+                    openai's the devspace runs, and the action names the
+                    engine left; with both over, only items labeled
+                    '${pools.URGENT_LABEL}' (in the bot's own repositories) are candidates. A pool without a reading
+                    holds nothing. A busy task whose Actual tokens passed
+                    its Budget tokens is a 'budget' action.
   dispatch          auto-dispatch: a lane with a free slot, while the remote
                     runs are under their share of the agents (pacing.opencode_share,
-                    1 in 4 by default: agent.yml runs only opencode),
+                    1 in 4 by default: agent.yml runs only opencode; never
+                    more than pacing.opencode_runs at once, which is the
+                    limit while the claude pool is held) and the openai
+                    pool is within its pace (each dispatch charged what a
+                    run was observed to cost; '${pools.URGENT_LABEL}'-labeled issues
+                    go anyway; the claude pool's pace holds nothing here),
                     gets its top Todo issue labeled '${disp.DISPATCH_LABEL}' (the opt-in, on
                     issues in the bot's own repositories) as one
                     'bot-runs dispatch'. The target is its repository, else a
@@ -138,7 +149,9 @@ Rules (${rules}):
                     for bot-runs apply (bot-runs reconcile sets that): apply
                     it with a local Opus worker (apply-preamble.md in the
                     coordinator skill), which reviews it and opens or updates
-                    the PR, and never merges it. Reported only, as waiting for
+                    the PR, and never merges it. While the claude pool is
+                    over its pace it is deferred, and says so, unless the
+                    item is labeled '${pools.URGENT_LABEL}'. Reported only, as waiting for
                     the operator, while APPLY_UNATTENDED in lib/reconcile.js
                     is false.
   answer-unapplied  a question the operator answered whose Unblocks items
@@ -322,7 +335,7 @@ async function observe(opts) {
     get("items", "the board", fromFile("board-file", () => runJson(tool("bot-board"), ["list", "--json"]))),
     get("sweep", "the latest sweep", () => latestSweep(opts["sweep-dir"] || SWEEP_DIR)),
     get("heartbeat", "the heartbeat", fromFile("heartbeat-file", () => runJson(tool("bot-heartbeat"), ["show"]))),
-    get("capacity", "the week's capacity", fromFile("capacity-file", () => runJson(tool("bot-capacity"), ["--json"]))),
+    get("capacity", "the pools' pace (bot-capacity)", fromFile("capacity-file", () => runJson(tool("bot-capacity"), ["--json"]))),
     get("questions", "the answered questions", fromFile("questions-file", () => questions(config, opts.now))),
     get("midstreams", "the midstreams", fromFile("midstreams-file", () => midstreams(config))),
     get("contentStates", "bot-watch's last-seen state", () => contentStates(opts["watch-state"] || WATCH_STATE)),

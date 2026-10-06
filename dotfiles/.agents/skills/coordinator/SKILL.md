@@ -377,7 +377,8 @@ or in their open PR, or their PR closed.
 
 The loop is level-triggered, like a Kubernetes controller: `bin/bot-reconcile`
 reads the observed state (the board, the latest sweep run, the heartbeat,
-the week's capacity and the recently answered questions), compares it
+the pace of each inference pool and the recently answered questions),
+compares it
 with the desired one, and prints the actions that close the gap, each
 with a stable key, a kind, the item's URL and what to do. It changes
 nothing itself. Its rules (`bot-reconcile --help` has the details):
@@ -390,7 +391,8 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   while the other runs over is only noted in the Observed line. A busy task
   past its Budget tokens is a **budget** action.
 - **dispatch:** auto-dispatch, deterministic and opt-in: a lane with a
-  free slot, while the remote runs are under the opencode share, gets its
+  free slot, while the remote runs are under the opencode share and the
+  openai pool is within its pace (the claude pool's holds no run), gets its
   top Todo issue labeled `dispatch` (an issue in the bot's own
   repositories, with `Repo: OWNER/REPO` in its body when it isn't in the
   target repository; an optional `Base: REF`) dispatched as one `bot-runs
@@ -549,27 +551,33 @@ Actual tokens current, and a task past its budget is a `budget` action:
 look at what the worker is doing, then stop it, or raise the budget
 (`bot-pace budget ITEM --tokens N --force`) and say why in its Why.
 
-The week's capacity scales the target. Plan by cost, not by a count of
+Each inference pool is paced on its own. Plan by cost, not by a count of
 workers alone (the CPU scales well; the weekly inference budget is what
 runs out). Every item you move to Todo or dispatch gets an **Est. cost**
 bucket, from the table in `workstream` ("Cost estimates"). Before
-dispatching, run `bot-capacity` (bot-reconcile reads it too, and halves
-the target to P0 work only at its "P0 only" mark, and to none at 100%):
-it shows the week's usage (the `seven_day` percent that `bot-heartbeat
-statusline` saves, else `--budget` tokens, else token totals), the burn
-rate, the percent projected at the reset, and the open P0/P1 estimates
-summed by bucket. Then:
+dispatching, run `bot-capacity` (bot-reconcile reads it too): its Pace
+section has a line per pool, `claude` (the subscription your local
+workers and the apply and review steps draw on, from the `seven_day`
+percent that `bot-heartbeat statusline` saves) and `openai` (the Codex
+one behind the devspace runs, from the praxis broker's `/usage`). A pool
+aims to have used its target (`pacing.pools.NAME.target`, 95%; the rest
+is the operator's reserve) by its window's reset, evenly, so the pace
+allows `target * elapsed / window` plus a small burst. Then:
 
-- dispatch only while the projected usage plus the estimate of the work
-  you are about to dispatch fits the remaining capacity (the report's
-  `fits` column and headroom), P0 work first, then P1;
-- at about 80% projected (`bot-capacity` says "P0 only"), dispatch P0
-  work only, and tell the operator in the brief; at 100% dispatch nothing
-  new and let running workers finish;
-- when the projection is "too early in the week to say" (under 12 hours
-  of the window), go by the used percent;
-- with no percent at all ("unknown"), use the token totals and the
-  operator's last word on the budget; don't guess one.
+- a pool over its pace holds new work **on its engine only**, and
+  `bot-reconcile`'s Observed line and `capacity` action say so ("openai:
+  17% used, pace allows 3% (ahead by 14 points; next dispatch in ~20h)"):
+  with claude held, start no local worker and defer apply and review
+  steps, but devspace runs go on (up to `pacing.opencode_runs` at once);
+  with openai held, dispatch no devspace run, but local workers go on.
+  Let running work finish either way;
+- an item labeled `urgent` (in the bot's own repositories: P0 work, or
+  what the operator raised, on their word) goes whatever the pace. Say in
+  the brief when you used it;
+- a pool with no reading isn't paced: only the agent target limits it;
+- the line also says what a run cost the pool so far and how many more
+  fit; the report's `fits` column and headroom say whether the open P0/P1
+  estimates fit the Claude week's projection, P0 work first, then P1.
 
 Each sweep runs `bot-actuals --open`: it sets Actual tokens on Done and
 busy items whose workers carried an `Item:` line. Compare it with Est.

@@ -1,1 +1,40 @@
-{"source": "statusline", "used_percent": 30, "projected": 45, "dispatch": {"scope": "all", "headroom": 55}}
+{
+  "source": "statusline",
+  "used_percent": 30,
+  "projected": 45,
+  "headroom": 55,
+  "pools": {
+    "claude": {
+      "source": "statusline",
+      "observed_at": "2026-10-02T11:50:00.000Z",
+      "used_percent": 30,
+      "window_minutes": 10080,
+      "resets_at": "2026-10-05T23:00:00.000Z",
+      "target_percent": 95,
+      "burst": 3,
+      "allowed_percent": 50.4,
+      "ahead": -20.4,
+      "hold": false,
+      "reason": null,
+      "next_dispatch_at": null,
+      "cost": null,
+      "fits": null
+    },
+    "openai": {
+      "source": "praxis",
+      "observed_at": "2026-10-02T11:50:00.000Z",
+      "used_percent": 3,
+      "window_minutes": 10080,
+      "resets_at": "2026-10-05T23:00:00.000Z",
+      "target_percent": 95,
+      "burst": 3,
+      "allowed_percent": 50.4,
+      "ahead": -47.4,
+      "hold": false,
+      "reason": null,
+      "next_dispatch_at": null,
+      "cost": null,
+      "fits": null
+    }
+  }
+}
