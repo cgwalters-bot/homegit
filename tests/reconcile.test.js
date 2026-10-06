@@ -370,7 +370,7 @@ test("patch-ready: unattended by default, with explicit false/true overrides", (
     const [a] = actions;
     assert.equal(a.url, "https://github.com/cgwalters-forge/tracker/issues/60", name);
     assert.equal(a.key, "patch-ready:https://github.com/cgwalters-forge/tracker/issues/60:4242", name);
-    assert.match(a.do, /dispatch a local Sonnet .*\(model sonnet\) on apply-preamble\.md to bot-runs apply it, review it and open or update the PR$/, name);
+    assert.match(a.do, /dispatch a local apply worker \(default model, not Sonnet\) on apply-preamble\.md to bot-runs apply it, review it and open or update the PR$/, name);
     if (unattended) assert.match(a.do, /^devspace run 4242's patch is ready: dispatch/, name);
     else assert.match(a.do, /^devspace run 4242's patch is ready; unattended apply is disabled: on the operator's word, dispatch/, name);
     assert.doesNotMatch(a.do, /until .*merges|homegit#82/, name);
@@ -385,9 +385,9 @@ test("patch-ready: unattended by default, with explicit false/true overrides", (
   // item is urgent; the openai pool's pace doesn't hold them.
   // [case, changes, key suffix, what the action says]
   const paced = [
-    ["openai over its pace", { capacity: held("openai") }, "", /patch is ready: dispatch a local Sonnet/],
+    ["openai over its pace", { capacity: held("openai") }, "", /patch is ready: dispatch a local apply worker/],
     ["claude over its pace", { capacity: held("claude") }, ":deferred", new RegExp(`patch is ready; its apply and review are deferred, since they run on Claude \\(${HELD.claude.replace(/[()]/g, "\\$&")}\\): nothing to do until then, or label it urgent to apply it now$`)],
-    ["claude over its pace, an urgent item", { capacity: held("claude"), items: setItem(board, "PVTI_p1", { labels: ["urgent"] }) }, "", /patch is ready: dispatch a local Sonnet/],
+    ["claude over its pace, an urgent item", { capacity: held("claude"), items: setItem(board, "PVTI_p1", { labels: ["urgent"] }) }, "", /patch is ready: dispatch a local apply worker/],
   ];
   for (const [name, changes, suffix, says] of paced) {
     const [p] = rec.patchReady(obs(changes));
