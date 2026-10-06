@@ -136,7 +136,7 @@ Rules (${rules}):
                     Observed line says so.
   patch-ready       a Draft item whose Why says a devspace run's patch is ready
                     for bot-runs apply (bot-runs reconcile sets that): apply
-                    it with a local Sonnet worker (apply-preamble.md in the
+                    it with a local Opus worker (apply-preamble.md in the
                     coordinator skill), which reviews it and opens or updates
                     the PR, and never merges it. Reported only, as waiting for
                     the operator, while APPLY_UNATTENDED in lib/reconcile.js

@@ -75,9 +75,9 @@ in-session agents: "Let's get away from that local agent entirely ... a
 separate Claude code subprocess here not subagents should be easier to
 poll". It is the Claude counterpart of `bot-opencode`; see `bot-claude
 --help`. The model is Opus by default (`--model` overrides it); the job
-does its cheap steps (reading, first-pass reviews, lint and log triage,
+does its mechanical steps (reading, mechanical reviews, lint and log triage,
 mechanical edits) through homegit's `sonnet-worker` subagent
-(`dotfiles/.claude/agents/`, `model: sonnet`), which is where subagents stay. Use `--model sonnet` for a worker whose whole task is
+(`dotfiles/.claude/agents/`, `model: sonnet`), which is where subagents stay. Sonnet is only for mechanical work: mechanical reviews (style, checklist, lint), code scanning, log triage and edits with an exact spec. The operator does not trust it for anything nontrivial, so whatever decides what a change should do, judges a patch, gates a merge or writes a research summary runs on Opus. Use `--model sonnet` only for a worker whose whole task is
 mechanical.
 
 ```
@@ -220,7 +220,7 @@ set: that run still owns it.
 A run's patch comes back to the board as a Draft item whose Why says
 "ready for bot-runs apply RUN". The reconcile rule **patch-ready** names
 it. Start a local
-Sonnet worker, `bin/bot-claude start --model sonnet --dir WT --item ITEM
+worker on the default model (Opus: judging a patch is not mechanical), `bin/bot-claude start --dir WT --item ITEM
 --job apply-RUN BRIEF` (a brief of `apply-preamble.md` with the `Item:`
 and `Run:` lines), and wait for it. It reads the run, applies the patch with `bot-runs
 apply` (which re-checks it), reviews the diff as a reviewer would, and
@@ -431,7 +431,7 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   step), so they neither drop out nor wake you again once it recovers.
 - **patch-ready:** a Draft item whose Why says a devspace run's patch is
   ready for `bot-runs apply` (see "Applying a run's patch"): dispatch the
-  Sonnet apply worker. Only reported, as waiting for the operator, if
+  apply worker (Opus). Only reported, as waiting for the operator, if
   `APPLY_UNATTENDED` is switched off.
 - **answer-unapplied:** a question the operator answered whose Unblocks
   items are still open and untouched since the answer.
