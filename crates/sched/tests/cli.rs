@@ -291,8 +291,17 @@ fn reconcile_reads_a_recording_or_a_snapshot_and_refuses_unknown_arguments() {
         .collect();
     assert_eq!(keys, KEYS);
 
+    // A snapshot of the schema before this one is refused by name.
+    let old = world.path("old.json");
+    fs::write(&old, r#"{"schema": "bot-sched-snapshot/v1", "board": {}}"#).unwrap();
+
     // (arguments, exit status, what stderr says)
     let refused = [
+        (
+            vec!["reconcile", "--snapshot", old.to_str().unwrap()],
+            1,
+            "is a snapshot of schema 'bot-sched-snapshot/v1', not bot-sched-snapshot/v2",
+        ),
         (
             vec!["reconcile", "--nope"],
             2,

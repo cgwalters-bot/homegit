@@ -2,11 +2,16 @@
 //! time (see "The read-only report" in homegit's
 //! docs/scheduled-dispatcher.md for what runs it today).
 //!
-//! A pass is three steps, each with its own module: [`observe`] reads
-//! the forge once into a typed [`model::Snapshot`]; [`rules`] are pure
-//! functions from a snapshot to [`action::Action`]s; and
-//! [`action::emit`] turns the actions' writes into gh-aw safe outputs
-//! for a later job to apply. Nothing here writes to the forge.
+//! A pass is three steps: [`observe`] reads the forge once into a typed
+//! [`model::Snapshot`]; [`rules`] are pure functions from a snapshot to
+//! [`action::Action`]s; and the forge's own module turns the actions'
+//! writes into what its appliers take ([`forge::github::emit()`]: gh-aw
+//! safe outputs), for a later job to apply. Nothing here writes to the
+//! forge.
+//!
+//! [`model`], [`rules`], [`observe`] and [`action`] name no forge: what
+//! is GitHub's is behind [`forge::Forge`], in [`forge::github`]
+//! (tests/neutral.rs holds them to it).
 
 pub mod action;
 pub mod forge;

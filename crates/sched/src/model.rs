@@ -8,8 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 /// The schema of a serialized [`Snapshot`].
-pub const SNAPSHOT_SCHEMA: &str = "bot-sched-snapshot/v1";
-const GITHUB: &str = "https://github.com/";
+pub const SNAPSHOT_SCHEMA: &str = "bot-sched-snapshot/v2";
 /// What a board without a Status calls an item, in messages.
 pub const UNTRIAGED: &str = "untriaged";
 /// The board fields this code reads or sets, by name.
@@ -20,48 +19,15 @@ pub const FIELD_RUN: &str = "Run";
 pub const FIELD_BRANCH: &str = "Branch";
 pub const FIELD_NEWS: &str = "News";
 
-/// Which Projects v2 board the snapshot is of.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BoardRef {
-    /// `orgs` or `users`, as in the REST path.
-    pub owner_type: String,
-    pub owner: String,
-    pub number: u64,
-}
-
-impl BoardRef {
-    /// Its REST path, without a leading slash.
-    pub fn api_path(&self) -> String {
-        format!(
-            "{}/{}/projectsV2/{}",
-            self.owner_type, self.owner, self.number
-        )
-    }
-
-    /// Its URL, as gh-aw's `update_project` names a project.
-    pub fn url(&self) -> String {
-        format!(
-            "{GITHUB}{}/{}/projects/{}",
-            self.owner_type, self.owner, self.number
-        )
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ContentKind {
     Issue,
+    /// A pull request, or what the forge has for one (a merge request).
     PullRequest,
 }
 
 impl ContentKind {
-    fn segment(self) -> &'static str {
-        match self {
-            Self::Issue => "issues",
-            Self::PullRequest => "pull",
-        }
-    }
-
     /// "issue" or "PR", for messages.
     pub fn noun(self) -> &'static str {
         match self {
@@ -71,89 +37,37 @@ impl ContentKind {
     }
 }
 
-/// The URL of an issue or pull request on github.com. The one parser of
-/// such URLs: it keeps the case it was given, and [`ContentUrl::key`] is
-/// the identity to compare by.
+/// An issue or pull request, as the forge that has it names it. Only a
+/// [`crate::forge::Forge`] makes one from text, since what such a URL
+/// looks like is the forge's to say; here it is data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(try_from = "String", into = "String")]
-pub struct ContentUrl {
-    pub owner: String,
+#[serde(deny_unknown_fields)]
+pub struct ContentRef {
+    /// Its web URL in the forge's one canonical form, which is what
+    /// messages and action keys show and what [`ContentRef::key`] is
+    /// made of.
+    pub url: String,
+    /// The repository it is in, as the forge writes one (`OWNER/REPO`).
     pub repo: String,
     pub kind: ContentKind,
     pub number: u64,
 }
 
-impl ContentUrl {
-    /// Parses an issue or PR URL, ignoring anything after its number (a
-    /// fragment, `/files`); None for anything else.
-    pub fn parse(s: &str) -> Option<Self> {
-        let mut parts = s.trim().strip_prefix(GITHUB)?.splitn(4, '/');
-        let (owner, repo, kind, rest) =
-            (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-        let kind = match kind {
-            "issues" => ContentKind::Issue,
-            "pull" => ContentKind::PullRequest,
-            _ => return None,
-        };
-        let name = |s: &str| {
-            !s.is_empty()
-                && s.chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-        };
-        let digits = rest.split(|c: char| !c.is_ascii_digit()).next()?;
-        (name(owner) && name(repo)).then_some(())?;
-        Some(Self {
-            owner: owner.to_owned(),
-            repo: repo.to_owned(),
-            kind,
-            number: digits.parse().ok()?,
-        })
-    }
-
-    /// Its identity: GitHub's owner and repository names ignore case.
+impl ContentRef {
+    /// Its identity. Forges ignore the case of an owner's and a
+    /// repository's name, and people type both, so this does too.
     pub fn key(&self) -> String {
-        self.to_string().to_ascii_lowercase()
-    }
-
-    /// `OWNER/REPO`.
-    pub fn repository(&self) -> String {
-        format!("{}/{}", self.owner, self.repo)
-    }
-
-    /// The REST path that answers for an issue and a PR alike.
-    pub fn issue_api_path(&self) -> String {
-        format!("repos/{}/{}/issues/{}", self.owner, self.repo, self.number)
+        self.url.to_ascii_lowercase()
     }
 }
 
-impl fmt::Display for ContentUrl {
+impl fmt::Display for ContentRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{GITHUB}{}/{}/{}/{}",
-            self.owner,
-            self.repo,
-            self.kind.segment(),
-            self.number
-        )
+        f.write_str(&self.url)
     }
 }
 
-impl TryFrom<String> for ContentUrl {
-    type Error = String;
-
-    fn try_from(s: String) -> Result<Self, String> {
-        Self::parse(&s).ok_or_else(|| format!("not an issue or pull request URL: {s}"))
-    }
-}
-
-impl From<ContentUrl> for String {
-    fn from(u: ContentUrl) -> Self {
-        u.to_string()
-    }
-}
-
-/// Where an issue or PR stands. `Gone` is one GitHub no longer shows.
+/// Where an issue or PR stands. `Gone` is one the forge no longer shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ContentState {
@@ -240,7 +154,7 @@ impl From<Status> for String {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Content {
-    pub url: ContentUrl,
+    pub of: ContentRef,
     pub state: ContentState,
 }
 
@@ -248,7 +162,7 @@ pub struct Content {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Item {
-    /// Its `PVTI_` node id.
+    /// Its id on the board, as the forge gives it.
     pub id: String,
     /// None for a draft item, which is of no issue or PR.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -264,12 +178,13 @@ pub struct Item {
     /// The issues and PRs its Branch field names; anything else there
     /// is dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub branch: Vec<ContentUrl>,
+    pub branch: Vec<ContentRef>,
 }
 
 impl Item {
-    pub fn url(&self) -> Option<&ContentUrl> {
-        self.content.as_ref().map(|c| &c.url)
+    /// The issue or PR it is of.
+    pub fn content_ref(&self) -> Option<&ContentRef> {
+        self.content.as_ref().map(|c| &c.of)
     }
 
     /// Its Status as messages name it.
@@ -283,10 +198,11 @@ impl Item {
 #[serde(deny_unknown_fields)]
 pub struct Snapshot {
     pub schema: String,
-    pub board: BoardRef,
+    /// The board's web URL.
+    pub board: String,
     pub items: Vec<Item>,
     /// The state of Branch PRs that are not items themselves, by
-    /// [`ContentUrl::key`]. One that could not be read is absent, and a
+    /// [`ContentRef::key`]. One that could not be read is absent, and a
     /// rule must take an absent state as unknown, never as ended.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub linked: BTreeMap<String, ContentState>,
@@ -300,7 +216,7 @@ impl Snapshot {
             .items
             .iter()
             .filter_map(|it| it.content.as_ref())
-            .map(|c| (c.url.key(), c.state));
+            .map(|c| (c.of.key(), c.state));
         self.linked.clone().into_iter().chain(own).collect()
     }
 }
@@ -308,39 +224,6 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn content_urls() {
-        // (input, the URL it is, or None)
-        let cases = [
-            (
-                "https://github.com/o/r/issues/7",
-                Some("https://github.com/o/r/issues/7"),
-            ),
-            (
-                "https://github.com/O/R.x/pull/12/files#diff",
-                Some("https://github.com/O/R.x/pull/12"),
-            ),
-            (
-                " https://github.com/o/r/pull/3 ",
-                Some("https://github.com/o/r/pull/3"),
-            ),
-            ("https://github.com/o/r/compare/main...b", None),
-            ("https://github.com/o/r/pull/", None),
-            ("https://github.com/o/r/pull/x1", None),
-            ("https://github.com/o//pull/1", None),
-            ("https://example.com/o/r/pull/1", None),
-            ("bot/t405", None),
-        ];
-        for (input, want) in cases {
-            let got = ContentUrl::parse(input).map(|u| u.to_string());
-            assert_eq!(got.as_deref(), want, "{input}");
-        }
-        let mixed = ContentUrl::parse("https://github.com/O/R/pull/1").unwrap();
-        assert_eq!(mixed.key(), "https://github.com/o/r/pull/1");
-        assert_eq!(mixed.repository(), "O/R");
-        assert_eq!(mixed.issue_api_path(), "repos/O/R/issues/1");
-    }
 
     #[test]
     fn statuses_round_trip() {

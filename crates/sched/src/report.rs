@@ -15,9 +15,10 @@ use serde::Deserialize;
 use serde::de::{Deserializer, MapAccess, Visitor};
 use serde_json::Number;
 
-use crate::action::{Action, emit};
+use crate::action::Action;
 use crate::forge::Forge;
-use crate::model::{BoardRef, Snapshot};
+use crate::forge::github::emit;
+use crate::model::Snapshot;
 use crate::observe::observe;
 use crate::parity::{Parity, parity};
 use crate::rules::{RULES, reconcile};
@@ -208,8 +209,8 @@ fn pass_section(pass: &Result<Pass>) -> String {
     out
 }
 
-fn pass(opts: &Options, forge: &dyn Forge, board: &BoardRef) -> Result<Pass> {
-    let observed = observe(forge, board)?;
+fn pass(opts: &Options, forge: &dyn Forge) -> Result<Pass> {
+    let observed = observe(forge)?;
     let snapshot = observed.snapshot;
     let write = |name: &str, text: String| {
         let file = opts.dir.join(name);
@@ -307,7 +308,7 @@ fn render(
 /// if there is one), and returns its path. Whatever the steps found is in
 /// the report, a SOURCE that could not be had included; only failing to
 /// write the report is an error.
-pub fn report(opts: &Options, source: Result<(Box<dyn Forge>, BoardRef)>) -> Result<PathBuf> {
+pub fn report(opts: &Options, source: Result<Box<dyn Forge>>) -> Result<PathBuf> {
     let sweep_dir = opts.dir.join("sweep");
     fs::create_dir_all(&sweep_dir)
         .with_context(|| format!("cannot create {}", sweep_dir.display()))?;
@@ -336,7 +337,7 @@ pub fn report(opts: &Options, source: Result<(Box<dyn Forge>, BoardRef)>) -> Res
         &opts.dir.join(format!("{RECONCILE}.txt")),
         true,
     );
-    let pass = source.and_then(|(forge, board)| pass(opts, forge.as_ref(), &board));
+    let pass = source.and_then(|forge| pass(opts, forge.as_ref()));
     let text = render(&status, &sweep, &reconcile, &pass);
     let file = opts.dir.join(REPORT_FILE);
     fs::write(&file, &text).with_context(|| format!("cannot write {}", file.display()))?;
