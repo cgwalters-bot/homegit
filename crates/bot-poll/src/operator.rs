@@ -34,6 +34,14 @@ const MAX_AGENTS: u64 = 64;
 /// The share of the agents that are devspace runs, as JSON text, so that
 /// it prints as in homegit's lib/operator.js.
 const DEFAULT_OPENCODE_SHARE: &str = "0.25";
+/// How many devspace runs may be going at once, whatever the share says.
+const DEFAULT_OPENCODE_RUNS: u64 = 2;
+/// The inference pools paced on their own (see homegit's lib/pools.js),
+/// and each one's default target and burst, as JSON text like the share.
+const POOLS: [&str; 2] = ["claude", "openai"];
+const DEFAULT_POOL_TARGET: &str = "0.95";
+const DEFAULT_POOL_BURST: &str = "3";
+const MAX_BURST: f64 = 100.0;
 const DEFAULT_BUDGETS: [(&str, &str); 3] = [("P0", "M"), ("P1", "S"), ("P2", "S")];
 const BUCKETS: [&str; 5] = ["XS", "S", "M", "L", "XL"];
 
@@ -99,6 +107,15 @@ struct RawPacing {
     harness_agents: Option<u64>,
     budgets: Option<BTreeMap<String, String>>,
     opencode_share: Option<serde_json::Number>,
+    opencode_runs: Option<u64>,
+    pools: Option<BTreeMap<String, RawPool>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawPool {
+    target: Option<serde_json::Number>,
+    burst: Option<serde_json::Number>,
 }
 
 /// The resolved config, defaults filled in.
@@ -164,6 +181,19 @@ pub struct Pacing {
     pub budgets: BTreeMap<String, String>,
     /// The share of the agents that are devspace runs (0 to 1).
     pub opencode_share: serde_json::Number,
+    /// How many devspace runs may be going at once.
+    pub opencode_runs: u64,
+    /// The pace of each inference pool, by name.
+    pub pools: BTreeMap<String, Pool>,
+}
+
+/// An inference pool's pace: the share of its window to have used by the
+/// reset (0 to 1; the rest is the operator's reserve), and the percent
+/// points of slack that let work start right after a reset.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Pool {
+    pub target: serde_json::Number,
+    pub burst: serde_json::Number,
 }
 
 impl Operator {
@@ -342,6 +372,26 @@ fn validate(raw: &Raw) -> Result<()> {
             &share.to_string(),
         )?;
     }
+    check_agents(raw.pacing.opencode_runs, "pacing.opencode_runs", 0)?;
+    for (name, pool) in raw.pacing.pools.iter().flatten() {
+        check(POOLS.contains(&name.as_str()), "pacing.pools name", name)?;
+        if let Some(target) = &pool.target {
+            check(
+                target.as_f64().is_some_and(|t| t > 0.0 && t <= 1.0),
+                &format!("pacing.pools.{name}.target"),
+                &target.to_string(),
+            )?;
+        }
+        if let Some(burst) = &pool.burst {
+            check(
+                burst
+                    .as_f64()
+                    .is_some_and(|b| (0.0..=MAX_BURST).contains(&b)),
+                &format!("pacing.pools.{name}.burst"),
+                &burst.to_string(),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -425,6 +475,22 @@ fn resolve(raw: Raw) -> Result<Config> {
         Some(share) => share,
         None => DEFAULT_OPENCODE_SHARE.parse()?,
     };
+    let mut raw_pools = raw.pacing.pools.unwrap_or_default();
+    let mut pools = BTreeMap::new();
+    for name in POOLS {
+        let pool = raw_pools.remove(name).unwrap_or_default();
+        let or_default = |v: Option<serde_json::Number>, default: &str| match v {
+            Some(n) => Ok(n),
+            None => default.parse(),
+        };
+        pools.insert(
+            name.to_string(),
+            Pool {
+                target: or_default(pool.target, DEFAULT_POOL_TARGET)?,
+                burst: or_default(pool.burst, DEFAULT_POOL_BURST)?,
+            },
+        );
+    }
     // The trust split: the bot must never pass for the operator.
     if operator.login.eq_ignore_ascii_case(&bot.login) {
         bail!("bot.login must differ from operator.login");
@@ -457,6 +523,8 @@ fn resolve(raw: Raw) -> Result<Config> {
             harness_agents,
             budgets,
             opencode_share,
+            opencode_runs: raw.pacing.opencode_runs.unwrap_or(DEFAULT_OPENCODE_RUNS),
+            pools,
         },
     })
 }

@@ -40,7 +40,18 @@
           "P1": "S",
           "P2": "S"
         },
-        "opencode_share": 0.25
+        "opencode_share": 0.25,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -96,7 +107,18 @@
           "P1": "S",
           "P2": "S"
         },
-        "opencode_share": 0.25
+        "opencode_share": 0.25,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -190,7 +212,18 @@
           "P2": "XS",
           "P3": "XL"
         },
-        "opencode_share": 0.25
+        "opencode_share": 0.25,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -249,7 +282,18 @@
           "P1": "S",
           "P2": "S"
         },
-        "opencode_share": 0.25
+        "opencode_share": 0.25,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -296,7 +340,18 @@
           "P1": "S",
           "P2": "S"
         },
-        "opencode_share": 0.25
+        "opencode_share": 0.25,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -342,7 +397,18 @@
           "P1": "S",
           "P2": "S"
         },
-        "opencode_share": 0.25
+        "opencode_share": 0.25,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -391,7 +457,18 @@
           "P1": "S",
           "P2": "S"
         },
-        "opencode_share": 0.25
+        "opencode_share": 0.25,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -440,7 +517,18 @@
           "P1": "S",
           "P2": "S"
         },
-        "opencode_share": 0.25
+        "opencode_share": 0.25,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -761,7 +849,18 @@
           "P1": "S",
           "P2": "S"
         },
-        "opencode_share": 0.5
+        "opencode_share": 0.5,
+        "opencode_runs": 2,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 3
+          },
+          "openai": {
+            "target": 0.95,
+            "burst": 3
+          }
+        }
       }
     }
   },
@@ -786,6 +885,170 @@
     "config": {
       "pacing": {
         "opencode_share": "a quarter"
+      }
+    }
+  },
+  {
+    "name": "pacing: a pool with its own reserve, and one run at a time",
+    "config": {
+      "pacing": {
+        "opencode_runs": 1,
+        "pools": {
+          "openai": {
+            "target": 0.8
+          },
+          "claude": {
+            "burst": 0
+          }
+        }
+      }
+    },
+    "expect": {
+      "operator": {
+        "login": "cgwalters",
+        "name": "Colin Walters",
+        "email": "walters@verbum.org"
+      },
+      "bot": {
+        "login": "cgwalters-bot",
+        "git_name": "Colin Walters",
+        "git_email": "walters+llm@verbum.org",
+        "issue_repo": "cgwalters-bot/cgwalters-bot",
+        "homegit_repo": "cgwalters-bot/homegit"
+      },
+      "forge_org": "cgwalters-forge",
+      "tracker_repo": "cgwalters-forge/tracker",
+      "heartbeat_issue": 176,
+      "board": {
+        "owner_type": "orgs",
+        "owner": "cgwalters-forge",
+        "number": 1,
+        "state_items": {},
+        "epics": {
+          "composefs-stable": "users/cgwalters-bot/2"
+        }
+      },
+      "generated_by_url": "https://github.com/cgwalters/#llms",
+      "devspace": {
+        "repo": "bootc-dev/cgwalters-devspace-sandbox",
+        "host_prefix": "cgwalters-devspace-"
+      },
+      "pacing": {
+        "agents": 4,
+        "harness_agents": 2,
+        "budgets": {
+          "P0": "M",
+          "P1": "S",
+          "P2": "S"
+        },
+        "opencode_share": 0.25,
+        "opencode_runs": 1,
+        "pools": {
+          "claude": {
+            "target": 0.95,
+            "burst": 0
+          },
+          "openai": {
+            "target": 0.8,
+            "burst": 3
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: an unknown pool",
+    "config": {
+      "pacing": {
+        "pools": {
+          "copilot": {}
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: a pool target of 0",
+    "config": {
+      "pacing": {
+        "pools": {
+          "openai": {
+            "target": 0
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: a pool target above 1",
+    "config": {
+      "pacing": {
+        "pools": {
+          "claude": {
+            "target": 1.5
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: a negative pool burst",
+    "config": {
+      "pacing": {
+        "pools": {
+          "claude": {
+            "burst": -1
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: a pool burst too big",
+    "config": {
+      "pacing": {
+        "pools": {
+          "claude": {
+            "burst": 101
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: an unknown pool key",
+    "config": {
+      "pacing": {
+        "pools": {
+          "claude": {
+            "reserve": 5
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: a pool that is not an object",
+    "config": {
+      "pacing": {
+        "pools": {
+          "claude": 0.9
+        }
+      }
+    }
+  },
+  {
+    "name": "pacing: too many opencode runs",
+    "config": {
+      "pacing": {
+        "opencode_runs": 65
+      }
+    }
+  },
+  {
+    "name": "pacing: fractional opencode runs",
+    "config": {
+      "pacing": {
+        "opencode_runs": 1.5
       }
     }
   }
