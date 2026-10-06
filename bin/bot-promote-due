@@ -3,7 +3,9 @@
 // runs 'bot-pr promote' on each whose current head they approved and
 // whose upstream's contribution policy lets the bot (or, with their own
 // text, them) post it; the others get one comment saying why not and
-// what to do next. bot-watch runs it on every sweep. See --help. Node's standard library only, plus gh (through
+// what to do next, after an advisory quoting the upstream's LLM rules;
+// it caches each upstream's policy in one tracker issue. bot-watch runs
+// it on every sweep. See --help. Node's standard library only, plus gh (through
 // bot-priority-health's REST helpers, with their ETag cache),
 // upstream-policy and bot-pr.
 "use strict";
@@ -23,14 +25,18 @@ const {
   Exit, restGet, pages, pool, BOT_LOGIN, FORK_OWNERS, FORK_META, EX_RATELIMIT,
 } = require(path.join(BIN_DIR, "bot-priority-health"));
 const retry = require(path.join(__dirname, "..", "lib", "retry-cache.js"));
+const policyCache = require(path.join(__dirname, "..", "lib", "policy-cache.js"));
 const BOT_PR = process.env.BOT_PROMOTE_DUE_BOT_PR || path.join(BIN_DIR, "bot-pr");
 const UPSTREAM_POLICY = process.env.BOT_PROMOTE_DUE_UPSTREAM_POLICY || path.join(BIN_DIR, "upstream-policy");
 const BOT_BOARD = process.env.BOT_PROMOTE_DUE_BOT_BOARD || path.join(BIN_DIR, "bot-board");
 // For the one write this makes itself, the notice (bot-priority-health's
 // helpers only read).
 const GH = process.env.BOT_PRIORITY_HEALTH_GH || "gh";
-// The operator (see lib/operator.js).
-const REVIEWER = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG).operator.login;
+// The operator (see lib/operator.js), and the tracker that holds the
+// policy cache issue.
+const CONFIG = require(path.join(__dirname, "..", "lib", "operator.js")).loadOrExit(PROG);
+const REVIEWER = CONFIG.operator.login;
+const TRACKER = CONFIG.tracker_repo;
 // As in bot-pr: his reviews that decide whether a fork PR is approved (a
 // later comment-only review leaves an approval be), and the lines of his
 // comments and review bodies that approve and ask for a draft.
@@ -51,9 +57,13 @@ const ITEM_RE = /Board item: `(PVTI_[A-Za-z0-9_-]+)`/;
 const NOTICE_RE = /<!-- bot-promote-due notice=([0-9a-f]{16}) -->/;
 const NOTICE_KEY_LEN = 16;
 const NOTICED = ["refused", "held", "needs-text", "head-moved"];
+// The bot's advisory comment quoting the upstream's LLM rules, posted
+// before the first promotion attempt (or the hold) of a fork PR, once per
+// record: its key names the upstream, the verdict and the record's sources.
+const ADVISORY_RE = /<!-- bot-promote-due advisory=([0-9a-f]{16}) -->/;
 // What check(), policy() and the attempts file add to a result that
 // --json leaves out.
-const INTERNAL = ["at", "human_text", "approval", "approved_head", "stale", "item", "notices", "next"];
+const INTERNAL = ["at", "human_text", "approval", "approved_head", "stale", "item", "notices", "advisories", "next", "view", "status"];
 const LLMS_TRAILER = "Generated-by: https://github.com/cgwalters/#llms";
 // bot-board's limit on a News line, less its date prefix.
 const NEWS_MAX = 185;
@@ -71,14 +81,20 @@ const PR_URL_RE = /^https:\/\/github\.com\/([^/]+)\/([^/]+)\/pull\/([0-9]+)$/;
 const POLICY_HUMAN_TEXT = 5;
 const RECHECK_NEXT = "nothing for you to do: the bot rechecks the policy, and a later sweep promotes this PR on the same approval if the policy allows it";
 const POLICY_HELD = {
-  3: { why: (u) => `${u} has no contribution policy record yet; dispatch a policy check`, next: RECHECK_NEXT },
-  4: { why: (u) => `${u}'s contribution policy record is stale; dispatch a policy check`, next: RECHECK_NEXT },
-  6: { why: (u) => `${u}'s contribution policy is human-only or no-go`, next: "the bot may not post this upstream; open the upstream PR yourself if you want it there" },
-  7: { why: (u) => `${u}'s contribution policy record is invalid or uncommitted`, next: RECHECK_NEXT },
+  3: { state: "missing", why: (u) => `${u} has no contribution policy record yet; dispatch a policy check`, next: RECHECK_NEXT },
+  4: { state: "stale", why: (u) => `${u}'s contribution policy record is stale; dispatch a policy check`, next: RECHECK_NEXT },
+  6: { state: "refused", why: (u) => `${u}'s contribution policy is human-only or no-go`, next: "the bot may not post this upstream; open the upstream PR yourself if you want it there" },
+  7: { state: "invalid", why: (u) => `${u}'s contribution policy record is invalid or uncommitted`, next: RECHECK_NEXT },
 };
+// upstream-policy show's exit statuses without a record it can read (none,
+// or an invalid one): the gate's own hold says that, so there is no view.
+const SHOW_NO_RECORD = [3, 7];
 // The heads 'bot-pr promote' refused: their result is listed again
 // instead of retrying (see lib/retry-cache.js).
 const ATTEMPTS_FILE = retry.cacheFile("bot-promote-due");
+// Where the policy cache issue's number is remembered, so that it is
+// looked up among the tracker's issues only once.
+const POLICY_ISSUE_FILE = path.join(path.dirname(ATTEMPTS_FILE), "policy-issue.json");
 const EX_ERROR = 1;
 const EX_USAGE = 2;
 
@@ -118,6 +134,21 @@ a sweep that finds nothing new says nothing again, and a new approval
 that still can't promote gets a new answer. A moved head is said once
 per approval, however often the head moves after it.
 
+Before that, and before promoting, --apply shows ${REVIEWER} the
+upstream's LLM rules on the fork PR, once per record ('upstream-policy
+show': its verdict, AI trailer and the quotes it rests on): an advisory,
+which holds nothing back by itself unless the rules disallow bot
+accounts (no-go); the policy gate's own holds are said as above. It
+goes before 'bot-pr promote' runs, and a PR whose advisory can't be
+posted isn't promoted. With --apply, it also keeps one issue in
+${TRACKER} (titled "${policyCache.TITLE}") with the bot's view of each
+upstream policy it checked: the record's verdict, what the check said
+(a stale record, its sources changed upstream, is marked for recheck),
+and the last upstream PR promoted there, with whether the record
+changed since. It opens the issue the first time, remembers its number
+in ${POLICY_ISSUE_FILE.replace(os.homedir(), "~")}, and edits it only
+when that view changes.
+
 Prints one line per PR:
 
   Promotion due: URL at HEAD (UPSTREAM)   (without --apply)
@@ -138,9 +169,10 @@ Options:
               on each that was not promoted
   --dry-run   print what --apply would run, and change nothing
   --json      print a JSON array of {url, head, upstream, draft, result,
-              upstream_url, detail, line, notice} (result: due,
-              would-run, promoted, refused, held, needs-text,
-              head-moved; notice: the comment --apply posted, or null)
+              upstream_url, detail, line, notice, advisory} (result:
+              due, would-run, promoted, refused, held, needs-text,
+              head-moved; notice and advisory: the comments --apply
+              posted, or null)
   -h, --help  show this help
 
 Exits 1 if the search, a PR, a policy check or a comment failed (the
@@ -224,8 +256,10 @@ function wantsDraft(items) {
 
 const isForkPr = (owner, item) => FORK_OWNERS.includes(owner) && byLogin(BOT_LOGIN)(item) && (item.body || "").includes(FORK_META);
 
-// noticeKeys(comments): the keys of the notices among a PR's comments.
-const noticeKeys = (comments) => new Set(comments.filter(byLogin(BOT_LOGIN)).map((c) => (NOTICE_RE.exec(c.body || "") || [])[1]).filter(Boolean));
+// markerKeys(comments, re): the keys of the bot's comments among a PR's
+// comments that carry the marker re (NOTICE_RE or ADVISORY_RE).
+const markerKeys = (comments, re) => new Set(comments.filter(byLogin(BOT_LOGIN)).map((c) => (re.exec(c.body || "") || [])[1]).filter(Boolean));
+const noticeKeys = (comments) => markerKeys(comments, NOTICE_RE);
 
 // candidates(): the URLs of the bot's open fork PRs.
 async function candidates() {
@@ -243,11 +277,12 @@ async function candidates() {
 }
 
 // check(url): {url, head, upstream, draft, human_text, approval,
-// approved_head, stale, item, notices} for a fork PR that REVIEWER's
+// approved_head, stale, item, notices, advisories} for a fork PR that REVIEWER's
 // latest verdict approves, else null. stale: the approval is of another
 // head than the current one; approval and approved_head: its URL and the
 // commit it reviewed (null for a comment); item: the board item; notices:
-// the keys of the notices already posted.
+// the keys of the notices already posted; advisories: those of the
+// advisories.
 async function check(url) {
   const [, owner, name, number] = PR_URL_RE.exec(url);
   const repo = `${owner}/${name}`;
@@ -283,6 +318,7 @@ async function check(url) {
   return {
     url, head, upstream: m[1], draft: wantsDraft([...reviews, ...comments, ...reviewComments]), human_text: a.human_text,
     approval: a.url, approved_head: a.commit_id, stale, item: (ITEM_RE.exec(meta) || [])[1] || null, notices: noticeKeys(comments),
+    advisories: markerKeys(comments, ADVISORY_RE),
   };
 }
 
@@ -292,14 +328,28 @@ async function check(url) {
 async function policy(upstream) {
   try {
     await execFileP(UPSTREAM_POLICY, ["check", upstream]);
-    return { status: "ok", detail: "" };
+    return { status: "ok", state: "ok", detail: "" };
   } catch (e) {
     const last = ((e.stderr || e.message || "").trim().split("\n").filter(Boolean).pop() || "").replace(/^error: /, "");
     if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (upstream-policy check ${upstream})`);
-    if (e.code === POLICY_HUMAN_TEXT) return { status: "human-text", detail: "" };
+    if (e.code === POLICY_HUMAN_TEXT) return { status: "human-text", state: "human-text", detail: "" };
     const held = POLICY_HELD[e.code];
-    if (held) return { status: "held", detail: held.why(upstream), next: held.next };
+    if (held) return { status: "held", state: held.state, detail: held.why(upstream), next: held.next };
     throw new Error(`upstream-policy check ${upstream} failed (${e.code}): ${last}`);
+  }
+}
+
+// view(upstream): upstream-policy show's JSON of upstream's record, or
+// null without a valid one. Throws on any other failure: an advisory that can't
+// be said holds the promotion back.
+async function view(upstream) {
+  try {
+    const { stdout } = await execFileP(UPSTREAM_POLICY, ["show", upstream]);
+    return JSON.parse(stdout);
+  } catch (e) {
+    if (SHOW_NO_RECORD.includes(e.code)) return null;
+    const last = ((e.stderr || e.message || "").trim().split("\n").filter(Boolean).pop() || "").replace(/^error: /, "");
+    throw new Error(`upstream-policy show ${upstream} failed (${e.code}): ${last}`);
   }
 }
 
@@ -374,6 +424,61 @@ function noticeBody(d, r, key) {
   return `Not promoted: ${why.replace(/\.$/, "")}.\n\nNext: ${nextStep(d, r)}.\n\n${LLMS_TRAILER}\n<!-- bot-promote-due notice=${key} -->\n`;
 }
 
+// fenced(text): text as a code block, where GitHub links nothing: an
+// @login quoted from upstream notifies nobody, and a link to an issue or
+// PR there puts no "mentioned this" on its timeline.
+function fenced(text) {
+  const fence = "`".repeat(Math.max(3, ...(text.match(/`+/g) || []).map((run) => run.length + 1)));
+  return `${fence}text\n${text}\n${fence}`;
+}
+
+// advisoryKey(d, w): the key of the advisory for the record view w of
+// d's upstream: a new verdict, or a record rechecked against changed
+// sources, is said again.
+const advisoryKey = (d, w) => crypto.createHash("sha256").update(["advisory", d.upstream, w.verdict, w.digest].join("\n")).digest("hex").slice(0, NOTICE_KEY_LEN);
+
+// advisoryBody(d, w, v, key): the advisory on d for the record view w,
+// with the verdict v of upstream-policy check: the upstream's LLM rules
+// as the record quotes them, and whether they hold this promotion back.
+// Only rules that disallow bot accounts (no-go) block in their own right;
+// the gate's other holds are said by the notice that follows.
+function advisoryBody(d, w, v, key) {
+  let effect = "Nothing here holds this PR back: the bot promotes it now.";
+  if (w.bots_disallowed) effect = "They disallow bot accounts, so this PR is not promoted.";
+  else if (v.status === "held") effect = "The policy gate holds this PR back; the next comment says why.";
+  else if (v.status === "human-text" && !d.human_text) effect = "The text sent there must be yours; the next comment says how.";
+  const rules = w.rules ? `\n\n<details><summary>What its policy sources say</summary>\n\n${fenced(w.rules)}\n\n</details>` : "";
+  return `Upstream LLM rules (advisory): ${d.upstream}'s contribution policy record says ${w.verdict}: ${w.verdict_means}. AI trailer: ${w.ai_trailer}. ${effect}${rules}\n\nRecord: \`upstream-policy/${w.repo}.md\`, checked ${w.checked}.\n\n${LLMS_TRAILER}\n<!-- bot-promote-due advisory=${key} -->\n`;
+}
+
+// comment(d, body): posts body as the bot's comment on d; its URL.
+async function comment(d, body) {
+  const [, owner, name, number] = PR_URL_RE.exec(d.url);
+  try {
+    const { stdout } = await execFileP(GH, ["api", "-X", "POST", `repos/${owner}/${name}/issues/${number}/comments`,
+      "-f", `body=${body}`, "--jq", ".html_url"]);
+    return stdout.trim() || null;
+  } catch (e) {
+    const detail = (e.stderr || e.message || "").trim().split("\n").pop();
+    if (/rate limit|abuse/i.test(e.stderr || "")) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (${detail})`);
+    throw new Error(`commenting on ${d.url} failed: ${detail}`);
+  }
+}
+
+// advise(d, w, v): shows REVIEWER the upstream's LLM rules (record view
+// w, check verdict v) on d before it is promoted or held, unless that
+// advisory is there. Its URL, or null. Throws if it can't be posted.
+async function advise(d, w, v) {
+  const key = advisoryKey(d, w);
+  if (d.advisories.has(key)) return null;
+  const [, owner, name, number] = PR_URL_RE.exec(d.url);
+  // Read again, as notify does: an overlapping run may just have said it.
+  if (markerKeys(await pages(`repos/${owner}/${name}/issues/${number}/comments`), ADVISORY_RE).has(key)) return null;
+  const url = await comment(d, advisoryBody(d, w, v, key));
+  d.advisories.add(key);
+  return url;
+}
+
 // notify(d, r): tells REVIEWER on the fork PR d why result r promoted
 // nothing, unless a notice with its key is there, and notes it in the
 // board item's News. Returns the comment's URL, or null if it was said
@@ -395,15 +500,7 @@ async function notify(d, r) {
     const signed = Boolean(d.approved_head) && approvesHead({ approved: true, via: null, commit_id: d.approved_head, url: d.approval }, d.head, null, now);
     if (!pr || pr.state !== "open" || pr.head.sha !== d.head || signed) return null;
   }
-  let stdout;
-  try {
-    ({ stdout } = await execFileP(GH, ["api", "-X", "POST", comments,
-      "-f", `body=${noticeBody(d, r, key)}`, "--jq", ".html_url"]));
-  } catch (e) {
-    const detail = (e.stderr || e.message || "").trim().split("\n").pop();
-    if (/rate limit|abuse/i.test(e.stderr || "")) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (${detail})`);
-    throw new Error(`commenting on ${d.url} failed: ${detail}`);
-  }
+  const url = await comment(d, noticeBody(d, r, key));
   // Their text is what it waits on: their turn (see 'bot-board assign').
   if (r.result === "needs-text") {
     try {
@@ -420,7 +517,54 @@ async function notify(d, r) {
       warn(`noting the refusal of ${d.url} on ${d.item} failed: ${(e.stderr || e.message || "").trim().split("\n").pop()}`);
     }
   }
-  return stdout.trim() || null;
+  return url;
+}
+
+// policyIssue(): the open tracker issue of the bot's that holds the
+// policy cache, or null if there is none yet.
+async function policyIssue() {
+  const ours = (i) => i && !i.pull_request && i.state === "open" && byLogin(BOT_LOGIN)(i) && (i.body || "").includes(`<!-- ${policyCache.MARKER}`);
+  let known = null;
+  try {
+    known = JSON.parse(fs.readFileSync(POLICY_ISSUE_FILE, "utf8"));
+  } catch {
+    // Looked up below.
+  }
+  if (known && known.repo === TRACKER && Number.isInteger(known.number)) {
+    const issue = await restGet(`repos/${TRACKER}/issues/${known.number}`);
+    if (ours(issue)) return issue;
+  }
+  const issue = (await pages(`repos/${TRACKER}/issues?creator=${BOT_LOGIN}&state=open`)).find(ours) || null;
+  if (issue) rememberPolicyIssue(issue.number);
+  return issue;
+}
+
+function rememberPolicyIssue(number) {
+  fs.mkdirSync(path.dirname(POLICY_ISSUE_FILE), { recursive: true });
+  fs.writeFileSync(POLICY_ISSUE_FILE, `${JSON.stringify({ repo: TRACKER, number })}\n`);
+}
+
+// recordPolicies(seen): updates the policy cache issue with what this
+// sweep saw of each upstream ({upstream: {at, status, view, submitted}}),
+// opening it the first time; edits it only if that changed anything.
+async function recordPolicies(seen) {
+  const issue = await policyIssue();
+  let entries = policyCache.parse(issue && issue.body);
+  for (const [upstream, s] of Object.entries(seen)) entries = policyCache.update(entries, upstream, s);
+  const body = policyCache.render(entries);
+  if (issue && issue.body === body) return;
+  const args = issue
+    ? ["api", "-X", "PATCH", `repos/${TRACKER}/issues/${issue.number}`, "-f", `body=${body}`, "--jq", ".number"]
+    : ["api", "-X", "POST", `repos/${TRACKER}/issues`, "-f", `body=${body}`, "-f", `title=${policyCache.TITLE}`, "--jq", ".number"];
+  let stdout;
+  try {
+    ({ stdout } = await execFileP(GH, args));
+  } catch (e) {
+    const detail = (e.stderr || e.message || "").trim().split("\n").pop();
+    if (/rate limit|abuse/i.test(e.stderr || "")) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (${detail})`);
+    throw new Error(`updating the policy cache issue in ${TRACKER} failed: ${detail}`);
+  }
+  if (!issue && /^[0-9]+$/.test(stdout.trim())) rememberPolicyIssue(Number(stdout.trim()));
 }
 
 async function main() {
@@ -439,6 +583,10 @@ async function main() {
   })).filter(Boolean);
   // One check per upstream, which reads its policy sources upstream.
   const verdicts = new Map();
+  // With --apply, each upstream's record as upstream-policy show reads it
+  // (local), and what the sweep saw of it, for the policy cache issue.
+  const views = new Map();
+  const seen = {};
   const tried = retry.load(ATTEMPTS_FILE, warn);
   const attempts = {};
   const results = [];
@@ -447,12 +595,21 @@ async function main() {
   for (const d of approved) {
     let r;
     let notice = null;
+    let advisory = null;
     try {
       // A stale approval needs no policy check: only a new one counts.
       if (!d.stale && !verdicts.has(d.upstream)) verdicts.set(d.upstream, await policy(d.upstream));
       const v = verdicts.get(d.upstream);
       const key = `${d.url}@${d.head}`;
       const t = tried[key];
+      // The upstream's LLM rules go on the fork PR before it is promoted,
+      // or held by its verdict; a stale or missing record has none to say.
+      if (opts.apply && !d.stale) {
+        if (!views.has(d.upstream)) views.set(d.upstream, v.state === "missing" ? null : await view(d.upstream));
+        const w = views.get(d.upstream);
+        seen[d.upstream] = { at: new Date().toISOString(), status: v.state, view: w, submitted: (seen[d.upstream] || {}).submitted || null };
+        if (w && ["ok", "human-text", "refused"].includes(v.state)) advisory = await advise(d, w, v);
+      }
       if (d.stale) r = { result: "head-moved", upstream_url: null, detail: headMoved(d) };
       else if (v.status === "human-text" && !d.human_text) r = { result: "needs-text", upstream_url: null, detail: NEEDS_TEXT };
       else if (v.status === "held") r = { result: "held", upstream_url: null, detail: v.detail, next: v.next };
@@ -463,6 +620,7 @@ async function main() {
       else r = { result: "due", upstream_url: null, detail: "" };
       // A repeated attempt keeps its time.
       if (r.result === "refused") attempts[key] = { at: new Date().toISOString(), ...r, approval: d.approval };
+      if (r.result === "promoted" && seen[d.upstream]) seen[d.upstream].submitted = r.upstream_url;
     } catch (e) {
       if (e instanceof Exit && e.status === EX_RATELIMIT) {
         // What was promoted already must still be reported.
@@ -488,9 +646,18 @@ async function main() {
       }
     }
     const shown = Object.fromEntries(Object.entries({ ...d, ...r }).filter(([k]) => !INTERNAL.includes(k)));
-    results.push({ ...shown, line: line(shown), notice });
+    results.push({ ...shown, line: line(shown), notice, advisory });
   }
   if (opts.apply && !rateLimited) retry.save(ATTEMPTS_FILE, attempts);
+  if (opts.apply && !rateLimited && Object.keys(seen).length) {
+    try {
+      await recordPolicies(seen);
+    } catch (e) {
+      if (e instanceof Exit && e.status === EX_RATELIMIT) rateLimited = e;
+      // Only the operator's overview: the next sweep writes it again.
+      else warn(e.message);
+    }
+  }
   process.stdout.write(opts.json ? `${JSON.stringify(results)}\n` : results.map((r) => `${r.line}\n`).join(""));
   if (rateLimited) throw rateLimited;
   if (failed.length) throw new Exit(EX_ERROR, `${failed.length} fork PR(s) could not be checked or commented on`);

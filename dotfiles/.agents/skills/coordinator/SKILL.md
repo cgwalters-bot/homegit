@@ -735,7 +735,11 @@ cost when an item is far off (two buckets), and correct the table in
   one comment from `bot-promote-due` telling them why and what is next
   (keyed by approval, head and reason, so only a new approval or reason
   is answered again), and the same in its item's News: don't repeat it
-  on the PR.
+  on the PR. Before it promotes or holds one, it posts the upstream's
+  LLM rules there once per record (an advisory, blocking only for
+  no-go), and it keeps the "Upstream contribution policies (the bot's
+  view)" issue in the tracker: a row marked for recheck needs a policy
+  check (see "Policy gate").
 - **Outstanding reviews first** (after P0 health). The "Outstanding reviews by LOGIN"
   section (LOGIN being the operator's login) `bot-watch` prints on every sweep is P0: dispatch a worker for
   each listed PR, unless a live worker is already on it (check it's
