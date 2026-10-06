@@ -50,8 +50,8 @@ so no polling is needed to find the run. The inputs are all strings:
 | `item`     | the board item id (`PVTI_...`) |
 | `repo`     | the target repository, `OWNER/REPO` |
 | `base`     | its base ref |
-| `agent`    | `opencode`, `fake` (scripted, no inference) or `claude` (once the broker holds its credential) |
-| `model`    | the model, as `provider/model` for opencode (`bot-runs dispatch` sends `praxis/gpt-6.1-sol`, GPT-6.1 Sol through the broker, unless `--model` or `BOT_RUNS_MODEL` says otherwise); empty for the agent's own default |
+| `agent`    | `opencode`, `fake` (scripted, no inference) or `claude` (Claude Code, through the praxis broker) |
+| `model`    | the model, as `provider/model` for opencode (`bot-runs dispatch` sends `praxis/gpt-6.1-sol`, GPT-6.1 Sol through the broker, unless `--model` or `BOT_RUNS_MODEL` says otherwise), a Claude Code model name or alias for claude (Opus by default); empty for the agent's own default |
 | `cores`    | `4`, `16` or `64` |
 | `timeout`  | minutes, at most 330 (`bot-runs dispatch` sends `75`) |
 | `max_requests` | the most model requests the run may make, subagents' included, as the broker counts them; `0` for no cap (the workflow's default is `150`; `bot-runs dispatch` sends it only with `--max-requests`) |
@@ -498,7 +498,7 @@ zero.
 | `praxis` | object | for runs registered with the praxis broker, its usage record's numbers, else `null`: `schema` (`praxis-run-usage/v2`), `state` (`active`, `finished` or `expired`), `requests` (metered), `unmetered` (successful responses whose usage never arrived; the cap keeps their reservation), and `tokens` with `input` (uncached), `cache_read`, `output`, `reasoning` (within `output`) and `total` (what the broker's per-run cap counts): integers |
 | `aic` | number | estimated cost in AIC |
 | `aic_budget` | number | the dispatched budget |
-| `aic_pricing` | string | `api` (billed), `api-equivalent` (a subscription run priced at API rates), `subscription` (no per-token price; the praxis broker caps tokens instead) or `mock` |
+| `aic_pricing` | string | `api` (billed), `api-equivalent` (a subscription run priced at API rates, as a claude run is), `subscription` (no per-token price; the praxis broker caps tokens instead) or `mock` |
 | `tools` | object | per tool name: `calls`, `errors` and `duration_s` (integers) |
 | `slowest` | array | at most 10 of `{tool, summary, duration_s}`, slowest first |
 | `failures` | array | `{kind, message}`, `kind` one of `tool_error`, `timeout`, `budget`, `validation`, `agent_exit` |
