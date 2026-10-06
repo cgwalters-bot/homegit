@@ -56,9 +56,7 @@ const ALL_KEYS = [
   "health:P0 ci-failing https://github.com/cgwalters-forge/r/pull/7 777777777777",
   "health:P0 stale https://github.com/cgwalters-forge/r/pull/8 888888888888",
   "health:P0 stale https://github.com/o/r/pull/2 bbbbbbbbbbbb",
-  "approval:https://github.com/cgwalters-forge/q/pull/5 https://github.com/cgwalters-forge/q/pull/5#pullrequestreview-5",
   "approval:https://github.com/cgwalters-forge/r/pull/3 https://github.com/cgwalters-forge/r/pull/3#pullrequestreview-3",
-  "approval:https://github.com/cgwalters-forge/r/pull/4 https://github.com/cgwalters-forge/r/pull/4#pullrequestreview-4",
   "patch-ready:https://github.com/cgwalters-forge/tracker/issues/60:4242",
   "answer-unapplied:https://github.com/cgwalters-forge/tracker/issues/50 https://github.com/cgwalters-forge/tracker/issues/50#issuecomment-1",
   "budget:https://github.com/cgwalters-forge/tracker/issues/1",
@@ -260,7 +258,10 @@ test("drive: the sweep's P0 drive and health lines and approvals, carried over",
   assert.match(byKey["drive:conflict https://github.com/o/r/pull/1 aaaaaaaaaaaa"].do, /^P0 conflict: dispatch a worker/);
   assert.equal(actions.find((a) => a.url.endsWith("r/pull/3")).do,
     "Not promoted: https://github.com/cgwalters-forge/r/pull/3: o/r's contribution policy record is stale; dispatch a policy check");
-  assert.equal(actions.find((a) => a.url.endsWith("q/pull/5")).do, "approved: bot-pr promote --human-text https://github.com/cgwalters-forge/q/pull/5");
+  // Only what the sweep could not promote: not an approval it has yet to
+  // see (r#4), one waiting on the operator's text (q#2, q#5), or a moved
+  // head (r#9), which it told them on the fork PR.
+  assert.deepEqual(actions.filter((a) => a.kind === "approval").map((a) => a.url.slice(-8)), ["r/pull/3"]);
   assert.deepEqual(rec.drive(obs({ sweep: undefined })), []);
 });
 
@@ -435,14 +436,14 @@ function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) 
 
 test("bot-reconcile: the report, and --json", () => {
   const out = cli([]);
-  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote \(opencode share target 1, limit 2\), 3 local\); budgets 8M, spent 1\.5M; claude 30% \(resets Mon 23:00\) · openai 3% \(resets Mon 23:00\); heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(14\):\n/);
+  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote \(opencode share target 1, limit 2\), 3 local\); budgets 8M, spent 1\.5M; claude 30% \(resets Mon 23:00\) · openai 3% \(resets Mon 23:00\); heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(12\):\n/);
   assert.doesNotMatch(out, /^. capacity /m);
   const j = JSON.parse(cli(["--json"]));
   assert.deepEqual(j.actions.map((a) => a.key), ALL_KEYS);
   assert.deepEqual(j.errors, []);
   assert.equal(j.observed.lanes.upstream.busy, 1);
   assert.deepEqual(JSON.parse(cli(["--json", "--rule", "drive", "--rule", "answer-unapplied"])).actions.map((a) => a.kind),
-    ["drive", "health", "health", "health", "approval", "approval", "approval", "answer-unapplied"]);
+    ["drive", "health", "health", "health", "approval", "answer-unapplied"]);
 });
 
 test("bot-reconcile --state: fires once, then on resync; an unread input keeps its actions", () => {
