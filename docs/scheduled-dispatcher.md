@@ -267,12 +267,28 @@ The first piece that runs in Actions is the observing half of the pass,
 with nothing applied: the `controller-report` workflow in this repository
 (hourly, `workflow_dispatch`, and on pull requests that touch it). It
 holds no secret, only the job's own `GITHUB_TOKEN` with `contents: read`,
-and runs `bin/bot-controller-report`, which is `bot-sweep --read-only`
-followed by `bot-reconcile` without `--apply` or `--state`. The report
-(each step's status and output, the sweep's problems, the reconcile
-actions) is the job summary and the `controller-report` artifact. It
-exists to be compared with the local sweep under
+and runs `bot-sched report` (`crates/sched`), which is `bot-sweep
+--read-only` followed by `bot-reconcile` without `--apply` or `--state`.
+The report (each step's status and output, the sweep's problems, the
+reconcile actions) is the job summary and the `controller-report`
+artifact. It exists to be compared with the local sweep under
 `~/.local/state/bot-sweep/runs` before anything that writes moves.
+
+The same report carries the first piece of the scheduler's rewrite, as a
+pass of its own: `bot-sched` reads the board once into a typed snapshot
+(`snapshot.json` in the artifact), runs its rules on it (`closed-not-done`
+and `stale-lead` so far, ports of the two in `lib/reconcile.js`), and
+writes the changes they ask for as gh-aw safe-output items
+(`agent_output.json`), which nothing applies yet. The board's REST
+listing carries each item's issue or PR whole, so the snapshot has their
+states from that one listing, without `bot-watch`'s request per URL.
+The report says whether `bot-reconcile`, given the same board and
+states, lists the same actions, saying and doing the same (`bot-sched
+parity`, which `tests/bot-sched-parity.sh` also runs on a recorded
+board); the copy in `lib/reconcile.js` goes once that has held and the
+write moves here. `bot-sched reconcile --recorded FILE` replays a pass
+from GitHub's recorded answers (`observe --record FILE`), which is how
+its tests run without a network.
 
 It lives here rather than next to `agent.yml` because the tools it runs
 are this repository's, so there is no second checkout to keep in step,

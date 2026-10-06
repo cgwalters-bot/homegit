@@ -1,0 +1,91 @@
+{
+  "actions": [
+    {
+      "key": "closed-not-done:https://github.com/cgwalters-bot/homegit/pull/1",
+      "kind": "closed-not-done",
+      "url": "https://github.com/cgwalters-bot/homegit/pull/1",
+      "do": "its PR merged, but it is Draft: set it Done",
+      "detail": [],
+      "apply": {
+        "id": "PVTI_merged",
+        "set": [
+          "--status",
+          "Done",
+          "--news",
+          "PR merged; set Done"
+        ]
+      }
+    },
+    {
+      "key": "closed-not-done:https://github.com/cgwalters-bot/homegit/pull/2",
+      "kind": "closed-not-done",
+      "url": "https://github.com/cgwalters-bot/homegit/pull/2",
+      "do": "its PR closed unmerged, but it is Draft: ask the operator whether to drop it (Done) or redo it (Needs human), or set it Done if it is clear",
+      "detail": [],
+      "apply": null
+    },
+    {
+      "key": "closed-not-done:https://github.com/cgwalters-forge/tracker/issues/7",
+      "kind": "closed-not-done",
+      "url": "https://github.com/cgwalters-forge/tracker/issues/7",
+      "do": "its issue closed, but it is Needs human: set it Done",
+      "detail": [],
+      "apply": {
+        "id": "PVTI_issue",
+        "set": [
+          "--status",
+          "Done",
+          "--news",
+          "issue closed; set Done"
+        ]
+      }
+    },
+    {
+      "key": "closed-not-done:https://github.com/cgwalters-forge/tracker/issues/9",
+      "kind": "closed-not-done",
+      "url": "https://github.com/cgwalters-forge/tracker/issues/9",
+      "do": "its issue closed, but it is Draft: set it Done",
+      "detail": [],
+      "apply": {
+        "id": "PVTI_gone",
+        "set": [
+          "--status",
+          "Done",
+          "--news",
+          "issue closed; set Done"
+        ]
+      }
+    },
+    {
+      "key": "stale-lead:https://github.com/cgwalters-forge/tracker/issues/11",
+      "kind": "stale-lead",
+      "url": "https://github.com/cgwalters-forge/tracker/issues/11",
+      "do": "Lead coordinator, but it is Todo: clear its Lead",
+      "detail": [],
+      "apply": {
+        "id": "PVTI_stale",
+        "set": [
+          "--field",
+          "Lead",
+          ""
+        ]
+      }
+    },
+    {
+      "key": "stale-lead:PVTI_draft",
+      "kind": "stale-lead",
+      "url": null,
+      "do": "Lead coordinator, but it is Done: clear its Lead",
+      "detail": [],
+      "apply": {
+        "id": "PVTI_draft",
+        "set": [
+          "--field",
+          "Lead",
+          ""
+        ]
+      }
+    }
+  ],
+  "errors": []
+}

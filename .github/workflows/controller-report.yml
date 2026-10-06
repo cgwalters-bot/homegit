@@ -1,7 +1,9 @@
 # The read-only part of the controller's pass, on a schedule: what
-# bot-sweep and bot-reconcile see with nothing applied, as an artifact and
-# a job summary, to compare with the local sweep before anything moves
-# here. See "The read-only report" in docs/scheduled-dispatcher.md.
+# bot-sweep and bot-reconcile see with nothing applied, and what bot-sched
+# (crates/sched, the scheduler's rewrite) observes, decides and would emit
+# as safe outputs, as an artifact and a job summary, to compare with the
+# local sweep before anything moves here. See "The read-only report" in
+# docs/scheduled-dispatcher.md.
 #
 # It holds no secret: only the job's own GITHUB_TOKEN, read-only, which
 # reads public data and cannot write anywhere. Keep it that way; a step
@@ -20,7 +22,9 @@ on:
   pull_request:
     paths:
       - .github/workflows/controller-report.yml
-      - bin/bot-controller-report
+      - Cargo.lock
+      - Cargo.toml
+      - crates/sched/**
       - bin/bot-board
       - bin/bot-pr
       - bin/bot-priority-health
@@ -40,7 +44,8 @@ concurrency:
 jobs:
   report:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    # The build, a sweep of at most 25 minutes, and reconcile twice.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -58,10 +63,20 @@ jobs:
             ~/.cache/bot-watch
           key: controller-report-etags-${{ github.run_id }}
           restore-keys: controller-report-etags-
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: controller-report-cargo-${{ hashFiles('Cargo.lock', 'crates/**') }}
+          restore-keys: controller-report-cargo-
+      - name: Build bot-sched
+        run: cargo build --locked --release -p bot-sched
       - name: Report
         env:
           GH_TOKEN: ${{ github.token }}
-        run: bin/bot-controller-report --dir "${RUNNER_TEMP}/controller-report"
+        run: target/release/bot-sched report --dir "${RUNNER_TEMP}/controller-report"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
