@@ -1,0 +1,612 @@
+{
+ "orgs/cgwalters-forge/projectsV2/1/fields?per_page=100": [
+  {
+   "id": 10,
+   "name": "Title",
+   "data_type": "title"
+  },
+  {
+   "id": 13,
+   "name": "Status",
+   "data_type": "single_select"
+  },
+  {
+   "id": 33,
+   "name": "Why",
+   "data_type": "text"
+  },
+  {
+   "id": 34,
+   "name": "Priority",
+   "data_type": "single_select"
+  },
+  {
+   "id": 36,
+   "name": "Branch",
+   "data_type": "text"
+  },
+  {
+   "id": 71,
+   "name": "Lead",
+   "data_type": "text"
+  },
+  {
+   "id": 82,
+   "name": "Run",
+   "data_type": "text"
+  }
+ ],
+ "orgs/cgwalters-forge/projectsV2/1/items?per_page=100&fields=13,34,36,71,82": [
+  {
+   "id": 1,
+   "node_id": "PVTI_merged",
+   "content_type": "PullRequest",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-bot/homegit/pull/1",
+    "number": 1,
+    "title": "PVTI_merged",
+    "state": "closed",
+    "merged_at": "2026-10-05T10:00:00Z"
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "Draft",
+       "html": "Draft"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_promoted",
+   "content_type": "PullRequest",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-forge/bootc/pull/5",
+    "number": 5,
+    "title": "PVTI_promoted",
+    "state": "closed",
+    "merged_at": null
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "In Review",
+       "html": "In Review"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": {
+      "raw": "https://github.com/bootc-dev/bootc/pull/50",
+      "html": "https://github.com/bootc-dev/bootc/pull/50"
+     }
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_issue",
+   "content_type": "Issue",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-forge/tracker/issues/7",
+    "number": 7,
+    "title": "PVTI_issue",
+    "state": "closed"
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "Needs human",
+       "html": "Needs human"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": {
+      "raw": "https://github.com/cgwalters-forge/bootc/pull/8 https://github.com/cgwalters-bot/homegit/pull/1",
+      "html": "https://github.com/cgwalters-forge/bootc/pull/8 https://github.com/cgwalters-bot/homegit/pull/1"
+     }
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_gone",
+   "content_type": "Issue",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-forge/tracker/issues/9",
+    "number": 9,
+    "title": "PVTI_gone",
+    "state": "closed"
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "Draft",
+       "html": "Draft"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": {
+      "raw": "https://github.com/cgwalters-forge/bootc/pull/404",
+      "html": "https://github.com/cgwalters-forge/bootc/pull/404"
+     }
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_unread",
+   "content_type": "Issue",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-forge/tracker/issues/10",
+    "number": 10,
+    "title": "PVTI_unread",
+    "state": "closed"
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "Draft",
+       "html": "Draft"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": {
+      "raw": "https://github.com/cgwalters-forge/bootc/pull/500",
+      "html": "https://github.com/cgwalters-forge/bootc/pull/500"
+     }
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_stale",
+   "content_type": "Issue",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-forge/tracker/issues/11",
+    "number": 11,
+    "title": "PVTI_stale",
+    "state": "open"
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "Todo",
+       "html": "Todo"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": {
+      "raw": "coordinator",
+      "html": "coordinator"
+     }
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_draft",
+   "content_type": "DraftIssue",
+   "archived_at": null,
+   "content": {
+    "title": "PVTI_draft",
+    "body": ""
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "Done",
+       "html": "Done"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": {
+      "raw": "coordinator",
+      "html": "coordinator"
+     }
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_busy",
+   "content_type": "Issue",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-forge/tracker/issues/12",
+    "number": 12,
+    "title": "PVTI_busy",
+    "state": "open"
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "In Progress",
+       "html": "In Progress"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": {
+      "raw": "coordinator",
+      "html": "coordinator"
+     }
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": {
+      "raw": "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/5",
+      "html": "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/5"
+     }
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_closed_pr",
+   "content_type": "PullRequest",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-bot/homegit/pull/2",
+    "number": 2,
+    "title": "PVTI_closed_pr",
+    "state": "closed",
+    "merged_at": null
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "Draft",
+       "html": "Draft"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  },
+  {
+   "id": 1,
+   "node_id": "PVTI_topic",
+   "content_type": "Issue",
+   "archived_at": null,
+   "content": {
+    "html_url": "https://github.com/cgwalters-forge/tracker/issues/13",
+    "number": 13,
+    "title": "PVTI_topic",
+    "state": "open"
+   },
+   "fields": [
+    {
+     "name": "Status",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "Parked",
+       "html": "Parked"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Priority",
+     "data_type": "single_select",
+     "value": {
+      "id": "x",
+      "name": {
+       "raw": "P1",
+       "html": "P1"
+      },
+      "color": "GRAY"
+     }
+    },
+    {
+     "name": "Branch",
+     "data_type": "text",
+     "value": null
+    },
+    {
+     "name": "Lead",
+     "data_type": "text",
+     "value": {
+      "raw": "wfc",
+      "html": "wfc"
+     }
+    },
+    {
+     "name": "Run",
+     "data_type": "text",
+     "value": null
+    }
+   ]
+  }
+ ],
+ "repos/bootc-dev/bootc/issues/50": {
+  "state": "open",
+  "pull_request": {
+   "merged_at": null
+  }
+ },
+ "repos/cgwalters-forge/bootc/issues/8": {
+  "state": "closed",
+  "pull_request": {
+   "merged_at": "2026-10-05T09:00:00Z"
+  }
+ },
+ "repos/cgwalters-forge/bootc/issues/404": null
+}
