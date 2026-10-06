@@ -84,11 +84,21 @@ name = "bot-poll"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bot-sched",
  "chrono",
  "clap",
  "serde",
  "serde_json",
  "tempfile",
+]
+
+[[package]]
+name = "bot-sched"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
