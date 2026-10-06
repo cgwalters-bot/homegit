@@ -1,0 +1,15 @@
+[package]
+name = "bot-sched"
+version = "0.1.0"
+description = "The scheduler: observes the forge as a typed snapshot, reconciles it with pure rules and emits the resulting writes as safe outputs"
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[lints]
+workspace = true

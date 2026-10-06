@@ -8,7 +8,8 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 pub mod hot;
-pub mod operator;
+/// The operator config, which the scheduler crate owns.
+pub use bot_sched::operator;
 use operator::Operator;
 
 /// A key not there for this long is forgotten, and news again when it

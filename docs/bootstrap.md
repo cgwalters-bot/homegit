@@ -57,7 +57,7 @@ forge org, and the rest is derived:
 
 Node tools load it with `lib/operator.js`, shell tools by sourcing
 `bin/operator.sh` (which runs `bot-operator --shell`), and `bot-poll`
-with `crates/bot-poll/src/operator.rs`; `tests/fixtures/operator/cases.json`
+with `crates/sched/src/operator.rs`; `tests/fixtures/operator/cases.json`
 holds the cases both loaders are tested against.
 
 ## Accounts and token

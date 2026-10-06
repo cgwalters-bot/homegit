@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 anyhow = "1"
+bot-sched = { path = "../sched" }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
