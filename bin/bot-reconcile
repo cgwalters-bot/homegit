@@ -24,6 +24,7 @@ const operator = require(path.join(ROOT, "lib", "operator.js"));
 const disp = require(path.join(ROOT, "lib", "dispatch.js"));
 const ms = require(path.join(ROOT, "lib", "midstream.js"));
 const pools = require(path.join(ROOT, "lib", "pools.js"));
+const tri = require(path.join(ROOT, "lib", "triage.js"));
 
 const tool = (name) => process.env[`BOT_RECONCILE_${name.replace(/^bot-/, "").toUpperCase()}`] || path.join(BIN_DIR, name);
 const STATE_HOME = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
@@ -33,12 +34,15 @@ const WATCH_STATE = path.join(STATE_HOME, "bot-watch", "watch.json");
 const ACTIVITY_FILE = path.join(process.env.BOT_OPERATOR_ACTIVITY_STATE || path.join(STATE_HOME, "bot-operator-activity"), "repos.json");
 const POLICY_DIR = process.env.UPSTREAM_POLICY_DIR || path.join(ROOT, "upstream-policy");
 const TOPIC_SKILL = path.join(ROOT, "dotfiles", ".agents", "skills", "topic-lead", "SKILL.md");
+// What a triage run is to do, put before the issue in its brief.
+const TRIAGE_GUIDE = path.join(ROOT, "dotfiles", ".agents", "skills", "coordinator", "triage-brief.md");
 const STATE_VERSION = 1;
 // The inputs each rule reads; only those of the rules run are read.
 // prs follows from the sweep, and children from the board.
 const RULE_INPUTS = {
   capacity: ["items", "capacity", "activity", "children"],
   dispatch: ["items", "capacity", "activity", "children"],
+  triage: ["items", "capacity", "activity", "children"],
   escalate: ["items"],
   heartbeat: ["items", "heartbeat", "children"],
   "lead-orphan": ["items", "heartbeat", "children"],
@@ -67,7 +71,7 @@ function usage() {
 Reconciles like a Kubernetes controller: reads the observed state, compares
 it with the desired one, and prints the actions that would close the gap,
 each with a stable key, a kind, the item's URL and what to do. It changes
-nothing itself, except with --apply (see closed-not-done, stale-lead, midstream and dispatch). Run it on each
+nothing itself, except with --apply (see closed-not-done, stale-lead, midstream, dispatch and triage). Run it on each
 wake, do the actions, then run it again to confirm they converged
 ("Actions: none").
 
@@ -123,6 +127,26 @@ Rules (${rules}):
                     leaves 'auto-dispatch failed: ...' in the item's Why, which
                     keeps the rule off it. A labeled item that can't be dispatched
                     is a dispatch-failed action.
+  triage            an open ${operator.loadOrExit(PROG).tracker_repo} issue on the board, the
+                    operator's with no Status yet, or any labeled '${tri.TRIAGE_LABEL}' with
+                    none or ${tri.RETRIAGE_STATUSES.join(" or ")} (the opt-in, also to triage it again),
+                    and no Run: one 'bot-runs dispatch --triage'
+                    a pass, a read-only opencode analysis run whose one output
+                    is a comment on the issue proposing its scope, priority,
+                    epic and estimate (coordinator/triage-brief.md); bot-runs
+                    reconcile applies it. It waits while the openai pool is
+                    over or out of its pace (but for '${pools.URGENT_LABEL}'-labeled issues)
+                    or the remote runs, with this pass's dispatches, are at
+                    their limit. --apply builds the brief
+                    from the issue (the operator's or the bot's only), its
+                    operator comments and the open board items, gives the item
+                    Status ${tri.CLAIM_STATUS} (one triage per status-less issue,
+                    whatever becomes of the run), removes the
+                    label (one triage per label), then dispatches on the
+                    first repository the issue names (else the tracker). A
+                    failure leaves '${tri.FAILED_PREFIX} ...' in the item's Why,
+                    which keeps the rule off it: a triage-failed action
+                    (clear the Why and label it '${tri.TRIAGE_LABEL}' to retry).
   escalate          an open issue labeled '${disp.ESCALATE_LABEL}', which the dispatcher filed
                     for the coordinator's judgment (see the dispatcher skill):
                     read it, decide or ask the operator, answer on it, close it.
@@ -417,11 +441,11 @@ async function readIssue(url, opts) {
     comments: comments.map((c) => ({ author: c.user && c.user.login, at: c.created_at, body: c.body })) };
 }
 
-// setDispatchLabel(url, on): adds or removes the dispatch label of an issue.
-async function setDispatchLabel(url, on) {
+// setLabel(url, name, on): adds or removes a label of an issue.
+async function setLabel(url, name, on) {
   const repoIssue = /^https:\/\/github\.com\/([^/]+\/[^/]+)\/issues\/(\d+)$/.exec(url);
   const base = `repos/${repoIssue[1]}/issues/${repoIssue[2]}/labels`;
-  const args = on ? ["api", "-X", "POST", base, "-f", `labels[]=${disp.DISPATCH_LABEL}`] : ["api", "-X", "DELETE", `${base}/${disp.DISPATCH_LABEL}`];
+  const args = on ? ["api", "-X", "POST", base, "-f", `labels[]=${name}`] : ["api", "-X", "DELETE", `${base}/${name}`];
   await execFileP(GH, args, { maxBuffer: MAX_BUFFER });
 }
 
@@ -448,7 +472,7 @@ async function dispatchOne(a, opts, config) {
   if (!live.repo) throw new Error("the issue no longer names a target repository: its Repo: line is gone");
   const brief = disp.buildBrief({ item: { title: d.title, content: { url: d.url } }, repo: live.repo, base: live.base, issue, comments: issue.comments, config });
   try {
-    await setDispatchLabel(d.url, false);
+    await setLabel(d.url, disp.DISPATCH_LABEL, false);
   } catch (e) {
     if (!NOT_FOUND_RE.test(`${e.stderr}${e.message}`)) throw new Error(`removing the ${disp.DISPATCH_LABEL} label: ${firstLine(e)}`);
     const err = new Error(`the ${disp.DISPATCH_LABEL} label was already gone: someone else took it`);
@@ -462,7 +486,72 @@ async function dispatchOne(a, opts, config) {
   } catch (e) {
     if (STARTED_RE.test(e.stdout || "")) throw new Error(`the run started, but bot-runs failed after: ${firstLine(e)}`);
     if (e.code !== EX_RATELIMIT) throw new Error(firstLine(e));
-    await setDispatchLabel(d.url, true);
+    await setLabel(d.url, disp.DISPATCH_LABEL, true);
+    const err = new Error(`GitHub's rate limit: ${firstLine(e)}`);
+    err.deferred = true;
+    throw err;
+  }
+}
+
+// triageOne(a, opts, obs): carries out a triage action like dispatchOne: checks
+// the issue is still open and the operator's or the bot's, consumes its
+// triage label if that is what asked (a label already gone means another
+// run of this took it), claims the item on the board (tri.CLAIM_STATUS, and
+// a Why that reads as failed until the run's replaces it), and runs bot-runs
+// dispatch --triage with the brief built from the issue, on the first
+// repository it names. The claim comes before the run, so that none starts for an
+// item the board can't record: a status-less issue would otherwise be
+// triaged again every pass. Throws like dispatchOne; a rate limit before
+// any run started puts the label (back) on, which asks again.
+async function triageOne(a, opts, obs) {
+  const t = a.triage;
+  const config = obs.config;
+  const issue = await readIssue(t.url, opts);
+  if (issue.state && issue.state !== "open") {
+    const err = new Error("the issue is closed");
+    err.skipped = true;
+    throw err;
+  }
+  if (!disp.trusted(issue, config)) throw new Error(`the issue was written by ${issue.author}, neither the operator nor the bot, so its text can't brief a run unread`);
+  const guide = fs.readFileSync(TRIAGE_GUIDE, "utf8");
+  const brief = tri.buildBrief({ guide, item: { title: t.title, content: { url: t.url } }, issue, config, board: obs.items });
+  const co = tri.checkout(issue.body, config);
+  if (t.label) {
+    try {
+      await setLabel(t.url, tri.TRIAGE_LABEL, false);
+    } catch (e) {
+      if (!NOT_FOUND_RE.test(`${e.stderr}${e.message}`)) throw new Error(`removing the ${tri.TRIAGE_LABEL} label: ${firstLine(e)}`);
+      const err = new Error(`the ${tri.TRIAGE_LABEL} label was already gone: someone else took it`);
+      err.skipped = true;
+      throw err;
+    }
+  }
+  // After the label: a pass that lost it to another mustn't touch the
+  // other's item.
+  try {
+    await execFileP(tool("bot-board"), ["set", t.id, "--status", tri.CLAIM_STATUS, "--why", tri.failure(tri.UNFINISHED)], { maxBuffer: MAX_BUFFER });
+  } catch (e) {
+    if (t.label) await setLabel(t.url, tri.TRIAGE_LABEL, true);
+    const err = new Error(`claiming it on the board: ${firstLine(e)}`);
+    // Nothing changed, so the next pass finds it as it was.
+    err.deferred = e.code === EX_RATELIMIT;
+    err.unclaimed = true;
+    throw err;
+  }
+  const p = execFileP(tool("bot-runs"), ["dispatch", "--triage", "--item", t.id, "--repo", co.repo, "--base", co.base, "-"], { maxBuffer: MAX_BUFFER });
+  p.child.stdin.end(brief);
+  try {
+    await p;
+  } catch (e) {
+    if (STARTED_RE.test(e.stdout || "")) {
+      const err = new Error(`the run started, but bot-runs failed after: ${firstLine(e)}`);
+      err.started = true;
+      throw err;
+    }
+    if (e.code !== EX_RATELIMIT) throw new Error(firstLine(e));
+    // The claim took its Status: the label is what asks again.
+    await setLabel(t.url, tri.TRIAGE_LABEL, true);
+    await execFileP(tool("bot-board"), ["set", t.id, "--why", ""], { maxBuffer: MAX_BUFFER });
     const err = new Error(`GitHub's rate limit: ${firstLine(e)}`);
     err.deferred = true;
     throw err;
@@ -472,11 +561,13 @@ async function dispatchOne(a, opts, config) {
 // What a PR converted back to a draft is told.
 const MIDSTREAM_DRAFT_COMMENT = `Converted back to a draft: this repository is a midstream (topic ${ms.MIDSTREAM_TOPIC}), whose main mirrors upstream and only moves by fast-forward sync, so its PRs are review vehicles and are never merged.\n\nGenerated-by: https://github.com/cgwalters/#llms`;
 
-// apply(actions, errors, opts, config): carries out the actions that have an
-// `apply` (a board change), a `draft` (a PR to convert) or a `dispatch`, recording the result in each. A
-// failed dispatch leaves its reason in the item's Why, so that the rule
-// leaves the item alone until someone looks.
-async function apply(actions, errors, opts, config) {
+// apply(actions, errors, opts, obs): carries out the actions that have an
+// `apply` (a board change), a `draft` (a PR to convert), a `dispatch` or a
+// `triage`, recording the result in each. A failed dispatch or triage leaves
+// its reason in the item's Why, so that the rule leaves the item alone until
+// someone looks.
+async function apply(actions, errors, opts, obs) {
+  const config = obs.config;
   for (const a of actions.filter((x) => x.apply)) {
     try {
       await execFileP(tool("bot-board"), ["set", a.apply.id, ...a.apply.set], { maxBuffer: MAX_BUFFER });
@@ -516,6 +607,25 @@ async function apply(actions, errors, opts, config) {
       }
     }
   }
+  for (const a of actions.filter((x) => x.triage)) {
+    try {
+      await triageOne(a, opts, obs);
+      a.applied = "dispatched";
+    } catch (e) {
+      a.applied = e.deferred ? `deferred: ${e.message}` : e.skipped ? `skipped: ${e.message}` : `failed: ${e.message}`;
+      if (e.deferred || e.skipped) continue;
+      errors.push(`applying ${a.key}: ${e.message}`);
+      // A started run's Why is bot-runs' marker of a triage run, if its
+      // board write got that far: keep it (else the claim's stands, which
+      // reads as failed). One that couldn't be claimed has nothing to record.
+      if (e.started || e.unclaimed) continue;
+      try {
+        await execFileP(tool("bot-board"), ["set", a.triage.id, "--why", tri.failure(e.message)], { maxBuffer: MAX_BUFFER });
+      } catch (e2) {
+        errors.push(`recording that ${a.key} failed: ${firstLine(e2)}`);
+      }
+    }
+  }
 }
 
 async function main(argv) {
@@ -524,7 +634,7 @@ async function main(argv) {
   const previous = opts.state ? readState(opts.state) : {};
   obs.previous = Object.keys(previous);
   let actions = rec.reconcile(obs, opts.rules).map((a) => ({ ...a, fired: null }));
-  if (opts.apply) await apply(actions, errors, opts, obs.config);
+  if (opts.apply) await apply(actions, errors, opts, obs);
   if (opts.state) {
     const r = rec.edge(previous, actions, opts.now, opts.resync, rec.unreadKinds(obs, opts.rules));
     actions = r.actions;

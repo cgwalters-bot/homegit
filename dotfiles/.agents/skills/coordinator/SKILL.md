@@ -407,6 +407,27 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   that can't be dispatched is a **dispatch-failed** action. Label an issue
   yourself (`gh issue edit N --add-label dispatch`) to hand it to the
   dispatcher.
+- **triage:** an open tracker issue of the operator's on the board with
+  no Status yet, or any one labeled `triage` (no Status, or Todo), gets a
+  triage run (the bot's own issues, like escalations, only on the label), deterministic, one per pass and
+  under the same pace and remote-share limits as dispatch: `bot-reconcile
+  --apply` sets it Todo (so a status-less issue is taken once), removes the
+  label and starts `bot-runs dispatch --triage` (an
+  `analysis` run checking out the first repository the issue names, else
+  the tracker, whose only allowed output is one `add_comment` on that
+  issue; its brief is `triage-brief.md` next to this skill, the issue and
+  the open board items). The item is In Progress while it runs; `bot-runs
+  reconcile` then applies it (`bot-runs apply RUN --triage`): it posts the
+  comment as the bot, sets the Priority and Est. cost it proposes where
+  the item has none, files it under the proposed epic, and either labels
+  it `dispatch` (dispatchable, the operator's issue, a `Repo:` line) or
+  assigns the operator as an ask, and sets it Todo. A failed dispatch
+  leaves `triage failed: ...` in Why (a **triage-failed** action: fix it,
+  clear the Why and label it); label the issue `triage` to triage it again. **Operator
+  ideas go to the board as issues and are triaged there, not planned in
+  chat:** file the idea in the tracker (`Repo: OWNER/REPO` when it has a
+  target), add it to the board without a Status, and let the triage run
+  propose the plan; answer its questions on the issue.
 - **escalate:** an open issue labeled `escalate`: what the dispatcher
   (see "The dispatcher") needs your judgment for. Read it, decide or ask
   the operator, answer on the issue, close it.
@@ -867,7 +888,9 @@ cost when an item is far off (two buckets), and correct the table in
   `triage` is a note the operator filed in the tracker, labelled
   `needs-triage` (the review app's capture bar files these, and adds
   them to the board). The label means "not yet triaged": handle it
-  in the same wake, before dispatching other Todo work.
+  in the same wake, before dispatching other Todo work. If a triage run
+  (the **triage** rule under "Reconcile") already commented on it, start
+  from its proposal: the fields it set stand unless they are wrong.
   1. Read the issue and what it links. Make sure it is on the board:
      `bot-board add URL` (the app's own add can fail; adding it again
      returns the existing item).

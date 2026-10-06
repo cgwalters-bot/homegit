@@ -531,7 +531,8 @@ map(.content_type as $type
   | {id: .node_id, title: .content.title,
      content: (.content | if $type == "DraftIssue" then {type: $type, id: .node_id, title, body: (.body // "")}
        else {type: $type, url: .html_url, number, title, body: (.body // ""),
-             repository: (first(.html_url // "" | capture("^https://github\\.com/(?<r>[^/]+/[^/]+)/").r) // null)} end)}
+             repository: (first(.html_url // "" | capture("^https://github\\.com/(?<r>[^/]+/[^/]+)/").r) // null)}
+         + (if .user.login then {author: .user.login} else {} end) + (if .state then {state} else {} end) end)}
     + ([.fields[] | {key: (.name | ascii_downcase), value: value_of}] | from_entries))'
 
 # Set by rest_get.

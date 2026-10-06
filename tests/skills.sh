@@ -48,11 +48,12 @@ done
 
 # The brief templates: what heads a subagent's prompt must carry the
 # board item's "Item:" line (bot-cost attributes tokens by it), as a
-# placeholder line of its own. runner-preamble.md is exempt: bot-runs
-# titles the run "agent PVTI_...", which bot-cost reads instead, and the
-# coordinator's SKILL.md shows a filled-in example.
+# placeholder line of its own. runner-preamble.md and triage-brief.md, a
+# devspace run's, are exempt: bot-runs titles the run "agent PVTI_...",
+# which bot-cost reads instead, and the coordinator's SKILL.md shows a
+# filled-in example.
 readonly ITEM_LINE='Item: ITEM_URL'
-readonly ITEM_EXEMPT=("${SKILLS}/coordinator/SKILL.md" "${SKILLS}/coordinator/runner-preamble.md")
+readonly ITEM_EXEMPT=("${SKILLS}/coordinator/SKILL.md" "${SKILLS}/coordinator/runner-preamble.md" "${SKILLS}/coordinator/triage-brief.md")
 for file in "${SKILLS}"/coordinator/*.md "${SKILLS}/topic-lead/SKILL.md"; do
     [[ " ${ITEM_EXEMPT[*]} " == *" ${file} "* ]] && continue
     grep -qxF "${ITEM_LINE}" "${file}" ||

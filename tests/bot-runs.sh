@@ -64,6 +64,7 @@ while test $# -gt 0; do
         -f|-F) fields+=("$2"); shift 2 ;;
         --jq) filter=$2; shift 2 ;;
         --input) input=$2; shift 2 ;;
+        --paginate) shift ;;
         -*) echo "fake gh: unexpected option $1" 1>&2; exit 1 ;;
         *) path=$1; shift ;;
     esac
@@ -190,6 +191,30 @@ case "${method} ${path%%\?*}" in
         cat "${store}/dispatch-response.json"
         ;;
     "GET repos/${repo}/actions/workflows/"*) fail_http 404 "Not Found" ;;
+    # The tracker's issues, for apply --triage: $FAKE_GH/issues/N.json and
+    # its comments in $FAKE_GH/issues/N-comments.json; a posted comment's
+    # request goes to $FAKE_GH/posted.jsonl.
+    "GET repos/cgwalters-forge/tracker/issues/"*/comments)
+        n=${path#repos/cgwalters-forge/tracker/issues/}
+        n=${n%%/*}
+        reply "$(cat "${store}/issues/${n}-comments.json" 2>/dev/null || echo '[]')"
+        ;;
+    "POST repos/cgwalters-forge/tracker/issues/"*/comments)
+        jq -c . "${input/#-//dev/stdin}" >>"${store}/posted.jsonl"
+        reply '{"id": 9001}'
+        ;;
+    "POST repos/cgwalters-forge/tracker/issues/"*/sub_issues)
+        test ! -e "${store}/sub-issue-422" || fail_http 422 "Validation Failed"
+        reply '{}'
+        ;;
+    "POST repos/cgwalters-forge/tracker/issues/"*/labels|"POST repos/cgwalters-forge/tracker/issues/"*/assignees)
+        reply '{}'
+        ;;
+    "GET repos/cgwalters-forge/tracker/issues/"*)
+        f=${store}/issues/${path##*/}.json
+        test -e "${f}" || fail_http 404 "Not Found"
+        reply "$(cat "${f}")"
+        ;;
     # A target repository: private-org's are private, gone's don't exist.
     "GET repos/"*/*)
         [[ "${path}" =~ ^repos/[^/]+/[^/]+$ ]] || { echo "fake gh: unexpected call: ${method} ${path}" 1>&2; exit 1; }
@@ -1261,6 +1286,164 @@ test_dispatch_no_run_id() {
     out=$("${BOT_RUNS}" dispatch --item PVTI_item1 --repo composefs/composefs-rs "${WORK}/brief.md" 2>&1) &&
         fail "succeeded without a run id"
     expect_lines "${out}" "GitHub returned no run id; find it with 'bot-runs list --item PVTI_item1' instead of dispatching again"
+}
+
+# --- triage ------------------------------------------------------------------
+
+readonly TRACKER_ISSUE=https://github.com/cgwalters-forge/tracker/issues/42
+readonly TRIAGE_MARKER='<!-- triage-run 1001 -->'
+
+# make_triage [COMMENT...]: run 1001 as a triage run of tracker issue 42
+# (an analysis run whose outputs are the COMMENT JSON lines, by default one
+# add_comment proposing P1, S, epic 5, a question), the item on the board
+# with the triage Why, the issue (the operator's, with a Repo: line) and
+# its open epic 5.
+make_triage() {
+    local out=${FAKE_GH}/artifacts/1001/safe-outputs block
+    set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" '.workflow = "analysis"'
+    mkdir -p "${out}" "${FAKE_GH}/issues"
+    block=$(jq -nc '{schema: "triage/v1", priority: "P1", epic: "https://github.com/cgwalters-forge/tracker/issues/5",
+        estimate: "S", dispatchable: false, repo: "composefs/composefs-rs", questions: ["Keep the old flag?"]}')
+    if test $# -eq 0; then
+        set -- "$(jq -nc --arg b "**Ask**: make fsck faster.
+
+\`\`\`json
+${block}
+\`\`\`" '{type: "add_comment", item_number: 42, body: $b}')"
+    fi
+    printf '%s\n' "$@" >"${out}/outputs.jsonl"
+    jq -nc '{repo: "composefs/composefs-rs", ref: "main", commit: "abc"}' >"${out}/base.json"
+    jq -n --arg r "${RUNS_URL}" --arg u "${TRACKER_ISSUE}" '[{id: "PVTI_item1", title: "Make fsck faster", status: "In Progress",
+        run: "\($r)/1001", why: "Triage: devspace agent run \($r)/1001", content: {type: "Issue", url: $u, number: 42}}]' >"${FAKE_GH}/board.json"
+    jq -nc --arg u "${TRACKER_ISSUE}" '{number: 42, id: 4242, html_url: $u, state: "open", user: {login: "cgwalters"},
+        body: "Repo: composefs/composefs-rs\nfsck is slow.", labels: [], assignees: []}' >"${FAKE_GH}/issues/42.json"
+    jq -nc '{number: 5, id: 55, html_url: "https://github.com/cgwalters-forge/tracker/issues/5", state: "open",
+        user: {login: "cgwalters"}, labels: [{name: "epic"}], assignees: []}' >"${FAKE_GH}/issues/5.json"
+}
+
+test_apply_triage() {
+    make_triage
+    local out
+    out=$("${BOT_RUNS}" apply 1001 --triage --json)
+    expect_json "$(jq -c 'del(.why)' <<<"${out}")" "$(jq -nc --arg u "${TRACKER_ISSUE}" '{run_id: 1001,
+        run_url: "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1001/attempts/1",
+        item: "PVTI_item1", issue: $u, posted: true, set: ["--priority", "P1", "--field", "Est. cost", "S (<1M tok)"],
+        calls: ["file under https://github.com/cgwalters-forge/tracker/issues/5", "assign cgwalters"], notes: []}')" "apply --triage --json"
+    expect_lines "$(jq -r .why <<<"${out}")" '^Triaged by agent run .*/1001/attempts/1: P1; est S; epic #5; asked cgwalters; 1 question\(s\)$'
+    expect_eq "$(wc -l <"${FAKE_GH}/posted.jsonl")" 1 "comments posted"
+    expect_lines "$(jq -r .body "${FAKE_GH}/posted.jsonl")" '^\*\*Ask\*\*: make fsck faster\.$' "^${TRIAGE_MARKER}$" '^Generated-by: https://github.com/cgwalters/#llms$'
+    expect_eq "$(grep '^set' "${FAKE_GH}/board-calls")" "set PVTI_item1 --priority P1 --field Est. cost S (<1M tok)" "board fields"
+    expect_eq "$(calls '^api -X POST repos/cgwalters-forge/tracker/issues/5/sub_issues -F sub_issue_id=4242$')" 1 "epic link"
+    expect_eq "$(calls '^api -X POST repos/cgwalters-forge/tracker/issues/42/assignees -f assignees\[\]=cgwalters$')" 1 "ask"
+    expect_eq "$(calls 'labels')" 0 "dispatch label of an ask"
+    # Once posted, a second apply finds its marker and doesn't post again;
+    # the fields the item now has are kept.
+    jq -n --arg m "${TRIAGE_MARKER}" '[{id: 1, user: {login: "cgwalters"}, body: "thanks \($m)"}, {id: 2, user: {login: "cgwalters-bot"}, body: "x\n\($m)\n"}]' \
+        >"${FAKE_GH}/issues/42-comments.json"
+    out=$("${BOT_RUNS}" apply 1001 --triage)
+    expect_lines "${out}" '^Triage run 1001: already posted its comment on https://github.com/cgwalters-forge/tracker/issues/42\.$' \
+        'kept Priority P1 \(proposed P1\)'
+    expect_eq "$(wc -l <"${FAKE_GH}/posted.jsonl")" 1 "comments posted after a second apply"
+}
+
+# An issue GitHub won't file under the epic (it has a parent already) is
+# a note, not a failure.
+test_apply_triage_has_parent() {
+    make_triage
+    touch "${FAKE_GH}/sub-issue-422"
+    local out
+    out=$("${BOT_RUNS}" apply 1001 --triage --json 2>/dev/null)
+    rm "${FAKE_GH}/sub-issue-422"
+    expect_json "$(jq -c .notes <<<"${out}")" '["not file under https://github.com/cgwalters-forge/tracker/issues/5 (HTTP 422: it may have a parent already)"]' "notes"
+    expect_lines "$(jq -r .why <<<"${out}")" '; not file under .*/issues/5 \(HTTP 422: it may have a parent already\)$'
+}
+
+# A dispatchable issue of the operator's gets the dispatch label, not an ask.
+test_apply_triage_dispatchable() {
+    make_triage "$(jq -nc '{type: "add_comment", body: "Go.\n\n```json\n{\"schema\": \"triage/v1\", \"dispatchable\": true, \"repo\": \"composefs/composefs-rs\"}\n```"}')"
+    local out
+    out=$("${BOT_RUNS}" apply 1001 --triage --json)
+    expect_json "$(jq -c '{set, calls}' <<<"${out}")" '{"set": [], "calls": ["label dispatch"]}' "dispatchable"
+    expect_eq "$(calls '^api -X POST repos/cgwalters-forge/tracker/issues/42/labels -f labels\[\]=dispatch$')" 1 "dispatch label"
+}
+
+# Refused: whatever isn't one add_comment for the item's own issue, and a
+# run that isn't an analysis run; nothing is posted or set. Data driven:
+# [outputs.jsonl lines (| separated) or a jq edit of the summary]|error.
+test_apply_triage_refused() {
+    local comment='{"type":"add_comment","item_number":42,"body":"x"}'
+    local cases=(
+        '{"type":"add_comment","item_number":7,"body":"x"}|the comment is for issue 7, not the triaged https://github.com/cgwalters-forge/tracker/issues/42'
+        '{"type":"add_comment","repo":"composefs/composefs-rs","body":"x"}|the comment is for composefs/composefs-rs, not cgwalters-forge/tracker'
+        "${comment}+${comment}|handed back 2 add_comment outputs; a triage run's is one"
+        "${comment}+"'{"type":"noop","message":"x"}|handed back noop; a triage run'"'"'s one output is an add_comment'
+        '{"type":"create_pull_request","title":"t","body":"b"}|handed back create_pull_request'
+        "summary:.workflow = \"branch\"|run 1001 is a branch run; a triage run is analysis"
+        # The board item names another run (1001 is a prefix of its id), or none.
+        "board:[.[0] + {run: \"${RUNS_URL}/10010\", why: \"Triage: devspace agent run ${RUNS_URL}/10010\"}]|doesn't name the run in its Run or Why"
+        "board:[.[0] + {run: null, why: \"operator: later\"}]|doesn't name the run in its Run or Why"
+    )
+    local c lines out
+    for c in "${cases[@]}"; do
+        lines=${c%%|*}
+        rm -f "${FAKE_GH}/posted.jsonl" "${FAKE_GH}/calls" "${FAKE_GH}/board-calls"
+        rm -rf "${XDG_STATE_HOME}/bot-runs" "${XDG_CACHE_HOME}/bot-runs"
+        if test "${lines#summary:}" != "${lines}"; then
+            make_triage
+            set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" "${lines#summary:}"
+        elif test "${lines#board:}" != "${lines}"; then
+            make_triage
+            set_json "${FAKE_GH}/board.json" "${lines#board:}"
+        else
+            local IFS=+
+            # shellcheck disable=SC2086 # split on +
+            make_triage ${lines}
+            unset IFS
+        fi
+        out=$("${BOT_RUNS}" apply 1001 --triage 2>&1) && fail "${lines}: applied"
+        grep -qF -- "${c#*|}" <<<"${out}" || fail "${lines}: no '${c#*|}' in: ${out}"
+        test ! -e "${FAKE_GH}/posted.jsonl" || fail "${lines}: posted"
+        ! grep -qs '^set' "${FAKE_GH}/board-calls" || fail "${lines}: changed the board"
+    done
+    # A change's options don't go with --triage.
+    out=$("${BOT_RUNS}" apply 1001 --triage --slug x 2>&1) && fail "--triage --slug accepted"
+    expect_lines "${out}" 'drop --slug'
+}
+
+test_dispatch_triage() {
+    local out
+    printf 'Triage it.\n' >"${WORK}/brief.md"
+    out=$("${BOT_RUNS}" dispatch --dry-run --triage --item PVTI_item1 --repo composefs/composefs-rs --no-preamble "${WORK}/brief.md")
+    expect_json "$(jq -c '.inputs | {workflow, outputs, max_outputs}' <<<"$(sed 1d <<<"${out}")")" \
+        '{"workflow": "analysis", "outputs": "add_comment", "max_outputs": "1"}' "dispatch --triage"
+    out=$("${BOT_RUNS}" dispatch --dry-run --triage --outputs noop --item PVTI_item1 --repo composefs/composefs-rs "${WORK}/brief.md" 2>&1) &&
+        fail "--triage --outputs accepted"
+    expect_lines "${out}" 'drop --outputs'
+    "${BOT_RUNS}" dispatch --triage --item PVTI_item1 --repo composefs/composefs-rs "${WORK}/brief.md" >/dev/null
+    expect_lines "$(cat "${FAKE_GH}/board-calls")" \
+        "^set PVTI_item1 --status In Progress --why Triage: devspace agent run ${RUNS_URL}/1006 --field Run ${RUNS_URL}/1006 --news "
+}
+
+# Reconcile applies a finished triage run and puts its item in Todo; a
+# failed one goes to Todo too, waiting for the label.
+test_reconcile_triage() {
+    make_triage
+    jq --arg r "${RUNS_URL}" '. + [{id: "PVTI_item2", title: "Failed triage", status: "In Progress", run: "\($r)/1004",
+        why: "Triage: devspace agent run \($r)/1004", content: {type: "Issue", url: "https://github.com/cgwalters-forge/tracker/issues/43"}}]' \
+        "${FAKE_GH}/board.json" >"${WORK}/b.json"
+    mv "${WORK}/b.json" "${FAKE_GH}/board.json"
+    local out
+    out=$("${BOT_RUNS}" reconcile)
+    expect_eq "${out}" "Make fsck faster [In Progress] PVTI_item1: triage run 1001 succeeded: post its comment, set the fields it proposes and Todo (with --apply)
+Failed triage [In Progress] PVTI_item2: triage run 1004 ended (failure): set Todo (with --apply)" "report"
+    out=$("${BOT_RUNS}" reconcile --apply)
+    expect_lines "${out}" '^Make fsck faster .*: triage run 1001 succeeded: applied, set Todo \(done\)$'
+    expect_eq "$(wc -l <"${FAKE_GH}/posted.jsonl")" 1 "comments posted"
+    expect_json "$(jq -c 'map({id, status, run, priority, "est. cost", why})' "${FAKE_GH}/board.json")" "$(jq -nc --arg r "${RUNS_URL}" '[
+        {id: "PVTI_item1", status: "Todo", run: null, priority: "P1", "est. cost": "S (<1M tok)",
+         why: "Triaged by agent run \($r)/1001/attempts/1: P1; est S; epic #5; asked cgwalters; 1 question(s)"},
+        {id: "PVTI_item2", status: "Todo", run: null, priority: null, "est. cost": null,
+         why: "Triage run \($r)/1004 ended: failure; label the issue triage to triage it again"}]')" "board after --apply"
 }
 
 # --- reconcile ---------------------------------------------------------------
