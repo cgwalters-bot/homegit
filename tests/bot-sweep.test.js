@@ -26,6 +26,11 @@ if [ "${name}" = bot-board ] && [ "$1" = status-update ]; then
   printf '%s' "\${FAKE_STATUS_OUT-}"
   exit "\${FAKE_STATUS_EXIT:-0}"
 fi
+if [ "${name}" = bot-board ] && [ "$1" = handback ]; then
+  test "$2" = --apply || exit 97
+  printf '%s' "\${FAKE_HANDBACK_OUT-}"
+  exit "\${FAKE_HANDBACK_EXIT:-0}"
+fi
 if [ "${name}" = bot-board ] && [ "$1" = archive-done ]; then
   printf '%s' "\${FAKE_ARCHIVE_OUT-Archive Done: 0 archived, 0 eligible}"
   printf '%s\\n' "$*" >"${WORK}/archive.args"
@@ -83,14 +88,14 @@ test("a clean sweep publishes its outputs and a complete status", () => {
   assert.deepEqual(s.last_complete.run, s.run);
   assert.match(s.run, /^[0-9]{8}-[0-9]{6}-[0-9]{3}$/);
   assert.ok(s.duration_s >= 0 && s.ended_at >= s.started_at);
-  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "archive-done", "fill-org", "git", "inbox", "notify", "status-update", "tmt-gc", "watch"]);
+  assert.deepEqual(Object.keys(s.steps).sort(), ["actuals", "archive-done", "fill-org", "git", "handback", "inbox", "notify", "status-update", "tmt-gc", "watch"]);
   assert.deepEqual(s.org_filled, []);
   assert.doesNotMatch(r.stdout, /Org filled/);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-notify.txt"), "utf8"), "notify says\n");
   assert.equal(fs.readFileSync(path.join(r.stateDir, "latest-inbox.txt"), "utf8"), "inbox says\n");
   // The run, in bot-poll's layout.
-  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0, "fill-org": 0, "archive-done": 0, "status-update": 0 });
+  assert.deepEqual(r.read(`runs/${s.run}/status.json`), { git: 0, watch: 0, notify: 0, inbox: 0, "tmt-gc": 0, actuals: 0, "fill-org": 0, handback: 0, "archive-done": 0, "status-update": 0 });
   assert.equal(fs.readFileSync(path.join(r.stateDir, "runs", s.run, "watch.txt"), "utf8"), `${SWEPT}\n`);
   assert.ok(!fs.existsSync(path.join(r.stateDir, "running.json")));
   assert.deepEqual(fs.readdirSync(path.join(r.stateDir, "runs")), [s.run]);
@@ -138,6 +143,19 @@ for (const c of [
   });
 }
 
+test("handback's lines go in the report; failing, it is a problem but the run is complete", () => {
+  const out = "Handed back: https://github.com/cgwalters-forge/tracker/issues/42 (cgwalters commented c1) assigned to cgwalters-bot\n" +
+    "Closed: https://github.com/cgwalters-forge/bootc/pull/3 unassigned\nHand-back: 1 handed back, 1 closed unassigned\n";
+  const ok = sweep({ FAKE_HANDBACK_OUT: out });
+  assert.equal(ok.code, 0, ok.stdout + ok.stderr);
+  assert.match(ok.stdout, /\nHanded back: https:\/\/github\.com\/cgwalters-forge\/tracker\/issues\/42 \(cgwalters commented c1\) assigned to cgwalters-bot\n/);
+  assert.doesNotMatch(ok.stdout, /Closed:|Hand-back:/);
+  const failed = sweep({ FAKE_HANDBACK_EXIT: "1" });
+  assert.equal(failed.code, 1);
+  assert.equal(failed.st.complete, true);
+  assert.ok(failed.st.problems.some((p) => /^handback exited 1/.test(p)), JSON.stringify(failed.st.problems));
+});
+
 test("fill-org with the real bot-board gives an Org-less item its Org", () => {
   // The real bot-board, against a fake gh serving a board with one item
   // that the project's auto-add left without an Org.
@@ -160,6 +178,8 @@ case "$1 $2" in
   "api -i") exec "${path.join(__dirname, "fixtures", "bot-board", "fake-rest")}" "${store}/items.json" "$3" ;;
   "project view") echo PVT_fake ;;
   "api rate_limit") echo 5000 ;;
+  # handback's searches: nothing assigned.
+  "api -X") test "$4" = search/issues && echo '{"items": []}' ;;
   "api graphql")
     if test "\${3:-}" = --input; then
       cat >/dev/null

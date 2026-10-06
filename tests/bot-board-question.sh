@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Offline tests of 'bot-board question', 'resolve', 'issue' and 'archive' against a
+# Offline tests of 'bot-board question', 'resolve', 'issue', 'archive' and 'assign' against a
 # fake 'gh' that serves a fixed board and records every write. No
 # network, no quota.
 #   tests/bot-board-question.sh
@@ -26,7 +26,8 @@ unset GH_TOKEN GITHUB_TOKEN
 # through fake-rest) and appends each write to $FAKE_GH/log, one line
 # each: "issue PAYLOAD" for a new issue (which becomes tracker#42, REST
 # id 900), "sub REPO#N ID", "add URL", "edit ITEM FIELD VALUE", "comment
-# REPO#N BODY", "close REPO#N", "archive ITEM".
+# REPO#N BODY", "close REPO#N", "archive ITEM", "assignees POST|DELETE REPO#N
+# LOGIN".
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -85,6 +86,11 @@ case "$1 $2" in
             DELETE\ repos/*/labels/*)
                 p=${path#repos/}; name=${p##*/}; p=${p%/labels/*}
                 log "rmlabel ${p%/issues/*}#${p##*/} ${name}" ;;
+            # Answers with the assignees named, as GitHub does.
+            *\ repos/*/assignees)
+                p=${path#repos/}; p=${p%/assignees}
+                log "assignees ${method} ${p%/issues/*}#${p##*/} $(printf '%s\n' "$@" | sed -n 's/^assignees\[\]=//p')"
+                printf '%s\n' "$@" | sed -n 's/^assignees\[\]=//p' | jq -Rsc '{assignees: [split("\n")[] | select(. != "") | {login: .}]}' ;;
             PATCH\ repos/*)
                 p=${path#repos/}
                 log "close ${p%/issues/*}#${p##*/} $(printf '%s ' "$@" | grep -o 'state_reason=[a-z_]*')" ;;
@@ -114,6 +120,8 @@ echo '{"labels": [{"name": "question"}, {"name": "P1"}]}' >"${FAKE_GH}/api/repos
 echo '{"labels": [{"name": "enhancement"}]}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_43"
 echo '[{"name": "question"}, {"name": "P1"}]' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_labels"
 for n in 5 44 45; do echo '{"labels": []}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_${n}"; done
+# Issue 45 waits on cgwalters.
+echo '{"labels": [], "assignees": [{"login": "cgwalters"}]}' >"${FAKE_GH}/api/repos_cgwalters-forge_tracker_issues_45"
 # Pull requests 9 and 10: no review requested.
 for n in 9 10; do echo '{"requested_reviewers": [{"login": "someone"}]}' >"${FAKE_GH}/api/repos_bootc-dev_bootc_pulls_${n}"; done
 jq -n --arg t "${TRACKER}" '{items: [
@@ -400,3 +408,20 @@ if run archive bootc-dev/bootc#99; then fail "archive of an item not on the boar
 grep -q "is not on the board" "${WORK}/err" || fail "archive of a missing item: $(cat "${WORK}/err")"
 test ! -s "${FAKE_GH}/log" || fail "archive of a missing item wrote: $(cat "${FAKE_GH}/log")"
 echo "ok: archive"
+
+# --- assign ----------------------------------------------------------------
+
+# By item id: the bot's turn now.
+run assign PVTI_br bot || fail "assign: $(cat "${WORK}/err")"
+expect_log "assignees POST cgwalters-forge/tracker#45 cgwalters-bot"
+expect_log "assignees DELETE cgwalters-forge/tracker#45 cgwalters"
+test "${out}" = "${TRACKER}/issues/45: bot: +cgwalters-bot -cgwalters" || fail "assign printed '${out}'"
+# An upstream PR is never assigned: the tracker issue with it in its Branch is.
+run assign https://github.com/bootc-dev/bootc/pull/10 none || fail "assign upstream: $(cat "${WORK}/err")"
+test "$(cat "${FAKE_GH}/log")" = "assignees DELETE cgwalters-forge/tracker#45 cgwalters" ||
+    fail "assign upstream wrote: $(cat "${FAKE_GH}/log")"
+if run assign https://github.com/bootc-dev/bootc/pull/9 operator; then fail "assigned an upstream PR without a tracker issue"; fi
+grep -q "no cgwalters-forge/tracker issue on the board has it in its Branch" "${WORK}/err" || fail "assign without a tracker issue: $(cat "${WORK}/err")"
+if run assign PVTI_br me; then fail "assign to 'me' succeeded"; fi
+test ! -s "${FAKE_GH}/log" || fail "a refused assign wrote: $(cat "${FAKE_GH}/log")"
+echo "ok: assign"

@@ -112,7 +112,8 @@ no-go); and one whose head moved since his approval.
 
 With --apply, each PR that was not promoted gets one comment from the
 bot saying why and what to do next, and the same in its board item's
-News. The comment is keyed by his approval, the head and the reason, so
+News; one that needs ${REVIEWER}'s text is also assigned to
+${REVIEWER} ('bot-board assign URL operator'): it waits on them. The comment is keyed by his approval, the head and the reason, so
 a sweep that finds nothing new says nothing again, and a new approval
 that still can't promote gets a new answer. A moved head is said once
 per approval, however often the head moves after it.
@@ -402,6 +403,14 @@ async function notify(d, r) {
     const detail = (e.stderr || e.message || "").trim().split("\n").pop();
     if (/rate limit|abuse/i.test(e.stderr || "")) throw new Exit(EX_RATELIMIT, `GitHub is rate limiting the bot (${detail})`);
     throw new Error(`commenting on ${d.url} failed: ${detail}`);
+  }
+  // Their text is what it waits on: their turn (see 'bot-board assign').
+  if (r.result === "needs-text") {
+    try {
+      await execFileP(BOT_BOARD, ["assign", d.url, "operator"]);
+    } catch (e) {
+      warn(`assigning ${d.url} to ${REVIEWER} failed: ${(e.stderr || e.message || "").trim().split("\n").pop()}`);
+    }
   }
   if (d.item) {
     const news = `not promoted: ${r.result === "needs-text" ? `${d.upstream} is human-text and needs ${REVIEWER}'s text` : r.detail}`;

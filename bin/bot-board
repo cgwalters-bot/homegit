@@ -266,6 +266,33 @@ Commands:
                               (an issue in ${TRACKER_REPO} labelled
                               ${ASK_LABELS[*]}), close it and set its item
                               ${DONE_STATUS}
+  assign ITEM operator|bot|none
+                              Say whose turn ITEM is, in GitHub's assignee
+                              field: operator (${OPERATOR} is assigned: it
+                              waits on them), bot (${BOT_LOGIN}: an agent is,
+                              or should be, on it) or none (nobody's:
+                              backlog, parked or done); other assignees
+                              stay. Only items in ${OP_FORGE_ORG}, ${BOT_LOGIN}'s
+                              repositories and ${TRACKER_REPO} are assigned:
+                              for an upstream issue or PR, the
+                              ${TRACKER_REPO} issues whose Branch has it are.
+                              GitHub emails whoever is assigned; ${OPERATOR},
+                              still assigned an item they acted on since,
+                              is assigned anew (it is a new ask)
+  handback [--dry-run | --apply]
+                              Hand ${OP_OPERATOR_POSSESSIVE} turn back: every open item
+                              assigned to ${OPERATOR} that they commented on,
+                              reviewed or approved since (on a tracker
+                              issue, also on the PRs in its Branch) is
+                              assigned to ${BOT_LOGIN} instead, and closed
+                              items assigned to either are unassigned.
+                              Defaults to dry-run; bot-sweep applies it
+  assign-migrate [--dry-run | --apply] FILE|-
+                              One-shot move to assignees: assign ${OPERATOR}
+                              the asks listed in FILE (URLs or OWNER/REPO#N,
+                              '#' starts a comment), and unassign ${OPERATOR} and
+                              ${BOT_LOGIN} from every other open item.
+                              Defaults to dry-run
   set ITEM [--status S] [--priority P] [--workflow W] [--org O] [--why TEXT]
            [--news TEXT] [--branch URL...] [--gist URL...] [--field NAME VALUE]...
                               Update fields of an item. News is one line
@@ -858,6 +885,33 @@ cmd_archive_done() {
     require_cmd node "install Node.js"
     node "$(dirname "$(readlink -f "$0")")/../lib/board-archive-done.js" \
         "$(readlink -f "$0")" "${PROJECT}" "$@"
+}
+
+# assignees ARGS...: runs lib/assignees.js (whose turn an item is, in
+# its assignees) with this bot-board for its board lookups.
+assignees() {
+    require_cmd node "install Node.js"
+    node "$(dirname "$(readlink -f "$0")")/../lib/assignees.js" "$(readlink -f "$0")" "$@"
+}
+
+cmd_assign() {
+    test $# -eq 2 || fatal "usage: $(basename "$0") assign ITEM operator|bot|none"
+    local item=$1 url
+    if [[ "${item}" == PVTI_* ]]; then
+        load_items
+        url=$(jq -r --arg id "$(resolve_item "${item}")" '.items[] | select(.id == $id) | .content.url // empty' <<<"${ITEMS_JSON}")
+        test -n "${url}" || fatal "${item} has no issue or PR to assign"
+        item=${url}
+    fi
+    assignees assign "${item}" "$2"
+}
+
+cmd_handback() {
+    assignees handback "$@"
+}
+
+cmd_assign_migrate() {
+    assignees assign-migrate "$@"
 }
 
 cmd_draft() {
@@ -1939,7 +1993,8 @@ command=$1
 shift
 case "${command}" in
     -h|--help|help) usage; exit 0 ;;
-    list|show|add|archive|draft|set|issue|resolve) ;;
+    list|show|add|archive|draft|set|issue|resolve|assign|handback) ;;
+    assign-migrate) command=assign_migrate ;;
     question) workstream_only "${command}" ;;
     fill-org) command=fill_org ;;
     status-update) command=status_update ;;

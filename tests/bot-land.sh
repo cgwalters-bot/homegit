@@ -202,7 +202,7 @@ run "no-auto" 0 "requested cgwalters' review of ${URL}" --no-auto
 called "POST repos/acme/proj/pulls -f" || fail "no-auto: didn't open"
 called "${REQUEST}" || fail "no-auto: no review request"
 ! called "pr merge" || fail "--no-auto: enabled auto-merge"
-test "$(cat "${FAKE_GH}/board")" = "add ${URL}"$'\n'"set PVTI_land --status Draft" ||
+test "$(cat "${FAKE_GH}/board")" = "add ${URL}"$'\n'"set PVTI_land --status Draft"$'\n'"assign ${URL} operator" ||
     fail "--no-auto: board calls: $(cat "${FAKE_GH}/board")"
 # The board failing only warns: the pull request is open.
 setup
