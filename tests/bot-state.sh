@@ -448,6 +448,29 @@ test_pr_inbox_migration() {
     expect_json "$(project_state pr-inbox | jq -c '.prs | keys')" '["A","B"]' "inbox state after the next run"
 }
 
+# BOT_GH_READ_ONLY ('bot-sweep --read-only'): a dry inbox run reads no
+# state from the board, and no sweep or inbox run but a dry one starts.
+# Nothing else heeds it: the state is read and written as ever.
+test_read_only() {
+    local recent cmd out
+    recent=$(date -u -d '1 hour ago' +%FT%TZ)
+    set_project_state pr-inbox "$(jq -nc --arg r "${recent}" '{version: 2, prs: {B: {body: "hb", seen: $r}}, closed: {}}')"
+    export BOT_GH_READ_ONLY=1
+    reset_calls
+    "${BIN}/bot-pr" inbox --dry-run >/dev/null 2>"${WORK}/err" || fail "a read-only dry inbox run failed: $(cat "${WORK}/err")"
+    expect_eq "$(graphql_calls)" 0 "GraphQL calls of a read-only dry run"
+    ! grep -q '^api user' "${FAKE_GH}/calls" || fail "a read-only run asked who gh is"
+    for cmd in "bot-pr inbox" "bot-watch" "bot-watch --apply"; do
+        reset_calls
+        # shellcheck disable=SC2086
+        ! out=$("${BIN}/"${cmd} 2>&1) || fail "'${cmd}' ran with BOT_GH_READ_ONLY set"
+        grep -q 'BOT_GH_READ_ONLY is set' <<<"${out}" || fail "'${cmd}' failed otherwise: ${out}"
+        expect_eq "$(graphql_calls)" 0 "GraphQL calls of a refused '${cmd}'"
+    done
+    expect_json "$(project_state pr-inbox | jq -c '.prs | keys')" '["B"]' "inbox state after the refused runs"
+    expect_json "$("${BIN}/bot-board" state-get pr-inbox | jq -c '.prs | keys')" '["B"]' "state-get with BOT_GH_READ_ONLY set"
+}
+
 # An open fork PR whose body alone is over ARG_MAX: the inbox run that
 # records it passes the open PRs to jq, and the state to bot-board,
 # without exceeding an argument's size.

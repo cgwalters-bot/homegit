@@ -1223,11 +1223,16 @@ board_failed() {
     fatal "$2"
 }
 
-# load_state [--untracked]: prints the inbox state, tracked for save_state
-# unless --untracked (for a run that won't save). Needs lock_state, unless
-# --untracked. A state file from before the board kept it is merged in,
+# load_state [--untracked | --empty]: prints the inbox state, tracked for
+# save_state unless --untracked (for a run that won't save), or with
+# --empty a new one, without reading any. Needs lock_state, unless
+# --untracked or --empty. A state file from before the board kept it is merged in,
 # with the board's entries taking precedence, until save_state succeeds.
 load_state() {
+    if test "${1:-}" = --empty; then
+        jq -nc --argjson v "${STATE_VERSION}" '{version: $v, prs: {}, closed: {}}'
+        return 0
+    fi
     local track=(--track) state rc=0
     test "${1:-}" != --untracked || track=()
     state=$("${BOT_BOARD}" state-get "${track[@]}" "${STATE_NAME}") || rc=$?
@@ -3083,14 +3088,22 @@ cmd_inbox() {
         parsed=$(date -u -d "${since}" +%FT%TZ 2>/dev/null) || fatal "invalid --since date '${since}'"
         since=${parsed}
     fi
-    check_login
-    # A dry run records nothing, so it needn't wait for a real run.
+    # BOT_GH_READ_ONLY=1 ('bot-sweep --read-only'): gh holds a token that
+    # is not the bot's and can only read, so there is no login to check,
+    # and no state: it is on the board, behind the project scope.
     local state
-    if ${dry_run}; then
-        state=$(load_state --untracked)
+    if test -n "${BOT_GH_READ_ONLY:-}"; then
+        ${dry_run} || fatal "BOT_GH_READ_ONLY is set: only 'inbox --dry-run'"
+        state=$(load_state --empty)
     else
-        lock_state
-        state=$(load_state)
+        check_login
+        # A dry run records nothing, so it needn't wait for a real run.
+        if ${dry_run}; then
+            state=$(load_state --untracked)
+        else
+            lock_state
+            state=$(load_state)
+        fi
     fi
     local default_since now closed_since
     default_since=${since:-$(date -u -d "${DEFAULT_LOOKBACK_DAYS} days ago" +%FT%TZ)}

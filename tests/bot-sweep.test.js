@@ -17,7 +17,8 @@ const SWEPT = "Swept 3 URLs of 2 board items: 0 failed.";
 const LOCK_MSG = "error: another bot-notify run holds /x/bot-notify/lock";
 
 // A fake tool: prints $FAKE_<NAME>_OUT, runs $FAKE_<NAME>_RUN (shell), and
-// exits $FAKE_<NAME>_EXIT; its calls are counted in WORK/NAME.calls.
+// exits $FAKE_<NAME>_EXIT; its calls are counted in WORK/NAME.calls, and
+// the last one's arguments and $BOT_GH_READ_ONLY kept in WORK/NAME.args.
 function fake(name, envName) {
   fs.writeFileSync(path.join(BIN, name), `#!/bin/bash
 if [ "${name}" = bot-board ] && [ "$1" = status-update ]; then
@@ -27,7 +28,7 @@ if [ "${name}" = bot-board ] && [ "$1" = status-update ]; then
   exit "\${FAKE_STATUS_EXIT:-0}"
 fi
 if [ "${name}" = bot-board ] && [ "$1" = handback ]; then
-  test "$2" = --apply || exit 97
+  test "$2" = "$([ -n "\${BOT_GH_READ_ONLY-}" ] && echo --dry-run || echo --apply)" || exit 97
   printf '%s' "\${FAKE_HANDBACK_OUT-}"
   exit "\${FAKE_HANDBACK_EXIT:-0}"
 fi
@@ -37,6 +38,7 @@ if [ "${name}" = bot-board ] && [ "$1" = archive-done ]; then
   exit "\${FAKE_ARCHIVE_EXIT:-0}"
 fi
 echo x >>"${WORK}/${envName}.calls"
+printf '%s\n' "$* [\${BOT_GH_READ_ONLY-}]" >"${WORK}/${envName}.args"
 n=$(wc -l <"${WORK}/${envName}.calls")
 printf '%s' "\${FAKE_${envName}_OUT-}"
 eval "\${FAKE_${envName}_RUN-}"
@@ -262,6 +264,33 @@ test("retention archives after 3 days by default, every 6h, takes another age or
   fs.writeFileSync(path.join(failed.stateDir, "status.json"), JSON.stringify({ ...retried.st, archive_done: { ...retried.st.archive_done, at: "bad" } }));
   sweep({}, failed.stateDir);
   assert.ok(fs.existsSync(archiveArgs), "run with an unreadable time");
+});
+
+test("a read-only sweep only reports: dry runs, no writing step, and the tools told so", () => {
+  const r = sweep({ FAKE_ARCHIVE_OUT: "Archive Done: 0 archived, 4 eligible\n" }, null, ["--read-only"]);
+  assert.equal(r.code, 0, r.stdout + r.stderr);
+  assert.equal(r.st.read_only, true);
+  assert.equal(r.st.complete, true);
+  assert.deepEqual(Object.keys(r.st.steps), ["watch", "inbox", "handback", "archive-done"]);
+  const args = (name) => fs.readFileSync(path.join(WORK, `${name}.args`), "utf8");
+  assert.equal(args("WATCH"), "--dry-run --exclude-lead * [1]\n");
+  assert.equal(args("INBOX"), "inbox --dry-run [1]\n");
+  assert.equal(args("archive"), "archive-done --days 3 --dry-run\n");
+  for (const name of ["GIT", "NOTIFY", "GC", "ACTUALS", "BOARD"]) assert.ok(!fs.existsSync(path.join(WORK, `${name}.calls`)), `${name} ran`);
+  assert.deepEqual({ ...r.st.archive_done, at: null }, { archived: 0, eligible: 4, dry_run: true, at: null });
+  // Every read-only run lists what is due, however recent the last one.
+  fs.rmSync(path.join(WORK, "archive.args"));
+  assert.equal(sweep({}, r.stateDir, ["--read-only"]).code, 0);
+  assert.equal(args("archive"), "archive-done --days 3 --dry-run\n");
+  // Never into the real sweep's directory, which bot-poll reads.
+  for (const extra of [[], ["--state-dir", path.join(WORK, ".local", "state", "bot-sweep", ".")]]) {
+    const bare = spawnSync(TOOL, ["--read-only", ...extra], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: WORK } });
+    assert.equal(bare.status, 2, bare.stderr);
+    assert.match(bare.stderr, /--read-only requires --state-dir, a directory other than the real sweep's/);
+  }
+  // The real sweep still tells its tools nothing of the kind.
+  sweep();
+  assert.equal(args("WATCH"), "--apply --exclude-lead * []\n");
 });
 
 test("the final status publisher's output and failure are recorded without losing sweep news", () => {

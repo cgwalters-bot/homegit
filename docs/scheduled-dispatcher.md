@@ -246,6 +246,62 @@ The apply step opens draft fork PRs or homegit PRs and never merges;
 merging stays with the review step: homegit and the devspace stack after
 an independent review, upstream only on the operator's approval.
 
+## The read-only report
+
+The first piece that runs in Actions is the observing half of the pass,
+with nothing applied: the `controller-report` workflow in this repository
+(hourly, `workflow_dispatch`, and on pull requests that touch it). It
+holds no secret, only the job's own `GITHUB_TOKEN` with `contents: read`,
+and runs `bin/bot-controller-report`, which is `bot-sweep --read-only`
+followed by `bot-reconcile` without `--apply` or `--state`. The report
+(each step's status and output, the sweep's problems, the reconcile
+actions) is the job summary and the `controller-report` artifact. It
+exists to be compared with the local sweep under
+`~/.local/state/bot-sweep/runs` before anything that writes moves.
+
+It lives here rather than next to `agent.yml` because the tools it runs
+are this repository's, so there is no second checkout to keep in step,
+and because the devspace repository belongs to bootc-dev, whose runners
+and settings are not ours to load with a controller.
+
+`bot-sweep --read-only` sets `BOT_GH_READ_ONLY=1`, under which
+`bot-watch` and `bot-pr inbox` skip their check that gh is the bot and
+refuse anything but `--dry-run`, starting from an empty state; no other
+tool heeds it. What that token reads decides what the report holds (measured
+on runs 37488421665 and 37489294615, 2026-10-06):
+
+- It reads everything public over REST: the Workstream board's items
+  and fields (an organization project), issues, PRs, reviews, checks,
+  search, the `agent.yml` runs and the heartbeat comment. A sweep of 362
+  URLs took about 200 seconds, as it does locally.
+- Its quota is small: four sweeps within 28 minutes passed and the fifth
+  was refused ("API rate limit exceeded for installation"), with the
+  ETag caches restored. `rate_limit` answered 5000 of 5000 throughout, so
+  it does not show this limit (GitHub documents 1000 requests an hour
+  per repository for `GITHUB_TOKEN`). Hence hourly: the local cadence
+  of 10 minutes needs a token with a quota of its own.
+- It reads no last-seen state. `bot-watch`, `bot-notify` and `bot-pr
+  inbox` keep theirs in archived draft items of the board (GraphQL,
+  behind the project scope) or in local files. So a read-only run starts
+  from none: its level sections are right, and its news is not news.
+- It reads no notifications (403), so `bot-notify` is left out and the
+  operator-activity section of `bot-watch` fails, which makes that step
+  a problem in every report.
+- It cannot list the epic board (`users/cgwalters-bot/2`): a user-owned
+  project answers 403 to a workflow token even though it is public. The
+  priority health and P0 drive sections then cover the Workstream board
+  only.
+- `bot-reconcile` has no pool readings (they come from the statusline
+  and the praxis broker's `/usage`, on the tailnet), so it reports both
+  pools as unpaced, and no `operator.json`, so it counts lanes and the
+  remote share by the default pacing, not the workstation's.
+
+Against the local sweep of the same ten minutes (20261006-154029-153):
+"Needs your text" (11), "Outstanding reviews" (3) and "Devspace runs"
+were identical; priority health had 9 of 16 lines, the other 7 being the
+epic board's; "Needs rebase" listed one PR more and the inbox 54 lines
+for 87, both for want of the state; operator activity had none of 10.
+
 ## Open points
 
 The runners for the job itself are the self-hosted question of
