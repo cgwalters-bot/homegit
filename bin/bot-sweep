@@ -56,6 +56,22 @@ const PHASES = [
   [{ name: ARCHIVE_STEP, tool: "bot-board", args: ["archive-done"], timeoutMin: 6 }],
   [{ name: "status-update", tool: "bot-board", args: ["status-update", "--auto"], timeoutMin: 2 }],
 ];
+// --read-only: the same observations with nothing applied and no state
+// advanced, for a job that holds no token of the bot's (see "The read-only
+// report" in docs/scheduled-dispatcher.md). The steps that only write
+// (git, tmt-gc, actuals, fill-org, status-update) are left out, and so is
+// bot-notify: only the bot's own token reads its notifications.
+const READ_ONLY_PHASES = [
+  [
+    { name: "watch", tool: "bot-watch", args: ["--dry-run", "--exclude-lead", "*"], timeoutMin: 20 },
+    { name: "inbox", tool: "bot-pr", args: ["inbox", "--dry-run"], timeoutMin: 10 },
+  ],
+  [{ name: "handback", tool: "bot-board", args: ["handback", "--dry-run"], timeoutMin: 3 }],
+  [{ name: ARCHIVE_STEP, tool: "bot-board", args: ["archive-done"], timeoutMin: 6 }],
+];
+// Tells the tools that gh's token is not the bot's and can only read:
+// they skip their check of who gh is, and refuse to do more than report.
+const READ_ONLY_ENV = "BOT_GH_READ_ONLY";
 // What 'bot-board fill-org' prints for each item it sets: ID, Org, title.
 const ORG_SET_RE = /^(PVTI_\S+)\t([^\t]+)\t(.*)$/gm;
 // What 'bot-board handback' prints for each item it gives back to the
@@ -95,7 +111,7 @@ class Exit extends Error {
 }
 
 function usage() {
-  return `Usage: ${PROG} [--state-dir DIR] [--archive-days N] [--archive-dry-run]
+  return `Usage: ${PROG} [--state-dir DIR] [--archive-days N] [--archive-dry-run] [--read-only]
 
 Runs one full sweep for the coordinator and publishes its results, for
 'bot-poll --from-sweep DIR' to read. The bot-sweep.timer user unit runs
@@ -157,6 +173,21 @@ refuses to start. Runs are kept ${KEEP_DAYS} days.
 
 DIR defaults to \${XDG_STATE_HOME:-~/.local/state}/bot-sweep.
 
+--read-only changes nothing on GitHub and advances no last-seen state: it
+runs only
+
+  bot-watch --dry-run --exclude-lead '*'   \\ at once
+  bot-pr inbox --dry-run                   /
+  bot-board handback --dry-run
+  bot-board archive-done --days N --dry-run
+
+with ${READ_ONLY_ENV}=1, under which those tools accept a gh token that
+is not the bot's (a workflow's own GITHUB_TOKEN, say) and refuse to do
+more than report. bot-notify is left out: the bot's notifications are
+readable only with its own token. It publishes the run the same way
+(complete without bot-notify), so it requires --state-dir: a directory
+of its own, never the real sweep's.
+
 Environment:
   BOT_SWEEP_TOOLBOX         run inside this toolbox container (re-executing
                             there, unless already in a container)
@@ -169,7 +200,7 @@ sweep is running.`;
 }
 
 function parseArgs(argv) {
-  const opts = { stateDir: null, archiveDays: ARCHIVE_DAYS, archiveApply: true };
+  const opts = { stateDir: null, archiveDays: ARCHIVE_DAYS, archiveApply: true, readOnly: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "-h" || a === "--help") {
@@ -184,14 +215,22 @@ function parseArgs(argv) {
       opts.archiveDays = Number(value);
     } else if (a === "--archive-dry-run") {
       opts.archiveApply = false;
+    } else if (a === "--read-only") {
+      opts.readOnly = true;
+      opts.archiveApply = false;
     } else {
       throw new Exit(EX_USAGE, `unknown argument: ${a} (see --help)`);
     }
   }
-  if (!opts.stateDir) {
-    const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
-    opts.stateDir = path.join(base, "bot-sweep");
+  // A read-only run is complete without bot-notify and lists what it
+  // would apply: bot-poll and bot-reconcile must never take it for the
+  // real sweep's.
+  const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state");
+  const defaultDir = path.join(base, "bot-sweep");
+  if (opts.readOnly && (!opts.stateDir || path.resolve(opts.stateDir) === path.resolve(defaultDir))) {
+    throw new Exit(EX_USAGE, `--read-only requires --state-dir, a directory other than the real sweep's (${defaultDir})`);
   }
+  if (!opts.stateDir) opts.stateDir = defaultDir;
   return opts;
 }
 
@@ -210,14 +249,16 @@ function maybeReexec(opts) {
   // as its parent when 'toolbox run' is killed.
   settings.push(`${PARENT_ENV}=${process.pid}`);
   const r = spawnSync("toolbox", ["run", "-c", box, "env", ...settings, SELF, "--state-dir", opts.stateDir,
-    "--archive-days", String(opts.archiveDays), ...(opts.archiveApply ? [] : ["--archive-dry-run"])],
+    "--archive-days", String(opts.archiveDays), ...(opts.archiveApply ? [] : ["--archive-dry-run"]),
+    ...(opts.readOnly ? ["--read-only"] : [])],
     { stdio: "inherit" });
   if (r.error) throw new Exit(EX_ERROR, `cannot run 'toolbox run -c ${box}': ${r.error.message}`);
   return r.status ?? EX_ERROR;
 }
 
-function childEnv() {
+function childEnv(readOnly) {
   const env = { ...process.env };
+  if (readOnly) env[READ_ONLY_ENV] = "1";
   // An EnvironmentFile expands no %h: take ~/ instead.
   const file = (process.env.BOT_SWEEP_GH_TOKEN_FILE || "").replace(/^~\//, `${os.homedir()}/`);
   if (!env.GH_TOKEN && file) {
@@ -383,7 +424,7 @@ function lastLine(text) {
 
 // What went wrong in a run, one line each, and whether bot-poll can
 // take its news as whole.
-function assess(steps, outputs) {
+function assess(steps, outputs, readOnly) {
   const problems = [];
   for (const [name, s] of Object.entries(steps)) {
     const text = outputs[name] || "";
@@ -402,7 +443,7 @@ function assess(steps, outputs) {
     if (!watch.trim()) problems.push("watch printed nothing");
     else if (!SWEPT_RE.test(watch)) problems.push("watch's report has no closing \"Swept\" line");
   }
-  const complete = SWEPT_RE.test(watch) && steps.notify?.exit === 0 && steps.inbox?.exit === 0;
+  const complete = SWEPT_RE.test(watch) && (readOnly || steps.notify?.exit === 0) && steps.inbox?.exit === 0;
   return { problems, complete };
 }
 
@@ -474,7 +515,7 @@ async function sweep(opts) {
   for (const sig of ["SIGTERM", "SIGINT", "SIGHUP"]) process.on(sig, () => stop(`got ${sig}`));
   orphanGuard(stop);
   try {
-    const env = childEnv();
+    const env = childEnv(opts.readOnly);
     const partial = path.join(runsDir, `.${id}.partial`);
     fs.mkdirSync(partial);
     const sweepDeadline = started.getTime() + DEADLINE_MS;
@@ -485,9 +526,10 @@ async function sweep(opts) {
     // older(at, ms): whether the time at is unknown, or at least ms ago.
     const older = (at, ms) => !Number.isFinite(Date.parse(at)) || started.getTime() - Date.parse(at) >= ms;
     const backlog = (a) => !a.dry_run && a.archived < a.eligible;
-    const archiveDue = lastArchive?.failed_at ? older(lastArchive.failed_at, ARCHIVE_RETRY_MS) :
-      !lastArchive || lastArchive.dry_run !== !opts.archiveApply || backlog(lastArchive) || older(lastArchive.at, ARCHIVE_EVERY_MS);
-    for (const all of PHASES) {
+    // A read-only run lists what is due every time: it archives nothing.
+    const archiveDue = opts.readOnly || (lastArchive?.failed_at ? older(lastArchive.failed_at, ARCHIVE_RETRY_MS) :
+      !lastArchive || lastArchive.dry_run !== !opts.archiveApply || backlog(lastArchive) || older(lastArchive.at, ARCHIVE_EVERY_MS));
+    for (const all of opts.readOnly ? READ_ONLY_PHASES : PHASES) {
       if (stopping) break;
       const phase = all.filter((s) => s.name !== ARCHIVE_STEP || archiveDue);
       const results = await Promise.all(phase.map((s) => runStep(s.name === ARCHIVE_STEP ?
@@ -504,13 +546,13 @@ async function sweep(opts) {
     fs.renameSync(partial, runDir);
     const outputs = {};
     for (const n of Object.keys(steps)) outputs[n] = fs.readFileSync(path.join(runDir, `${n}.txt`), "utf8");
-    const { problems, complete } = assess(steps, outputs);
+    const { problems, complete } = assess(steps, outputs, opts.readOnly);
     if (stopping) problems.unshift(`the sweep was stopped (${stopping})`);
     const ended = new Date();
     for (const n of NEWS_STEPS) writeAtomic(path.join(dir, `latest-${n}.txt`), outputs[n] ?? "");
     const archiveMatch = /^Archive Done: (\d+) archived, (\d+) eligible/m.exec(outputs[ARCHIVE_STEP] || "");
     const status = {
-      version: STATUS_VERSION, run: id, dir: runDir,
+      version: STATUS_VERSION, run: id, dir: runDir, read_only: opts.readOnly,
       started_at: started.toISOString(), ended_at: ended.toISOString(),
       duration_s: Math.round((ended - started) / 100) / 10,
       steps, problems, complete,

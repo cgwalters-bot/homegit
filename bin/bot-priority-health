@@ -244,6 +244,12 @@ async function loadBoard(file, project) {
       ({ stdout: text } = await execFileP(BOT_BOARD, args, { maxBuffer: 256 << 20 }));
     } catch (e) {
       if (e.code === EX_RATELIMIT) throw new Exit(EX_RATELIMIT, "GitHub is rate limiting the bot (listing the board)");
+      // 'bot-sweep --read-only': a workflow's own token reads the org's
+      // public board, but no user-owned one. The rest is still worth it.
+      if (project && process.env.BOT_GH_READ_ONLY && /HTTP 403/.test(e.stderr || "")) {
+        warn(`the ${project} board could not be listed (BOT_GH_READ_ONLY: a workflow's token reads no user-owned board); its PRs are left out`);
+        return [];
+      }
       throw new Exit(EX_ERROR, `bot-board ${args.join(" ")} failed: ${(e.stderr || e.message).trim()}`);
     }
   }

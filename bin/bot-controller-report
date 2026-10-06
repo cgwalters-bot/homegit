@@ -1,0 +1,147 @@
+#!/usr/bin/env node
+// The controller's pass with nothing applied: 'bot-sweep --read-only', then
+// 'bot-reconcile' on that sweep, as one Markdown report. The
+// controller-report workflow runs it with the job's own read-only token,
+// to compare with the local sweep. See --help. Node's standard library
+// only.
+"use strict";
+
+const { spawnSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const PROG = path.basename(process.argv[1] || "bot-controller-report");
+const BIN_DIR = process.env.BOT_CONTROLLER_REPORT_BIN_DIR || path.dirname(fs.realpathSync(process.argv[1] || __filename));
+const REPORT = "report.md";
+const RECONCILE = "reconcile";
+// bot-sweep stops its own steps by 22 minutes.
+const SWEEP_TIMEOUT_MS = 25 * 60 * 1000;
+const RECONCILE_TIMEOUT_MS = 5 * 60 * 1000;
+// A job summary holds 1MiB: each output is cut to this many characters
+// there; the steps' are whole in the sweep's run directory.
+const OUTPUT_MAX = 60 * 1000;
+const EX_ERROR = 1;
+const EX_USAGE = 2;
+
+function usage() {
+  return `Usage: ${PROG} [--dir DIR]
+
+Runs the read-only part of the controller's pass and writes what it found
+to DIR/${REPORT} (and appends it to $GITHUB_STEP_SUMMARY, if set):
+
+  bot-sweep --read-only --state-dir DIR/sweep
+  bot-reconcile --sweep-dir DIR/sweep
+
+bot-reconcile runs without --apply and --state. Nothing is changed on
+GitHub and no last-seen state is advanced, so every report is level: what
+a sweep with no memory of the last one sees. The
+report has each step's exit status, time and output, the sweep's problems
+and the reconcile actions. DIR also keeps the sweep's own run directory
+(DIR/sweep, see bot-sweep --help) and DIR/${RECONCILE}.txt.
+
+DIR defaults to a new temporary directory, whose name is printed.
+
+Exits 0 once the report is written, whatever the steps found: a step that
+cannot run with the token at hand is a finding, in the report. Exits 1 if
+the report could not be produced.`;
+}
+
+function parseArgs(argv) {
+  let dir = null;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "-h" || a === "--help") {
+      process.stdout.write(`${usage()}\n`);
+      process.exit(0);
+    } else if (a === "--dir") {
+      if (i + 1 >= argv.length) throw new Error("--dir requires a directory");
+      dir = argv[++i];
+    } else {
+      throw new Error(`unknown argument: ${a} (see --help)`);
+    }
+  }
+  return { dir };
+}
+
+// run(tool, args, timeoutMs): its exit status (null if killed), seconds
+// and output (stdout and stderr, as bot-sweep keeps a step's).
+function run(tool, args, timeoutMs) {
+  const start = Date.now();
+  const r = spawnSync(path.join(BIN_DIR, tool), args, { encoding: "utf8", timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024 });
+  const output = `${r.stdout || ""}${r.stderr || ""}${r.error ? `${PROG}: cannot run ${tool}: ${r.error.message}\n` : ""}`;
+  return { exit: r.status, duration_s: Math.round((Date.now() - start) / 100) / 10, output };
+}
+
+// A fenced block that TEXT cannot close early.
+function fenced(text) {
+  const cut = text.length > OUTPUT_MAX ? `${text.slice(0, OUTPUT_MAX)}\n[... ${text.length - OUTPUT_MAX} more characters cut]\n` : text;
+  let longest = 2;
+  for (const m of cut.matchAll(/`+/g)) longest = Math.max(longest, m[0].length);
+  const fence = "`".repeat(longest + 1);
+  return `${fence}text\n${cut}${cut.endsWith("\n") || !cut ? "" : "\n"}${fence}`;
+}
+
+function section(name, step, output) {
+  const exit = step.exit === null ? "killed" : `exit ${step.exit}`;
+  return `<details><summary><code>${name}</code>: ${exit}, ${step.duration_s}s, ${output.length} characters</summary>\n\n${fenced(output)}\n\n</details>\n`;
+}
+
+function report(status, sweep, reconcile, outputs) {
+  const lines = [
+    `# Controller report (read-only): sweep ${status ? status.run : "not published"}`,
+    "",
+    status ? `Started ${status.started_at}, took ${status.duration_s}s; ${status.complete ? "complete" : "not complete"}.` :
+      `bot-sweep published no status (exit ${sweep.exit}).`,
+    "",
+  ];
+  const problems = status ? status.problems : [];
+  // Fenced: a problem ends with a tool's last line, which is not Markdown.
+  if (problems.length) lines.push("Problems:", "", fenced(`${problems.join("\n")}\n`), "");
+  else if (status) lines.push("No problems.", "");
+  for (const [name, step] of Object.entries(status ? status.steps : {})) lines.push(section(name, step, outputs[name] || ""));
+  lines.push(section(RECONCILE, reconcile, reconcile.output));
+  lines.push(section("bot-sweep", sweep, sweep.output));
+  return `${lines.join("\n")}\n`;
+}
+
+function main() {
+  const opts = parseArgs(process.argv.slice(2));
+  const dir = opts.dir || fs.mkdtempSync(path.join(os.tmpdir(), `${PROG}-`));
+  const sweepDir = path.join(dir, "sweep");
+  fs.mkdirSync(sweepDir, { recursive: true });
+  const statusFile = path.join(sweepDir, "status.json");
+  // In a DIR used before: a sweep that publishes nothing must not be
+  // reported with the last one's status.
+  fs.rmSync(statusFile, { force: true });
+  const sweep = run("bot-sweep", ["--read-only", "--state-dir", sweepDir], SWEEP_TIMEOUT_MS);
+  let status = null;
+  try {
+    status = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+  } catch {
+    // The report says that the sweep published none.
+  }
+  const outputs = {};
+  for (const name of Object.keys(status ? status.steps : {})) {
+    try {
+      outputs[name] = fs.readFileSync(path.join(status.dir, `${name}.txt`), "utf8");
+    } catch (e) {
+      outputs[name] = `${PROG}: cannot read the output of ${name}: ${e.message}\n`;
+    }
+  }
+  const reconcile = run("bot-reconcile", ["--sweep-dir", sweepDir], RECONCILE_TIMEOUT_MS);
+  fs.writeFileSync(path.join(dir, `${RECONCILE}.txt`), reconcile.output);
+  const text = report(status, sweep, reconcile, outputs);
+  const file = path.join(dir, REPORT);
+  fs.writeFileSync(file, text);
+  if (process.env.GITHUB_STEP_SUMMARY) fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, text);
+  process.stdout.write(`${PROG}: wrote ${file}\n${sweep.output}`);
+}
+
+try {
+  main();
+} catch (e) {
+  const usageError = /^(unknown argument|--dir requires)/.test(e.message);
+  process.stderr.write(`${PROG}: ${usageError ? "" : "error: "}${e.message}\n`);
+  process.exit(usageError ? EX_USAGE : EX_ERROR);
+}

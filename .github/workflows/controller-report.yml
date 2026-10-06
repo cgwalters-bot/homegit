@@ -1,0 +1,70 @@
+# The read-only part of the controller's pass, on a schedule: what
+# bot-sweep and bot-reconcile see with nothing applied, as an artifact and
+# a job summary, to compare with the local sweep before anything moves
+# here. See "The read-only report" in docs/scheduled-dispatcher.md.
+#
+# It holds no secret: only the job's own GITHUB_TOKEN, read-only, which
+# reads public data and cannot write anywhere. Keep it that way; a step
+# that needs the bot's token is a decision for the operator, not a change
+# to this file.
+name: controller-report
+
+on:
+  schedule:
+    # Hourly: the job's token is refused after about four sweeps in an
+    # hour (pull request runs count too), so the local sweep's 10 minutes
+    # are out of its reach. Off the hour, when scheduled runs are delayed
+    # least.
+    - cron: "17 * * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/controller-report.yml
+      - bin/bot-controller-report
+      - bin/bot-board
+      - bin/bot-pr
+      - bin/bot-priority-health
+      - bin/bot-reconcile
+      - bin/bot-sweep
+      - bin/bot-watch
+
+permissions:
+  contents: read
+
+# One at a time, each pull request apart, so that a queued scheduled run
+# is never replaced by a pull request's.
+concurrency:
+  group: controller-report-${{ github.event.pull_request.number || 'main' }}
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+      # The tools' ETag caches: a conditional request answered 304 costs
+      # no quota, which keeps a sweep of the whole board every hour cheap.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/bot-board
+            ~/.cache/bot-priority-health
+            ~/.cache/bot-watch
+          key: controller-report-etags-${{ github.run_id }}
+          restore-keys: controller-report-etags-
+      - name: Report
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bin/bot-controller-report --dir "${RUNNER_TEMP}/controller-report"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: controller-report
+          path: ${{ runner.temp }}/controller-report
+          retention-days: 7

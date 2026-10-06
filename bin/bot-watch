@@ -504,8 +504,14 @@ if test -n "${lead}"; then
     STATE_NAME=watch-lead-${lead//[^A-Za-z0-9._-]/_}
 fi
 
-login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
-test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}"
+# BOT_GH_READ_ONLY=1 ('bot-sweep --read-only'): gh holds a token that is
+# not the bot's and can only read, so there is no login to check.
+if test -n "${BOT_GH_READ_ONLY:-}"; then
+    ${dry_run} || fatal "BOT_GH_READ_ONLY is set: only --dry-run sweeps"
+else
+    login=$(ghapi user --jq .login) || fatal "'gh api user' failed; authenticate gh as ${BOT_LOGIN}"
+    test "${login}" = "${BOT_LOGIN}" || fatal "gh is authenticated as '${login}', not ${BOT_LOGIN}"
+fi
 
 # Two sweeps on one machine must not race on the state (or both apply).
 mkdir -p "${LOCK_DIR}"
@@ -533,7 +539,12 @@ else
     state_file=${LOCK_DIR}/${STATE_NAME}.json
     test -e "${state_file}" || test -n "${board_file}" || migrate=true
 fi
-if ! ${migrate}; then
+if test -n "${BOT_GH_READ_ONLY:-}"; then
+    # The board's state items are archived drafts, which only a token with
+    # the project scope reads: such a sweep has no memory (and, as a dry
+    # run, keeps none), so what it reports is level, not news.
+    state='{}'
+elif ! ${migrate}; then
     state=$(if test -s "${state_file}"; then cat "${state_file}"; else echo '{}'; fi) ||
         fatal "cannot read the last-seen state in ${state_file}"
 else
