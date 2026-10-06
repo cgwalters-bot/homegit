@@ -63,8 +63,9 @@ A pool is paced on its own: it aims to have used its target share of its
 window by the reset (pacing.pools.NAME.target in the operator config, 95%
 by default; the rest is the operator's reserve), evenly, so at any time
 the pace allows target * elapsed / window, plus pacing.pools.NAME.burst
-percent points (3) so that work can start right after a reset. A pool
-whose usage is above that holds new work routed to it, and only that:
+percent points (3) so that work can start right after a reset, and never
+more than the target. A pool whose usage is above that holds new work
+routed to it, and only that:
 claude (local workers, the apply and review steps) is read from the
 seven_day window \`bot-heartbeat statusline\` saves, until that window
 resets; openai (devspace runs, which run opencode) from the praxis
