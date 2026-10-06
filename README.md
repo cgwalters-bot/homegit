@@ -203,10 +203,22 @@ the transcripts of workers whose prompt has an `Item: URL` line.
 percent `bot-heartbeat statusline` saves) next to the open P0/P1
 estimates, which the coordinator uses to decide what to dispatch.
 
+Each inference pool is paced on its own, as a budget controller that
+aims to have used `pacing.pools.NAME.target` (95%) of the pool's window
+by its reset, evenly: at any time the pace allows `target * elapsed /
+window`, plus a few points of burst. The Claude subscription is read from
+the status line's weekly window and the OpenAI Codex one from the praxis
+broker's `/usage`. A pool whose usage is above its pace holds new work
+routed to it and nothing else: Claude's the local workers and the apply
+and review steps, OpenAI's the devspace runs. An item labeled `urgent`
+goes anyway, and a pool without a reading is limited only by the agent
+target. `bot-capacity` also records what a run costs each pool, which
+says how many more fit.
+
 The coordinator's loop is a controller: `bot-reconcile` compares the
-observed state (the board, the latest sweep, the heartbeat, the week's
-capacity, answered questions) with the desired one and prints the actions
-that close the gap, under rules in `lib/reconcile.js`: keep the operator
+observed state (the board, the latest sweep, the heartbeat, the pace of
+each inference pool, answered questions) with the desired one and prints
+the actions that close the gap, under rules in `lib/reconcile.js`: keep the operator
 config's `pacing.agents` work agents busy, split between harness and
 upstream work; keep the heartbeat in step with the board; carry over the
 sweep's P0 drive and approvals; apply answered questions; set items Done

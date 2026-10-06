@@ -4,6 +4,9 @@
 // tests/reconcile.test.js.
 "use strict";
 
+// The Observed line shows a reset's weekday and hour in the local time zone.
+process.env.TZ = "UTC";
+
 const assert = require("node:assert/strict");
 const { execFileSync, spawnSync } = require("node:child_process");
 const fs = require("node:fs");
@@ -38,6 +41,14 @@ function obs(changes = {}) {
   };
 }
 const keys = (actions) => actions.map((a) => a.key);
+// held(...names): bot-capacity's report with these pools over their pace:
+// 90% used where an even pace allows 50%, the next dispatch in 3 hours.
+function held(...names) {
+  const c = read("capacity.json");
+  for (const n of names) Object.assign(c.pools[n], { used_percent: 90, ahead: 39.6, hold: true, reason: "pace", next_dispatch_at: new Date(NOW + 3 * 60 * MIN).toISOString(), fits: 0 });
+  return c;
+}
+const HELD = { claude: "claude: 90% used, pace allows 50% (ahead by 40 points; next dispatch in ~3h)", openai: "openai: 90% used, pace allows 50% (ahead by 40 points; next dispatch in ~3h)" };
 const setItem = (items, id, fields) => items.map((it) => (it.id === id ? { ...it, ...fields } : it));
 
 const ALL_KEYS = [
@@ -66,52 +77,60 @@ test("topics come from the topic-lead skill's table", () => {
   assert.deepEqual(rec.topics("| Topic | Epic |\n| --- | --- |\n| `a` | x |\n| `b-c` | y |\nnot | `d` |"), ["a", "b-c"]);
 });
 
-test("capacity: lanes against the target, paced by the week's capacity", () => {
+test("capacity: lanes against the target; a pool over its pace holds only its engine", () => {
   // The fixture world is at the target: 4 of 4 busy, harness 3 of 2, upstream 1 of 2.
   const board = read("board.json");
   // One harness agent less: 3 of 4 busy, one upstream slot free.
   const oneFree = setItem(board, "PVTI_o1", { status: "Draft" });
-  // Under the P0-only target (1 and 1): harness 1 of 1 (the topic's), upstream idle.
-  const upstreamIdle = setItem(setItem(oneFree, "PVTI_h1", { status: "Draft" }), "PVTI_u1", { status: "Done" });
-  const p0 = { capacity: { dispatch: { scope: "p0" } } };
-  // [case, changes, capacity action keys, the upstream candidates]
+  const urgent = setItem(oneFree, "PVTI_c2", { labels: ["urgent"] });
+  // An upstream issue's label is someone else's word.
+  const foreign = setItem(oneFree, "PVTI_c1", { labels: ["urgent"] });
+  // The candidates an action's detail lines name, by their URLs.
+  const named = (a) => a.detail.map((d) => board.find((it) => d.includes(` ${it.content.url} `)).id);
+  const all = ["PVTI_c4", "PVTI_c2", "PVTI_c1"];
+  // [case, changes, capacity action keys, the upstream candidates, what the action says]
   const cases = [
     ["the total at the target: a lane under its share gets nothing", {}, [], null],
     ["the total over it (the epic busy too)", { children: {} }, [], null],
-    ["one upstream slot free", { items: oneFree }, ["capacity:upstream"], ["PVTI_c4", "PVTI_c2", "PVTI_c1"]],
-    ["unknown capacity is no limit", { items: oneFree, capacity: undefined }, ["capacity:upstream"], ["PVTI_c4", "PVTI_c2", "PVTI_c1"]],
-    ["P0 only: half the target, which the total is over", { ...p0, items: oneFree }, [], null],
-    ["P0 only, upstream idle", { ...p0, items: upstreamIdle }, ["capacity:upstream"], ["PVTI_c4"]],
-    ["the week is used up", { capacity: { dispatch: { scope: "none" } }, items: upstreamIdle }, [], null],
+    ["one upstream slot free", { items: oneFree }, ["capacity:upstream"], all, /dispatch up to 1, as a devspace run .* \(1 of 1 remote\), else as a local worker/],
+    ["no reading of any pool is no limit", { items: oneFree, capacity: undefined }, ["capacity:upstream"], all],
+    ["a pool without a reading holds nothing", { items: oneFree, capacity: { pools: { claude: null, openai: null } } }, ["capacity:upstream"], all],
+    ["the pools held, the total at the target", { capacity: held("claude", "openai") }, [], null],
+    ["claude over its pace: devspace runs only, up to the run limit", { items: oneFree, capacity: held("claude") }, ["capacity:upstream:claude-held"], all,
+      new RegExp(`dispatch up to 1, only as a devspace run \\(bot-runs dispatch\\) while under the opencode run limit \\(1 of 2 remote\\): no new local workers but for urgent-labeled items \\(${HELD.claude.replace(/[()]/g, "\\$&")}\\)`)],
+    ["openai over its pace: local workers only", { items: oneFree, capacity: held("openai") }, ["capacity:upstream:opencode-held"], all,
+      new RegExp(`dispatch up to 1, only as a local worker \\(bot-pace assign\\): no new devspace runs but for urgent-labeled items \\(${HELD.openai.replace(/[()]/g, "\\$&")}\\)`)],
+    ["both over: nothing to dispatch", { items: oneFree, capacity: held("claude", "openai") }, [], null],
+    ["both over: only an urgent item", { items: urgent, capacity: held("claude", "openai") }, ["capacity:upstream:claude+opencode-held"], ["PVTI_c2"], /both pools are over their pace .*: dispatch only these urgent-labeled items, up to 1/],
+    ["both over: an upstream issue's urgent label doesn't count", { items: foreign, capacity: held("claude", "openai") }, [], null],
     ["no candidates", { items: oneFree.filter((it) => !/^PVTI_c/.test(it.id)) }, ["capacity:upstream"], []],
     ["a bigger harness share", { config: operator.resolve({ pacing: { agents: 6, harness_agents: 5 } }) }, ["capacity:harness"], null],
   ];
-  for (const [name, changes, want, candidates] of cases) {
+  for (const [name, changes, want, candidates, says] of cases) {
     const actions = rec.capacity(obs(changes)).filter((a) => a.kind === "capacity");
     assert.deepEqual(keys(actions), want, name);
-    if (candidates) {
-      const r = pace.slotReport({ ...obs(changes), factor: rec.SCOPE_FACTORS[(changes.capacity || read("capacity.json")).dispatch.scope],
-        priorities: changes.capacity && changes.capacity.dispatch.scope === "p0" ? ["P0"] : null });
-      assert.deepEqual(r.lanes.upstream.candidates.map((c) => c.id), candidates, name);
-      assert.equal(actions[0].detail.length, candidates.length, name);
-    }
+    if (candidates) assert.deepEqual(named(actions[0]), candidates, name);
+    if (says) assert.match(actions[0].do, says, name);
   }
   const [free] = rec.capacity(obs({ items: oneFree }));
-  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1, as a devspace run \(bot-runs dispatch\) while the remote runs are under their opencode share \(1 of 1\), else as a local worker \(bot-pace assign\), which is also for work that does GitHub I\/O or can't run remotely; 2 P0 wait on a human$/);
+  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1, as a devspace run \(bot-runs dispatch\) while under their opencode share \(1 of 1 remote\), else as a local worker \(bot-pace assign\), which is also for work that does GitHub I\/O or can't run remotely; 2 P0 wait on a human$/);
   assert.equal(free.detail[0], "P0 https://github.com/cgwalters-forge/tracker/issues/30 image-builder analysis (osbuild/image-builder, budget 5M by P0)");
   const a = rec.capacity(obs({ items: oneFree.filter((it) => !/^PVTI_c/.test(it.id)) }))[0];
   assert.match(a.do, /no Todo candidates: triage the backlog or file upstream work; 2 P0 wait on a human$/);
   // A lane's shortfall with the total at the target is only noted.
   // [case, changes, the Observed line's agents part]
   const noted = [
-    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote (opencode share target 1), 3 local)"],
-    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 1 remote (opencode share target 1), 2 local)"],
+    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote (opencode share target 1, limit 2), 3 local)"],
+    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 1 remote (opencode share target 1, limit 2), 2 local)"],
     ["mostly remote", { items: setItem(setItem(read("board.json"), "PVTI_h1", { lead: undefined, run: "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/6" }), "PVTI_o1", { status: "Draft" }) },
-      "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 2 remote (opencode share target 1, over it), 1 local)"],
+      "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 2 remote (opencode share target 1, over it, limit 2), 1 local)"],
   ];
   for (const [name, changes, want] of noted) {
     assert.ok(rec.render(rec.observed(obs(changes)), []).startsWith(`Observed: ${want}; budgets `), name);
   }
+  // The Observed line shows each pool, and why one holds.
+  assert.match(rec.render(rec.observed(obs({ capacity: held("openai") })), []), new RegExp(`; claude 30% \\(resets Mon 23:00\\) · ${HELD.openai.replace(/[()]/g, "\\$&")}; heartbeat `));
+  assert.match(rec.render(rec.observed(obs({ capacity: { pools: { claude: null, openai: read("capacity.json").pools.openai } } })), []), /; claude no reading \(unpaced\) · openai 3% \(resets Mon 23:00\); heartbeat /);
 });
 
 test("capacity: a task over its budget, unless the budget was raised", () => {
@@ -361,6 +380,19 @@ test("patch-ready: unattended by default, with explicit false/true overrides", (
   assert.deepEqual(rec.patchReady(obs({ items: setItem(board, "PVTI_p1", { why: "Draft PR https://github.com/cgwalters-forge/r/pull/9" }) })), []);
   assert.deepEqual(rec.patchReady(obs({ items: setItem(board, "PVTI_p1", { status: "Todo" }) })), []);
   assert.deepEqual(rec.patchReady(obs({ items: undefined })), []);
+  // The apply and review run on Claude: over its pace they wait, unless the
+  // item is urgent; the openai pool's pace doesn't hold them.
+  // [case, changes, key suffix, what the action says]
+  const paced = [
+    ["openai over its pace", { capacity: held("openai") }, "", /patch is ready: dispatch a local Sonnet/],
+    ["claude over its pace", { capacity: held("claude") }, ":deferred", new RegExp(`patch is ready; its apply and review are deferred, since they run on Claude \\(${HELD.claude.replace(/[()]/g, "\\$&")}\\): nothing to do until then, or label it urgent to apply it now$`)],
+    ["claude over its pace, an urgent item", { capacity: held("claude"), items: setItem(board, "PVTI_p1", { labels: ["urgent"] }) }, "", /patch is ready: dispatch a local Sonnet/],
+  ];
+  for (const [name, changes, suffix, says] of paced) {
+    const [p] = rec.patchReady(obs(changes));
+    assert.equal(p.key, `patch-ready:https://github.com/cgwalters-forge/tracker/issues/60:4242${suffix}`, name);
+    assert.match(p.do, says, name);
+  }
 });
 
 test("stale-lead: Lead coordinator ends with In Progress; other Leads stay", () => {
@@ -403,7 +435,7 @@ function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) 
 
 test("bot-reconcile: the report, and --json", () => {
   const out = cli([]);
-  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote \(opencode share target 1\), 3 local\); budgets 8M, spent 1\.5M; capacity all, 45% projected; heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(14\):\n/);
+  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote \(opencode share target 1, limit 2\), 3 local\); budgets 8M, spent 1\.5M; claude 30% \(resets Mon 23:00\) · openai 3% \(resets Mon 23:00\); heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(14\):\n/);
   assert.doesNotMatch(out, /^. capacity /m);
   const j = JSON.parse(cli(["--json"]));
   assert.deepEqual(j.actions.map((a) => a.key), ALL_KEYS);

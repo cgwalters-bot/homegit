@@ -29,8 +29,16 @@ const labeled = (repo, fields = {}, body = "") => item({ org: repo.split("/")[0]
 const busyRun = (repo) => item({ status: "In Progress", org: repo.split("/")[0], run: `${GH}/o/r/actions/runs/${++seq}`, content: issue(repo, seq) });
 const busyLocal = (repo) => item({ status: "In Progress", org: repo.split("/")[0], lead: "coordinator", content: issue(repo, seq) });
 
+// pool(fields): a pool's pace as bot-capacity reports it: within it, with
+// no run's cost known, unless fields say otherwise.
+const pool = (fields = {}) => ({ source: "praxis", observed_at: new Date(NOW).toISOString(), used_percent: 10, window_minutes: 10080, resets_at: new Date(NOW + 4 * 864e5).toISOString(),
+  target_percent: 95, burst: 3, allowed_percent: 40, ahead: -30, hold: false, reason: null, next_dispatch_at: null, cost: null, fits: null, ...fields });
+// Over its pace: tracker#375's reading, 19% used 7.5 hours into the week.
+const OVER = { used_percent: 19, allowed_percent: 4.2, ahead: 14.8, hold: true, reason: "pace", next_dispatch_at: new Date(NOW + 21 * 3600e3).toISOString(), fits: 0 };
+const pools = (claude, openai) => ({ capacity: { pools: { claude, openai } } });
+
 function obs(items, changes = {}) {
-  return { now: NOW, config: CONFIG, items, capacity: { dispatch: { scope: "all" } }, verdicts: {}, activity: {}, topics: [], children: {}, ...changes };
+  return { now: NOW, config: CONFIG, items, ...pools(pool(), pool()), verdicts: {}, activity: {}, topics: [], children: {}, ...changes };
 }
 const dispatched = (items, changes) => rec.dispatch(obs(items, changes)).filter((a) => a.kind === "dispatch");
 
@@ -123,9 +131,9 @@ test("the dispatch rule: pacing decides, the opt-in picks", () => {
     ["the opencode share is full", [h(), busyRun("bootc-dev/bootc")], {}, []],
     ["a lane at its target", [h(), busyLocal("cgwalters-bot/homegit"), busyLocal("cgwalters-bot/homegit")], {}, []],
     ["the total at its target", [h(), ...Array.from({ length: 4 }, () => busyLocal("bootc-dev/bootc"))], {}, []],
-    ["the week used up", [h()], { capacity: { dispatch: { scope: "none" } } }, []],
-    ["P0 only: a P1 waits", [h()], { capacity: { dispatch: { scope: "p0" } } }, []],
-    ["P0 only: a P0 goes (2 agents, 1 run)", [h({ priority: "P0" })], { capacity: { dispatch: { scope: "p0" } } }, [["harness", "cgwalters-bot/homegit", "main"]]],
+    ["the run limit caps a bigger share (8 agents, all remote: 2 runs)", [h(), todoUpstream({ labels: ["dispatch"] }), busyRun("bootc-dev/bootc")],
+      { config: operator.resolve({ pacing: { agents: 8, harness_agents: 4, opencode_share: 1 } }) }, [["harness", "cgwalters-bot/homegit", "main"]]],
+    ["no runs allowed", [h()], { config: operator.resolve({ pacing: { opencode_runs: 0 } }) }, []],
     ["no label, no dispatch", [item({ org: "cgwalters-bot", content: issue("cgwalters-bot/homegit", 5) })], {}, []],
     ["an ask for the operator is no candidate", [h({ labels: ["dispatch", "question"] })], {}, []],
     ["a restricted repository is no candidate", [h()], { verdicts: { "cgwalters-bot/homegit": "human-only" } }, []],
@@ -139,6 +147,41 @@ test("the dispatch rule: pacing decides, the opt-in picks", () => {
     if (title) assert.equal(got[0].dispatch.title, title, name);
     for (const a of got) assert.equal(a.key, `dispatch:${a.url}`, name);
   }
+});
+
+test("the dispatch rule: each pool's pace holds only its own engine", () => {
+  const h = (extra) => labeled("cgwalters-bot/homegit", extra);
+  const up = (extra) => labeled("cgwalters-forge/tracker", { org: "bootc-dev", ...extra }, "Repo: bootc-dev/bootc");
+  // Claude used up: 90% with a day left, 105% projected (the reading that stopped every run in tracker#375).
+  const exhausted = pool({ source: "statusline", used_percent: 90, allowed_percent: 81.4, ahead: 8.6, hold: true, reason: "pace", next_dispatch_at: new Date(NOW + 9 * 3600e3).toISOString(), fits: 0 });
+  const eight = { config: operator.resolve({ pacing: { agents: 8, harness_agents: 4 } }) };
+  const both = [["harness", "cgwalters-bot/homegit"], ["upstream", "bootc-dev/bootc"]];
+  // [case, items, changes, dispatched [lane, repo]]
+  const cases = [
+    ["claude used up, openai within its pace: opencode still dispatches", [h()], pools(exhausted, pool()), [both[0]]],
+    ["claude used up, no openai reading: unpaced, capped by the agents", [h()], pools(exhausted, null), [both[0]]],
+    ["claude used up: the free slots go remote up to the run limit, past the share (4 agents: 1)", [h(), up()], pools(exhausted, pool()), both],
+    ["claude used up: the run limit still holds", [h(), up(), busyRun("bootc-dev/bootc")], pools(exhausted, pool()), [both[0]]],
+    ["claude within its pace: the share (4 agents: 1 run)", [h(), up()], {}, [both[0]]],
+    ["openai over its pace, claude within it: no run", [h()], pools(pool(), pool(OVER)), []],
+    ["openai over its pace, no claude reading: no run", [h()], pools(null, pool(OVER)), []],
+    ["openai over its pace: an urgent issue goes", [h({ title: "plain" }), h({ title: "now", labels: ["dispatch", "urgent"], priority: "P2" })], pools(pool(), pool(OVER)), [both[0]], "now"],
+    ["both over their pace: only the urgent one, within the run limit", [h({ labels: ["dispatch", "urgent"] }), up()], pools(exhausted, pool(OVER)), [both[0]]],
+    ["no reading at all: unpaced", [h()], { capacity: undefined }, [both[0]]],
+    ["the pace pays for one run at the observed cost: the second waits", [h(), up()], { ...eight, ...pools(pool(), pool({ cost: { points_per_run: 10 }, fits: 1 })) }, [both[0]]],
+    ["the pace pays for two", [h(), up()], { ...eight, ...pools(pool(), pool({ cost: { points_per_run: 10 }, fits: 2 })) }, both],
+    ["one paid for, and an urgent one on top", [h(), up({ labels: ["dispatch", "urgent"] })], { ...eight, ...pools(pool(), pool({ cost: { points_per_run: 10 }, fits: 1 })) }, both],
+    ["no cost known: no charge", [h(), up()], { ...eight, ...pools(pool(), pool()) }, both],
+  ];
+  for (const [name, items, changes, want, title] of cases) {
+    const got = dispatched(items, changes);
+    assert.deepEqual(got.map((a) => [a.dispatch.lane, a.dispatch.repo]), want, name);
+    if (title) assert.equal(got[0].dispatch.title, title, name);
+  }
+  // The local workers are the other way around: see the capacity rule's cases in reconcile.test.js.
+  assert.deepEqual(rec.holds(obs([], pools(exhausted, pool()))), { claude: exhausted, opencode: null });
+  assert.deepEqual(rec.holds(obs([], pools(null, pool(OVER)))), { claude: null, opencode: pool(OVER) });
+  assert.deepEqual(rec.holds(obs([], { capacity: undefined })), { claude: null, opencode: null });
 });
 
 test("labeled but not dispatchable: a dispatch-failed action says why", () => {
@@ -170,7 +213,7 @@ test("observed: the opencode share of the mix", () => {
   const items = [busyRun("bootc-dev/bootc"), busyRun("bootc-dev/bootc"), busyLocal("cgwalters-bot/homegit")];
   const o = rec.observed(obs(items));
   assert.deepEqual([o.busy, o.remote, o.remote_target, o.local], [3, 2, 1, 1]);
-  assert.match(rec.render(o, []), /; 2 remote \(opencode share target 1, over it\), 1 local\)/);
+  assert.match(rec.render(o, []), /; 2 remote \(opencode share target 1, over it, limit 2\), 1 local\)/);
   const half = rec.observed(obs(items, { config: operator.resolve({ pacing: { opencode_share: 0.5 } }) }));
   assert.equal(half.remote_target, 2);
 });
@@ -195,7 +238,7 @@ function apply({ author = "cgwalters-bot", state = "open", env = {}, flags = ["-
   const board = path.join(TMP, "board.json");
   fs.writeFileSync(board, JSON.stringify(items || [it]));
   fs.writeFileSync(path.join(TMP, "issues.json"), JSON.stringify({ [it.content.url]: { author, state, body: liveBody ?? it.content.body, comments: [{ author: "cgwalters", at: "2026-10-02T09:00:00Z", body: "Use approach B." }] } }));
-  fs.writeFileSync(path.join(TMP, "capacity.json"), JSON.stringify({ dispatch: { scope: "all" } }));
+  fs.writeFileSync(path.join(TMP, "capacity.json"), JSON.stringify(pools(pool(), pool()).capacity));
   fs.writeFileSync(path.join(TMP, "children.json"), "{}");
   fs.rmSync(calls, { force: true });
   const r = spawnSync(TOOL, ["--rule", "dispatch", ...flags, "--board-file", board, "--capacity-file", path.join(TMP, "capacity.json"), "--children-file", path.join(TMP, "children.json"),
