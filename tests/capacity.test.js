@@ -283,16 +283,16 @@ test("bot-capacity paces each pool on its own reading", () => {
   fs.rmSync(state);
   fs.rmSync(rate);
   const t = (h) => NOW + h * 3600e3;
-  const steps = [[60, 4, 1000, [remote(1)]], [61, 14, 1200, [remote(1), remote(2)]], [62, 24, 1400, [remote(2)]]];
+  const steps = [[60, 4, 1000, [remote(1)]], [61, 14, 1200, [remote(1), remote(2)]], [62, 24, 1400, [remote(2)]], [63, 24, 1400, []]];
   for (const [h, used, requests, list] of steps) {
     items(list);
     usage(t(h), used, h * 3600e3, requests);
     p = run(t(h));
   }
   assert.deepEqual(p.openai.cost, { runs: 2, points_per_run: 10, requests_per_run: 200, tokens_per_run: 0, points_per_request: 0.05, window: "current" });
-  // 62 hours in: 35.1% allowed, 38.1% with the burst, 24% used: one run, and one more at 10 points.
+  // 63 hours in: 35.6% allowed, 38.6% with the burst, 24% used: one run, and one more at 10 points.
   assert.equal(p.openai.fits, 2);
-  assert.match(run(t(62), []), /^  openai 24% \(resets \w+ \d\d:\d\d\); 95% by the reset, burst 3; a run costs 10\.0 points \(200 requests\) over 2 runs this window, 2 more fit$/m);
+  assert.match(run(t(63), []), /^  openai 24% \(resets \w+ \d\d:\d\d\); 95% by the reset, burst 3; a run costs 10\.0 points \(200 requests\) over 2 runs this window, 2 more fit$/m);
   assert.deepEqual(JSON.parse(fs.readFileSync(state, "utf8")).pools.openai.runs, [remote(1).run, remote(2).run]);
 });
 
