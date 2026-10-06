@@ -74,7 +74,10 @@ readonly DEFAULT_OPENCODE_MODEL=${BOT_RUNS_MODEL:-praxis/gpt-6.1-sol}
 readonly CORES='["4", "16", "64"]'
 readonly WORKFLOWS='["branch", "analysis"]'
 readonly MAX_TIMEOUT=330
-readonly DEFAULT_TIMEOUT=120
+# The cheap runs finish in 28 to 48 minutes; a run that needs more says so
+# with --timeout. The run's other caps (model requests, subagent tasks) are
+# the workflow's own defaults unless dispatch is given them.
+readonly DEFAULT_TIMEOUT=75
 readonly DEFAULT_BUDGET=500
 # The output types a run may hand back (agent.yml's outputs input, checked
 # against its static allowlist) and how many: a branch run proposes a pull
@@ -129,6 +132,7 @@ docs/devspace-agent-runs.md in homegit.
 Commands:
   dispatch --item ITEM --repo OWNER/REPO [--base REF] [--agent AGENT]
            [--model MODEL] [--cores N] [--timeout MIN] [--budget AIC]
+           [--max-requests N] [--max-tasks N]
            [--workflow branch|analysis] [--outputs TYPES] [--max-outputs N]
            [--no-preamble] [--dry-run] BRIEF
       Start a run on BRIEF (a file, or - for stdin) and print its id and
@@ -140,7 +144,11 @@ Commands:
       budget ${DEFAULT_BUDGET} AIC, workflow branch, outputs create_pull_request,noop,missing_tool
       (an analysis run: noop,missing_tool,missing_data), at most ${DEFAULT_MAX_OUTPUTS} of them: the
       run refuses types and numbers its static allowlist doesn't have,
-      before it starts. The task sent is the
+      before it starts. --max-requests and --max-tasks cap the run's model
+      requests (subagents' included) and subagent tasks, 0 for no cap;
+      without them the workflow's defaults apply. The runner warns the
+      agent as it nears the timeout or a cap, has it hand back, and only
+      then stops it. The task sent is the
       runner-side worker brief (runner-preamble.md in the coordinator
       skill), the run's target, then BRIEF; --no-preamble sends BRIEF
       alone. --dry-run prints the request.
@@ -648,11 +656,11 @@ require_public_repo() {
 cmd_dispatch() {
     local item="" repo="" base=main agent=${DEFAULT_AGENT} model="" cores=4 timeout=${DEFAULT_TIMEOUT}
     local budget=${DEFAULT_BUDGET} workflow=branch brief_file="" dry_run=false json=false preamble=true
-    local outputs="" max_outputs=${DEFAULT_MAX_OUTPUTS}
+    local outputs="" max_outputs=${DEFAULT_MAX_OUTPUTS} max_requests="" max_tasks=""
     local inputs body len resp rc=0
     while test $# -gt 0; do
         case "$1" in
-            --item|--repo|--base|--agent|--model|--cores|--timeout|--budget|--workflow|--outputs|--max-outputs)
+            --item|--repo|--base|--agent|--model|--cores|--timeout|--budget|--workflow|--outputs|--max-outputs|--max-requests|--max-tasks)
                 test $# -ge 2 || fatal "$1 requires a value"
                 local opt=${1#--}
                 printf -v "${opt//-/_}" '%s' "$2"
@@ -684,6 +692,8 @@ cmd_dispatch() {
     if ! [[ "${budget}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! jq -e --argjson b "${budget}" -n '$b > 0' >/dev/null; then
         fatal "--budget must be a positive number of AIC"
     fi
+    [[ "${max_requests}" =~ ^(|0|[1-9][0-9]{0,4})$ ]] || fatal "--max-requests must be a number of model requests (0: no cap), not ${max_requests}"
+    [[ "${max_tasks}" =~ ^(|0|[1-9][0-9]{0,2})$ ]] || fatal "--max-tasks must be a number of subagent tasks (0: no cap), not ${max_tasks}"
     test -n "${brief_file}" || fatal "missing BRIEF (a file, or - for stdin)"
     # A file, not an argument: a long brief could pass the argument size limit.
     if test "${brief_file}" = -; then
@@ -705,9 +715,12 @@ cmd_dispatch() {
     inputs=$(jq -nc --arg item "${item}" --arg repo "${repo}" --arg base "${base}" --arg agent "${agent}" \
         --arg model "${model}" --arg cores "${cores}" --arg timeout "${timeout}" --arg budget "${budget}" \
         --arg workflow "${workflow}" --arg outputs "${outputs}" --arg max_outputs "${max_outputs}" --rawfile brief "${scratch}/brief" \
+        --arg max_requests "${max_requests}" --arg max_tasks "${max_tasks}" \
         '{item: $item, repo: $repo, base: $base, agent: $agent, model: $model, cores: $cores,
           timeout: $timeout, budget: $budget, workflow: $workflow, outputs: $outputs, max_outputs: $max_outputs,
-          brief: ($brief | rtrimstr("\n"))}')
+          brief: ($brief | rtrimstr("\n"))}
+         # Only when given: the workflow has its own defaults.
+         + ({max_requests: $max_requests, max_tasks: $max_tasks} | with_entries(select(.value != "")))')
     len=$(jq 'tojson | length' <<<"${inputs}")
     test "${len}" -le "${MAX_INPUTS_LEN}" ||
         fatal "the dispatch inputs are ${len} characters, over GitHub's ${MAX_INPUTS_LEN}; shorten the brief"
@@ -785,7 +798,7 @@ heartbeat_done() {
 # with a Run, {item, title, status, run, result, set: [bot-board set
 # arguments] or null, line}. Fails only when the run can't be read.
 reconcile_one() {
-    local item=$1 id title status run run_id meta rec flat result patch url why news set=null recovery_board fresh_meta attempt
+    local item=$1 id title status run run_id meta rec flat result patch url why news set=null recovery_board fresh_meta attempt partial=""
     read -r id status < <(jq -r '"\(.id) \(.status // "")"' <<<"${item}")
     title=$(jq -r '.title // ""' <<<"${item}")
     run=$(jq -r .run <<<"${item}")
@@ -866,7 +879,13 @@ reconcile_one() {
     fi
     # The run's own account of why, if it gave one.
     why+=$(jq -r '(.summary.outcome.why // .summary.failures[0]?.message // .summary.patch.error? // "") | select(. != "") | "; " + .' <<<"${rec}")
-    why=${why:0:${WHY_MAX}}
+    # A run the runner stopped at a limit still hands its working tree
+    # back: work to continue from, not a change ready to apply. Kept
+    # whatever the run's own account gets cut to.
+    if test -n "${patch}" && test "$(jq -r '.summary.stopped_early // false' <<<"${rec}")" = true; then
+        partial="; partial patch (${patch} bytes) to continue from in its ${OUT_ARTIFACT} artifact"
+    fi
+    why=${why:0:$((WHY_MAX - ${#partial}))}${partial}
     news="Devspace agent run ${run_id} ended (${result}): ${url}"
     set=$(jq -nc --arg s "${RETRY_STATUS}" --arg f "${RUN_FIELD}" --arg why "${why}" --arg news "${news}" \
         '["--status", $s, "--field", $f, "", "--why", $why, "--news", $news]')

@@ -53,7 +53,9 @@ so no polling is needed to find the run. The inputs are all strings:
 | `agent`    | `opencode`, `fake` (scripted, no inference) or `claude` (once the broker holds its credential) |
 | `model`    | the model, as `provider/model` for opencode (`bot-runs dispatch` sends `praxis/gpt-6.1-sol`, GPT-6.1 Sol through the broker, unless `--model` or `BOT_RUNS_MODEL` says otherwise); empty for the agent's own default |
 | `cores`    | `4`, `16` or `64` |
-| `timeout`  | minutes, at most 330 |
+| `timeout`  | minutes, at most 330 (`bot-runs dispatch` sends `75`) |
+| `max_requests` | the most model requests the run may make, subagents' included, as the broker counts them; `0` for no cap (the workflow's default is `150`; `bot-runs dispatch` sends it only with `--max-requests`) |
+| `max_tasks` | the most subagent tasks the agent may start; `0` for no cap (default `4`; sent only with `--max-tasks`) |
 | `budget`   | the spend cap in AIC (1 AIC = $0.01) |
 | `workflow` | `branch` or `analysis` |
 | `outputs`  | the output types the run may hand back, comma separated (`create_pull_request`, `add_comment`, `noop`, `missing_tool`, `missing_data`; `all` for every type allowed to this workflow): `bot-runs dispatch` sends `create_pull_request,noop,missing_tool` for a branch run and `noop,missing_tool,missing_data` for an analysis run |
@@ -113,7 +115,10 @@ Progress moves to Draft if the run succeeded with a patch (ready for
 a local Sonnet apply worker applies, reviews and proposes it, see
 `dotfiles/.agents/skills/coordinator/apply-preamble.md`; it opens a draft
 PR and never merges), and back to Todo otherwise (failure, timeout, budget, cancelled, or
-no change), with Why and News linking the run. Either way `Run` is
+no change), with Why and News linking the run. A run the runner stopped
+at a limit (`stopped_early`) still hands back its working tree, and Why
+then names the partial patch to continue from, in the run's
+`safe-outputs` artifact; `bot-runs apply` takes only successful runs. Either way `Run` is
 cleared, so an item In Progress without a `Run` is local work, and a
 finished run never moves an item twice.
 
@@ -497,6 +502,10 @@ zero.
 | `tools` | object | per tool name: `calls`, `errors` and `duration_s` (integers) |
 | `slowest` | array | at most 10 of `{tool, summary, duration_s}`, slowest first |
 | `failures` | array | `{kind, message}`, `kind` one of `tool_error`, `timeout`, `budget`, `validation`, `agent_exit` |
+| `stopped_early` | boolean | the runner stopped the session at a limit (`result` is `timeout` or `budget`); absent in older runs. Not `outcome.json`'s `stopped_early`, the agent's own reason as text, which the runner fills in for a run it stopped |
+| `handed_back` | boolean | stopped early, the agent finished the turn it was given to hand back in, so `outcome.json` and the patch are its own account of a partial change |
+| `notices` | array | the budget notices the runner sent the agent, in order: `60%`, `80%`, `last task`, `hand back` |
+| `limits` | object | the limits the harness ran with: `timeout_s`, `budget_aic`, `max_tool_calls`, `max_requests`, `max_tasks` (`null` for none) |
 | `tests` | array | `{command, exit_code, duration_s}` from `outcome.json` |
 | `files` | array | paths the agent changed, relative to the repository |
 | `patch` | object | branch runs that changed files: `base` (the commit the change is against), and `bytes` (of the patch) or `error` (why no change was handed back); else `null` |

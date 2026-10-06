@@ -1140,7 +1140,7 @@ test_dispatch() {
     expect_eq "${out}" "Dispatched run 1006: https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/1006" "dispatch output"
     expect_json "$(jq -c '.inputs.brief = null' "${FAKE_GH}/dispatch-body.json")" '{"ref": "bot/agent-run-praxis", "return_run_details": true, "inputs": {
         "item": "PVTI_item1", "repo": "composefs/composefs-rs", "base": "main", "agent": "opencode", "model": "praxis/gpt-6.1-sol",
-        "cores": "16", "timeout": "120", "budget": "250", "workflow": "branch",
+        "cores": "16", "timeout": "75", "budget": "250", "workflow": "branch",
         "outputs": "create_pull_request,noop,missing_tool", "max_outputs": "3", "brief": null}}' "dispatch request"
     # The runner brief, the run's target, then the task.
     jq -e --rawfile p "${TESTS}/../dotfiles/.agents/skills/coordinator/runner-preamble.md" \
@@ -1157,6 +1157,11 @@ test_dispatch() {
         --max-outputs 5 --no-preamble "${WORK}/brief.md")
     expect_json "$(jq -c '.inputs | {outputs, max_outputs}' <<<"$(sed 1d <<<"${out}")")" \
         '{"outputs": "create_pull_request,add_comment", "max_outputs": "5"}' "dispatch with outputs"
+    # The run's caps are sent only when given.
+    out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs --max-requests 60 --max-tasks 0 \
+        --no-preamble "${WORK}/brief.md")
+    expect_json "$(jq -c '.inputs | {max_requests, max_tasks}' <<<"$(sed 1d <<<"${out}")")" \
+        '{"max_requests": "60", "max_tasks": "0"}' "dispatch with caps"
     # Each dispatch put its run on its item.
     local run=${RUNS_URL}/1006
     expect_eq "$(cat "${FAKE_GH}/board-calls")" "field-ensure Run
@@ -1201,6 +1206,8 @@ test_dispatch_invalid() {
         "--cores 8|--cores must be one of"
         "--timeout 331|--timeout must be 1 to 330 minutes"
         "--timeout 0|--timeout must be 1 to 330 minutes"
+        "--max-requests many|--max-requests must be a number of model requests"
+        "--max-tasks -1|--max-tasks must be a number of subagent tasks"
         "--budget -5|--budget must be a positive number"
         "--budget 0|--budget must be a positive number"
         "--agent gemini|--agent must be one of"
@@ -1323,6 +1330,38 @@ test_reconcile_unreadable() {
     local out
     out=$("${BOT_RUNS}" reconcile --board-file "${FAKE_GH}/board.json" --apply 2>&1) && fail "succeeded with an unreadable run"
     expect_lines "${out}" 'reading the run of item PVTI_gone failed' '^Failed .*: set Todo \(done\)$'
+}
+
+# A run the runner stopped at a limit goes back to Todo like any other
+# that didn't finish, but its Why says there is a partial patch, however
+# long the run's own account is. Data driven: a jq edit of run 1002's
+# summary, then whether Why has the note.
+test_reconcile_stopped_early() {
+    local stopped='.result = "budget" | .stopped_early = true | .handed_back = true | .outcome.why = null
+        | .failures = [{kind: "budget", message: "used 140 of 150 model requests; the agent handed back"}]'
+    local cases=(
+        "${stopped} | .patch = {base: \"abc\", bytes: 99}|yes"
+        "${stopped} | .patch = {base: \"abc\", bytes: 99} | .outcome.why = (\"long \" * 100)|yes"
+        "${stopped} | .patch = null|no"
+        # An older run: a patch collected after a timeout, nothing said of why.
+        ".result = \"timeout\" | .patch = {base: \"abc\", bytes: 99}|no"
+    )
+    local c out why
+    local note='; partial patch (99 bytes) to continue from in its safe-outputs artifact'
+    cp "${FAKE_GH}/artifacts/1002/agent-run/summary.json" "${WORK}/1002.json"
+    jq -n --arg r "${RUNS_URL}" '[{id: "PVTI_partial", title: "Partial", status: "In Progress", run: "\($r)/1002"}]' >"${FAKE_GH}/board.json"
+    for c in "${cases[@]}"; do
+        jq "${c%|*}" "${WORK}/1002.json" >"${FAKE_GH}/artifacts/1002/agent-run/summary.json"
+        rm -rf "${XDG_STATE_HOME}/bot-runs" "${XDG_CACHE_HOME}/bot-runs"
+        out=$("${BOT_RUNS}" reconcile --json)
+        expect_eq "$(jq -r '.[0].set[1]' <<<"${out}")" Todo "${c%|*}: status"
+        why=$(jq -r '.[0].set | .[index("--why") + 1]' <<<"${out}")
+        test "${#why}" -le 300 || fail "${c%|*}: Why is ${#why} characters"
+        case "${c##*|}" in
+            yes) [[ "${why}" == *"${note}" ]] || fail "${c%|*}: no note in: ${why}" ;;
+            no) [[ "${why}" != *"partial patch"* ]] || fail "${c%|*}: a note in: ${why}" ;;
+        esac
+    done
 }
 
 # A finished run whose files can't be read yet is left for a later pass:
