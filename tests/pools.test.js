@@ -39,6 +39,10 @@ test("pace: an even use of the target by the reset, with a burst", () => {
     ["a point over it", 51.5, 3.5 * DAY, 47.5, true, (48.5 / 95) * WEEK],
     ["the target used with days left: the reserve holds until the reset", 99, 6 * DAY, (95 * 6) / 7, true, WEEK],
     ["at the reset's eve, the target is allowed", 95, WEEK - 1, 95, false, null],
+    // The burst is slack over the pace, not over the target: the reserve stays.
+    ["at the reset's eve, the burst doesn't reach into the reserve", 96, WEEK - 1, 95, true, WEEK],
+    ["three hours before the reset, within the burst but past the target", 95.5, WEEK - 3 * HOUR, 95 * (1 - 3 / 168), true, WEEK],
+    ["three hours before the reset, within the burst and the target", 94.9, WEEK - 3 * HOUR, 95 * (1 - 3 / 168), false, null],
   ];
   for (const [name, used, elapsed, allowed, hold, next] of cases) {
     const p = at(used, elapsed);
@@ -133,6 +137,10 @@ test("runs that fit: one while within the pace, and what the points left pay for
     ["less than a run left: still one", 48, cost(10), 1], ["at the limit", 50.5, cost(10), 1],
   ];
   for (const [name, used, c, want] of cases) assert.equal(pools.runsThatFit(at(used, 3.5 * DAY), c), want, name);
+  // A day before the reset 81.4% is allowed, 84.4% with the burst; with a
+  // burst of 20 the points left are those under the target, not 101.4%.
+  const wide = { target: 0.95, burst: 20 };
+  assert.deepEqual([70, 90].map((used) => pools.runsThatFit(at(used, 6 * DAY, wide), cost(5))), [6, 2]);
 });
 
 test("a pool in a line, and the engines' pools", () => {
