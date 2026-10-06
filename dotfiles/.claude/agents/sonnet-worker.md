@@ -1,6 +1,6 @@
 ---
 name: sonnet-worker
-description: Cheap, bounded sub-tasks for a bot-claude job (an Opus process) on Sonnet - read-only research and summaries, first-pass reviews of a diff or doc, lint and log triage, mechanical edits with a clear spec. Leaves its changes uncommitted for the caller. Never for design, deciding what a change should do, final verdicts, credentials or security judgment.
+description: Cheap, bounded sub-tasks for a bot-claude job (an Opus process) on Sonnet - mechanical reviews of a diff or doc (style, checklist, lint), code scanning, log triage, lookups, and mechanical edits with an exact spec. Leaves its changes uncommitted for the caller. Never for anything nontrivial: design, deciding what a change should do, research conclusions, the review that gates a merge, final verdicts, credentials or security judgment.
 model: sonnet
 disallowedTools: Agent, Workflow
 hooks:

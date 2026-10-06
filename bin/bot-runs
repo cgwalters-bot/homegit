@@ -109,7 +109,7 @@ readonly RUN_STATUS='In Progress'
 readonly PATCH_STATUS=Draft
 readonly RETRY_STATUS=Todo
 # reconcile only reports a successful run's patch as ready; applying it is
-# bot-reconcile's patch-ready action (a Sonnet apply worker), which never merges.
+# bot-reconcile's patch-ready action (an Opus apply worker), which never merges.
 readonly WHY_MAX=300
 BOT_BOARD=${BOT_RUNS_BOT_BOARD:-$(dirname "$(readlink -f "$0")")/bot-board}
 readonly BOT_BOARD
