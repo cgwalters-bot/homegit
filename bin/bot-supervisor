@@ -10,7 +10,7 @@ const path = require("node:path");
 const { parseArgs } = require("node:util");
 
 const ROOT = path.resolve(__dirname, "..");
-const DEFAULT_KINDS = "capacity,dispatch-failed,patch-ready,approval,drive,health,answer-unapplied,lead-orphan,heartbeat,budget,forge-review,rebase,review,notify,news,sweep-problem,reconcile-failing,heartbeat-refresh,drive-P0,health-P0";
+const DEFAULT_KINDS = "capacity,dispatch-failed,triage-failed,patch-ready,approval,drive,health,answer-unapplied,lead-orphan,heartbeat,budget,forge-review,rebase,review,notify,news,sweep-problem,reconcile-failing,heartbeat-refresh,drive-P0,health-P0";
 const JOB_RE = /^supervisor-[a-f0-9]{32}$/;
 const MAX_OUTPUT = 4 * 1024 * 1024;
 const TERMINAL_FAILURES = { failed: 1, timeout: 3, killed: 4, lost: 4, incomplete: 5 };

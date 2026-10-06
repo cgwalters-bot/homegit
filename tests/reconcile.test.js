@@ -364,7 +364,7 @@ test("edge: new and resynced actions fire, others wait; gone keys are forgotten 
     ["approval", "closed-not-done", "drive", "health", "heartbeat", "lead-orphan", "midstream-drift", "midstream-pr"]);
   // The rules that didn't run keep theirs too.
   assert.deepEqual([...rec.unreadKinds({ items: [], heartbeat: null, sweep: {}, questions: [], contentStates: {}, midstreams: [] }, ["capacity", "drive"])].sort(),
-    ["answer-unapplied", "closed-not-done", "dispatch", "dispatch-failed", "escalate", "heartbeat", "lead-orphan", "midstream-drift", "midstream-pr", "patch-ready", "stale-lead"]);
+    ["answer-unapplied", "closed-not-done", "dispatch", "dispatch-failed", "escalate", "heartbeat", "lead-orphan", "midstream-drift", "midstream-pr", "patch-ready", "stale-lead", "triage", "triage-failed"]);
 });
 
 test("patch-ready: unattended by default, with explicit false/true overrides", () => {

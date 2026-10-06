@@ -62,7 +62,7 @@ same job failing twice is an escalation.
 
 Mechanical, do it:
 
-- `closed-not-done`, `stale-lead`, `midstream-pr`, `dispatch`: already carried out by
+- `closed-not-done`, `stale-lead`, `midstream-pr`, `dispatch`, `triage`: already carried out by
   `--apply`, and an action marked `(dispatched)` or `(skipped: ...)` needs
   nothing. `(deferred: ...)` was a rate limit with the label restored, so
   the next cycle retries it. A `(failed: ...)` is a failure: see
@@ -85,6 +85,13 @@ Mechanical, do it:
   is plain (an issue body, a label), clear its Why once to retry
   (`bin/bot-board set ITEM --why ""`, relabel). A second failure of the
   same item: escalate.
+- `triage-failed`: a new tracker issue's triage run (the coordinator
+  skill's **triage** rule) failed to start. As for `dispatch-failed`:
+  fix a plain cause, then once clear its Why (`bin/bot-board set ITEM
+  --why ""`) and label the issue `triage`, so the next cycle triages it
+  again, and escalate a second failure.
+  Never plan a new issue yourself: its triage run proposes the plan on the
+  issue.
 - `patch-ready`: when the action says to, start a worker on the default model (`bin/bot-claude start --dir WT --item ITEM --job apply-RUN BRIEF`) on `coordinator/apply-preamble.md`, with `Item:` and `Run:` lines in the brief. It reads the run, applies the patch, opens or updates
   the draft PR (a fork PR, or a homegit PR via `bot-land --no-auto
   --no-review`), and never merges. Then the review step below.

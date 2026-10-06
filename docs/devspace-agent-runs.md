@@ -58,8 +58,8 @@ so no polling is needed to find the run. The inputs are all strings:
 | `max_tasks` | the most subagent tasks the agent may start; `0` for no cap (default `4`; sent only with `--max-tasks`) |
 | `budget`   | the spend cap in AIC (1 AIC = $0.01; `bot-runs dispatch` sends `500`, or `5000` for `claude`, whose AIC are `api-equivalent`) |
 | `workflow` | `branch` or `analysis` |
-| `outputs`  | the output types the run may hand back, comma separated (`create_pull_request`, `add_comment`, `noop`, `missing_tool`, `missing_data`; `all` for every type allowed to this workflow): `bot-runs dispatch` sends `create_pull_request,noop,missing_tool` for a branch run and `noop,missing_tool,missing_data` for an analysis run |
-| `max_outputs` | the most outputs of all types the run may hand back (`bot-runs dispatch` sends `3`) |
+| `outputs`  | the output types the run may hand back, comma separated (`create_pull_request`, `add_comment`, `noop`, `missing_tool`, `missing_data`; `all` for every type allowed to this workflow): `bot-runs dispatch` sends `create_pull_request,noop,missing_tool` for a branch run, `noop,missing_tool,missing_data` for an analysis run and `add_comment` for a triage run (`--triage`) |
+| `max_outputs` | the most outputs of all types the run may hand back (`bot-runs dispatch` sends `3`, and `1` for a triage run) |
 | `brief`    | the task text: `bot-runs dispatch` sends the runner-side worker brief (`dotfiles/.agents/skills/coordinator/runner-preamble.md`), the run's target, then the given brief, unless `--no-preamble` |
 
 Dispatch inputs are public in a public repository and capped at 65,535
@@ -433,7 +433,7 @@ every file) and run by `safe-outputs/safe-outputs.mjs`:
   `Agent-run:` trailer linking the run attempt. The agent's own title and
   body are printed (and in `--json`) for the fork PR; the other outputs
   (`noop`, `missing_tool`, `add_comment`, `missing_data`) are listed, never
-  posted. Nothing is pushed: after review, `bot-pr fork-pr --from DIR`
+  posted, except by `bot-runs apply RUN --triage` (below). Nothing is pushed: after review, `bot-pr fork-pr --from DIR`
   opens it on the forge, or, for the bot's own repositories, ordinary `bot-land`
   publishes it through `origin`. A refused change's worktree and clone are removed.
 
@@ -451,6 +451,24 @@ slug's managed worktrees), then remove the backing clone once nothing
 needs its commits. The helper prunes Git registrations and preserves
 branches in the backing clone; it refuses tracked or untracked changes
 unless `--force` is given after verifying they can be discarded.
+
+**Triage runs.** `bot-runs dispatch --triage` (which `bot-reconcile
+--apply` runs for a new tracker issue, see lib/triage.js) starts an
+`analysis` run whose only allowed output is one `add_comment`, with
+`Triage: devspace agent run URL` in the item's Why. `bot-runs reconcile`
+applies a successful one with `bot-runs apply RUN --triage`, which takes
+no patch: the checked outputs must be exactly one `add_comment`, for the
+item's own tracker issue (its `item_number` and repository, when given,
+must agree, or the run is refused). It posts the comment as the bot with a
+footer and a hidden `<!-- triage-run RUN -->` marker (a second apply finds
+the marker and doesn't post again), parses the comment's ` ```json `
+block (`"schema": "triage/v1"`), sets the Priority and Est. cost it
+proposes where the item has none, links the issue under the proposed epic
+(an open tracker issue labeled `epic`; GitHub refusing it, as for an issue
+that has a parent already, is a note), and labels it `dispatch` (when
+dispatchable, the operator's and with a `Repo:` line) or assigns the
+operator. The item goes back to Todo either way, with Why saying what was
+applied.
 
 Before this, a branch run uploaded `agent-out` with `changes.patch` and
 `bot-runs apply` checked it in shell. That format is gone: runs from before

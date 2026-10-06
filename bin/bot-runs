@@ -90,6 +90,17 @@ readonly DEFAULT_CLAUDE_BUDGET=5000
 # request, an analysis run has no change to propose.
 declare -rA DEFAULT_OUTPUTS=([branch]="create_pull_request,noop,missing_tool" [analysis]="noop,missing_tool,missing_data")
 readonly DEFAULT_MAX_OUTPUTS=3
+# A triage run (dispatch --triage, see lib/triage.js): read-only, and its one
+# output is a comment on the issue it triages, which apply --triage posts.
+readonly TRIAGE_WORKFLOW=analysis
+readonly TRIAGE_OUTPUTS=add_comment
+readonly TRIAGE_MAX_OUTPUTS=1
+# Before the run URL in a triage item's Why: how reconcile tells a triage
+# run, whose output it applies (lib/triage.js's WHY_PREFIX).
+readonly TRIAGE_WHY_PREFIX='Triage: devspace agent run'
+readonly TRIAGE_LABEL=triage
+TRIAGE_JS=$(dirname "$(readlink -f "$0")")/../lib/triage.js
+readonly TRIAGE_JS
 readonly MAX_INPUTS_LEN=65535
 # The runner-side worker brief, put before every dispatched brief: the
 # agent runs without credentials, and its only outputs are the working
@@ -140,7 +151,7 @@ Commands:
            [--model MODEL] [--cores N] [--timeout MIN] [--budget AIC]
            [--max-requests N] [--max-tasks N]
            [--workflow branch|analysis] [--outputs TYPES] [--max-outputs N]
-           [--no-preamble] [--dry-run] BRIEF
+           [--triage] [--no-preamble] [--dry-run] BRIEF
       Start a run on BRIEF (a file, or - for stdin) and print its id and
       URL, then put the run URL in the item's ${RUN_FIELD} field (added to the
       board if missing), with Status ${RUN_STATUS} and a News line, and give the
@@ -157,14 +168,20 @@ Commands:
       then stops it. The task sent is the
       runner-side worker brief (runner-preamble.md in the coordinator
       skill), the run's target, then BRIEF; --no-preamble sends BRIEF
-      alone. --dry-run prints the request.
+      alone. --triage makes it a triage run (bot-reconcile's triage rule):
+      workflow ${TRIAGE_WORKFLOW}, outputs ${TRIAGE_OUTPUTS}, at most ${TRIAGE_MAX_OUTPUTS}, and Why
+      '${TRIAGE_WHY_PREFIX} URL', which has reconcile apply it. --dry-run
+      prints the request.
   reconcile [--apply | --dry-run] [--board-file FILE]
       Move the board items with a ${RUN_FIELD} whose run is over (bot-watch
       runs it on every sweep): from ${RUN_STATUS}, a success with a patch
       to ${PATCH_STATUS} (patch ready for 'apply'), anything else to ${RETRY_STATUS}, with Why
       and News linking the run; ${RUN_FIELD} is then cleared. A run still
       going leaves its item alone, and so does a finished run whose item
-      left ${RUN_STATUS} (only ${RUN_FIELD} is cleared). Only --apply changes the
+      left ${RUN_STATUS} (only ${RUN_FIELD} is cleared). A triage run (dispatch
+      --triage) goes to ${RETRY_STATUS} too; with --apply, a successful one is
+      applied first ('apply RUN --triage'), and its Why says what was done.
+      Only --apply changes the
       board; --dry-run prints the bot-board calls. FILE is a 'bot-board
       list --json' array (default: the board). Prints one line per item
       with a ${RUN_FIELD} (--json: an array of {item, run, line, ...}).
@@ -219,6 +236,17 @@ Commands:
       posted. Nothing is pushed. For the bot's own repositories origin stays
       pushable, so bot-land works; for any other origin has no push URL:
       after review, bot-pr fork-pr --from DIR opens it on the forge.
+  apply RUN --triage [--repo OWNER/REPO]
+      Apply a triage run (dispatch --triage), checked as above with the
+      outputs narrowed to ${TRIAGE_OUTPUTS}: its outputs must be exactly one
+      add_comment, for the issue of the run's board item (an issue of
+      ${OP_TRACKER_REPO}). Posts it there as the bot, with a footer naming the
+      run (once: a second apply finds it), then applies its triage/v1 block
+      (lib/triage.js): Priority and Est. cost where the item has none, the
+      epic's sub-issue link, and the outcome: the dispatch label when
+      the block says dispatchable and the issue is ${OP_OPERATOR_LOGIN}'s with a
+      matching Repo: line, else an ask (assigned to ${OP_OPERATOR_LOGIN}). Exits
+      1 if any of those failed.
   stats [--since AGE] [--limit N] [--by agent|model|repo|item|result]
       Aggregate the finished runs (the last ${DEFAULT_STATS_SINCE}, at most ${DEFAULT_STATS_LIMIT} by
       default): success rate, failures by kind, duration, tokens and
@@ -662,16 +690,18 @@ require_public_repo() {
 cmd_dispatch() {
     local item="" repo="" base=main agent=${DEFAULT_AGENT} model="" cores=4 timeout=${DEFAULT_TIMEOUT}
     local budget="" workflow=branch brief_file="" dry_run=false json=false preamble=true
-    local outputs="" max_outputs=${DEFAULT_MAX_OUTPUTS} max_requests="" max_tasks=""
+    local outputs="" max_outputs=${DEFAULT_MAX_OUTPUTS} max_requests="" max_tasks="" triage=false shaped=""
     local inputs body len resp rc=0
     while test $# -gt 0; do
         case "$1" in
             --item|--repo|--base|--agent|--model|--cores|--timeout|--budget|--workflow|--outputs|--max-outputs|--max-requests|--max-tasks)
                 test $# -ge 2 || fatal "$1 requires a value"
                 local opt=${1#--}
+                case "${opt}" in workflow|outputs|max-outputs) shaped=$1 ;; esac
                 printf -v "${opt//-/_}" '%s' "$2"
                 shift 2
                 ;;
+            --triage) triage=true; shift ;;
             --dry-run) dry_run=true; shift ;;
             --no-preamble) preamble=false; shift ;;
             --json) json=true; shift ;;
@@ -687,6 +717,10 @@ cmd_dispatch() {
     jq -e --arg v "${cores}" 'index($v)' <<<"${CORES}" >/dev/null || fatal "--cores must be one of ${CORES}"
     if test -z "${model}" && test "${agent}" = opencode; then
         model=${DEFAULT_OPENCODE_MODEL}
+    fi
+    if ${triage}; then
+        test -z "${shaped}" || fatal "--triage sets the workflow and outputs itself; drop ${shaped}"
+        workflow=${TRIAGE_WORKFLOW} outputs=${TRIAGE_OUTPUTS} max_outputs=${TRIAGE_MAX_OUTPUTS}
     fi
     jq -e --arg v "${workflow}" 'index($v)' <<<"${WORKFLOWS}" >/dev/null || fatal "--workflow must be one of ${WORKFLOWS}"
     test -n "${outputs}" || outputs=${DEFAULT_OUTPUTS[${workflow}]}
@@ -758,9 +792,11 @@ cmd_dispatch() {
     # The run is the source of truth for the item from now on: reconcile
     # follows it from this field.
     rc=0
+    local why=()
+    ! ${triage} || why=(--why "${TRIAGE_WHY_PREFIX} ${url}")
     "${BOT_BOARD}" field-ensure "${RUN_FIELD}" || rc=$?
     test "${rc}" -ne 0 ||
-        "${BOT_BOARD}" set "${item}" --status "${RUN_STATUS}" --field "${RUN_FIELD}" "${url}" \
+        "${BOT_BOARD}" set "${item}" --status "${RUN_STATUS}" "${why[@]}" --field "${RUN_FIELD}" "${url}" \
             --news "Dispatched devspace agent run ${url} (${agent}, ${cores} cores)" >/dev/null || rc=$?
     pass_ratelimit "${rc}"
     test "${rc}" -eq 0 ||
@@ -873,6 +909,10 @@ reconcile_one() {
         entry "${result}" "run ${run_id} ended (${result}) after the item left ${RUN_STATUS}: clear ${RUN_FIELD}"
         return 0
     fi
+    if [[ "$(jq -r '.why // ""' <<<"${item}")" == "${TRIAGE_WHY_PREFIX} "* ]]; then
+        reconcile_triage "${run_id}" "${url}" "${result}" "${2:-report}"
+        return
+    fi
     if test "${result}" = success && test -n "${patch}"; then
         why="Agent run ${url} succeeded with a patch (${patch} bytes): ready for bot-runs apply ${run_id} --slug SLUG --message FILE, then bot-pr fork-pr"
         news="Devspace agent run ${run_id} succeeded; patch ready"
@@ -899,6 +939,38 @@ reconcile_one() {
     set=$(jq -nc --arg s "${RETRY_STATUS}" --arg f "${RUN_FIELD}" --arg why "${why}" --arg news "${news}" \
         '["--status", $s, "--field", $f, "", "--why", $why, "--news", $news]')
     entry "${result}" "run ${run_id} ended (${result}): set ${RETRY_STATUS}"
+}
+
+# reconcile_triage RUN_ID URL RESULT MODE: the end of reconcile_one for a
+# triage run (dispatch --triage): back to RETRY_STATUS, after applying a
+# successful run's comment and fields (apply --triage) with --apply. Its
+# Why says what was done, or why not: a failed triage isn't retried until
+# someone labels the issue triage again.
+reconcile_triage() {
+    local run_id=$1 url=$2 result=$3 mode=$4 line out rc=0
+    news="Triage run ${run_id} ended (${result}): ${url}"
+    if test "${result}" != success; then
+        why="Triage run ${url} ended: ${result}; label the issue ${TRIAGE_LABEL} to triage it again"
+        line="triage run ${run_id} ended (${result}): set ${RETRY_STATUS}"
+    elif test "${mode}" != apply; then
+        why="Triaged by agent run ${url}"
+        line="triage run ${run_id} succeeded: post its comment, set the fields it proposes and ${RETRY_STATUS}"
+        test "${mode}" != dry-run || printf 'bot-runs apply %s --triage\n' "${run_id}" 1>&2
+    else
+        out=$("$0" apply "${run_id}" --triage --json 2>"${scratch}/triage-err") || rc=$?
+        pass_ratelimit "${rc}"
+        why=$(jq -r '.why // empty' <<<"${out:-null}" 2>/dev/null || true)
+        if test -z "${why}"; then
+            why="Triage run ${url} succeeded, but applying it failed ($(grep . "${scratch}/triage-err" | tail -n1)); retry: bot-runs apply ${run_id} --triage"
+        fi
+        test "${rc}" -eq 0 || cat "${scratch}/triage-err" 1>&2
+        news="Triaged by devspace agent run ${run_id}: ${url}"
+        line="triage run ${run_id} succeeded: $(test "${rc}" -eq 0 && echo applied || echo "applying it FAILED"), set ${RETRY_STATUS}"
+    fi
+    why=${why:0:${WHY_MAX}}
+    set=$(jq -nc --arg s "${RETRY_STATUS}" --arg f "${RUN_FIELD}" --arg why "${why}" --arg news "${news}" \
+        '["--status", $s, "--field", $f, "", "--why", $why, "--news", $news]')
+    entry "${result}" "${line}"
 }
 
 cmd_reconcile() {
@@ -1513,7 +1585,7 @@ apply_worktree() {
 }
 
 cmd_apply() {
-    local run_id="" slug="" dir="" source="" message_file="" json=false want_repo="" want_base="" outputs=${ALL_OUTPUTS}
+    local run_id="" slug="" dir="" source="" message_file="" json=false want_repo="" want_base="" outputs=${ALL_OUTPUTS} triage=false
     local run meta attempt run_url why rec item repo base workflow result summary_run commit branch files head backing managed chk verdict pr others
     while test $# -gt 0; do
         case "$1" in
@@ -1531,22 +1603,31 @@ cmd_apply() {
                 shift 2
                 ;;
             --json) json=true; shift ;;
+            --triage) triage=true; shift ;;
             -h|--help) usage; exit 0 ;;
             -*) fatal "unknown apply option: $1 (see --help)" ;;
             *) test -z "${run_id}" || fatal "apply takes one RUN"; run_id=$(parse_run "$1"); shift ;;
         esac
     done
     test -n "${run_id}" || fatal "apply requires a RUN"
-    [[ "${want_repo}" =~ ${REPO_RE} ]] || fatal "--repo OWNER/REPO is required: the repository the run's change must be for"
+    test -z "${want_repo}" || [[ "${want_repo}" =~ ${REPO_RE} ]] || fatal "--repo must be OWNER/REPO, not ${want_repo}"
+    ${triage} || test -n "${want_repo}" || fatal "--repo OWNER/REPO is required: the repository the run's change must be for"
     test -z "${want_base}" || [[ "${want_base}" =~ ${BASE_RE} ]] || fatal "--base must be a branch name, not ${want_base}"
-    [[ "${slug}" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || fatal "--slug must be a branch slug like fix-typo (the branch is bot/SLUG)"
-    test -n "${message_file}" || fatal "--message FILE is required: the commit message, why first (see upstream-pr/SKILL.md)"
-    test -r "${message_file}" || fatal "cannot read ${message_file}"
-    grep -q '[^[:space:]]' "${message_file}" || fatal "the commit message in ${message_file} is empty"
-    ! grep -qi '^Signed-off-by:' "${message_file}" ||
-        fatal "the commit message has a Signed-off-by; only the operator's own approval adds one (bot-pr promote)"
-    ! grep -qi "^${RUN_TRAILER}:" "${message_file}" ||
-        fatal "the commit message has an ${RUN_TRAILER} trailer; apply adds the run's own"
+    if ${triage}; then
+        test -z "${slug}${message_file}${dir}${source}" || fatal "--triage posts a comment and applies no change: drop --slug, --message, --dir and --source"
+        test "${outputs}" = "${ALL_OUTPUTS}" || fatal "--triage narrows the outputs to ${TRIAGE_OUTPUTS} itself; drop --outputs"
+        outputs=${TRIAGE_OUTPUTS}
+    fi
+    ${triage} || [[ "${slug}" =~ ^[a-z0-9][a-z0-9._-]*$ ]] || fatal "--slug must be a branch slug like fix-typo (the branch is bot/SLUG)"
+    if ! ${triage}; then
+        test -n "${message_file}" || fatal "--message FILE is required: the commit message, why first (see upstream-pr/SKILL.md)"
+        test -r "${message_file}" || fatal "cannot read ${message_file}"
+        grep -q '[^[:space:]]' "${message_file}" || fatal "the commit message in ${message_file} is empty"
+        ! grep -qi '^Signed-off-by:' "${message_file}" ||
+            fatal "the commit message has a Signed-off-by; only the operator's own approval adds one (bot-pr promote)"
+        ! grep -qi "^${RUN_TRAILER}:" "${message_file}" ||
+            fatal "the commit message has an ${RUN_TRAILER} trailer; apply adds the run's own"
+    fi
     branch=bot/${slug}
 
     # The run: a successful dispatch of the agent workflow, for the
@@ -1559,6 +1640,7 @@ cmd_apply() {
         --arg bot "${OP_BOT_LOGIN}" --arg operator "${OP_OPERATOR_LOGIN}" \
         "${RUN_ORIGIN_JQ}" <<<"${run}")
     test -z "${why}" || fatal "run ${run_id} ${why}; only dispatches of ${RUNS_WORKFLOW} from trusted agent branches are applied"
+    test -n "${want_repo}" || want_repo=$(jqlib -r '{run: .} | title_parts | .repo // ""' <<<"${meta}")
     test "$(jqlib -r '{run: .} | title_parts | .repo // ""' <<<"${meta}")" = "${want_repo}" ||
         fatal "run ${run_id} was dispatched for $(jqlib -r '{run: .} | title_parts | .repo // "?"' <<<"${meta}"), not ${want_repo}"
     attempt=$(jq -r .attempt <<<"${meta}")
@@ -1578,6 +1660,8 @@ cmd_apply() {
     [[ "${base}" =~ ${BASE_RE} ]] || fatal "run ${run_id}'s summary has no valid base"
     test -z "${want_base}" || test "${base}" = "${want_base}" ||
         fatal "run ${run_id}'s base is ${base}, not ${want_base}"
+    ! ${triage} || test "${workflow}" = "${TRIAGE_WORKFLOW}" ||
+        fatal "run ${run_id} is a ${workflow:-branch} run; a triage run is ${TRIAGE_WORKFLOW}"
 
     # Its outputs, as uploaded by its agent job and checked in the run by
     # gh-aw's validation, checked again here by the same code: the
@@ -1592,6 +1676,10 @@ cmd_apply() {
         fatal "run ${run_id}'s outputs are refused:
 $(jq -r '.errors[] | "  \(.)"' "${scratch}/verdict.json" 2>/dev/null)"
     verdict=$(<"${scratch}/verdict.json")
+    if ${triage}; then
+        apply_triage "${run_id}" "${run_url}" "${item}" "${verdict}" "${json}"
+        return
+    fi
     pr=$(jq -c '[.items[] | select(.type == "create_pull_request")] | first // null' <<<"${verdict}")
     others=$(jq -c '[.items[] | select(.type != "create_pull_request") | {type, text: (.message // .body // .reason // "")}]' <<<"${verdict}")
     if test "${pr}" = null; then
@@ -1689,6 +1777,102 @@ ${why}"
     jq -r '.[] | "  also handed back, not acted on: \(.type): \(.text)"' <<<"${others}"
     printf 'Review it (commit-review), then open it on the forge:\n  bot-pr fork-pr --repo %s --base %s --branch %s --item %s --from %s --title TITLE --body-file FILE\n' \
         "${want_repo}" "${base}" "${branch}" "${item:-ITEM}" "${dir}"
+}
+
+# apply_triage RUN_ID RUN_URL ITEM VERDICT JSON: the rest of apply --triage,
+# once the run's outputs passed the checker: exactly one add_comment, for
+# the issue of the board item ITEM, posted there with a footer naming the
+# run unless a comment with its marker is there already, then its block's
+# fields and outcome (lib/triage.js plans them). Prints what was done (JSON
+# with {why}, when JSON is true); fails if any of it failed.
+apply_triage() {
+    local run_id=$1 run_url=$2 item_id=$3 verdict=$4 json=$5
+    local comment board item url number issue block epic_url lc_epic epic=null posted plan args what failed=() refused=() rc=0
+    what=$(jq -r '[.items[] | select(.type != "add_comment") | .type] | unique | join(", ")' <<<"${verdict}")
+    test -z "${what}" || fatal "run ${run_id} handed back ${what}; a triage run's one output is an add_comment"
+    test "$(jq '.items | length' <<<"${verdict}")" -eq 1 ||
+        fatal "run ${run_id} handed back $(jq '.items | length' <<<"${verdict}") add_comment outputs; a triage run's is one"
+    comment=$(jq -c '.items[0]' <<<"${verdict}")
+    board=$("${BOT_BOARD}" list --json) || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || fatal "listing the board failed"
+    item=$(jq -c --arg id "${item_id}" 'map(select(.id == $id)) | first // null' <<<"${board}")
+    test "${item}" != null || fatal "run ${run_id}'s item ${item_id} is not on the board"
+    # The board says which item a run is for: its Run while it is applied,
+    # its Why after (and for a retry). The run's own files don't decide
+    # where the bot comments.
+    jq -e --arg re "/actions/runs/${run_id}([^0-9]|\$)" '[.run, .why] | map(strings | test($re)) | any' <<<"${item}" >/dev/null ||
+        fatal "run ${run_id}'s item ${item_id} doesn't name the run in its ${RUN_FIELD} or Why: its comment is posted only on the issue it was dispatched for"
+    url=$(jq -r '.content.url // ""' <<<"${item}")
+    number=${url##*/}
+    if test "${url,,}" != "https://github.com/${OP_TRACKER_REPO,,}/issues/${number}" || ! [[ "${number}" =~ ^[0-9]+$ ]]; then
+        fatal "run ${run_id}'s item ${item_id} is ${url:-a draft}, not an issue of ${OP_TRACKER_REPO}: a triage comment goes only there"
+    fi
+    issue=$(rest_get "repos/${OP_TRACKER_REPO}/issues/${number}") || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || fatal "reading ${url} failed"
+    issue=$(jq -c '{number, id, author: .user.login, body: (.body // ""), state,
+        labels: [.labels[]?.name], assignees: [.assignees[]?.login]}' <<<"${issue}")
+    block=$(jq -r .body <<<"${comment}" | node "${TRIAGE_JS}" block)
+    epic_url=$(jq -r '.block.epic // ""' <<<"${block}")
+    lc_epic=${epic_url,,}
+    if test "${lc_epic%/issues/*}" = "https://github.com/${OP_TRACKER_REPO,,}"; then
+        rc=0
+        epic=$(rest_get "repos/${OP_TRACKER_REPO}/issues/${epic_url##*/}") || rc=$?
+        pass_ratelimit "${rc}"
+        if test "${rc}" -eq 0; then
+            epic=$(jq -c '{url: .html_url, state, labels: [.labels[]?.name]}' <<<"${epic}")
+        else
+            epic=null
+        fi
+    fi
+    rc=0
+    posted=$(ghapi --paginate "repos/${OP_TRACKER_REPO}/issues/${number}/comments?per_page=${PER_PAGE}" \
+        --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and (.body | contains(\"<!-- triage-run ${run_id} -->\"))) | .id") || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || fatal "reading the comments of ${url} failed"
+    plan=$(jq -nc --argjson id "${run_id}" --arg url "${run_url}" --argjson comment "${comment}" --argjson item "${item}" \
+        --argjson issue "${issue}" --argjson epic "${epic}" --arg posted "${posted}" \
+        '{run: {id: $id, url: $url}, comment: $comment, item: $item, issue: $issue, epic: $epic, posted: ($posted != "")}' |
+        node "${TRIAGE_JS}" plan) || fatal "planning the triage of ${url} failed"
+    jq -e '.errors | length == 0' <<<"${plan}" >/dev/null ||
+        fatal "run ${run_id}'s comment is refused:
+$(jq -r '.errors[] | "  \(.)"' <<<"${plan}")"
+    if jq -e .post <<<"${plan}" >/dev/null; then
+        rc=0
+        jq -c '{body}' <<<"${plan}" | ghapi -X POST "repos/${OP_TRACKER_REPO}/issues/${number}/comments" --input - >/dev/null || rc=$?
+        pass_ratelimit "${rc}"
+        test "${rc}" -eq 0 || fatal "posting run ${run_id}'s comment on ${url} failed"
+    fi
+    mapfile -t args < <(jq -r '.set[]' <<<"${plan}")
+    if test "${#args[@]}" -gt 0 && ! "${BOT_BOARD}" set "${item_id}" "${args[@]}" >/dev/null; then
+        failed+=("the board fields")
+    fi
+    while IFS= read -r what; do
+        test -n "${what}" || continue
+        mapfile -d '' -t args < <(jq -j --arg w "${what}" '.calls[] | select(.what == $w) | .args[] | . + "\u0000"' <<<"${plan}")
+        ghapi "${args[@]}" >/dev/null && continue
+        # GitHub refuses a second parent: the issue is already filed elsewhere.
+        if [[ "${what}" == "file under "* ]] && grep -q 'HTTP 422' "${scratch}/err"; then
+            refused+=("${what} (HTTP 422: it may have a parent already)")
+        else
+            failed+=("${what}")
+        fi
+    done < <(jq -r '.calls[].what' <<<"${plan}")
+    plan=$(jq -c --arg failed "$(IFS=,; echo "${failed[*]}")" --arg refused "$(IFS=,; echo "${refused[*]}")" --argjson max "${WHY_MAX}" \
+        'if $refused == "" then . else .notes += ["not \($refused)"] | .why += "; not \($refused)" end
+        | if $failed == "" then . else .why += "; FAILED: \($failed)" end | .why |= .[:$max]' <<<"${plan}")
+    if ${json}; then
+        jq --argjson run "${run_id}" --arg url "${run_url}" --arg item "${item_id}" --arg issue "${url}" \
+            '{run_id: $run, run_url: $url, item: $item, issue: $issue, posted: .post, set, calls: [.calls[].what], notes, why}' <<<"${plan}"
+    else
+        printf 'Triage run %s: %s comment on %s.\n' "${run_id}" "$(jq -r 'if .post then "posted its" else "already posted its" end' <<<"${plan}")" "${url}"
+        jq -r '.why' <<<"${plan}"
+    fi
+    if test "${#failed[@]}" -gt 0; then
+        warn "applying the triage of ${url} failed for: ${failed[*]}"
+        return 1
+    fi
 }
 
 # --- main ---------------------------------------------------------------------
