@@ -163,9 +163,11 @@ test("the dispatch rule: each pool's pace holds only its own engine", () => {
     ["claude used up: the free slots go remote up to the run limit, past the share (4 agents: 1)", [h(), up()], pools(exhausted, pool()), both],
     ["claude used up: the run limit still holds", [h(), up(), busyRun("bootc-dev/bootc")], pools(exhausted, pool()), [both[0]]],
     ["claude within its pace: the share (4 agents: 1 run)", [h(), up()], {}, [both[0]]],
-    ["openai over its pace, claude within it: no run", [h()], pools(pool(), pool(OVER)), []],
+    ["openai over its pace, claude on its own: no run", [h()], pools(pool({ ahead: 0 }), pool(OVER)), []],
     ["openai over its pace, no claude reading: no run", [h()], pools(null, pool(OVER)), []],
-    ["openai over its pace: an urgent issue goes", [h({ title: "plain" }), h({ title: "now", labels: ["dispatch", "urgent"], priority: "P2" })], pools(pool(), pool(OVER)), [both[0]], "now"],
+    ["openai over its pace: an urgent issue goes", [h({ title: "plain" }), h({ title: "now", labels: ["dispatch", "urgent"], priority: "P2" })], pools(pool({ ahead: 0 }), pool(OVER)), [both[0]], "now"],
+    ["openai over its pace, claude behind its own: a claude run", [h()], pools(pool(), pool(OVER)), [both[0]]],
+    ["openai over, claude behind: claude's pace pays for one run", [h(), up()], { ...eight, ...pools(pool({ cost: { points_per_run: 10 }, fits: 1 }), pool(OVER)) }, [both[0]]],
     ["both over their pace: only the urgent one, within the run limit", [h({ labels: ["dispatch", "urgent"] }), up()], pools(exhausted, pool(OVER)), [both[0]]],
     ["no reading at all: unpaced", [h()], { capacity: undefined }, [both[0]]],
     ["the pace pays for one run at the observed cost: the second waits", [h(), up()], { ...eight, ...pools(pool(), pool({ cost: { points_per_run: 10 }, fits: 1 })) }, [both[0]]],
@@ -178,6 +180,12 @@ test("the dispatch rule: each pool's pace holds only its own engine", () => {
     assert.deepEqual(got.map((a) => [a.dispatch.lane, a.dispatch.repo]), want, name);
     if (title) assert.equal(got[0].dispatch.title, title, name);
   }
+  // The run's agent: claude only while its pool is behind and openai's ahead.
+  const agents = (changes) => dispatched([h()], changes).map((a) => [a.dispatch.agent, / as an? (\w+) run on /.exec(a.do)[1]]);
+  assert.deepEqual(agents(pools(pool(), pool(OVER))), [["claude", "claude"]]);
+  assert.deepEqual(agents(pools(pool(), pool({ ahead: 1 }))), [["claude", "claude"]]);
+  assert.deepEqual(agents(pools(pool(), pool())), [["opencode", "opencode"]]);
+  assert.deepEqual(agents(pools(exhausted, pool())), [["opencode", "opencode"]]);
   // The local workers are the other way around: see the capacity rule's cases in reconcile.test.js.
   assert.deepEqual(rec.holds(obs([], pools(exhausted, pool()))), { claude: exhausted, opencode: null });
   assert.deepEqual(rec.holds(obs([], pools(null, pool(OVER)))), { claude: null, opencode: pool(OVER) });
@@ -209,11 +217,11 @@ test("escalate: open issues labeled for the coordinator", () => {
   assert.deepEqual(rec.escalate({ ...obs([]), items: undefined }), []);
 });
 
-test("observed: the opencode share of the mix", () => {
+test("observed: the remote share of the mix", () => {
   const items = [busyRun("bootc-dev/bootc"), busyRun("bootc-dev/bootc"), busyLocal("cgwalters-bot/homegit")];
   const o = rec.observed(obs(items));
   assert.deepEqual([o.busy, o.remote, o.remote_target, o.local], [3, 2, 1, 1]);
-  assert.match(rec.render(o, []), /; 2 remote \(opencode share target 1, over it, limit 2\), 1 local\)/);
+  assert.match(rec.render(o, []), /; 2 remote \(share target 1, over it, limit 2\), 1 local\)/);
   const half = rec.observed(obs(items, { config: operator.resolve({ pacing: { opencode_share: 0.5 } }) }));
   assert.equal(half.remote_target, 2);
 });
@@ -257,7 +265,7 @@ test("bot-reconcile --apply dispatches: consumes the label, runs bot-runs with t
   const r = apply();
   assert.equal(r.status, 0, r.stderr);
   const n = r.url.split("/").pop();
-  assert.deepEqual(r.log, [`gh api -X DELETE repos/cgwalters-bot/homegit/issues/${n}/labels/dispatch`, "bot-runs dispatch --item PVTI_apply --repo cgwalters-bot/homegit --base main -"]);
+  assert.deepEqual(r.log, [`gh api -X DELETE repos/cgwalters-bot/homegit/issues/${n}/labels/dispatch`, "bot-runs dispatch --item PVTI_apply --repo cgwalters-bot/homegit --base main --agent opencode -"]);
   assert.match(r.stdout, /\(dispatched\)/);
   const brief = fs.readFileSync(path.join(TMP, "brief"), "utf8");
   assert.ok(brief.startsWith("Task: Fix X\n"));
@@ -265,7 +273,7 @@ test("bot-reconcile --apply dispatches: consumes the label, runs bot-runs with t
 });
 
 test("bot-reconcile --apply: refusals and failures leave Why, a rate limit leaves the label", () => {
-  const RUNS = "bot-runs dispatch --item PVTI_apply --repo cgwalters-bot/homegit --base main -";
+  const RUNS = "bot-runs dispatch --item PVTI_apply --repo cgwalters-bot/homegit --base main --agent opencode -";
   const label = (n, verb) => (verb === "DELETE" ? `gh api -X DELETE repos/cgwalters-bot/homegit/issues/${n}/labels/dispatch` : `gh api -X POST repos/cgwalters-bot/homegit/issues/${n}/labels -f labels[]=dispatch`);
   // [case, options, exit status, the calls before the board's, the Why (null: none set)]
   const cases = [

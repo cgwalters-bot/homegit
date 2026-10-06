@@ -19,6 +19,13 @@ const operator = require(path.join(__dirname, "..", "lib", "operator.js"));
 const PROG = path.basename(process.argv[1] || "bot-capacity");
 const COST = process.env.BOT_CAPACITY_COST || path.join(__dirname, "bot-cost");
 const BOARD = process.env.BOT_CAPACITY_BOARD || path.join(__dirname, "bot-board");
+// The heartbeat's workers say which agent each devspace run is (bot-runs
+// dispatch registers them): first its last local input, which keeps the
+// workers on items in private repositories that publishing leaves out,
+// then the published heartbeat, for runs dispatched elsewhere.
+const HEARTBEAT = process.env.BOT_CAPACITY_HEARTBEAT || path.join(__dirname, "bot-heartbeat");
+const HEARTBEAT_INPUT = process.env.BOT_CAPACITY_HEARTBEAT_INPUT
+  || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state"), "bot-heartbeat", "last-publish.json");
 // What `bot-heartbeat statusline` saves of Claude Code's rate_limits.
 const RATE_FILE = process.env.BOT_CAPACITY_RATE_FILE
   || path.join(process.env.XDG_CACHE_HOME || path.join(os.homedir(), ".cache"), "bot-heartbeat", "rate-limits.json");
@@ -66,9 +73,10 @@ the pace allows target * elapsed / window, plus pacing.pools.NAME.burst
 percent points (3) so that work can start right after a reset, and never
 more than the target. A pool whose usage is above that holds new work
 routed to it, and only that:
-claude (local workers, the apply and review steps) is read from the
-seven_day window \`bot-heartbeat statusline\` saves, until that window
-resets; openai (devspace runs, which run opencode) from the praxis
+claude (local workers, the apply and review steps, devspace runs of
+claude) is read from the seven_day window \`bot-heartbeat statusline\`
+saves, until that window resets; openai (devspace runs of opencode, the
+agent of a run the heartbeat doesn't name) from the praxis
 broker's /usage (\$${PRAXIS_ENV}: a URL or a file, by default the broker
 of ${OPENCODE_CONFIG.replace(os.homedir(), "~")}). A shorter window that is used up
 holds its pool too. A pool without a reading isn't paced: only the agent
@@ -88,6 +96,26 @@ token; a bucket counts as ${cap.BUCKETS.map((b) => `${b.key} ${b.expected / 1e3}
 }
 
 const run = (cmd, args) => execFileSync(cmd, args, { encoding: "utf8", maxBuffer: MAX_BUFFER, stdio: ["ignore", "pipe", "inherit"] });
+
+// readRunAgents(runs): {run id: agent} of the heartbeat's devspace runs
+// (pools.runAgents): the local input's, and the published heartbeat's
+// when that doesn't name every one of runs (their Run URLs). A run
+// neither names counts as pools.DEFAULT_RUN_AGENT.
+function readRunAgents(runs) {
+  let agents = {};
+  try {
+    agents = pools.runAgents(JSON.parse(fs.readFileSync(HEARTBEAT_INPUT, "utf8")).input.workers);
+  } catch (e) {
+    if (e.code !== "ENOENT") warn(`ignoring ${HEARTBEAT_INPUT}: ${e.message}`);
+  }
+  if (runs.every((r) => agents[pools.runId(r)])) return agents;
+  try {
+    return { ...pools.runAgents(JSON.parse(run(HEARTBEAT, ["show"])).workers), ...agents };
+  } catch (e) {
+    warn(`cannot read the runs' agents from the heartbeat (counting the unknown ones as ${pools.DEFAULT_RUN_AGENT}): ${e.message.split("\n")[0]}`);
+    return agents;
+  }
+}
 
 // readRate(now): {usedPercent, resetsAt (ms)} of the saved seven_day
 // window, or null if missing, stale, malformed or already reset.
@@ -187,11 +215,12 @@ function writeState(state) {
   }
 }
 
-// poolReport(readings, items, config, now): {POOL: its pace (poolPace) with
-// what a run costs it (cost) and how many more fit (fits), or null without
-// a reading}, updating the cost records with this reading and the busy
-// items (a devspace run by its Run, a local worker by its item).
-function poolReport(readings, items, config, now) {
+// poolReport(readings, items, config, now, agents): {POOL: its pace
+// (poolPace) with what a run costs it (cost) and how many more fit (fits),
+// or null without a reading}, updating the cost records with this reading
+// and the busy items (a devspace run by its Run, on the pool of its agent
+// in agents (pools.runAgents), a local worker by its item).
+function poolReport(readings, items, config, now, agents = {}) {
   const busy = items.filter(pace.isActive);
   const state = readState();
   const out = {};
@@ -202,7 +231,7 @@ function poolReport(readings, items, config, now) {
       out[name] = null;
       continue;
     }
-    const runs = busy.filter((it) => pools.engineOf(it) === engine).map((it) => it.run || it.id);
+    const runs = busy.filter((it) => pools.engineOf(it, agents) === engine).map((it) => it.run || it.id);
     state[name] = pools.trackCost(state[name], { resets_at: Date.parse(p.resets_at), used_percent: p.used_percent, runs, ...reading.counters });
     const cost = pools.costOf(state[name]);
     out[name] = { ...p, cost, fits: pools.runsThatFit(p, cost) };
@@ -276,7 +305,8 @@ async function main(argv) {
   const claude = claudeReading();
   // The Claude pool's tokens: this week's, when its window is the one summed.
   if (claude && rate) claude.counters = { epoch: rate.resetsAt, tokens: weekTokens };
-  report.pools = poolReport({ claude, openai: await openaiReading() }, items, operator.loadOrExit(PROG), now);
+  report.pools = poolReport({ claude, openai: await openaiReading() }, items, operator.loadOrExit(PROG), now,
+    readRunAgents(items.filter((it) => pace.isActive(it) && it.run).map((it) => it.run)));
   process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : render(report, now));
   return 0;
 }

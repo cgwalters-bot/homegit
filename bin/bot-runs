@@ -80,6 +80,11 @@ readonly MAX_TIMEOUT=330
 # the workflow's own defaults unless dispatch is given them.
 readonly DEFAULT_TIMEOUT=75
 readonly DEFAULT_BUDGET=500
+# A claude run's AIC are api-equivalent: its subscription tokens at API
+# rates, where 500 (about \$5) is less than an Opus run of any size costs,
+# and the budget would stop every one; this lets a run of the default
+# timeout finish, and still stops a runaway.
+readonly DEFAULT_CLAUDE_BUDGET=5000
 # The output types a run may hand back (agent.yml's outputs input, checked
 # against its static allowlist) and how many: a branch run proposes a pull
 # request, an analysis run has no change to propose.
@@ -142,7 +147,7 @@ Commands:
       item a token budget ('bot-pace budget ITEM', unless it has one).
       Defaults: base main, agent ${DEFAULT_AGENT} (model ${DEFAULT_OPENCODE_MODEL}, as
       provider/model; BOT_RUNS_MODEL or --model changes it), 4 cores, ${DEFAULT_TIMEOUT} minutes,
-      budget ${DEFAULT_BUDGET} AIC, workflow branch, outputs create_pull_request,noop,missing_tool
+      budget ${DEFAULT_BUDGET} AIC (${DEFAULT_CLAUDE_BUDGET} for claude, whose AIC are api-equivalent), workflow branch, outputs create_pull_request,noop,missing_tool
       (an analysis run: noop,missing_tool,missing_data), at most ${DEFAULT_MAX_OUTPUTS} of them: the
       run refuses types and numbers its static allowlist doesn't have,
       before it starts. --max-requests and --max-tasks cap the run's model
@@ -656,7 +661,7 @@ require_public_repo() {
 
 cmd_dispatch() {
     local item="" repo="" base=main agent=${DEFAULT_AGENT} model="" cores=4 timeout=${DEFAULT_TIMEOUT}
-    local budget=${DEFAULT_BUDGET} workflow=branch brief_file="" dry_run=false json=false preamble=true
+    local budget="" workflow=branch brief_file="" dry_run=false json=false preamble=true
     local outputs="" max_outputs=${DEFAULT_MAX_OUTPUTS} max_requests="" max_tasks=""
     local inputs body len resp rc=0
     while test $# -gt 0; do
@@ -689,6 +694,9 @@ cmd_dispatch() {
     [[ "${max_outputs}" =~ ^[1-9][0-9]?$ ]] || fatal "--max-outputs must be a number, not ${max_outputs}"
     if ! [[ "${timeout}" =~ ^[0-9]+$ ]] || test "${timeout}" -lt 1 || test "${timeout}" -gt "${MAX_TIMEOUT}"; then
         fatal "--timeout must be 1 to ${MAX_TIMEOUT} minutes (the job's cap is 360)"
+    fi
+    if test -z "${budget}"; then
+        if test "${agent}" = claude; then budget=${DEFAULT_CLAUDE_BUDGET}; else budget=${DEFAULT_BUDGET}; fi
     fi
     if ! [[ "${budget}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || ! jq -e --argjson b "${budget}" -n '$b > 0' >/dev/null; then
         fatal "--budget must be a positive number of AIC"

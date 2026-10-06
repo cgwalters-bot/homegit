@@ -217,7 +217,12 @@ test("bot-capacity paces each pool on its own reading", () => {
   const state = path.join(TMP, "pools.json");
   const board = path.join(TMP, "pools-board.json");
   const fakeItems = fake("pools-board", `cat ${board}`);
-  const env = { ...process.env, BOT_CAPACITY_COST: fakeCost, BOT_CAPACITY_BOARD: fakeItems, BOT_CAPACITY_RATE_FILE: rate, BOT_CAPACITY_PRAXIS_USAGE: praxis, BOT_CAPACITY_STATE: state,
+  const heartbeat = path.join(TMP, "pools-heartbeat.json");
+  const input = path.join(TMP, "pools-last-publish.json");
+  const shows = path.join(TMP, "pools-heartbeat-shows.log");
+  fs.writeFileSync(heartbeat, JSON.stringify({ workers: [] }));
+  const env = { ...process.env, BOT_CAPACITY_COST: fakeCost, BOT_CAPACITY_BOARD: fakeItems, BOT_CAPACITY_HEARTBEAT: fake("pools-heartbeat", `echo "$@" >>${shows}; cat ${heartbeat}`),
+    BOT_CAPACITY_HEARTBEAT_INPUT: input, BOT_CAPACITY_RATE_FILE: rate, BOT_CAPACITY_PRAXIS_USAGE: praxis, BOT_CAPACITY_STATE: state,
     BOT_OPERATOR_CONFIG: OPERATOR_CONFIG, TZ: "UTC" };
   const sec = (ms) => Math.round(ms / 1e3);
   // What the broker answers: its codex week, read `age` before `at`, and its request count.
@@ -294,6 +299,24 @@ test("bot-capacity paces each pool on its own reading", () => {
   assert.equal(p.openai.fits, 2);
   assert.match(run(t(63), []), /^  openai 24% \(resets \w+ \d\d:\d\d\); 95% by the reset, burst 3; a run costs 10\.0 points \(200 requests\) over 2 runs this window, 2 more fit$/m);
   assert.deepEqual(JSON.parse(fs.readFileSync(state, "utf8")).pools.openai.runs, [remote(1).run, remote(2).run]);
+  // A run of claude (as bot-runs dispatch registers it) is the claude pool's, not openai's: as the
+  // published heartbeat names it, or the local input (which keeps a private item's), without asking
+  // for the published one when that names every run.
+  const worker = (n, engine) => ({ name: `run-${n}`, item_url: `https://github.com/o/r/issues/${n}`, location: "remote", engine });
+  fs.writeFileSync(heartbeat, JSON.stringify({ workers: [worker(3, "claude")] }));
+  claude(t(64), 50, DAY);
+  items([remote(3)]);
+  usage(t(64), 24, 64 * 3600e3, 1400);
+  run(t(64));
+  let saved = JSON.parse(fs.readFileSync(state, "utf8")).pools;
+  assert.deepEqual([saved.claude.runs, saved.openai.runs], [[remote(3).run], [remote(1).run, remote(2).run]]);
+  fs.writeFileSync(input, JSON.stringify({ session: null, published: {}, input: { workers: [worker(4, "claude"), worker(5, "fake")] } }));
+  fs.rmSync(shows, { force: true });
+  items([remote(4), remote(5)]);
+  run(t(64));
+  saved = JSON.parse(fs.readFileSync(state, "utf8")).pools;
+  assert.deepEqual([saved.claude.runs, saved.openai.runs], [[remote(3).run, remote(4).run], [remote(1).run, remote(2).run]]);
+  assert.ok(!fs.existsSync(shows), "asked for the published heartbeat");
 });
 
 test("bot-cost attributes a transcript to its Item: marker, with fresh tokens", () => {

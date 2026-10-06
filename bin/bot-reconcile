@@ -95,21 +95,25 @@ Rules (${rules}):
                     on its own (bot-capacity): one over its pace holds only
                     the new work of its engine, claude's the local workers,
                     openai's the devspace runs, and the action names the
-                    engine left; with both over, only items labeled
+                    engine left (a held openai pool leaves devspace runs
+                    open while claude takes them, see dispatch); with both
+                    over, only items labeled
                     '${pools.URGENT_LABEL}' (in the bot's own repositories) are candidates. A pool without a reading
                     holds nothing. A busy task whose Actual tokens passed
                     its Budget tokens is a 'budget' action.
   dispatch          auto-dispatch: a lane with a free slot, while the remote
                     runs are under their share of the agents (pacing.opencode_share,
-                    1 in 4 by default: agent.yml runs only opencode; never
-                    more than pacing.opencode_runs at once, which is the
-                    limit while the claude pool is held) and the openai
-                    pool is within its pace (each dispatch charged what a
-                    run was observed to cost; '${pools.URGENT_LABEL}'-labeled issues
-                    go anyway; the claude pool's pace holds nothing here),
-                    gets its top Todo issue labeled '${disp.DISPATCH_LABEL}' (the opt-in, on
+                    1 in 4 by default; never more than pacing.opencode_runs
+                    at once, which is the limit while the claude pool is
+                    held) and the pool of the run's agent is within its
+                    pace (each dispatch charged what a run was observed to
+                    cost; '${pools.URGENT_LABEL}'-labeled issues go anyway), gets its
+                    top Todo issue labeled '${disp.DISPATCH_LABEL}' (the opt-in, on
                     issues in the bot's own repositories) as one
-                    'bot-runs dispatch'. The target is its repository, else a
+                    'bot-runs dispatch'. Its agent is opencode (the openai
+                    pool), or claude (with bot-runs' default budget for it)
+                    while the claude pool is behind its pace and the openai
+                    one is held or ahead of its own. The target is its repository, else a
                     'Repo: OWNER/REPO' line in the issue body (and an optional
                     'Base: REF'). --apply builds the brief from the issue: its
                     title, body, the operator's comments and its acceptance
@@ -431,7 +435,8 @@ const NOT_FOUND_RE = /HTTP 404|Not Found/;
 // its live text, consumes its label (so that a run that fails and returns
 // the item to Todo isn't dispatched again unlabeled; a label already gone
 // means another run of this took it), and runs bot-runs dispatch with the
-// brief built from the issue. Throws Error with the reason; err.deferred
+// brief built from the issue, on the agent the pools' pace chose (whose
+// default budget bot-runs picks). Throws Error with the reason; err.deferred
 // when only a rate limit stopped it before any run started (the label is
 // back), err.skipped when someone else took the label.
 async function dispatchOne(a, opts, config) {
@@ -450,7 +455,7 @@ async function dispatchOne(a, opts, config) {
     err.skipped = true;
     throw err;
   }
-  const p = execFileP(tool("bot-runs"), ["dispatch", "--item", d.id, "--repo", live.repo, "--base", live.base, "-"], { maxBuffer: MAX_BUFFER });
+  const p = execFileP(tool("bot-runs"), ["dispatch", "--item", d.id, "--repo", live.repo, "--base", live.base, "--agent", d.agent || pools.DEFAULT_RUN_AGENT, "-"], { maxBuffer: MAX_BUFFER });
   p.child.stdin.end(brief);
   try {
     await p;
