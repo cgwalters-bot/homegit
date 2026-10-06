@@ -166,6 +166,21 @@ to provide observations. Stop kills the unit's cgroup, including jobs it
 started; restart recovers their terminal/lost state. Service installation
 and live enabling are operator steps, not part of checkout-only changes.
 
+Neither unit may own the toolbox container. A container started from a
+systemd unit keeps its conmon in that unit's cgroup, so if `bot-supervisor.service` (or
+`bot-sweep.service`) were first to run `toolbox run` after a boot,
+stopping it would kill the container, the coordinator's session and
+every job in it; that took the coordinator down on 2026-10-06. Both
+therefore start a stopped container themselves, with `podman start` in
+a transient `bot-toolbox-NAME.scope` (`systemd-run --user --scope`), and
+refuse to run, saying so in the journal, while its conmon is in their
+own cgroup. Remove any local `KillMode=process` drop-in for
+`bot-supervisor.service` once this is installed: it is no longer needed
+and leaks the unit's `toolbox run` child on restart. Even so, never
+restart or stop these units from inside the toolbox without first
+checking with `systemd-cgls --user` that the container's conmon is in
+its own scope (or a login session's), not under the unit.
+
 ## The workflow
 
 Triggers, one workflow where it can be, because every trigger means the

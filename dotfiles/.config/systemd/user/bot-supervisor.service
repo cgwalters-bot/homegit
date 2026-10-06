@@ -3,6 +3,10 @@
 # prefix of the token file):
 #   BOT_SUPERVISOR_TOOLBOX=NAME           run inside that toolbox
 #   BOT_SUPERVISOR_GH_TOKEN_FILE=~/PATH   the bot's existing gh token file
+# The toolbox container is started in its own bot-toolbox-NAME.scope,
+# never in this unit's cgroup (see homegit's lib/toolbox.js): stopping
+# this unit must not kill it. Check 'systemd-cgls --user' before
+# restarting this unit from inside the toolbox.
 [Unit]
 Description=Deterministic bot controller with short Sonnet dispatcher jobs
 
