@@ -52,8 +52,8 @@ following an already completed job, `wait` exits 0 when it succeeded,
 1 failed, 3 timed out, 4 killed or lost, 5 incomplete, and prints the final
 report on stdout; `bot-claude status`, `log`
 and `kill` look in and stop it. Jobs run Opus by default and call the
-Sonnet `sonnet-worker` subagent for cheap steps; pass `--model sonnet`
-for mechanical apply workers and reviewers of small changes. A failed
+Sonnet `sonnet-worker` subagent for mechanical steps. Apply workers and
+reviewers judge a change, so they run on the default model, never Sonnet. A failed
 job is read (`bin/bot-claude log JOB`) before it is started again; the
 same job failing twice is an escalation.
 
@@ -85,7 +85,7 @@ Mechanical, do it:
   is plain (an issue body, a label), clear its Why once to retry
   (`bin/bot-board set ITEM --why ""`, relabel). A second failure of the
   same item: escalate.
-- `patch-ready`: when the action says to, start a Sonnet worker (`bin/bot-claude start --model sonnet --dir WT --item ITEM --job apply-RUN BRIEF`) on `coordinator/apply-preamble.md`, with `Item:` and `Run:` lines in the brief. It reads the run, applies the patch, opens or updates
+- `patch-ready`: when the action says to, start a worker on the default model (`bin/bot-claude start --dir WT --item ITEM --job apply-RUN BRIEF`) on `coordinator/apply-preamble.md`, with `Item:` and `Run:` lines in the brief. It reads the run, applies the patch, opens or updates
   the draft PR (a fork PR, or a homegit PR via `bot-land --no-auto
   --no-review`), and never merges. Then the review step below.
 - `approval`: the sweep already ran `bot-pr promote` and told the
@@ -125,7 +125,7 @@ Mechanical, do it:
 ## Reviews and merges
 
 A result is never reviewed by the worker that wrote it. For each PR a
-worker or the apply step opened, start a Sonnet reviewer (`bin/bot-claude start --model sonnet --dir WT --item ITEM --job review-N BRIEF`, WT a worktree at the PR head) on `coordinator/reviewer-preamble.md` with the `Item:` line in the brief; its report (`bot-claude wait`'s stdout) must start with `Verdict:`. Then, by where the PR is:
+worker or the apply step opened, start a reviewer on the default model (`bin/bot-claude start --dir WT --item ITEM --job review-N BRIEF`, WT a worktree at the PR head) on `coordinator/reviewer-preamble.md` with the `Item:` line in the brief; its report (`bot-claude wait`'s stdout) must start with `Verdict:`. Then, by where the PR is:
 
 - **homegit and the bot's other harness repositories, and the devspace
   sandbox stack:** on `Verdict: APPROVE` of the PR's current head and
