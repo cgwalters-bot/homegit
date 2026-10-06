@@ -116,6 +116,16 @@ of the bot's repositories whose issues are on the board): `dispatch`, which
 opts an issue in to `bot-reconcile`'s auto-dispatch of a devspace run, and
 `escalate`, which marks an issue the dispatcher filed for the coordinator.
 
+Assignees say whose turn an issue or PR in the forge org, the bot's
+repositories or the tracker is (the `workstream` skill's "Whose turn"):
+the bot assigns the operator each time something waits on them, and
+assigns itself when they act. GitHub emails and notifies the operator on
+each of those assignments; that is the point, but they can route them
+in their notification settings (assignments come with the reason
+`assign`). Both must be assignable in each of those repositories, as
+members of the forge org or collaborators; `bot-board assign` says so
+when GitHub drops an assignee.
+
 The views in the `workstream` skill are optional; the Projects API can't
 create them, so they are made by hand.
 

@@ -252,9 +252,10 @@ function decision(repo, pr) {
   return { state, sha };
 }
 
-// requestReview(repo, pr, head): request OPERATOR's review of PR, unless
-// they already approved HEAD, or requested changes on it (the bot's turn:
-// a request would put either back in their queue).
+// requestReview(repo, pr, head): request OPERATOR's review of PR and
+// assign it to them, unless they already approved HEAD, or requested
+// changes on it (the bot's turn: a request would put either back in
+// their queue).
 function requestReview(repo, pr, head) {
   const d = decision(repo, pr);
   if (d && d.sha === head && d.state !== "DISMISSED") {
@@ -274,6 +275,13 @@ function requestReview(repo, pr, head) {
     );
   }
   log(`requested ${OPERATOR_S} review of ${pr.html_url}`);
+  // Assigned, it is their turn: it waits on them until they act on it.
+  try {
+    run(BOT_BOARD, ["assign", pr.html_url, "operator"], `assign ${pr.html_url} to ${OPERATOR}`);
+  } catch (e) {
+    if (!(e instanceof Exit)) throw e;
+    log(`warning: ${e.message}; assign it by hand: bot-board assign ${pr.html_url} operator`);
+  }
 }
 
 function shellQuote(s) {

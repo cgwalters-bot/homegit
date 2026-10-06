@@ -348,6 +348,7 @@ test("--apply says once on the fork PR why an approval promoted nothing, and wha
     assert.match(n.body, /\n\nGenerated-by: https:\/\/github\.com\/cgwalters\/#llms\n<!-- bot-promote-due notice=[0-9a-f]{16} -->\n$/, c.name);
     assert.equal(byUrl[prUrl(c)].notice, n.html_url, c.name);
     assert.ok(r.calls.some((l) => l.startsWith(`bot-board set ${itemOf(c)} --news not promoted: `)), `${c.name}:\n${r.calls.join("\n")}`);
+    assert.equal(r.calls.includes(`bot-board assign ${prUrl(c)} operator`), c.result === "needs-text", `${c.name}:\n${r.calls.join("\n")}`);
   }
   assert.ok(Object.values(byUrl).filter((x) => x.result === "promoted").every((x) => x.notice === null));
   // Nothing new: nothing is said again, by --apply or anything else.

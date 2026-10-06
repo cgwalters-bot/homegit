@@ -101,6 +101,59 @@ review app (cgwalters-forge/review) is the UI over this same view.
   the review makes it Needs human.
 - Set Priority, so the view's order is their reading order.
 
+### Whose turn: assignees
+
+GitHub's assignee field says whose turn an issue or PR is, one fact kept
+on the forge: **assigned to cgwalters** it waits on them; **assigned to
+cgwalters-bot** it is the bot's turn (an agent or run is, or should be,
+on it); **unassigned** it is nobody's (backlog, parked or done). So the
+operator's decisions are one search,
+`is:open assignee:cgwalters org:cgwalters-forge user:cgwalters-bot`
+(the tracker is in the forge org), ranked by Priority, and the bot's
+work in progress is the same with `assignee:cgwalters-bot`, joined with
+the running jobs. Set it with `bot-board assign ITEM operator|bot|none`,
+which changes only those two logins (anyone else assigned stays):
+
+- **The bot assigns the operator exactly when it creates an ask**:
+  `bot-board question` assigns the question; `bot-land --no-auto`
+  assigns the PR whose review it requests; `bot-promote-due` assigns an
+  approved fork PR that needs their text. For a forge draft PR ready for
+  their review, or an escalation on an item, run
+  `bot-board assign URL operator` yourself, alongside the review request
+  or the Why. Never assign them anything that doesn't wait on them.
+  Asking again on an item still assigned to them that they acted on
+  since (the hand-back hasn't run yet) assigns them anew, one more
+  notification: the hand-back counts from the assignment, and would
+  otherwise take the new ask for answered.
+- **Their action hands it back, deterministically**: every sweep runs
+  `bot-board handback --apply`, which assigns cgwalters-bot instead of
+  cgwalters on every open item assigned to them that they commented on,
+  reviewed or approved since they were assigned (an answer to a
+  question is a comment). The bot's own comments and anyone else's
+  change nothing. The event still reaches the dispatcher as before; the
+  sweep's report repeats each "Handed back:" line. Closed and merged
+  items assigned to either are unassigned.
+- **Claiming and parking**: `bot-board assign ITEM bot` when work starts
+  on an item, `none` when it is parked or back in the backlog.
+- **Upstream is never assigned**: only issues and PRs in cgwalters-forge,
+  cgwalters-bot's repositories and the tracker carry the turn (an upstream
+  assignment would notify its maintainers, and needs triage rights the
+  bot mostly lacks). `bot-board assign` on an upstream issue or PR
+  assigns the tracker issues whose board item has it in its Branch, and
+  hand-back reads the operator's comments and reviews on those Branch PRs
+  too. With no such tracker issue it refuses: open one (`bot-board
+  issue`) with the PR in its Branch.
+- **Notifications**: GitHub emails and notifies the assignee on every
+  assignment (not on unassignment), so each ask is one notification to
+  the operator, and none comes from hand-back. Assigning cgwalters-bot
+  notifies nobody, since the bot makes the change itself.
+
+The Needs human status stays until the review app's Decisions reads
+assignees (cgwalters-forge/tracker#342); keep both in step meanwhile.
+`bot-board assign-migrate --apply FILE` is the one-shot move: it assigns cgwalters the asks listed in FILE (the live ones of
+cgwalters-forge/tracker#329) and unassigns both logins from every other
+open item.
+
 Items also carry a **Why** text field. It holds the rationale for adding the
 item, and is where you put the current result, and an action the operator
 must take on it (questions are issues of their own; see below). Read it before starting. The **Branch** and **Gist** text

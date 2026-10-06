@@ -49,12 +49,18 @@ const PHASES = [
     // which the capacity lanes, bot-reconcile and planning select by.
     // With none to set, it reads only the REST listing: no GraphQL.
     { name: "fill-org", tool: "bot-board", args: ["fill-org"], timeoutMin: 2 },
+    // Whose turn: what the operator answered, reviewed or approved is
+    // assigned back to the bot; closed items are unassigned.
+    { name: "handback", tool: "bot-board", args: ["handback", "--apply"], timeoutMin: 3 },
   ],
   [{ name: ARCHIVE_STEP, tool: "bot-board", args: ["archive-done"], timeoutMin: 6 }],
   [{ name: "status-update", tool: "bot-board", args: ["status-update", "--auto"], timeoutMin: 2 }],
 ];
 // What 'bot-board fill-org' prints for each item it sets: ID, Org, title.
 const ORG_SET_RE = /^(PVTI_\S+)\t([^\t]+)\t(.*)$/gm;
+// What 'bot-board handback' prints for each item it gives back to the
+// bot, which the report repeats.
+const HANDED_BACK_RE = /^Handed back: /;
 // The steps whose output bot-poll reads for news: published as
 // latest-NAME.txt too.
 const NEWS_STEPS = ["watch", "notify", "inbox"];
@@ -102,7 +108,8 @@ never killed halfway by a poll's timeout:
   bot-pr inbox --dry-run                 /
   bot-tmt-number --gc                    \\
   bot-actuals --open                      > at once
-  bot-board fill-org                     /
+  bot-board fill-org                      |
+  bot-board handback --apply             /
   bot-board archive-done --days N --apply   (every ${ARCHIVE_EVERY_MS / (60 * MINUTE_MS)}h)
   bot-board status-update --auto
 
@@ -114,7 +121,7 @@ limited number per run). One that failed is tried again after ${ARCHIVE_RETRY_MS
 archive (the other steps still run normally).
 
 Each step has a timeout (git 2, bot-watch 20, bot-notify 5, inbox 10,
-gc 2, actuals 3, fill-org 2, archive-done 6, status-update 2 minutes) and runs in its own process group,
+gc 2, actuals 3, fill-org 2, handback 3, archive-done 6, status-update 2 minutes) and runs in its own process group,
 all of which is killed when it times out, so no orphan keeps holding
 bot-watch's lock. A step that finds another run holding its lock is
 retried ${LOCK_RETRIES} times.
@@ -140,6 +147,8 @@ and inbox succeeded; last_complete is the newest complete run {run,
 ended_at}; org_filled lists the items fill-org gave an Org ([{id, org,
 title}]), which the report ends with under "Org filled". A failing
 fill-org is a problem like any step's, but leaves the run complete.
+The report also repeats the "Handed back: URL ..." lines of handback:
+the items assigned to the operator that they acted on, now the bot's.
 archive_done reports the last finished retention run: archived and
 eligible counts, dry_run and at (when), plus failed_at if a later run
 failed; null if none ran yet. Its failure is also a problem.
@@ -520,6 +529,8 @@ async function sweep(opts) {
       const url = (outputs["status-update"] || "").split("\n").find((line) => /^https:\/\/github\.com\/\S+$/.test(line));
       if (url) process.stdout.write(`Project status update: ${url}\n`);
     }
+    const handedBack = (outputs.handback || "").split("\n").filter((line) => HANDED_BACK_RE.test(line));
+    if (handedBack.length) process.stdout.write(`${handedBack.join("\n")}\n`);
     if (archiveMatch) process.stdout.write(`Archive Done: ${status.archive_done.archived} archived, ${status.archive_done.eligible} eligible${status.archive_done.dry_run ? " (dry-run)" : ""}\n`);
     return problems.length ? EX_ERROR : 0;
   } finally {
