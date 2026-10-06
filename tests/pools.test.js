@@ -94,10 +94,13 @@ test("cost: what the pool spent while runs were busy, per run", () => {
   assert.equal(pools.costOf(s), null);
   s = pools.trackCost(s, sample(4, ["r1"], { requests: 150, tokens: 0 }));
   assert.equal(pools.costOf(s), null);
-  // Two runs took the pool from 4% to 24% in 400 requests: 10 points and 200 requests each.
+  // Two runs took the pool from 4% to 24% in 400 requests. While both are
+  // busy that is no run's cost yet; with one over and one busy, it is a run
+  // and a half's.
   s = pools.trackCost(s, sample(14, ["r1", "r2"], { requests: 350, tokens: 1e6 }));
+  assert.equal(pools.costOf(s), null);
   s = pools.trackCost(s, sample(24, ["r2"], { requests: 550, tokens: 3e6 }));
-  assert.deepEqual(pools.costOf(s), { runs: 2, points_per_run: 10, requests_per_run: 200, tokens_per_run: 1.5e6, points_per_request: 0.05, window: "current" });
+  assert.deepEqual(pools.costOf(s), { runs: 2, points_per_run: 20 / 1.5, requests_per_run: 400 / 1.5, tokens_per_run: 2e6, points_per_request: 0.05, window: "current" });
   // The broker restarted: its counters start again, the percent goes on.
   s = pools.trackCost(s, { ...sample(26, ["r2"], { requests: 40, tokens: 0 }), epoch: 2 });
   assert.deepEqual([s.points, s.requests, s.runs.length], [22, 440, 2]);
@@ -119,13 +122,20 @@ test("cost: what the pool spent while runs were busy, per run", () => {
   const next = pools.trackCost(s, { ...sample(1, ["r3"], { requests: 60 }), epoch: 2, resets_at: RESET + WEEK });
   assert.deepEqual([next.runs, next.points], [["r3"], 0]);
   assert.deepEqual(pools.costOf(next), { ...pools.costOf(s), window: "previous" });
+  // Its first run's first minutes are not what a run costs: the last
+  // window's cost stands until a run of this one is over.
+  let begun = pools.trackCost(next, { ...sample(1.4, ["r3"], { requests: 80 }), epoch: 2, resets_at: RESET + WEEK });
+  assert.deepEqual([begun.points > 0, pools.costOf(begun)], [true, pools.costOf(next)]);
+  begun = pools.trackCost(begun, { ...sample(9, [], { requests: 260 }), epoch: 2, resets_at: RESET + WEEK });
+  assert.deepEqual([pools.costOf(begun).window, pools.costOf(begun).points_per_run], ["current", 8]);
   // A state file's record that isn't one is dropped.
-  for (const junk of [{}, { runs: "x", resets_at: RESET, last: {} }, { runs: [], resets_at: RESET }, "x"]) {
+  for (const junk of [{}, { runs: "x", resets_at: RESET, last: {} }, { runs: [], resets_at: RESET }, { runs: ["r1"], resets_at: RESET, last: { busy: "x" } }, "x"]) {
     assert.deepEqual(pools.trackCost(junk, sample(5, ["r9"])).runs, ["r9"], JSON.stringify(junk));
   }
   // Without counters (the Claude pool's status line) there are only points.
   let c = pools.trackCost(undefined, { resets_at: RESET, used_percent: 10, runs: ["a"] });
   c = pools.trackCost(c, { resets_at: RESET, used_percent: 16, runs: ["a", "b", "c"] });
+  c = pools.trackCost(c, { resets_at: RESET, used_percent: 16, runs: [] });
   assert.deepEqual(pools.costOf(c), { runs: 3, points_per_run: 2, requests_per_run: 0, tokens_per_run: 0, points_per_request: null, window: "current" });
 });
 
