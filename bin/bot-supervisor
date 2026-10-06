@@ -10,6 +10,7 @@ const path = require("node:path");
 const { parseArgs } = require("node:util");
 
 const ROOT = path.resolve(__dirname, "..");
+const { ensureToolbox } = require(path.join(ROOT, "lib/toolbox.js"));
 const DEFAULT_KINDS = "capacity,dispatch-failed,patch-ready,approval,drive,health,answer-unapplied,lead-orphan,heartbeat,budget,forge-review,rebase,review,notify,news,sweep-problem,reconcile-failing,heartbeat-refresh,drive-P0,health-P0";
 const JOB_RE = /^supervisor-[a-f0-9]{32}$/;
 const MAX_OUTPUT = 4 * 1024 * 1024;
@@ -201,6 +202,7 @@ function sleep(ms) {
 // The tools (gh, rg) live in a toolbox, not on the host PATH. 'toolbox run'
 // passes on little of the environment, so the BOT_SUPERVISOR_* settings
 // (never a token itself, which would show in ps) go on its command line.
+// The container is started apart from this unit first (see lib/toolbox.js).
 // Resolves to the exit status, or null to run here.
 function reexecInToolbox() {
   const box = process.env.BOT_SUPERVISOR_TOOLBOX;
@@ -208,6 +210,7 @@ function reexecInToolbox() {
   const settings = Object.entries(process.env)
     .filter(([k]) => k.startsWith("BOT_SUPERVISOR_") && k !== "BOT_SUPERVISOR_TOOLBOX")
     .map(([k, v]) => `${k}=${v}`);
+  ensureToolbox(box);
   return new Promise((resolve, reject) => {
     const p = spawn("toolbox", ["run", "-c", box, "env", ...settings, process.execPath, __filename, ...process.argv.slice(2)], { stdio: "inherit" });
     child = p;
