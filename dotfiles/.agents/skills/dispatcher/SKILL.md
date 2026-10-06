@@ -88,9 +88,13 @@ Mechanical, do it:
 - `patch-ready`: when the action says to, start a Sonnet worker (`bin/bot-claude start --model sonnet --dir WT --item ITEM --job apply-RUN BRIEF`) on `coordinator/apply-preamble.md`, with `Item:` and `Run:` lines in the brief. It reads the run, applies the patch, opens or updates
   the draft PR (a fork PR, or a homegit PR via `bot-land --no-auto
   --no-review`), and never merges. Then the review step below.
-- `approval`: run the command the action prints (`bot-pr promote URL`),
-  once the policy gate passes (`upstream-policy check`); a refusal is
-  read, not worked around, and escalated when it isn't plain.
+- `approval`: the sweep already ran `bot-pr promote` and told the
+  operator on the fork PR why it promoted nothing; the action is that
+  refusal. Never run `bot-pr promote` for it. Read it and fix its cause
+  when it is plain and the bot's (a missing or stale policy record: a
+  policy check; a conflict: a worker), which the next sweep then
+  promotes; one that waits on the operator needs nothing; escalate the
+  rest.
 - `drive` and `health` (including `drive-P0` and `health-P0` wakes, P0 first): `needs-regen` and `conflict` get a
   worker as the coordinator skill's "P0 drive" says; `ci-failing` gets the
   failing job's log read (flake: rerun it; real: a worker); `review`,

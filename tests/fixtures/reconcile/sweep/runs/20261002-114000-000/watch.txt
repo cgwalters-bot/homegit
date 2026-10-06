@@ -17,6 +17,7 @@ P0 drive:
 Promotions:
   Promoted: https://github.com/cgwalters-forge/r/pull/1 -> https://github.com/o/r/pull/11
   Not promoted: https://github.com/cgwalters-forge/r/pull/3: o/r's contribution policy record is stale; dispatch a policy check
+  Not promoted: https://github.com/cgwalters-forge/r/pull/9: cgwalters approved 111111111111, and its head is now 999999999999; it needs his approval of the current head
 
 Needs your text:
   Needs your text: https://github.com/cgwalters-forge/q/pull/2 (o/q is human-text): retitle it, then comment '/promote --human-text'
