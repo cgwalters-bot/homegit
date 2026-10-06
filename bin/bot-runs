@@ -63,13 +63,14 @@ readonly BOT_LOGIN=${OP_BOT_LOGIN}
 # A run whose summary could not be found at all is looked up again after
 # this many minutes (its footer may be written after the run).
 readonly NONE_RETRY_MINUTES=1440
-# agent.yml's choices: claude joins once the praxis broker holds its
-# credential; fake is the scripted agent, which needs no inference.
+# agent.yml's choices: opencode and claude (Claude Code) both get inference
+# from the praxis broker; fake is the scripted agent, which needs no inference.
 readonly AGENTS='["opencode", "fake", "claude"]'
 readonly DEFAULT_AGENT=opencode
 # opencode's model for a run, in its provider/model form: GPT-6.1 Sol
 # through the praxis broker (the Codex subscription), so runs that don't
-# need Claude don't spend its usage. Other agents choose their own.
+# need Claude don't spend its usage. For claude the runner chooses Opus
+# unless --model names a Claude Code model name or alias.
 readonly DEFAULT_OPENCODE_MODEL=${BOT_RUNS_MODEL:-praxis/gpt-6.1-sol}
 readonly CORES='["4", "16", "64"]'
 readonly WORKFLOWS='["branch", "analysis"]'
