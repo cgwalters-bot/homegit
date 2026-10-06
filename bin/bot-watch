@@ -159,12 +159,16 @@ listed.
 
 Then the "Promotions" of 'bot-promote-due' (see its --help): the bot's
 fork PRs whose current head ${REQUESTER} approved (a review or a
-'/promote' line), for a repository whose contribution policy is bot-ok.
+'/promote' line), for a repository whose contribution policy is bot-ok
+(or human-text, approved with '/promote --human-text').
 With --apply, each gets 'bot-pr promote' (with --draft after his
 '/draft') and a line "Promoted: URL -> UPSTREAM-PR-URL", or why it was
 refused; with --dry-run (or --board-file), the command it would run;
-otherwise they are only listed. Approved fork PRs for a human-text
-repository are never promoted: they are listed under "Needs your text".
+otherwise they are only listed. Fork PRs he only approved for a
+human-text repository are never promoted: they are listed under "Needs
+your text". With --apply, each approved fork PR that was not promoted
+(those, a refusal, a policy record that doesn't allow it, a head that
+moved since his approval) gets one comment saying why and what is next.
 
 Then "Devspace runs" ('bot-runs watch', then 'bot-runs reconcile', see 'bot-runs --help'):
 the items whose Run field names a devspace agent run, and with --apply
@@ -1233,8 +1237,8 @@ drive_failed=false
 drive=$(due_step drive "P0 drive steps") || drive_failed=true
 signoff_failed=false
 signoffs=$(due_step signoff "sign-offs due") || signoff_failed=true
-# Fork PRs approved for a human-text repository only get listed, under
-# "Needs your text".
+# Fork PRs only approved for a human-text repository (no
+# '/promote --human-text') only get listed, under "Needs your text".
 promotion_failed=false
 promotions=$(due_step promote "promotions due") || promotion_failed=true
 propagation_failed=false
