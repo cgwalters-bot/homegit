@@ -34,7 +34,9 @@ to enforce access control. Paperclip avoids the question with its own
 identity system.
 
 The direction is sandboxed, forge-native devspace runners with
-separately validated and applied safe-outputs, moving toward gh-aw.
+separately validated and applied safe-outputs, moving toward gh-aw;
+[agent runtimes](docs/agent-runtimes.md) proposes how the custom job,
+the gh-aw fork and the workflow compiler converge there.
 [Devspace agent runs](docs/devspace-agent-runs.md) describe the current
 contract; the [scheduled dispatcher](docs/scheduled-dispatcher.md) is the
 planned move from a local controller session to scheduled and event-driven
