@@ -6,9 +6,9 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 
-use bot_sched::action::emit;
-use bot_sched::forge::{Forge, Recorded, Recorder, Rest};
-use bot_sched::model::{BoardRef, SNAPSHOT_SCHEMA, Snapshot};
+use bot_sched::forge::Forge;
+use bot_sched::forge::github::{Api, BoardRef, GitHub, Recorded, Recorder, Rest, emit};
+use bot_sched::model::{SNAPSHOT_SCHEMA, Snapshot};
 use bot_sched::observe::observe;
 use bot_sched::parity::{Parity, parity};
 use bot_sched::{operator, report, rules};
@@ -88,11 +88,17 @@ enum Cmd {
     },
 }
 
-fn forge(source: &Source) -> Result<Box<dyn Forge>> {
+/// GitHub's API, live or recorded. The only forge there is so far, so
+/// it is chosen here rather than by the operator config.
+fn api(source: &Source) -> Result<Box<dyn Api>> {
     Ok(match &source.recorded {
         Some(file) => Box::new(Recorded::load(file)?),
         None => Box::new(Rest::from_env()?),
     })
+}
+
+fn forge(source: &Source) -> Result<Box<dyn Forge>> {
+    Ok(Box::new(GitHub::new(api(source)?, board()?)))
 }
 
 fn board() -> Result<BoardRef> {
@@ -107,14 +113,18 @@ fn board() -> Result<BoardRef> {
 fn read_snapshot(file: &Path) -> Result<Snapshot> {
     let text = std::fs::read_to_string(file)
         .with_context(|| format!("cannot read the snapshot {}", file.display()))?;
-    let snapshot: Snapshot = serde_json::from_str(&text)
-        .with_context(|| format!("{} is not a snapshot", file.display()))?;
+    // The schema first: an older one fails to parse in ways that do not
+    // say why.
+    let value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("{} is not JSON", file.display()))?;
+    let schema = value["schema"].as_str().unwrap_or_default();
     anyhow::ensure!(
-        snapshot.schema == SNAPSHOT_SCHEMA,
-        "{} is a snapshot of schema '{}', not {SNAPSHOT_SCHEMA}",
-        file.display(),
-        snapshot.schema
+        schema == SNAPSHOT_SCHEMA,
+        "{} is a snapshot of schema '{schema}', not {SNAPSHOT_SCHEMA}",
+        file.display()
     );
+    let snapshot: Snapshot = serde_json::from_value(value)
+        .with_context(|| format!("{} is not a snapshot", file.display()))?;
     Ok(snapshot)
 }
 
@@ -132,9 +142,9 @@ fn warn(problems: &[String]) {
 fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Cmd::Observe { source, record } => {
-            let forge = forge(&source)?;
-            let recorder = Recorder::new(forge.as_ref());
-            let observed = observe(&recorder, &board()?)?;
+            let api = api(&source)?;
+            let recorder = Recorder::new(api.as_ref());
+            let observed = observe(&GitHub::new(&recorder, board()?))?;
             if let Some(file) = record {
                 recorder.save(&file)?;
             }
@@ -151,7 +161,7 @@ fn run(cli: Cli) -> Result<()> {
             let snapshot = match snapshot {
                 Some(file) => read_snapshot(&file)?,
                 None => {
-                    let observed = observe(forge(&source)?.as_ref(), &board()?)?;
+                    let observed = observe(forge(&source)?.as_ref())?;
                     warn(&observed.problems);
                     observed.snapshot
                 }
@@ -182,7 +192,7 @@ fn run(cli: Cli) -> Result<()> {
             dir,
             bin_dir,
         } => {
-            let observed = observe(forge(&source)?.as_ref(), &board()?)?;
+            let observed = observe(forge(&source)?.as_ref())?;
             warn(&observed.problems);
             let actions = rules::reconcile(&observed.snapshot, &[])?;
             let parity = parity(&dir, &bin_dir, &observed.snapshot, &actions);
@@ -196,8 +206,7 @@ fn run(cli: Cli) -> Result<()> {
             bin_dir,
         } => {
             let opts = report::Options { dir, bin_dir };
-            let source = forge(&source).and_then(|forge| Ok((forge, board()?)));
-            let file = report::report(&opts, source)?;
+            let file = report::report(&opts, forge(&source))?;
             println!("bot-sched: wrote {}", file.display());
             Ok(())
         }

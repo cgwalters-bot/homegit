@@ -78,7 +78,7 @@ fn closed_item(item: &Item, states: &BTreeMap<String, ContentState>) -> Option<A
     if item.status == Some(Status::Done) || !content.state.ended() {
         return None;
     }
-    let own = content.url.key();
+    let own = content.of.key();
     let pending =
         |key: &String| !matches!(states.get(key), Some(s) if s.ended() || *s == ContentState::Gone);
     if item
@@ -89,7 +89,7 @@ fn closed_item(item: &Item, states: &BTreeMap<String, ContentState>) -> Option<A
     {
         return None;
     }
-    let kind = content.url.kind;
+    let kind = content.of.kind;
     let unmerged = kind == ContentKind::PullRequest && content.state == ContentState::Closed;
     let what = format!(
         "{} {}",
@@ -122,10 +122,10 @@ fn closed_item(item: &Item, states: &BTreeMap<String, ContentState>) -> Option<A
         )
     };
     Some(Action {
-        key: format!("{}:{}", Kind::ClosedNotDone, content.url),
+        key: format!("{}:{}", Kind::ClosedNotDone, content.of),
         kind: Kind::ClosedNotDone,
         item: item.id.clone(),
-        url: Some(content.url.clone()),
+        content: Some(content.of.clone()),
         todo,
         write,
     })
@@ -141,11 +141,11 @@ fn stale_lead(snapshot: &Snapshot) -> Vec<Action> {
         key: format!(
             "{}:{}",
             Kind::StaleLead,
-            it.url().map_or(it.id.clone(), ToString::to_string)
+            it.content_ref().map_or(it.id.clone(), ToString::to_string)
         ),
         kind: Kind::StaleLead,
         item: it.id.clone(),
-        url: it.url().cloned(),
+        content: it.content_ref().cloned(),
         todo: format!(
             "Lead {COORDINATOR_LEAD}, but it is {}: clear its Lead",
             it.status_name()
@@ -160,19 +160,34 @@ fn stale_lead(snapshot: &Snapshot) -> Vec<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{BoardRef, Content, ContentUrl, SNAPSHOT_SCHEMA};
+    use crate::model::{Content, ContentRef, SNAPSHOT_SCHEMA};
 
-    const FORK: &str = "https://github.com/o/r/pull/100";
-    const OTHER: &str = "https://github.com/o/r/pull/101";
+    /// No forge's: the rules read references, they never parse them.
+    const WEB: &str = "https://forge.example/";
+    const FORK: &str = "https://forge.example/o/r/pull/100";
+    const OTHER: &str = "https://forge.example/o/r/pull/101";
+
+    /// The reference a forge would make of `WEB/OWNER/REPO/KIND/N`.
+    fn content_ref(url: &str) -> ContentRef {
+        let parts: Vec<&str> = url.strip_prefix(WEB).unwrap().split('/').collect();
+        let [owner, repo, kind, number] = parts[..] else {
+            panic!("{url}");
+        };
+        ContentRef {
+            url: url.to_owned(),
+            repo: format!("{owner}/{repo}"),
+            kind: match kind {
+                "issues" => ContentKind::Issue,
+                _ => ContentKind::PullRequest,
+            },
+            number: number.parse().unwrap(),
+        }
+    }
 
     fn snapshot(items: Vec<Item>, linked: &[(&str, ContentState)]) -> Snapshot {
         Snapshot {
             schema: SNAPSHOT_SCHEMA.to_owned(),
-            board: BoardRef {
-                owner_type: "orgs".to_owned(),
-                owner: "o".to_owned(),
-                number: 1,
-            },
+            board: format!("{WEB}o/boards/1"),
             items,
             linked: linked.iter().map(|(u, s)| ((*u).to_owned(), *s)).collect(),
         }
@@ -180,19 +195,16 @@ mod tests {
 
     fn item(n: u64, status: Option<&str>, url: &str, state: ContentState, branch: &str) -> Item {
         Item {
-            id: format!("PVTI_{n}"),
+            id: format!("ITEM_{n}"),
             content: Some(Content {
-                url: ContentUrl::parse(url).unwrap(),
+                of: content_ref(url),
                 state,
             }),
             status: status.map(|s| Status::from(s.to_owned())),
             priority: None,
             lead: None,
             run: None,
-            branch: branch
-                .split_whitespace()
-                .filter_map(ContentUrl::parse)
-                .collect(),
+            branch: branch.split_whitespace().map(content_ref).collect(),
         }
     }
 
@@ -213,8 +225,8 @@ mod tests {
     fn closed_not_done_cases() {
         use ContentState::{Closed, Gone, Merged, Open};
         const ASK: &str = "ask the operator whether to drop it (Done) or redo it (Needs human), or set it Done if it is clear";
-        let pr = |n| format!("https://github.com/o/r/pull/{n}");
-        let issue = |n| format!("https://github.com/o/r/issues/{n}");
+        let pr = |n| format!("https://forge.example/o/r/pull/{n}");
+        let issue = |n| format!("https://forge.example/o/r/issues/{n}");
         let both = format!("{FORK} {OTHER}");
         #[rustfmt::skip]
         let cases: Vec<Case> = vec![
@@ -235,10 +247,10 @@ mod tests {
             (Some("In Review"), pr(13), Merged, FORK, None, None, None),
             (Some("Draft"), issue(14), Closed, &both, Some(Merged), None, None),
             (Some("In Review"), issue(15), Closed, FORK, Some(Merged), Some("its issue closed, but it is In Review: set it Done".into()), Some("issue closed; set Done")),
-            (Some("In Review"), issue(16), Closed, "https://github.com/O/R/pull/100", Some(Closed), Some("its issue closed, but it is In Review: set it Done".into()), Some("issue closed; set Done")),
+            (Some("In Review"), issue(16), Closed, "https://forge.example/O/R/pull/100", Some(Closed), Some("its issue closed, but it is In Review: set it Done".into()), Some("issue closed; set Done")),
             (Some("In Review"), issue(17), Closed, FORK, Some(Gone), Some("its issue closed, but it is In Review: set it Done".into()), Some("issue closed; set Done")),
             // Its own URL in Branch is not another PR to wait for.
-            (Some("Draft"), pr(18), Merged, "https://github.com/o/r/pull/18", None, Some("its PR merged, but it is Draft: set it Done".into()), Some("PR merged; set Done")),
+            (Some("Draft"), pr(18), Merged, "https://forge.example/o/r/pull/18", None, Some("its PR merged, but it is Draft: set it Done".into()), Some("PR merged; set Done")),
         ];
         for (status, url, state, branch, fork, todo, news) in cases {
             let it = item(1, status, &url, state, branch);
@@ -250,7 +262,7 @@ mod tests {
                 continue;
             };
             assert_eq!(action.key, format!("closed-not-done:{url}"));
-            assert_eq!(action.item, "PVTI_1");
+            assert_eq!(action.item, "ITEM_1");
             let want = news.map(|news| Write::SetFields {
                 fields: BTreeMap::from([
                     ("Status".to_owned(), "Done".to_owned()),
@@ -306,7 +318,7 @@ mod tests {
             let mut it = item(
                 1,
                 status,
-                "https://github.com/o/r/issues/1",
+                "https://forge.example/o/r/issues/1",
                 ContentState::Open,
                 "",
             );
@@ -323,7 +335,7 @@ mod tests {
                     field: "Lead".to_owned(),
                 };
                 assert_eq!(action.write, Some(clear));
-                assert_eq!(action.key, "stale-lead:https://github.com/o/r/issues/1");
+                assert_eq!(action.key, "stale-lead:https://forge.example/o/r/issues/1");
             }
         }
     }

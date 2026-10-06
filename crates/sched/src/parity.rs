@@ -175,11 +175,11 @@ fn board_file(snapshot: &Snapshot) -> Value {
     let item = |it: &Item| {
         let content = match &it.content {
             Some(c) => {
-                let kind = match c.url.kind {
+                let kind = match c.of.kind {
                     ContentKind::Issue => "Issue",
                     ContentKind::PullRequest => "PullRequest",
                 };
-                json!({ "type": kind, "url": c.url })
+                json!({ "type": kind, "url": c.of.url })
             }
             None => json!({ "type": "DraftIssue" }),
         };
@@ -260,7 +260,7 @@ mod tests {
             key: key.to_owned(),
             kind: Kind::ClosedNotDone,
             item: "PVTI_1".to_owned(),
-            url: None,
+            content: None,
             todo: todo.to_owned(),
             write,
         }

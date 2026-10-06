@@ -4,9 +4,8 @@
 
 use std::path::{Path, PathBuf};
 
-use bot_sched::action::emit;
-use bot_sched::forge::Recorded;
-use bot_sched::model::{BoardRef, ContentState};
+use bot_sched::forge::github::{BoardRef, GitHub, Recorded, emit};
+use bot_sched::model::ContentState;
 use bot_sched::observe::observe;
 use bot_sched::rules::reconcile;
 use serde_json::json;
@@ -25,8 +24,8 @@ fn board() -> BoardRef {
 
 #[test]
 fn a_recorded_pass() {
-    let forge = Recorded::load(&fixture()).unwrap();
-    let observed = observe(&forge, &board()).unwrap();
+    let forge = GitHub::new(Recorded::load(&fixture()).unwrap(), board());
+    let observed = observe(&forge).unwrap();
     let snapshot = &observed.snapshot;
 
     assert_eq!(snapshot.items.len(), 10);
@@ -126,7 +125,8 @@ fn a_board_without_status_is_refused() {
     let file = dir.path().join("board.json");
     let recording = json!({ "orgs/cgwalters-forge/projectsV2/1/fields?per_page=100": [{ "id": 1, "name": "Title" }] });
     std::fs::write(&file, recording.to_string()).unwrap();
-    let err = observe(&Recorded::load(&file).unwrap(), &board()).unwrap_err();
+    let forge = GitHub::new(Recorded::load(&file).unwrap(), board());
+    let err = observe(&forge).unwrap_err();
     assert_eq!(
         err.to_string(),
         "the board https://github.com/orgs/cgwalters-forge/projects/1 has no 'Status' field: its layout changed"
