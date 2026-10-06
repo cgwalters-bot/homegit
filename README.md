@@ -123,8 +123,14 @@ that no edge-triggered rule caught still wakes the coordinator. With
 DCO check fails although I approved their head (`bot-signoff-due`), so
 my approval is all a sign-off takes, and `bot-pr promote` on the fork
 PRs whose head I approved for a bot-ok repository (`bot-promote-due`),
-so my approval is all a promotion takes too. Approved fork PRs for a
-human-text repository are only listed, under "Needs your text".
+so my approval is all a promotion takes too; no model is in that loop.
+For a human-text repository it promotes only on my `/promote
+--human-text`, once the text is mine. When an approval of mine can't
+promote (the repository is human-text and I only approved, its policy
+record is missing or stale, the head moved since, or `bot-pr promote`
+refused), it comments once on the fork PR with the reason and my next
+step, and notes it in the board item's News; a new approval that still
+can't promote gets a new answer.
 
 The coordinator doesn't run these by hand: `bot-sweep`, run every 10
 minutes by the `bot-sweep.timer` systemd user unit (in

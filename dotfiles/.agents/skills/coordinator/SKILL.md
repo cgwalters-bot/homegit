@@ -707,6 +707,8 @@ cost when an item is far off (two buckets), and correct the table in
   itself (with `--draft` after the operator's `/draft`) on each fork PR
   whose current head they approved, by review or `/promote` line, when
   `upstream-policy check` passes for its upstream (`bot-promote-due`).
+  Never run `bot-pr promote` for an approval yourself, or have a worker
+  do it: the sweep does, and `bot-poll` at once on a new approval.
   This is level-triggered: an approval `bot-poll` never woke on (its
   seen-set was reset, say) still gets promoted on the next sweep. The
   "Promotions" section lists `Promoted: FORK-PR -> UPSTREAM-PR`, which
@@ -714,11 +716,16 @@ cost when an item is far off (two buckets), and correct the table in
   needs the same look a refused promote by hand does, then `bot-pr
   promote URL` by hand once fixed, since refused heads are retried only
   after 6h; or `Not promoted: ...` for a missing or stale policy
-  record, which needs a policy check (see "Policy gate"). Fork PRs
-  approved for a human-text repository are never promoted
-  automatically: they are listed under "Needs your text" until the
-  operator's text and `/promote --human-text` are in, and then promoted
-  by hand.
+  record, which needs a policy check (see "Policy gate"), or for a
+  head that moved since their approval, which waits on them. Fork PRs
+  they only approved for a human-text repository are listed under
+  "Needs your text" until their text and `/promote --human-text` are
+  in, and then promoted by the sweep like the others (`bot-pr promote`
+  checks the text is theirs). Each fork PR that was not promoted gets
+  one comment from `bot-promote-due` telling them why and what is next
+  (keyed by approval, head and reason, so only a new approval or reason
+  is answered again), and the same in its item's News: don't repeat it
+  on the PR.
 - **Outstanding reviews first** (after P0 health). The "Outstanding reviews by LOGIN"
   section (LOGIN being the operator's login) `bot-watch` prints on every sweep is P0: dispatch a worker for
   each listed PR, unless a live worker is already on it (check it's
@@ -765,7 +772,8 @@ cost when an item is far off (two buckets), and correct the table in
   the worker who wrote the change. Once it's merged (bot-land
   fast-forwards the shared clone; otherwise `git -C
   ~/src/github/cgwalters-bot/homegit pull --ff-only`) so the gate sees
-  it, promote. For a human-text verdict, tell the operator the text must be
+  it, the next sweep promotes. For a human-text verdict, the sweep's comment
+  on the fork PR tells the operator the text must be
   theirs: they retitle the fork PR, edit its body (dropping the bot's
   `Generated-by` line), reword the commits and push them themselves, then
   comment a `/promote --human-text` line (or open the upstream PR

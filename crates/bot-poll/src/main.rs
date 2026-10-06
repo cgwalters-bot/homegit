@@ -151,7 +151,7 @@ From those outputs it takes the set of what is there now, per kind:
   promotion     its promotion lines (bot-promote-due): fork PRs promoted,
                 refused or held back by their contribution policy
   text          its \"Needs your text\" lines: approved fork PRs for a
-                human-text repository, which are never promoted
+                human-text repository, which wait for his own text
   rebase        its PRs that need a rebase (by PR)
   news          its item news, but for bots' own activity
 

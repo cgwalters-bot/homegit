@@ -1,10 +1,13 @@
 // Offline tests of bin/bot-promote-due against the fake gh of
 // bot-priority-health's tests (REST fixtures with ETags), a fake
-// upstream-policy and a fake bot-pr that log their calls. Run with
+// upstream-policy, a fake bot-pr and a fake bot-board that log their
+// calls, and a gh that takes the notices it is asked to post. Run with
 // tests/bot-promote-due.sh, or node --test tests/bot-promote-due.test.js.
 // The main case replays bootc#24, composefs-rs#6 and
 // containers-image-proxy-rs#2 on the forge: cgwalters approved them, and
-// nobody ran 'bot-pr promote' for over a day.
+// nobody ran 'bot-pr promote' for over a day. The notices replay
+// bootupd#2: approved twice for a human-text repository, with nothing
+// said on the PR either time.
 "use strict";
 
 const assert = require("node:assert/strict");
@@ -21,10 +24,12 @@ const REST = path.join(WORK, "rest");
 const LOG = path.join(WORK, "calls.log");
 const FAKE_BOT_PR = path.join(WORK, "bot-pr");
 const FAKE_POLICY = path.join(WORK, "upstream-policy");
+const FAKE_BOARD = path.join(WORK, "bot-board");
+const GH_WRAP = path.join(WORK, "gh");
 const ATTEMPTS = path.join(WORK, "cache", "bot-promote-due", "attempts.json");
 const ENV = {
-  ...process.env, XDG_CACHE_HOME: path.join(WORK, "cache"), FAKE_GH_DIR: REST, BOT_PRIORITY_HEALTH_GH: FAKE_GH,
-  BOT_PROMOTE_DUE_BOT_PR: FAKE_BOT_PR, BOT_PROMOTE_DUE_UPSTREAM_POLICY: FAKE_POLICY, FAKE_LOG: LOG,
+  ...process.env, XDG_CACHE_HOME: path.join(WORK, "cache"), FAKE_GH_DIR: REST, BOT_PRIORITY_HEALTH_GH: GH_WRAP, FAKE_GH,
+  BOT_PROMOTE_DUE_BOT_PR: FAKE_BOT_PR, BOT_PROMOTE_DUE_UPSTREAM_POLICY: FAKE_POLICY, BOT_PROMOTE_DUE_BOT_BOARD: FAKE_BOARD, FAKE_LOG: LOG,
 };
 const GH = "https://github.com";
 const FORGE = "cgwalters-forge";
@@ -64,6 +69,34 @@ if (name === "broken") { process.stderr.write("error: cannot read the sources\\n
 console.log("bot-ok");
 `, { mode: 0o755 });
 
+fs.writeFileSync(FAKE_BOARD, `#!/usr/bin/env node
+require("node:fs").appendFileSync(process.env.FAKE_LOG, "bot-board " + process.argv.slice(2).join(" ") + "\\n");
+`, { mode: 0o755 });
+// gh: a POST of a comment is logged ("comment PATH") and added to the
+// PR's comments as the bot's, as GitHub would list it next time, unless
+// its repository is named "nocomment"; the rest is the fake gh's.
+fs.writeFileSync(GH_WRAP, `#!/usr/bin/env node
+const fs = require("node:fs");
+const path = require("node:path");
+const args = process.argv.slice(2);
+if (args[1] !== "-X") {
+  const r = require("node:child_process").spawnSync(process.env.FAKE_GH, args, { stdio: "inherit" });
+  process.exit(r.status);
+}
+if (args[3].includes("/nocomment/")) {
+  process.stderr.write("gh: Server Error (HTTP 500)\\n");
+  process.exit(1);
+}
+const file = path.join(process.env.FAKE_GH_DIR, args[3] + ".json");
+const comments = JSON.parse(fs.readFileSync(file, "utf8"));
+const at = new Date().toISOString();
+const url = "notice-" + comments.length;
+comments.push({ user: { login: "cgwalters-bot" }, body: args[5].replace(/^body=/, ""), created_at: at, updated_at: at, html_url: url });
+fs.writeFileSync(file, JSON.stringify(comments));
+fs.appendFileSync(process.env.FAKE_LOG, "comment " + args[3] + "\\n");
+console.log(url);
+`, { mode: 0o755 });
+
 const put = (p, data) => {
   fs.mkdirSync(path.dirname(path.join(REST, p)), { recursive: true });
   fs.writeFileSync(path.join(REST, `${p}.json`), JSON.stringify(data));
@@ -78,11 +111,13 @@ const review = (state, commit, { login = "cgwalters", body = "" } = {}) => ({
 const comment = (body, { login = "cgwalters", at = tick() } = {}) => ({
   user: { login }, body, created_at: at, updated_at: at, html_url: `comment-${clock}`,
 });
-const meta = (upstream, why = "Why.") => `${why}\n\n<!-- bot-meta -->\n- Upstream: \`${upstream}\`, base \`main\`\n<!-- /bot-meta -->`;
+const meta = (upstream, why = "Why.", item = "") => `${why}\n\n<!-- bot-meta -->\n- Upstream: \`${upstream}\`, base \`main\`\n${item && `- Board item: \`${item}\`\n`}<!-- /bot-meta -->`;
+const itemOf = (c) => `PVTI_${c.number}`;
 
 // Each case: a fork PR on the forge (upstream example/REPO), cgwalters'
-// reviews and comments, and the result it gets from --apply (null: not
-// listed at all).
+// reviews and comments, the result it gets from --apply (null: not
+// listed at all), and for one that isn't promoted, what the notice on
+// the fork PR says.
 const signed = review("APPROVED", OLD);
 const CASES = [
   { name: "bootc#24: approved at its head, bot-ok", repo: "bootc", number: 24,
@@ -100,17 +135,20 @@ const CASES = [
   { name: "a sign-off record by someone else counts for nothing", repo: "forgedrecord", number: 18,
     reviews: [signed],
     comments: [comment(`<!-- bot-pr signoff approved=${OLD} signed=${HEAD} approval=${signed.html_url} review=1 -->`, { login: "mallory" })],
-    result: null },
+    result: "head-moved", says: /^Not promoted: cgwalters approved 000000000000, and its head is now/ },
   { name: "a sign-off record of another approval counts for nothing", repo: "otherrecord", number: 19,
     reviews: [signed],
     comments: [comment(`<!-- bot-pr signoff approved=${OLD} signed=${HEAD} approval=elsewhere review=1 -->`, { login: "cgwalters-bot" })],
-    result: null },
+    result: "head-moved", says: /^Not promoted: cgwalters approved 000000000000, and its head is now/ },
   { name: "only the bot-meta section names the upstream", repo: "humantext-decoy", number: 20,
-    why: "Quoting: - Upstream: `example/bootc`, base `main`", reviews: [review("APPROVED", HEAD)], result: "needs-text" },
-  { name: "stale approval: of an older head", repo: "stale", number: 5,
-    reviews: [review("APPROVED", OLD)], result: null },
-  { name: "stale /promote: written before the push", repo: "stalepromote", number: 6,
-    comments: [comment("/promote", { at: "2026-09-29T11:00:00.000Z" })], result: null },
+    why: "Quoting: - Upstream: `example/bootc`, base `main`", reviews: [review("APPROVED", HEAD)], result: "needs-text",
+    says: /^Not promoted: example\/humantext-decoy is human-text/ },
+  { name: "head moved since the approval", repo: "stale", number: 5,
+    reviews: [review("APPROVED", OLD)], result: "head-moved",
+    says: new RegExp(`^Not promoted: cgwalters approved ${OLD.slice(0, 12)}, and its head is now ${SHORT}; it needs his approval of the current head\\.\n\nNext: approve the current head, or comment \`/promote\` on a line of its own\\.`) },
+  { name: "head moved since the /promote", repo: "stalepromote", number: 6,
+    comments: [comment("/promote", { at: "2026-09-29T11:00:00.000Z" })], result: "head-moved",
+    says: /^Not promoted: cgwalters's '\/promote' is older than the last push/ },
   { name: "a /promote when the push can't be told", repo: "nolog", number: 7,
     comments: [comment("/promote")], activity: [], result: null },
   { name: "changes requested after the approval", repo: "changes", number: 8,
@@ -121,14 +159,17 @@ const CASES = [
     reviews: [review("APPROVED", HEAD, { login: "maintainer" })], result: null },
   { name: "a go-ahead in other words", repo: "lgtm", number: 11,
     comments: [comment("LGTM, ship it")], result: null },
-  { name: "human-text: never promoted, listed", repo: "humantext", number: 12,
-    reviews: [review("APPROVED", HEAD)], result: "needs-text" },
-  { name: "human-text, approved with his text", repo: "humantext-his", number: 13,
-    comments: [comment("/promote --human-text")], result: "needs-text" },
+  { name: "bootupd#2: human-text, approved without his text", repo: "humantext", number: 12,
+    reviews: [review("APPROVED", HEAD)], result: "needs-text",
+    says: /^Not promoted: example\/humantext is human-text, so the title, body and commit messages sent there must be yours\.\n\nNext: edit this PR's title and body \(dropping the `Generated-by` line\), reword the commits and push them to this branch yourself, then comment `\/promote --human-text` on a line of its own\.\n/ },
+  { name: "human-text, approved with his text: bot-pr promote checks it is his", repo: "humantext-his", number: 13,
+    comments: [comment("/promote --human-text")], result: "promoted" },
   { name: "no policy record", repo: "nopolicy", number: 14,
-    reviews: [review("APPROVED", HEAD)], result: "held" },
+    reviews: [review("APPROVED", HEAD)], result: "held",
+    says: /^Not promoted: example\/nopolicy has no contribution policy record yet; dispatch a policy check\.\n\nNext: nothing for you to do: / },
   { name: "bot-pr promote refuses", repo: "refused", number: 15,
-    reviews: [review("APPROVED", HEAD)], result: "refused" },
+    reviews: [review("APPROVED", HEAD)], result: "refused",
+    says: /^Not promoted: `bot-pr promote` refused: bot\/x conflicts with example\/refused:main in src\/lib\.rs\.\n\nNext: if that is yours to fix, do so and comment `\/promote` .* retries in 6h\./ },
   { name: "closed since the search", repo: "closed", number: 16, state: "closed",
     reviews: [review("APPROVED", HEAD)], result: null },
 ];
@@ -136,7 +177,7 @@ const prUrl = (c) => `${GH}/${FORGE}/${c.repo}/pull/${c.number}`;
 const fixture = (c) => {
   const repo = `${FORGE}/${c.repo}`;
   put(`repos/${repo}/pulls/${c.number}`, {
-    state: c.state || "open", user: { login: "cgwalters-bot" }, body: meta(`example/${c.repo}`, c.why),
+    state: c.state || "open", user: { login: "cgwalters-bot" }, body: meta(`example/${c.repo}`, c.why, itemOf(c)),
     head: { sha: HEAD, ref: `bot/${c.repo}` },
   });
   put(`repos/${repo}/pulls/${c.number}/reviews`, c.reviews || []);
@@ -174,14 +215,16 @@ test("lists the fork PRs approved at their head, by policy verdict", () => {
     assert.equal(byUrl[prUrl(c)].draft, Boolean(c.draft), c.name);
   }
   assert.deepEqual(r.promotes, [], "listing promotes nothing");
-  // One policy check per upstream of an approved PR only.
+  // One policy check per upstream of a PR approved at its head only.
   assert.deepEqual(r.calls.filter((l) => l.startsWith("upstream-policy")).sort(),
-    listed.map((c) => `upstream-policy check example/${c.repo}`).sort());
+    listed.filter((c) => c.result !== "head-moved").map((c) => `upstream-policy check example/${c.repo}`).sort());
   assert.equal(byUrl[`${GH}/${FORGE}/nopolicy/pull/14`].line,
     `Not promoted: ${GH}/${FORGE}/nopolicy/pull/14: example/nopolicy has no contribution policy record yet; dispatch a policy check`);
   assert.match(byUrl[`${GH}/${FORGE}/humantext/pull/12`].line,
     /^Needs your text: \S+ \(example\/humantext is human-text\): retitle it, .* then comment '\/promote --human-text'$/);
-  assert.match(byUrl[`${GH}/${FORGE}/humantext-his/pull/13`].line, /approved with '\/promote --human-text'; promote it by hand/);
+  assert.equal(byUrl[`${GH}/${FORGE}/stale/pull/5`].line,
+    `Not promoted: ${GH}/${FORGE}/stale/pull/5: cgwalters approved ${OLD.slice(0, 12)}, and its head is now ${SHORT}; it needs his approval of the current head`);
+  assert.deepEqual(r.calls.filter((l) => /^(comment|bot-board) /.test(l)), [], "listing says nothing on the PRs");
 });
 
 test("--dry-run prints the commands and runs none", () => {
@@ -199,7 +242,7 @@ test("--apply promotes the bot-ok ones, and only those, backing off a refusal", 
   const r = tool(["--apply"]);
   assert.equal(r.status, 0, r.stderr);
   assert.deepEqual(r.promotes.sort(), toPromote.map(promoteCall).sort());
-  assert.ok(!r.promotes.some((l) => /humantext|nopolicy|stale|changes|other|lgtm|closed|nolog/.test(l)), r.promotes.join("\n"));
+  assert.ok(!r.promotes.some((l) => /humantext\/|decoy|nopolicy|stale|changes|other|lgtm|closed|nolog/.test(l)), r.promotes.join("\n"));
   const lines = r.stdout.trim().split("\n");
   assert.equal(lines.length, listed.length, r.stdout);
   assert.ok(lines.includes(`Promoted: ${GH}/${FORGE}/bootc/pull/24 -> ${GH}/example/bootc/pull/99`), r.stdout);
@@ -223,6 +266,11 @@ test("--apply promotes the bot-ok ones, and only those, backing off a refusal", 
   for (const a of Object.values(aged)) a.at = new Date(Date.now() - 6 * 3600 * 1000 - 1000).toISOString();
   fs.writeFileSync(ATTEMPTS, JSON.stringify(aged));
   assert.deepEqual(tool(["--apply"]).promotes.filter((l) => l.includes("/refused/")), [`bot-pr promote ${GH}/${FORGE}/refused/pull/15`]);
+  // A new approval of the head it refused is tried at once.
+  const commentsPath = `repos/${FORGE}/refused/issues/15/comments`;
+  put(commentsPath, [comment("/promote")]);
+  assert.deepEqual(tool(["--apply"]).promotes.filter((l) => l.includes("/refused/")), [`bot-pr promote ${GH}/${FORGE}/refused/pull/15`]);
+  put(commentsPath, []);
   // A head that moved is forgotten: the approval no longer holds, and
   // nothing of the old head is kept.
   const prPath = `repos/${FORGE}/refused/pulls/15`;
@@ -251,7 +299,7 @@ test("rate limited halfway through --apply: the promotions before are still list
 });
 
 test("a failed read or policy check skips that PR and exits 1; a failed search exits 1", () => {
-  const fail = path.join(REST, `repos/${FORGE}/stale/pulls/5/reviews.fail`);
+  const fail = path.join(REST, `repos/${FORGE}/lgtm/pulls/11/reviews.fail`);
   fs.writeFileSync(fail, "502 Bad Gateway\nHTTP 502: Bad Gateway");
   const broken = { repo: "broken", number: 17, reviews: [review("APPROVED", HEAD)] };
   fixture(broken);
@@ -261,7 +309,7 @@ test("a failed read or policy check skips that PR and exits 1; a failed search e
     const r = tool(["--apply"]);
     assert.equal(r.status, 1, r.stderr);
     assert.deepEqual(r.stdout.trim().split("\n").length, listed.length, r.stdout);
-    assert.match(r.stderr, /reading https:\/\/github\.com\/cgwalters-forge\/stale\/pull\/5 failed/);
+    assert.match(r.stderr, /reading https:\/\/github\.com\/cgwalters-forge\/lgtm\/pull\/11 failed/);
     assert.match(r.stderr, /upstream-policy check example\/broken failed \(1\): cannot read the sources/);
     assert.ok(!r.promotes.some((l) => l.includes("/broken/")));
   } finally {
@@ -277,6 +325,73 @@ test("a failed read or policy check skips that PR and exits 1; a failed search e
     assert.deepEqual(r.promotes, []);
   } finally {
     fs.rmSync(searchFail);
+  }
+});
+
+test("--apply says once on the fork PR why an approval promoted nothing, and what is next", () => {
+  CASES.forEach(fixture);
+  fs.rmSync(ATTEMPTS, { force: true });
+  const noticed = CASES.filter((c) => c.says);
+  assert.deepEqual(noticed.map((c) => c.result).sort(), listed.filter((c) => c.result !== "promoted").map((c) => c.result).sort(),
+    "every result but a promotion has a notice");
+  const commentsPath = (c) => `repos/${FORGE}/${c.repo}/issues/${c.number}/comments`;
+  const notices = (c) => JSON.parse(fs.readFileSync(path.join(REST, `${commentsPath(c)}.json`), "utf8")).filter((x) => x.user.login === "cgwalters-bot" && /bot-promote-due notice=/.test(x.body));
+  const said = (r) => r.calls.filter((l) => l.startsWith("comment ")).sort();
+  const r = tool(["--apply", "--json"]);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(said(r), noticed.map((c) => `comment ${commentsPath(c)}`).sort());
+  const byUrl = Object.fromEntries(JSON.parse(r.stdout).map((x) => [x.url, x]));
+  for (const c of noticed) {
+    const [n, ...more] = notices(c);
+    assert.deepEqual(more, [], c.name);
+    assert.match(n.body, c.says, c.name);
+    assert.match(n.body, /\n\nGenerated-by: https:\/\/github\.com\/cgwalters\/#llms\n<!-- bot-promote-due notice=[0-9a-f]{16} -->\n$/, c.name);
+    assert.equal(byUrl[prUrl(c)].notice, n.html_url, c.name);
+    assert.ok(r.calls.some((l) => l.startsWith(`bot-board set ${itemOf(c)} --news not promoted: `)), `${c.name}:\n${r.calls.join("\n")}`);
+  }
+  assert.ok(Object.values(byUrl).filter((x) => x.result === "promoted").every((x) => x.notice === null));
+  // Nothing new: nothing is said again, by --apply or anything else.
+  for (const args of [["--apply", "--json"], ["--dry-run"], []]) {
+    const again = tool(args);
+    assert.equal(again.status, 0, again.stderr);
+    assert.deepEqual(again.calls.filter((l) => /^(comment|bot-board) /.test(l)), [], args.join(" "));
+  }
+  // What gets a new notice, per case: [NAME, REPO, CHANGE, COMMENTS].
+  const prOf = (c) => `repos/${FORGE}/${c.repo}/pulls/${c.number}`;
+  const read = (p) => JSON.parse(fs.readFileSync(path.join(REST, `${p}.json`), "utf8"));
+  const moveHead = (c) => put(prOf(c), { ...read(prOf(c)), head: { sha: "5".repeat(40), ref: `bot/${c.repo}` } });
+  const approveAgain = (c) => put(`${prOf(c)}/reviews`, [...read(`${prOf(c)}/reviews`), review("APPROVED", HEAD)]);
+  const changes = [
+    ["bootupd#2: approving again without his text is answered again", "humantext", approveAgain, 2],
+    ["a head that moves again after the same approval is not", "stale", moveHead, 1],
+    ["a refused head that moved: the approval is stale now", "refused", moveHead, 2],
+    ["a refusal for another reason at the same head", "nopolicy", (c) => put(prOf(c), { ...read(prOf(c)), body: meta("example/humantext", "Why.", itemOf(c)) }), 2],
+  ];
+  for (const [name, repo, change, want] of changes) {
+    const c = CASES.find((x) => x.repo === repo);
+    change(c);
+    const next = tool(["--apply"]);
+    assert.equal(next.status, 0, `${name}: ${next.stderr}`);
+    assert.equal(notices(c).length, want, name);
+    assert.deepEqual(said(next), want > 1 ? [`comment ${commentsPath(c)}`] : [], name);
+  }
+  assert.match(notices(CASES.find((x) => x.repo === "refused"))[1].body, /^Not promoted: cgwalters approved 12fe99311b45, and its head is now 555555555555/);
+  CASES.forEach(fixture);
+  fs.rmSync(ATTEMPTS, { force: true });
+});
+
+test("a notice that can't be posted: the PR is still listed, and the sweep exits 1", () => {
+  const c = { repo: "nocomment", number: 21, reviews: [review("APPROVED", OLD)] };
+  fixture(c);
+  const search = JSON.parse(fs.readFileSync(path.join(REST, "search/issues.json"), "utf8"));
+  put("search/issues", { ...search, items: [{ html_url: prUrl(c), user: { login: "cgwalters-bot" }, body: meta("example/nocomment") }] });
+  try {
+    const r = tool(["--apply"]);
+    assert.equal(r.status, 1, r.stderr);
+    assert.match(r.stdout, /^Not promoted: \S+\/nocomment\/pull\/21: cgwalters approved /);
+    assert.match(r.stderr, /commenting on \S+\/nocomment\/pull\/21 failed: gh: Server Error \(HTTP 500\)/);
+  } finally {
+    put("search/issues", search);
   }
 });
 
