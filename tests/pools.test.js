@@ -153,6 +153,22 @@ test("runs that fit: one while within the pace, and what the points left pay for
   assert.deepEqual([70, 90].map((used) => pools.runsThatFit(at(used, 6 * DAY, wide), cost(5))), [6, 2]);
 });
 
+test("a remote run's agent: claude while its pool is behind and openai's ahead", () => {
+  const p = (ahead, hold = false) => ({ ahead, hold });
+  // [case, claude, openai, agent]
+  const cases = [
+    ["claude behind, openai held", p(-20), p(15, true), "claude"],
+    ["claude behind, openai ahead within its burst", p(-20), p(2), "claude"],
+    ["claude behind, openai behind too", p(-20), p(-5), "opencode"],
+    ["claude ahead, openai held", p(5), p(15, true), "opencode"],
+    ["claude behind but a shorter window used up", p(-20, true), p(15, true), "opencode"],
+    ["claude without a reading", null, p(15, true), "opencode"],
+    ["openai without a reading", p(-20), null, "opencode"],
+  ];
+  for (const [name, claude, openai, want] of cases) assert.equal(pools.remoteAgent({ claude, openai }), want, name);
+  assert.equal(pools.remoteAgent(undefined), "opencode");
+});
+
 test("a pool in a line, and the engines' pools", () => {
   const now = START + 7.5 * HOUR;
   const claude = pools.poolPace({ source: "statusline", observed_at: now - 60e3, windows: [{ used_percent: 90, window_ms: WEEK, resets_at: now + 12 * HOUR }] }, CFG, now);
@@ -168,6 +184,15 @@ test("a pool in a line, and the engines' pools", () => {
   assert.equal(pools.line({ claude, openai: null }, now), "claude 90% (resets Tue 12:30) · openai no reading (unpaced)");
   assert.deepEqual([pools.span(30e3), pools.span(47 * HOUR), pools.span(3 * DAY)], ["~1m", "~47h", "~3d"]);
   assert.deepEqual(pools.ENGINE_POOL, { claude: "claude", opencode: "openai" });
-  assert.deepEqual([{ run: "x", lead: "c" }, { lead: "c" }, {}].map(pools.engineOf), ["opencode", "claude", "claude"]);
+  // A run's engine is its agent, as the heartbeat's remote workers say; opencode when unknown.
+  const agents = pools.runAgents([{ name: "run-7", location: "remote", engine: "claude" }, { name: "run-8", location: "remote", engine: "fake" },
+    { name: "run-9", location: "local", engine: "claude" }, { name: "w", location: "remote", engine: "claude" }, null]);
+  assert.deepEqual(agents, { 7: "claude", 8: "fake" });
+  assert.deepEqual(pools.runAgents(undefined), {});
+  const run = (n) => ({ run: `https://github.com/o/r/actions/runs/${n}`, lead: "c" });
+  assert.deepEqual([run(7), run(8), run(9), { run: "x", lead: "c" }, { lead: "c" }, {}].map((it) => pools.engineOf(it, agents)),
+    ["claude", "fake", "opencode", "opencode", "claude", "claude"]);
+  assert.deepEqual([{ run: "x" }, {}].map((it) => pools.engineOf(it)), ["opencode", "claude"]);
+  assert.deepEqual([run(7).run, "x", undefined].map(pools.runId), ["7", null, null]);
   assert.deepEqual([{ labels: ["Urgent"] }, { labels: ["P0"] }, {}].map(pools.isUrgent), [true, false, false]);
 });

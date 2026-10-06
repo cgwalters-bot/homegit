@@ -1175,6 +1175,15 @@ pace budget PVTI_item2" "board calls"
     # fake agent has none.
     out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs --agent fake "${WORK}/brief.md")
     expect_eq "$(jq -r .inputs.model <<<"$(sed 1d <<<"${out}")")" "" "fake agent's model"
+    # The default budget is the agent's: a claude run's AIC are api-equivalent.
+    local agent budgets=""
+    for agent in opencode claude fake; do
+        out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs --agent "${agent}" "${WORK}/brief.md")
+        budgets+="${agent} $(jq -r .inputs.budget <<<"$(sed 1d <<<"${out}")") "
+    done
+    out=$("${BOT_RUNS}" dispatch --dry-run --item PVTI_item1 --repo composefs/composefs-rs --agent claude --budget 800 "${WORK}/brief.md")
+    budgets+="claude --budget $(jq -r .inputs.budget <<<"$(sed 1d <<<"${out}")")"
+    expect_eq "${budgets}" "opencode 500 claude 5000 fake 500 claude --budget 800" "default budgets by agent"
     # --dry-run sends nothing.
     : >"${FAKE_GH}/calls"
     : >"${FAKE_GH}/board-calls"

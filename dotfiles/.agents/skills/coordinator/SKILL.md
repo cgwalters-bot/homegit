@@ -391,12 +391,14 @@ nothing itself. Its rules (`bot-reconcile --help` has the details):
   while the other runs over is only noted in the Observed line. A busy task
   past its Budget tokens is a **budget** action.
 - **dispatch:** auto-dispatch, deterministic and opt-in: a lane with a
-  free slot, while the remote runs are under the opencode share and the
-  openai pool is within its pace (the claude pool's holds no run), gets its
+  free slot, while the remote runs are under their share and the pool of
+  the run's agent is within its pace, gets its
   top Todo issue labeled `dispatch` (an issue in the bot's own
   repositories, with `Repo: OWNER/REPO` in its body when it isn't in the
   target repository; an optional `Base: REF`) dispatched as one `bot-runs
-  dispatch`. `bot-reconcile --apply` (which `bot-poll-loop` runs each cycle)
+  dispatch`: an opencode run (the openai pool), or `--agent claude` while
+  the claude pool is behind its pace and the openai one is held or ahead
+  of its own. `bot-reconcile --apply` (which `bot-poll-loop` runs each cycle)
   builds the brief from the issue (title, body, the operator's comments,
   acceptance criteria; the operator's or the bot's issues only), removes the
   label (one dispatch per label, so a run that fails and returns the item
@@ -537,8 +539,8 @@ Fill a free slot with `bot-runs dispatch` (see "Devspace agent runs
 are the default"); only for the cases listed there that need a local
 worker, use `bot-pace assign ITEM` (In Progress, Lead `coordinator`, and
 its budget) before briefing it. The operator's mix is 1 remote run in 4
-agents (`pacing.opencode_share`, since `agent.yml` runs only opencode, so a
-remote run is the opencode share), the rest local Claude workers:
+agents (`pacing.opencode_share`, whichever agent the run uses; the name is
+from when `agent.yml` ran only opencode), the rest local Claude workers:
 `bot-reconcile`'s Observed line says how many of the busy agents are
 remote against that target, and flags a share that is over it. The
 `dispatch` rule fills the remote share by itself (see "Reconcile").
@@ -558,8 +560,9 @@ bucket, from the table in `workstream` ("Cost estimates"). Before
 dispatching, run `bot-capacity` (bot-reconcile reads it too): its Pace
 section has a line per pool, `claude` (the subscription your local
 workers and the apply and review steps draw on, from the `seven_day`
-percent that `bot-heartbeat statusline` saves) and `openai` (the Codex
-one behind the devspace runs, from the praxis broker's `/usage`). A pool
+percent that `bot-heartbeat statusline` saves; a devspace run with
+`--agent claude` draws on it too) and `openai` (the Codex
+one behind the devspace runs of opencode, from the praxis broker's `/usage`). A pool
 aims to have used its target (`pacing.pools.NAME.target`, 95%; the rest
 is the operator's reserve) by its window's reset, evenly, so the pace
 allows `target * elapsed / window` plus a small burst. Then:
@@ -569,8 +572,15 @@ allows `target * elapsed / window` plus a small burst. Then:
   17% used, pace allows 3% (ahead by 14 points; next dispatch in ~20h)"):
   with claude held, start no local worker and defer apply and review
   steps, but devspace runs go on (up to `pacing.opencode_runs` at once);
-  with openai held, dispatch no devspace run, but local workers go on.
+  with openai held, dispatch no opencode run, but local workers go on.
   Let running work finish either way;
+- a devspace run is opencode, unless the `capacity` action names `bot-runs
+  dispatch --agent claude`: it does while the claude pool is behind its
+  pace and the openai one is held or ahead of its own, so that a held
+  openai pool doesn't leave the remote share idle. Such a run is charged
+  to the claude pool and counts toward the same remote share and run
+  limit; `bot-runs dispatch` gives it a larger default `--budget` (its AIC
+  are api-equivalent);
 - an item labeled `urgent` (in the bot's own repositories: P0 work, or
   what the operator raised, on their word) goes whatever the pace. Say in
   the brief when you used it;

@@ -48,6 +48,12 @@ function held(...names) {
   for (const n of names) Object.assign(c.pools[n], { used_percent: 90, ahead: 39.6, hold: true, reason: "pace", next_dispatch_at: new Date(NOW + 3 * 60 * MIN).toISOString(), fits: 0 });
   return c;
 }
+// onPace(c): bot-capacity's report c with the claude pool on its pace,
+// neither ahead nor behind: devspace runs stay opencode.
+function onPace(c) {
+  Object.assign(c.pools.claude, { used_percent: 50.4, ahead: 0 });
+  return c;
+}
 const HELD = { claude: "claude: 90% used, pace allows 50% (ahead by 40 points; next dispatch in ~3h)", openai: "openai: 90% used, pace allows 50% (ahead by 40 points; next dispatch in ~3h)" };
 const setItem = (items, id, fields) => items.map((it) => (it.id === id ? { ...it, ...fields } : it));
 
@@ -95,9 +101,13 @@ test("capacity: lanes against the target; a pool over its pace holds only its en
     ["a pool without a reading holds nothing", { items: oneFree, capacity: { pools: { claude: null, openai: null } } }, ["capacity:upstream"], all],
     ["the pools held, the total at the target", { capacity: held("claude", "openai") }, [], null],
     ["claude over its pace: devspace runs only, up to the run limit", { items: oneFree, capacity: held("claude") }, ["capacity:upstream:claude-held"], all,
-      new RegExp(`dispatch up to 1, only as a devspace run \\(bot-runs dispatch\\) while under the opencode run limit \\(1 of 2 remote\\): no new local workers but for urgent-labeled items \\(${HELD.claude.replace(/[()]/g, "\\$&")}\\)`)],
-    ["openai over its pace: local workers only", { items: oneFree, capacity: held("openai") }, ["capacity:upstream:opencode-held"], all,
+      new RegExp(`dispatch up to 1, only as a devspace run \\(bot-runs dispatch\\) while under the remote run limit \\(1 of 2 remote\\): no new local workers but for urgent-labeled items \\(${HELD.claude.replace(/[()]/g, "\\$&")}\\)`)],
+    ["openai over its pace, claude on its own: local workers only", { items: oneFree, capacity: onPace(held("openai")) }, ["capacity:upstream:opencode-held"], all,
       new RegExp(`dispatch up to 1, only as a local worker \\(bot-pace assign\\): no new devspace runs but for urgent-labeled items \\(${HELD.openai.replace(/[()]/g, "\\$&")}\\)`)],
+    ["openai over its pace, claude behind its own: devspace runs of claude", { items: oneFree, capacity: held("openai") }, ["capacity:upstream:opencode-held:claude-remote"], all,
+      new RegExp(`dispatch up to 1, as a devspace run \\(bot-runs dispatch --agent claude\\) while under their remote share \\(1 of 1 remote\\), else as a local worker \\(bot-pace assign\\): the claude pool is behind its pace, so devspace runs go to it \\(${HELD.openai.replace(/[()]/g, "\\$&")}\\); `)],
+    ["openai ahead of its pace, within the burst, claude behind: devspace runs of claude", { items: oneFree, capacity: (() => { const c = read("capacity.json"); c.pools.openai.ahead = 1; return c; })() },
+      ["capacity:upstream:claude-remote"], all, /--agent claude\) while under their remote share .*can't run remotely; the claude pool is behind its pace, so devspace runs go to it; /],
     ["both over: nothing to dispatch", { items: oneFree, capacity: held("claude", "openai") }, [], null],
     ["both over: only an urgent item", { items: urgent, capacity: held("claude", "openai") }, ["capacity:upstream:claude+opencode-held"], ["PVTI_c2"], /both pools are over their pace .*: dispatch only these urgent-labeled items, up to 1/],
     ["both over: an upstream issue's urgent label doesn't count", { items: foreign, capacity: held("claude", "openai") }, [], null],
@@ -111,17 +121,17 @@ test("capacity: lanes against the target; a pool over its pace holds only its en
     if (says) assert.match(actions[0].do, says, name);
   }
   const [free] = rec.capacity(obs({ items: oneFree }));
-  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1, as a devspace run \(bot-runs dispatch\) while under their opencode share \(1 of 1 remote\), else as a local worker \(bot-pace assign\), which is also for work that does GitHub I\/O or can't run remotely; 2 P0 wait on a human$/);
+  assert.match(free.do, /^upstream 1 of 2 busy: dispatch up to 1, as a devspace run \(bot-runs dispatch\) while under their remote share \(1 of 1 remote\), else as a local worker \(bot-pace assign\), which is also for work that does GitHub I\/O or can't run remotely; 2 P0 wait on a human$/);
   assert.equal(free.detail[0], "P0 https://github.com/cgwalters-forge/tracker/issues/30 image-builder analysis (osbuild/image-builder, budget 5M by P0)");
   const a = rec.capacity(obs({ items: oneFree.filter((it) => !/^PVTI_c/.test(it.id)) }))[0];
   assert.match(a.do, /no Todo candidates: triage the backlog or file upstream work; 2 P0 wait on a human$/);
   // A lane's shortfall with the total at the target is only noted.
   // [case, changes, the Observed line's agents part]
   const noted = [
-    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote (opencode share target 1, limit 2), 3 local)"],
-    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 1 remote (opencode share target 1, limit 2), 2 local)"],
+    ["at the target", {}, "4 of 4 agents busy (harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote (share target 1, limit 2), 3 local)"],
+    ["under it", { items: oneFree }, "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 1 remote (share target 1, limit 2), 2 local)"],
     ["mostly remote", { items: setItem(setItem(read("board.json"), "PVTI_h1", { lead: undefined, run: "https://github.com/bootc-dev/cgwalters-devspace-sandbox/actions/runs/6" }), "PVTI_o1", { status: "Draft" }) },
-      "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 2 remote (opencode share target 1, over it, limit 2), 1 local)"],
+      "3 of 4 agents busy (harness 2 of 2, upstream 1 of 2; 2 remote (share target 1, over it, limit 2), 1 local)"],
   ];
   for (const [name, changes, want] of noted) {
     assert.ok(rec.render(rec.observed(obs(changes)), []).startsWith(`Observed: ${want}; budgets `), name);
@@ -436,7 +446,7 @@ function cli(args, { now = "2026-10-02T12:00:00Z", status = 0, env = {} } = {}) 
 
 test("bot-reconcile: the report, and --json", () => {
   const out = cli([]);
-  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote \(opencode share target 1, limit 2\), 3 local\); budgets 8M, spent 1\.5M; claude 30% \(resets Mon 23:00\) · openai 3% \(resets Mon 23:00\); heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(12\):\n/);
+  assert.match(out, /^Observed: 4 of 4 agents busy \(harness 3 of 2, upstream 1 of 2; upstream under its share, held: the total is at the target; 1 remote \(share target 1, limit 2\), 3 local\); budgets 8M, spent 1\.5M; claude 30% \(resets Mon 23:00\) · openai 3% \(resets Mon 23:00\); heartbeat 10 min old; sweep 20261002-114000-000, 17 min old\nActions \(12\):\n/);
   assert.doesNotMatch(out, /^. capacity /m);
   const j = JSON.parse(cli(["--json"]));
   assert.deepEqual(j.actions.map((a) => a.key), ALL_KEYS);

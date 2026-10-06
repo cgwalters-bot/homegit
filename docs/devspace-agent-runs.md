@@ -56,7 +56,7 @@ so no polling is needed to find the run. The inputs are all strings:
 | `timeout`  | minutes, at most 330 (`bot-runs dispatch` sends `75`) |
 | `max_requests` | the most model requests the run may make, subagents' included, as the broker counts them; `0` for no cap (the workflow's default is `150`; `bot-runs dispatch` sends it only with `--max-requests`) |
 | `max_tasks` | the most subagent tasks the agent may start; `0` for no cap (default `4`; sent only with `--max-tasks`) |
-| `budget`   | the spend cap in AIC (1 AIC = $0.01) |
+| `budget`   | the spend cap in AIC (1 AIC = $0.01; `bot-runs dispatch` sends `500`, or `5000` for `claude`, whose AIC are `api-equivalent`) |
 | `workflow` | `branch` or `analysis` |
 | `outputs`  | the output types the run may hand back, comma separated (`create_pull_request`, `add_comment`, `noop`, `missing_tool`, `missing_data`; `all` for every type allowed to this workflow): `bot-runs dispatch` sends `create_pull_request,noop,missing_tool` for a branch run and `noop,missing_tool,missing_data` for an analysis run |
 | `max_outputs` | the most outputs of all types the run may hand back (`bot-runs dispatch` sends `3`) |
