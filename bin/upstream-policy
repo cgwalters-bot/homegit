@@ -58,6 +58,10 @@ const WORKFLOWS_DIR = ".github/workflows";
 // The workflow event a merge queue runs checks on.
 const MERGE_GROUP = "merge_group";
 const SOURCE_KEYS = ["repo", "path", "sha"];
+// What show quotes of a record's body at most, and the length of its
+// digest.
+const RULES_MAX = 4000;
+const DIGEST_LEN = 16;
 const SHA_RE = /^[0-9a-f]{40}$/;
 // OWNER/REPO, neither of them all dots ('..' would leave the records).
 const REPO_RE = /^(?!\.+\/)[A-Za-z0-9_.-]+\/(?!\.+$)[A-Za-z0-9_.-]+$/;
@@ -148,6 +152,18 @@ Commands:
         has (not fetched); otherwise it warns, and a HEAD or
         ${REMOTE}/${REMOTE_BRANCH} record saying '${REBASE_CONFLICTS_ONLY}' still
         holds, else detection decides.
+  show OWNER/REPO
+        Print the record as JSON, for the advisory 'bot-promote-due'
+        shows on a fork PR before promoting it: {repo, file, verdict,
+        verdict_means, ai_trailer, dco, checked, sources, digest, rules,
+        bots_disallowed}. rules is the record's quoted upstream text
+        (its '> ' lines, at most ${RULES_MAX} characters), digest a
+        short hash of its sources' ids, which changes whenever the
+        record is rechecked against changed sources, and
+        bots_disallowed whether the verdict is no-go. Read from the
+        checkout without the gate's checks, and never a verdict for
+        promote: only check is. Exit status ${EX_MISSING} without a record,
+        ${EX_INVALID} for an invalid one.
 
 A record counts only when it is committed and is what ${REMOTE}/${REMOTE_BRANCH}
 has (check fetches it first), as a regular file (no symlinks). Its
@@ -776,13 +792,43 @@ function rebaseMode(name, branch) {
   return why ? `${REBASE_CONFLICTS_ONLY}: ${why}` : REBASE_ANY;
 }
 
+// show(name): the record of NAME in the checkout, as show prints it.
+function show(name) {
+  const file = path.join(POLICY_DIR, `${name}.md`);
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (e) {
+    if (e.code === "ENOENT") throw new Exit(EX_MISSING, `${name} has no policy record (${file})`);
+    throw new Exit(EX_ERROR, `cannot read ${file}: ${e.message}`);
+  }
+  const record = parseRecord(text, file);
+  const sources = record.sources.map((s) => ({ repo: s.repo || name, path: s.path, sha: s.sha }));
+  const ids = sources.map((s) => `${s.repo.toLowerCase()}:${s.path.replace(/\/+$/, "")}:${s.sha}`).sort();
+  const body = text.split(/\r?\n/);
+  const quoted = body.slice(body.indexOf("---", 1) + 1).filter((l) => /^>/.test(l)).join("\n");
+  return {
+    repo: name,
+    file,
+    verdict: record.verdict,
+    verdict_means: VERDICTS[record.verdict],
+    ai_trailer: record["ai-trailer"],
+    dco: record.dco,
+    checked: record.checked,
+    sources,
+    digest: crypto.createHash("sha256").update(ids.join("\n")).digest("hex").slice(0, DIGEST_LEN),
+    rules: quoted.length > RULES_MAX ? `${quoted.slice(0, RULES_MAX - 3)}...` : quoted,
+    bots_disallowed: record.verdict === "no-go",
+  };
+}
+
 function main(argv) {
   if (argv.includes("-h") || argv.includes("--help")) {
     process.stdout.write(usage());
     return;
   }
   const [command, name, ...rest] = argv;
-  if (!command || !name || !REPO_RE.test(name)) throw new Exit(EX_USAGE, `usage: ${PROG} check|scan|rebase OWNER/REPO (see --help)`);
+  if (!command || !name || !REPO_RE.test(name)) throw new Exit(EX_USAGE, `usage: ${PROG} check|scan|rebase|show OWNER/REPO (see --help)`);
   if (command === "check") {
     const allow = rest.length === 1 && rest[0] === "--allow-human-text";
     if (rest.length > (allow ? 1 : 0)) throw new Exit(EX_USAGE, `unknown arguments for check: ${rest.join(" ")}`);
@@ -790,6 +836,9 @@ function main(argv) {
   } else if (command === "rebase") {
     if (rest.length !== 1 || !rest[0] || rest[0].startsWith("-")) throw new Exit(EX_USAGE, `usage: ${PROG} rebase OWNER/REPO BRANCH`);
     console.log(rebaseMode(name, rest[0]));
+  } else if (command === "show") {
+    if (rest.length) throw new Exit(EX_USAGE, `unknown arguments for show: ${rest.join(" ")}`);
+    console.log(JSON.stringify(show(name)));
   } else if (command === "scan") {
     if (rest.length) throw new Exit(EX_USAGE, `unknown arguments for scan: ${rest.join(" ")}`);
     const found = scan(name);

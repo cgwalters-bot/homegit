@@ -42,7 +42,9 @@ test.after(() => fs.rmSync(WORK, { recursive: true, force: true }));
 // $FAKE_BOT_PR_RATELIMIT, refuses a PR whose repository is named
 // "refused" (a conflict, say), and else prints the upstream PR it opened.
 // upstream-policy says human-text for a repository named humantext*,
-// has no record for "nopolicy", fails for "broken", and else says bot-ok.
+// no-go for "nogo", has no record for "nopolicy", fails for "broken", and
+// else says bot-ok; its show prints such a record, with the digest in
+// $FAKE_DIGEST.
 fs.writeFileSync(FAKE_BOT_PR, `#!/usr/bin/env node
 const fs = require("node:fs");
 const args = process.argv.slice(2);
@@ -63,18 +65,27 @@ const fs = require("node:fs");
 const args = process.argv.slice(2);
 fs.appendFileSync(process.env.FAKE_LOG, "upstream-policy " + args.join(" ") + "\\n");
 const name = args[1].split("/")[1];
-if (name.startsWith("humantext")) { console.log("human-text"); process.exit(5); }
+const verdict = name.startsWith("humantext") ? "human-text" : name === "nogo" ? "no-go" : "bot-ok";
 if (name === "nopolicy") { process.stderr.write("error: no record for " + args[1] + "\\n"); process.exit(3); }
 if (name === "broken") { process.stderr.write("error: cannot read the sources\\n"); process.exit(1); }
-console.log("bot-ok");
+if (args[0] === "show") {
+  console.log(JSON.stringify({ repo: args[1], verdict, verdict_means: "what " + verdict + " means", ai_trailer: "Assisted-by",
+    checked: "2026-10-01 by the policy-check subagent", digest: process.env.FAKE_DIGEST || "d".repeat(16),
+    rules: "> Disclose AI use, @maintainer says (https://github.com/example/policy/issues/7, \`\`\`see\`\`\`).", bots_disallowed: verdict === "no-go" }));
+  process.exit(0);
+}
+console.log(verdict);
+process.exit({ "human-text": 5, "no-go": 6 }[verdict] || 0);
 `, { mode: 0o755 });
 
 fs.writeFileSync(FAKE_BOARD, `#!/usr/bin/env node
 require("node:fs").appendFileSync(process.env.FAKE_LOG, "bot-board " + process.argv.slice(2).join(" ") + "\\n");
 `, { mode: 0o755 });
-// gh: a POST of a comment is logged ("comment PATH") and added to the
-// PR's comments as the bot's, as GitHub would list it next time, unless
-// its repository is named "nocomment"; the rest is the fake gh's.
+// gh: a POST of a comment is logged ("comment PATH", or "advisory PATH"
+// for an advisory) and added to the PR's comments as the bot's, as GitHub
+// would list it next time, unless its repository is named "nocomment". A
+// POST of an issue ("issue PATH") or a PATCH of one ("edit PATH") is
+// kept likewise. The rest is the fake gh's.
 fs.writeFileSync(GH_WRAP, `#!/usr/bin/env node
 const fs = require("node:fs");
 const path = require("node:path");
@@ -87,13 +98,36 @@ if (args[3].includes("/nocomment/")) {
   process.stderr.write("gh: Server Error (HTTP 500)\\n");
   process.exit(1);
 }
-const file = path.join(process.env.FAKE_GH_DIR, args[3] + ".json");
-const comments = JSON.parse(fs.readFileSync(file, "utf8"));
+const fields = {};
+for (let i = 4; i < args.length; i++) {
+  if (args[i] === "-f") {
+    const [k, ...v] = args[++i].split("=");
+    fields[k] = v.join("=");
+  }
+}
+const file = (p) => path.join(process.env.FAKE_GH_DIR, p + ".json");
+const read = (p) => (fs.existsSync(file(p)) ? JSON.parse(fs.readFileSync(file(p), "utf8")) : null);
+const write = (p, data) => {
+  fs.mkdirSync(path.dirname(file(p)), { recursive: true });
+  fs.writeFileSync(file(p), JSON.stringify(data));
+};
+const log = (what) => fs.appendFileSync(process.env.FAKE_LOG, what + " " + args[3] + "\\n");
+if (args[3].endsWith("/issues") || args[2] === "PATCH") {
+  const list = args[2] === "PATCH" ? path.dirname(args[3]) : args[3];
+  const issue = args[2] === "PATCH" ? { ...read(args[3]), ...fields }
+    : { number: 1000 + (read(list) || []).length, state: "open", user: { login: "cgwalters-bot" }, ...fields };
+  write(list + "/" + issue.number, issue);
+  write(list, [...(read(list) || []).filter((i) => i.number !== issue.number), issue]);
+  log(args[2] === "PATCH" ? "edit" : "issue");
+  console.log(issue.number);
+  process.exit(0);
+}
+const comments = read(args[3]);
 const at = new Date().toISOString();
 const url = "notice-" + comments.length;
-comments.push({ user: { login: "cgwalters-bot" }, body: args[5].replace(/^body=/, ""), created_at: at, updated_at: at, html_url: url });
-fs.writeFileSync(file, JSON.stringify(comments));
-fs.appendFileSync(process.env.FAKE_LOG, "comment " + args[3] + "\\n");
+comments.push({ user: { login: "cgwalters-bot" }, body: fields.body, created_at: at, updated_at: at, html_url: url });
+write(args[3], comments);
+log(/bot-promote-due advisory=/.test(fields.body) ? "advisory" : "comment");
 console.log(url);
 `, { mode: 0o755 });
 
@@ -394,6 +428,93 @@ test("a notice that can't be posted: the PR is still listed, and the sweep exits
   } finally {
     put("search/issues", search);
   }
+});
+
+test("--apply shows the upstream's LLM rules before promoting, and caches each policy in one issue", () => {
+  CASES.forEach(fixture);
+  fs.rmSync(ATTEMPTS, { force: true });
+  const tracker = "repos/cgwalters-forge/tracker/issues";
+  fs.rmSync(path.join(REST, tracker), { recursive: true, force: true });
+  fs.rmSync(path.join(REST, `${tracker}.json`), { force: true });
+  const nogo = { repo: "nogo", number: 22, reviews: [review("APPROVED", HEAD)] };
+  fixture(nogo);
+  const search = JSON.parse(fs.readFileSync(path.join(REST, "search/issues.json"), "utf8"));
+  put("search/issues", { ...search, items: [...search.items, { html_url: prUrl(nogo), user: { login: "cgwalters-bot" }, body: meta("example/nogo") }] });
+  const commentsOf = (c) => JSON.parse(fs.readFileSync(path.join(REST, `repos/${FORGE}/${c.repo}/issues/${c.number}/comments.json`), "utf8"));
+  const advisories = (c) => commentsOf(c).filter((x) => /bot-promote-due advisory=/.test(x.body));
+  const advised = (r) => r.calls.filter((l) => l.startsWith("advisory ")).sort();
+  const writes = (r) => r.calls.filter((l) => /^(issue|edit) /.test(l));
+  const issue = () => JSON.parse(fs.readFileSync(path.join(REST, `${tracker}.json`), "utf8"));
+  const cached = () => {
+    const m = /<!-- bot-policy-cache\n([\s\S]*?)\n-->/.exec(issue()[0].body);
+    return JSON.parse(m[1]);
+  };
+  try {
+    const r = tool(["--apply", "--json"]);
+    assert.equal(r.status, 0, r.stderr);
+    // Every PR the policy check got to with a record, before bot-pr ran.
+    const want = [...listed.filter((c) => ["promoted", "refused", "needs-text"].includes(c.result)), nogo];
+    assert.deepEqual(advised(r), want.map((c) => `advisory repos/${FORGE}/${c.repo}/issues/${c.number}/comments`).sort());
+    const bootc = CASES.find((c) => c.repo === "bootc");
+    assert.ok(r.calls.indexOf(`advisory repos/${FORGE}/bootc/issues/24/comments`) < r.calls.indexOf(promoteCall(bootc)), r.calls.join("\n"));
+    const [a] = advisories(bootc);
+    assert.match(a.body, /^Upstream LLM rules \(advisory\): example\/bootc's contribution policy record says bot-ok: what bot-ok means\. AI trailer: Assisted-by\. Nothing here holds this PR back: the bot promotes it now\.\n\n<details><summary>What its policy sources say<\/summary>\n\n````text\n> Disclose AI use, @maintainer says \(https:\/\/github\.com\/example\/policy\/issues\/7, ```see```\)\.\n````\n\n<\/details>/);
+    // Quoted upstream text is only ever code: it mentions nobody, and
+    // links no upstream thread.
+    for (const c of advisories(bootc)) assert.doesNotMatch(c.body.replace(/^(`{3,})text\n[\s\S]*?\n\1$/gm, ""), /@maintainer|example\/policy/);
+    assert.match(advisories(nogo)[0].body, /They disallow bot accounts, so this PR is not promoted\./);
+    assert.match(advisories(CASES.find((c) => c.repo === "humantext"))[0].body, /The text sent there must be yours; the next comment says how\./);
+    const out = Object.fromEntries(JSON.parse(r.stdout).map((x) => [x.url, x]));
+    assert.equal(out[prUrl(bootc)].advisory, a.html_url);
+    assert.equal(out[prUrl(nogo)].result, "held");
+    // One issue holds the policies the sweep saw.
+    assert.deepEqual(writes(r), [`issue ${tracker}`]);
+    assert.equal(issue().length, 1);
+    let entries = cached();
+    assert.equal(entries["example/bootc"].status, "ok");
+    assert.equal(entries["example/bootc"].submission.url, `${GH}/example/bootc/pull/99`);
+    assert.equal(entries["example/bootc"].recheck, false);
+    assert.equal(entries["example/nopolicy"].status, "missing");
+    assert.equal(entries["example/nopolicy"].recheck, true);
+    assert.equal(entries["example/humantext"].verdict, "human-text");
+    assert.equal(entries["example/nogo"].status, "refused");
+    assert.ok(!("example/stale" in entries), "a moved head checks no policy");
+    assert.match(issue()[0].body, /\| example\/bootc \| bot-ok \| ok \|/);
+    // The tracker is public: the upstream PR is named in code only, which
+    // puts no "mentioned this" on it.
+    assert.match(issue()[0].body, /\| `https:\/\/github\.com\/example\/bootc\/pull\/99` \(/);
+    assert.doesNotMatch(issue()[0].body.replace(/<!--[\s\S]*?-->/g, ""), /(?<!`)https:\/\/github\.com\/example\//);
+    // Nothing new: nothing is said or written again.
+    const again = tool(["--apply"]);
+    assert.equal(again.status, 0, again.stderr);
+    assert.deepEqual([...advised(again), ...writes(again)], []);
+    // A record rechecked against changed sources is shown again, and the
+    // cache says it changed since the last submission.
+    const next = tool(["--apply"], { FAKE_DIGEST: "e".repeat(16) });
+    assert.equal(next.status, 0, next.stderr);
+    assert.deepEqual(advised(next), advised(r));
+    assert.deepEqual(writes(next), [`edit ${tracker}/1000`]);
+    entries = cached();
+    assert.equal(entries["example/bootc"].changed_since_submission, false, "promoted again at once");
+    assert.equal(entries["example/humantext"].changed_since_submission, false, "never submitted");
+  } finally {
+    put("search/issues", search);
+    CASES.forEach(fixture);
+    fs.rmSync(ATTEMPTS, { force: true });
+  }
+});
+
+test("the policy cache flags a record that changed since the last submission", () => {
+  const { update, parse, render } = require("../lib/policy-cache.js");
+  const view = (digest) => ({ verdict: "bot-ok", checked: "c", ai_trailer: "t", digest });
+  let e = update({}, "o/r", { at: "2026-10-01T00:00:00Z", status: "ok", view: view("a"), submitted: "https://github.com/o/r/pull/1" });
+  assert.equal(update(e, "o/r", { at: "2026-10-02T00:00:00Z", status: "ok", view: view("a") }), e, "the same view changes nothing");
+  e = update(e, "o/r", { at: "2026-10-03T00:00:00Z", status: "stale", view: view("a") });
+  assert.deepEqual([e["o/r"].recheck, e["o/r"].changed_since_submission], [true, false]);
+  e = update(e, "o/r", { at: "2026-10-04T00:00:00Z", status: "ok", view: view("b") });
+  assert.deepEqual([e["o/r"].recheck, e["o/r"].changed_since_submission, e["o/r"].submission.digest], [false, true, "a"]);
+  assert.deepEqual(parse(render({ ...e, "x/y": { ...e["o/r"], checked: "a --> b" } })), { ...e, "x/y": { ...e["o/r"], checked: "a --> b" } });
+  assert.deepEqual(parse("no marker"), {});
 });
 
 test("usage errors", () => {

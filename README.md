@@ -130,7 +130,13 @@ promote (the repository is human-text and I only approved, its policy
 record is missing or stale, the head moved since, or `bot-pr promote`
 refused), it comments once on the fork PR with the reason and my next
 step, and notes it in the board item's News; a new approval that still
-can't promote gets a new answer.
+can't promote gets a new answer. Before promoting (or holding) a fork
+PR, it also comments there once per policy record with the upstream's
+LLM rules as the record quotes them: advisory, blocking only where they
+disallow bot accounts (no-go). And it keeps one tracker issue with its
+view of each upstream's policy (verdict, what the check said, the last
+upstream PR it promoted there), marking a record whose sources changed
+since for a recheck.
 
 The coordinator doesn't run these by hand: `bot-sweep`, run every 10
 minutes by the `bot-sweep.timer` systemd user unit (in

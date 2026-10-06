@@ -611,6 +611,28 @@ git -C "${HOMEGIT}" checkout -q -- .
 rm "${FAKE_GH}/rest/repos/acme/proj/rules/branches/main.json"
 run "rebase usage" 2 usage rebase acme/plain
 
+# --- show: the record for the advisory on a fork PR, never a gate ---
+record human-only
+: >"${FAKE_GH}/calls"
+shown=$("${TOOL}" show acme/proj) || fail "show: exit status $?"
+test ! -s "${FAKE_GH}/calls" || fail "show called: $(cat "${FAKE_GH}/calls")"
+jq -e --arg c "${CONTRIB}" --arg h "${HACKING}" '
+    .repo == "acme/proj" and .verdict == "human-only" and .ai_trailer == "Assisted-by" and (.bots_disallowed | not)
+    and .rules == "> CONTRIBUTING.md: \"Disclose AI assistance.\"" and (.digest | test("^[0-9a-f]{16}$"))
+    and .sources[0] == {repo: "acme/proj", path: "CONTRIBUTING.md", sha: $c}
+    and .sources[3] == {repo: "acme/proj", path: "src/HACKING.md", sha: $h}' <<<"${shown}" >/dev/null ||
+    fail "show: unexpected ${shown}"
+digest=$(jq -r .digest <<<"${shown}")
+sed -i "s/${HACKING}/$(sha 99)/" "${RECORD}"
+test "$("${TOOL}" show acme/proj | jq -r .digest)" != "${digest}" || fail "show: a changed source id keeps the digest"
+sed -i 's/^verdict:.*/verdict: no-go/' "${RECORD}"
+"${TOOL}" show acme/proj | jq -e .bots_disallowed >/dev/null || fail "show: no-go does not disallow bots"
+sed -i 's/^verdict:.*/verdict: maybe/' "${RECORD}"
+run "show: invalid" "${EX_INVALID}" "unknown verdict 'maybe'" show acme/proj
+git -C "${HOMEGIT}" checkout -q -- .
+run "show: missing" "${EX_MISSING}" 'acme/none has no policy record' show acme/none
+run "show usage" 2 "unknown arguments for show" show acme/proj extra
+
 run "usage" 2 usage check not-a-repo
 for bad in ../x acme/.. ./proj acme/...; do
     run "usage: ${bad}" 2 usage check "${bad}"
