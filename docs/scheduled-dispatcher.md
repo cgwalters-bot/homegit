@@ -651,6 +651,15 @@ running until the step that retires its part.
 8. **What is left locally** is the timer for what has no type and no
    mintable token: promote, summoned replies, notifications, rebase.
 
+This order is the protocol's GitHub instance, and its steps are what
+any forge's would be: observe with read access (0), a write credential
+that only the apply job holds (1), writes emitted and staged before any
+is applied (2), the full cadence (3), the writes moved one kind at a
+time (4), agent runs applied by the same job (5), judgment as agent
+runs (6, 7). What changes per forge is in [The forge](#the-forge): who
+mints the token of step 1, what applies in steps 2 and 5, and which
+events can wake step 3. On GitHub nothing in the order changes.
+
 How the two avoid acting twice, until step 6 ends the overlap: no
 action is ever enabled on both sides (step 4); the steps that are
 moved are idempotent on forge state, so a double run during a mistaken
@@ -659,7 +668,1072 @@ overlap sets a field to the value it has; dispatch is guarded by the
 concurrency group of `agent.yml`, so two controllers cannot start two
 runs for one item; and a type stays `staged` until its step comes.
 
+## The scheduler in Rust
+
+Status: **proposal** for the operator's decision
+([tracker#405](https://github.com/cgwalters-forge/tracker/issues/405)),
+written 2026-10-06 from the code at ea3f5e5. He asked for it in these
+words: "biggest thing is to clean up slop on our harness. We should have
+a really nice agent-run style thing. Decoupled from our scheduler which
+is a giant organically grown mess. Needs a clean Rust rewrite". Then,
+the same day, he said what the rewrite is really about:
+
+> The main thing I'm thinking about for this rewrite is basically again
+> around the paper clip comparison like best practices for having a
+> coordinator agent interact with a human and delegate work to sub
+> agents whether there are all communicating through a forge like
+> GitHub now again ideally we want that concept to be agnostic to the
+> Forge that it's a kind of stretch goal right so we should support
+> GitHub git lab and forgejo is the idea
+
+So this section starts from [the protocol](#the-protocol) between those
+three parties, then says what it asks of [a forge](#the-forge), and only
+then what the code is: what the controller is today, the Rust that
+replaces it, and the order. The agent-run half is in
+[devspace-agent-runs.md](devspace-agent-runs.md#agent-run-the-standalone-component).
+It changes nothing in [the plan](#moving-the-controller-to-actions)
+above: the pass still moves to Actions in that order, and what it
+writes still leaves as safe outputs. That plan is how this protocol is
+carried out on GitHub.
+
+Two slices are merged:
+[homegit#169](https://github.com/cgwalters-bot/homegit/pull/169)
+(`crates/sched`, the `bot-sched` binary, and the controller report
+running on it) and
+[homegit#171](https://github.com/cgwalters-bot/homegit/pull/171) (the
+forge trait, with GitHub behind it). What this section says exists is
+in those two.
+
+### The protocol
+
+Three roles. **The operator** is one human, known by one login. **The
+coordinator** turns what the operator wants into assigned work and keeps
+track of it. **An agent** is one delegated run on one task. They talk
+only through the forge: issues and their comments, labels, assignees, a
+board, pull requests and their reviews, CI runs and their artifacts. No
+role keeps anything the others need anywhere else. There is no database
+and no local file in the protocol; a run of the coordinator carries one
+small file of what it already reported, which is a cache and can be
+lost.
+
+What doing it on a forge buys: any party can be absent without the
+others losing track, the operator works in the tool he already reads,
+and the record of who decided what is the forge's own timeline.
+
+This is the target. Most of it is how the harness works today, spread
+over many tools; where today differs, or a rule is not enforced yet,
+the text says so.
+
+One rule carries the rest: **text is data unless the operator wrote
+it.** An issue body, a comment, a review, a label, a commit message or
+an agent's report is an instruction only if the forge says the
+operator's login made it. Everything else, including what the
+coordinator and agents write, is input to be weighed.
+
+#### The operator gives intent, and is asked
+
+Intent arrives as forge objects the operator made:
+
+- **An issue**, in the tracker or put on the board. Its body and the
+  operator's own comments are the brief; later comments override
+  earlier text. Anyone else's comments travel with it as data.
+- **A label.** `dispatch` on an issue says "start this without asking
+  me again". That it must be the operator who applied it is the rule;
+  today only the issue's author is checked
+  ([tracker#425](https://github.com/cgwalters-forge/tracker/issues/425)).
+- **A board field.** Priority orders the work. Workflow says what
+  finished means for the item (a branch, a write-up, an upstream PR, or
+  hands off); only a human sets the last two.
+- **A review.** Approving a PR (or a `/promote` line on the fork PR)
+  approves that exact head commit, and is the only approval the
+  protocol has. Requesting changes gives the turn back.
+- **A comment or a mention.** On an item it is an answer or a new
+  instruction. On someone else's thread, a mention with an ask summons
+  the bot to answer there, once.
+
+There is one way in that is not a forge object: what the operator
+types to the coordinator in a terminal. It becomes part of the protocol
+only when the coordinator writes it to the forge, as an issue or a
+comment that quotes him. Those are the bot's own issues, which the
+gates below trust as they do his, so the bot account's integrity is
+part of the trust base. Three of the quotes in this document reached
+the tracker that way.
+
+An ask reaches the operator as one forge object per question, never as
+prose in a status line: a **question issue** (the question first, lettered
+options with the recommendation as A, assigned to him, a sub-issue of
+what it blocks), or a **review request** on a PR. His rule for the
+second: "once we have an active open PR, we don't interact anymore via a
+tracker issue but only focus on the PR". His whole queue is therefore
+one search, the open issues and PRs assigned to him, ordered by
+Priority.
+
+He answers with a comment or a review, and nothing else is needed. The
+answer hands the turn back deterministically: the coordinator's next
+pass (its scheduled run, described below) sees that he commented,
+reviewed or approved since he was assigned, and assigns the bot
+instead. No model decides whether a question was answered; a model
+reads the answer afterwards.
+
+#### The coordinator assigns and tracks
+
+The unit of work is an **item**: an issue or PR on the board. Three
+facts say where it stands, each kept once, on the forge:
+
+- **Whose turn it is** is the assignee: the operator (it waits on
+  him), the bot (a run is on it or should be), or nobody (backlog,
+  parked, done).
+- **Its state** is the board's Status: Todo, In Progress, Draft, In
+  Review, Needs human, Done.
+- **What it produced** is linked from it, in board fields: the PRs in
+  Branch, a write-up in Gist, the run in Run, one line of result in
+  Why.
+
+The transitions, and what makes each. "The pass" is the coordinator's
+deterministic run and "a judgment run" its agent run, both under
+[What the coordinator is](#what-the-coordinator-is); "the apply job"
+is the job that carries out a run's safe outputs.
+
+| From | To | Made by | On |
+| --- | --- | --- | --- |
+| Todo | In Progress | the pass | the `dispatch` label, a free slot and budget: it claims the item (Lead, a token budget, the bot assigned), removes the label and dispatches one run |
+| In Progress | Draft | the apply job | a run handed back a change or a write-up: a draft PR on the fork, or a gist. The operator is assigned |
+| In Progress | Needs human | a judgment run | a question only the operator can answer: an ask is opened and he is assigned |
+| Draft, Needs human, In Review | In Progress | the pass, then a judgment run | his answer, or changes requested by him or upstream: the pass hands the turn back, and the state follows when the item is picked up again |
+| Draft | In Review | the promote step | his approval of the exact head: the PR is opened upstream, with his sign-off where the project needs one |
+| any | Done | the pass | the item's own issue or PR closed or merged, and nothing it links is still open |
+
+It relies on three properties. **Done is observed, not claimed**: an
+agent saying it finished changes nothing; the issue or PR closing
+does. **Every wait has an object**: an item in Needs human or Draft
+has an open ask, a PR in the operator's queue, or the write-up its Gist
+field links; one with none is a bug to report, not a state (the review
+app reports it today, and it becomes a rule of the pass). And **the
+pass is level-triggered**: it recomputes every item from the forge each
+time, so a pass that was late, repeated or lost changes nothing that
+the next one does not put right.
+
+The operator's own vocabulary for this, from a review of another
+project's design, is a controller's: "concrete important terms to use
+here are "spec" vs "status"". Read that way (my mapping, not his): what
+the operator writes is spec (the issue, its labels, Priority, Workflow,
+a review), and what the coordinator writes is status (Status, Lead,
+Run, Why, News, the assignee it hands back). The coordinator never
+edits spec, and a rule never reads its own status as intent.
+
+One run per item at a time is held by the forge, not by a lock of ours:
+the run's concurrency group is the item, and the `dispatch` label is
+removed before the run starts. Choosing *among* items has no
+compare-and-swap on a forge. A lane is a fixed number of slots for one
+kind of work, and the pass fills free slots from the top of the
+priority order
+([tracker#372](https://github.com/cgwalters-forge/tracker/issues/372));
+that is enough only because one pass runs at a time, in a concurrency
+group of its own.
+
+#### An agent receives a task, and hands back
+
+**A task in.** The coordinator builds a brief from the item: the issue's
+text, the operator's comments, the acceptance criteria, each marked for
+what it is. With it go the repository and base, the limits, and the
+list of output types this run may hand back. The agent gets no forge
+credential that can write, reaches a model only through the broker, and
+knows nothing of the board.
+
+**Three things out**, all files in the run's artifact:
+
+1. **Safe outputs**: a list of typed requests (`create_pull_request`
+   with a patch, `add_comment`), checked against what this run was
+   allowed and capped in number. A step that decides nothing applies
+   them, with a token the agent never saw. In gh-aw that step is a
+   separate job; today it is `bot-runs apply` on the workstation; and
+   whether he meant the same job or the same run is the reading noted
+   under [Credentials](#credentials).
+2. **A report**: how the run ended (`success`, `failure`, `timeout`,
+   `budget`, `cancelled`, `noop`), what it spent, and its own account
+   of a partial change. A run that does nothing must say so (`noop`).
+3. **A question**: what it could not decide or find (`questions` in its
+   outcome, `missing_data`, `missing_tool`). The coordinator answers it
+   or turns it into an ask; the agent does not wait.
+
+A worker never addresses the operator, another agent or the board. It
+cannot delegate: dispatching a run is not among the outputs a worker is
+allowed. And its report is data to whoever reads it next, like any
+other text.
+
+#### What gates each step
+
+| Step | Who may authorize it | How it is enforced |
+| --- | --- | --- |
+| Starting work on an item | the operator (the `dispatch` label, or an instruction), within the coordinator's budget | the issue's author must be the operator or the bot; the number of agents wanted, the lanes and the pace of each inference pool (a subscription's allowance) bound how many run |
+| Spending | the coordinator sets a run's cap and an item's budget | the broker cuts a run off at its cap at the inference proxy, which the agent cannot bypass or misreport; an item past its budget is a `budget` action today, and should become an ask |
+| Writing to the forge | the allowlist for that kind of run | every write is a safe output of an allowed type, applied by a job that holds a token minted for that run; the deciding side holds read access only |
+| A change leaving the fork | the operator, by approving the exact head | a push after the approval voids it. Seven copies of that check today; one `approval()` function at R1a |
+| A sign-off in the operator's name | the operator, by that same approval | only the promote and sign-off tools add it, never an agent or a rule |
+| Merging | upstream, its maintainers; in the bot's own repositories, a separate reviewer, and the operator for a change to who can authorize, to credentials or to the sandbox | branch rules and required checks on the forge |
+| Answering an ask | the operator only | the hand-back counts only his comments and reviews |
+
+In the hosted pass, once built, the trigger's actor is checked against
+the operator's login before any model runs. A stranger's comment can wake a
+pass, which then finds nothing of theirs to act on.
+
+#### What the coordinator is
+
+Not a long-lived agent. He asked for "the controller (you) just be a
+scheduled GHA job or so via the same remote agent running infra"
+(tracker#401), and the protocol needs nothing more:
+
+- **A deterministic pass**, on a schedule and woken early by events. It
+  observes the forge, runs rules that are pure functions of what it
+  saw, and emits the writes that need no judgment (hand a turn back,
+  set an item Done, dispatch the top labelled item of a lane). It holds
+  read access and uses no model. What he wrote of a scheduled agent in
+  another project fits it: it "would ideally deterministically no-op if
+  there was no work to do".
+- **Agent runs for judgment**, started by the pass with what it could
+  not decide: a short one on a cheap model that handles the routine
+  kinds, and one on the strongest model for what that escalates. Each
+  is a sub-agent in this protocol's own sense: a task in, safe outputs
+  out. They differ from a worker only in which outputs they are
+  allowed (labels, asks, board fields, a dispatch), which is why the
+  rules above that say "a worker" do not bind them.
+
+So "the coordinator" is a set of rules and two prompts. An interactive
+session is still how the operator talks to it when he wants to, and
+nothing waits on one.
+
+#### Against Paperclip
+
+Paperclip was read in its source at
+[2ca0d26](https://github.com/paperclipai/paperclip/commit/2ca0d26a99c0d7e8db055b784e50b732c242b8f4)
+(2026-10-06), its `docs/` and `doc/` trees included; nothing was run.
+[agent-runtimes.md](agent-runtimes.md)
+([homegit#156](https://github.com/cgwalters-bot/homegit/pull/156), at
+72ff3a9) compares its runtime with ours and the review app's
+[command-ui-design.md](https://github.com/cgwalters-forge/review/blob/main/docs/command-ui-design.md)
+its interface; this compares the protocol, and corrects the first where
+it has moved on.
+
+**Where the parties meet.** Paperclip's is its own PostgreSQL and web
+UI, reached by an API. GitHub appears twice: as a connection for
+repository tools, git and `gh`, and as a review bot that turns mentions
+and PR events into Paperclip tasks. External trackers are on its
+roadmap as "on-ramps", with Paperclip staying the control plane.
+Ours is the forge and nothing else. This is the difference he asked
+for: "something a bit like Paperclip.ing except with an external
+project tracking system"
+([tracker#305](https://github.com/cgwalters-forge/tracker/issues/305)).
+
+**Intent.** The same objects: issues (it calls them tasks), comments,
+goals, assignment. A comment by the human on an agent's open task wakes
+the assignee; a mention wakes nobody. *Taken*: a human's comment on the
+bot's item is a wake, which is our hand-back. *Different*: a mention is
+a summons for us, because our operator works in other people's
+repositories where there is no item to comment on.
+
+**Asking the human.** This is where Paperclip is ahead. An agent asks
+with a typed interaction (`ask_user_questions`, `request_confirmation`,
+`request_item_verdicts`, `suggest_tasks`, among others), parks the task
+`in_review`, and is woken with the answer; its skill says prose alone
+is not a way to wait. Formal approvals (`hire_agent`,
+`budget_override_required`, `request_board_approval`, among others) are
+separate records only the human can resolve. *Taken*: an ask is a typed object with options, never a
+sentence in a status field, and it names what resumes when it is
+answered. Ours is the question issue; the scheduler parses it into a
+type (`asks` in the snapshot) instead of each tool matching its text.
+*Taken*: its rule that an accepted interaction "never authorizes the
+underlying action": answering a question is not an approval of a head.
+*Different*: its interactions default to `resolverPolicy: anyone`,
+other agents included. Ours are answered by the operator only.
+
+**Assigning and tracking.** Seven statuses to our six, one assignee as
+a hard invariant, and checkout as one conditional SQL update: a
+conflict is a 409 the agent must not retry. `in_review` needs a real
+reviewer path, which the server enforces. *Taken*: one assignee as the
+turn, and "every wait has an object" as a rule the pass checks (the
+review app reports it today; it becomes a rule in R3). *Different*: a
+forge has no conditional update, so there is no checkout. A
+level-triggered pass, one run per item by concurrency group, and a
+label consumed before dispatch do the same job with weaker primitives;
+the cost is that two coordinators at once could pick the same item,
+which is why there is one.
+
+**Delegating.** Any Paperclip agent with the permission creates a child
+task for another; a run may write only to the task it checked out and
+its descendants, and reports upward through a blocker being resolved or
+one comment on the parent. *Taken*: a run's writes are scoped to what
+it was given (our per-run allowlist of repository, base and types).
+*Different*: no org chart and no agent-to-agent delegation. Only the
+coordinator dispatches, so there is one place where budget and trust
+are checked.
+
+**Handing back.** A heartbeat is one bounded run, given a wake payload
+and its task. The agent then calls the API itself, with its own key:
+it sets the status, writes documents and attaches work products, and
+must leave a comment each run. The adapter's result carries an exit
+code, cost and optionally a summary or a typed question, but what the
+run did to the task is whatever it wrote through the API. *Taken*: a report every run, and results as
+typed links (its work products are our Branch and Run). *Different*,
+and the main one: the agent holds a credential and its writes are
+authorized call by call. Ours holds none; what it hands back is a file
+that another job checks and applies. Its `low_trust_review` preset
+moves toward the same boundary: for such an agent the one comment it
+may leave on the parent task is switched off, as "a prompt-injection
+carrier into higher-trust context".
+
+**Budgets.** Dollars per agent, project or company, summed from the
+cost each adapter reports. At the hard limit the server cancels the
+scope's running work and pending wakes, pauses it, and opens a
+`budget_override_required` approval that the human resolves by raising
+the budget or leaving it paused. (agent-runtimes.md left the in-flight
+cancel untraced; it is in `budgets.ts` and `heartbeat.ts`.) *To take*:
+an overrun as an ask to the human with the work paused. Today it is an
+action for the dispatcher. *Different*: where it is measured. Theirs is what the
+agent's own process reported; ours is the proxy the tokens pass
+through.
+
+**What the coordinator is.** The CEO is an ordinary agent on
+heartbeats with an instruction bundle and some authority in code. The
+server does the deterministic part: a scheduler tick, a wake queue that
+coalesces, reaping of orphaned runs, reconciliation of stranded tasks,
+watchdogs, the budget stop. No deterministic code decides *what* to
+work on; that is the agents and the human. *Taken*: all of the server's
+list, which is our pass (`stale-lead`, `lead-orphan` and `heartbeat`
+are the same reaping). *Different*: what is next is decided by rules
+(Priority, lanes, the label), and a model is asked only where a rule
+cannot say.
+
+**Sandboxing.** Unchanged since agent-runtimes.md: local adapters run
+unsandboxed on the host by default and sandboxes are opt-in plugins.
+
+#### Against current practice elsewhere
+
+Three projects the operator has reviewed or contributed to, each read
+in its repository on 2026-10-06: gh-aw at 3fd44f8, fullsend at cb9825e,
+packit/ai-workflows at 698e58f. His positions are quoted from his own
+comments there; the survey that collected them is
+[tracker#392](https://github.com/cgwalters-forge/tracker/issues/392).
+
+**gh-aw** is the closest on hand-back and gates, and has no protocol
+above them. An agent's output is typed items in `agent_output.json`; a
+detection job and scoped write jobs follow; his summary is "the tools
+you provide to the agent are read-only, then safe outputs gates
+writes." It has no state machine (its docs compose queues from issue
+checklists, sub-issues or a project board), no type for asking a human
+(a comment, an issue or `missing_data`, the answer arriving as the next
+event; that reading is mine), and its orchestrator is another LLM
+workflow that calls `dispatch_workflow`. Human approval is an Actions
+environment's required reviewers. *Taken*: the schema and the handlers,
+as he asked on tracker#401 ("We should be able to reuse the GHA
+safe-outputs code directly I think"); `noop` as a required answer; and
+his
+point that "agent invocations are just action runs and so existing
+verbs like `concurrency` which are already well-understood and known
+apply." *Different*: we add the states, the turn and the ask on top,
+and the orchestrator is rules.
+
+**fullsend** has the same sandbox boundary ("No credentials present
+inside") and a deterministic coordinator of a different shape: "there
+is no central orchestrator", a shim workflow dispatches agents from
+labels and slash commands, and "Labels are the state machine"
+(`needs-info`, `ready-to-code`, `ready-for-review`, `ready-for-merge`).
+An agent asks by labelling `needs-info` and commenting; the human
+replies and reruns triage. Output is validated against a schema on the
+host and a post-script writes. It is the only one with a forge
+abstraction (`forge.Client`, with GitHub, GitLab and Jira; Forgejo
+intended). *Taken*: labels as the state where a forge has no board (see
+[the gaps](#the-gaps-and-what-stands-in)), and clearing
+`ready-for-merge` when a review starts, which is our exact-head rule by
+other means. *Different*: we have a coordinator, because one operator's
+work spans many repositories that are not ours to install a workflow
+in. On whether every agent must reconcile, he wrote "Do we *really*
+need that for all agents? I don't think so."; here only the pass does.
+On credentials, of fullsend's central service that hands out tokens
+for shared Apps, "I've come to dislike the mint and consider it a
+highly privileged security risk", naming as alternatives the stock
+Actions bot or to "Create their own bot app owned by their repo/org".
+The App of [Credentials](#credentials) above is the second: its token
+is issued by GitHub to the job, with no service of ours in between.
+
+**packit/ai-workflows** runs the same loop against Jira and GitLab
+dist-git with deterministic Python on cron: Jira labels are the state,
+a fetcher swaps a trigger label for an in-progress one, triage can
+return a typed `CLARIFICATION_NEEDED` that becomes a comment and a
+`ymir_needs_attention` label, and the human answers and adds a retry
+label. Its agents write through MCP tools directly, with human review
+of the merge request as the check, and its threat model lists an agent
+driven to exhaust its build and test quotas as unmitigated. *Taken*: its trigger label counts only if a member of a
+trusted group applied it, verified from the issue's changelog. We check
+an issue's author and not who applied `dispatch`
+([tracker#425](https://github.com/cgwalters-forge/tracker/issues/425)).
+His comments there are consistent with the gates above being code:
+"constraints like this are better enforced in *code* than in text"
+(of a working tree an agent was told not to change), and "prompt
+injection is often the primary risk to anything related to LLMs".
+
+Across the four: fullsend and ai-workflows schedule with deterministic
+code and ask a model only for content, as this design does, while
+gh-aw's orchestrator and Paperclip's CEO are themselves agents. Only
+fullsend abstracts the forge, and only Paperclip has an ask as a typed,
+assigned object.
+
+#### What is inferred here
+
+The operator has not stated these; they are this design's reading.
+
+- That "spec" and "status" map onto the operator's and the
+  coordinator's writes as described.
+- That only the operator answers an ask. He has said who is trusted,
+  not this in particular.
+- That an item over budget should become an ask rather than a
+  dispatcher action; taken from Paperclip.
+- That who applied a label should be checked. Today's code checks the
+  issue's author (`lib/dispatch.js`).
+- That an issue the bot wrote from a terminal session is as trusted as
+  one he wrote. Today's code treats it so.
+- That "GitHub first" is the order. His words name the three forges
+  and call it a stretch goal.
+- That an agent must not delegate. It is true today because of which
+  outputs workers are allowed, and nobody decided it.
+- How gh-aw workflows ask a human, which its docs do not name.
+
+### The forge
+
+He called forge-agnosticism "a kind of stretch goal" and named the
+forges: "we should support GitHub git lab and forgejo". GitHub is
+built first because it is where everything is. He has also said what
+he does not want from an abstraction, on fullsend's design: "A problem with any abstraction
+layer like that is it drives to the lowest common denominator, and I
+don't think we want to force that. People who know they are using a
+specific forge should be able to do forge-native things", and "I'm
+arguing for supporting both."
+
+So the split is this. The snapshot, the rules and the actions name no
+forge: they are the protocol. A forge is a module that implements one
+trait and keeps its API, its URLs and its way of carrying out a write
+to itself. The core never takes a forge's types. Where the protocol
+wants something only one forge has (a project status update, archiving
+a board item), it is a write that forge carries out and the others
+answer as unsupported, with the reason.
+
+#### The trait
+
+`crates/sched/src/forge.rs` has the reading part the first rules need
+(homegit#171). The whole, in the model's types:
+
+```rust
+/// Reading one forge, with read access.
+pub trait Forge {
+    // The board, or what stands in for one.
+    fn board_url(&self) -> String;
+    fn board_fields(&self) -> Result<Vec<String>>;
+    fn board_items(&self, fields: &[&str]) -> Result<Vec<BoardItem>>;
+
+    // Issues and pull requests.
+    fn content_ref(&self, text: &str) -> Option<ContentRef>;
+    fn content_state(&self, content: &ContentRef) -> Result<ContentState>;
+    /// Body, author, labels with who applied each, assignees, comments.
+    fn thread(&self, content: &ContentRef) -> Result<Thread>;
+    /// Head, base, draft, mergeable, reviews (who, verdict, when, and
+    /// on which commit if the forge records one), requested reviewers,
+    /// checks.
+    fn pull(&self, content: &ContentRef) -> Result<Pull>;
+    fn children(&self, content: &ContentRef) -> Result<Vec<ContentRef>>;
+
+    // Agent runs: CI runs of one kind since a time, each with the id
+    // its caller gave it.
+    fn runs(&self, kind: &RunKind, since: Timestamp) -> Result<Vec<Run>>;
+    fn artifact(&self, run: &RunId, name: &str) -> Result<Vec<u8>>;
+}
+
+/// What the forge wants one user to look at. Apart from `Forge`: it
+/// needs that user's own token, which no job can mint.
+pub trait Inbox {
+    fn notifications(&self, since: Timestamp) -> Result<Vec<Notification>>;
+}
+
+/// How writes leave. A forge has up to two: one that writes a file for
+/// a job that holds the token, and one that writes directly, for a tool
+/// a person runs with a token of its own.
+pub trait Outbox {
+    fn send(&self, writes: &[Write]) -> Result<Sent>;
+}
+```
+
+A `Write` is the protocol's, not a forge's: set or clear a field, add
+or remove a label, comment, open an issue under a parent, assign, open
+or update a pull request, request a review, archive, post a status
+update, dispatch a run with a task. An outbox that cannot carry one out
+says so with a reason in what it returns (`Emitted::unsupported` does
+this today for clearing a field); nothing is dropped silently.
+
+Three things are deliberately not in the trait. Logins: who the
+operator and the bot are is configuration, not something a forge can
+say, and a job's token is neither. Tokens: a `Forge` is built with read
+access and an `Outbox` with whatever its job was given, so which token
+a step holds is the workflow's to say. And a second forge: a snapshot
+is of one. A link to an issue or PR on another forge is not a reference
+and is dropped, as a URL that is not GitHub's is today; several forges
+in one pass is not designed.
+
+How a run gets its caller's id is the forge module's business: on
+GitHub it is in the run's name, which the listing returns. An approval
+without a commit (GitLab's) is no approval of an exact head, so
+`approval()` answers no there and promote stays off; see the gaps.
+
+Each forge's transport stays its own. GitHub's is REST by path with
+recordings by path, which is where conditional requests and replaying a
+real board belong; another forge would bring its own, and the
+forge-neutral fixture is a saved snapshot.
+
+#### What each concept maps to
+
+Checked on 2026-10-06 against GitLab's documentation at master (19.5)
+and Forgejo's at v16.0 with the swagger of 16.0.5. "Premium" is
+GitLab's paid tier and above. Nothing here was tried against a running
+instance.
+
+| Concept | GitHub (built) | GitLab | Forgejo |
+| --- | --- | --- | --- |
+| Issues, comments | REST issues and comments | Issues and Notes APIs | issues, comments, timeline |
+| Closed as done or not planned | `state_reason` | no reason on an issue; work item Status is Premium | none |
+| Parent and child issues | sub-issues | child tasks, GraphQL only; issue links over REST (`blocks` is Premium) | none; dependencies (`/dependencies`, `/blocks`) |
+| Labels | labels | labels; scoped `key::value` is Premium | labels; exclusive `scope/name` |
+| The turn (assignees) | several | one on Free, several on Premium | several |
+| Board with typed fields | Projects v2 over REST | boards of label lists over REST; custom fields and status are Premium and GraphQL only, with no date type | projects exist in the UI only: **no API** (a first [pull request](https://codeberg.org/forgejo/forgejo/pulls/14723) is open) |
+| Status updates | project status updates | none | none |
+| Pull requests | pulls | merge requests | pulls |
+| Review on an exact commit | a review has `commit_id` | approving takes a `sha` and fails unless it is the head, but the recorded approval has none; "changes requested" is a reviewer state, not a review; resetting approvals on push is Premium | a review has `commit_id` and `stale` |
+| Auto-merge, rebase | yes | `auto_merge`; the merge method is the project's | `merge_when_checks_succeed`, `Do: rebase` |
+| CI runs and artifacts | Actions runs, artifacts | pipelines, jobs, job artifacts | Actions runs (v12), artifacts (v16) |
+| A run's summary page | job summary | none found | not documented |
+| Dispatch a run with inputs | `workflow_dispatch` | create a pipeline with `inputs`, or a trigger token | workflow dispatch with `inputs`, returning the run |
+| A reusable unit | `workflow_call` | CI/CD components, `include`, downstream pipelines | `workflow_call` (its `secrets` key is [rejected](https://codeberg.org/forgejo/forgejo/issues/14674)), composite actions |
+| Waking on an event | `issue_comment`, `issues`, `pull_request_review`, `schedule` | schedules only; a pipeline has no issue, comment or approval source, so a webhook must call the trigger URL | `issues`, `issue_comment`, `schedule`; no `pull_request_review` ([issue](https://codeberg.org/forgejo/forgejo/issues/14548)) |
+| Notifications | notification threads | the To-Do list | notification threads |
+| A bot identity | a user, or an App | a service account, or a project or group access token's bot user (paid on GitLab.com) | a user with scoped tokens |
+| A write token minted per run | an App installation token | none: `CI_JOB_TOKEN` cannot write issues, notes or merge requests | Authorized Integrations (v16): the API takes a job's own JWT, bound to a repository, workflow, ref and event, with token scopes |
+| A job's OIDC identity | `id-token: write` | `id_tokens:` | `enable-openid-connect` (v15) |
+
+#### The gaps, and what stands in
+
+**Projects v2 fields.** The board is the operator's main view, and
+neither other forge has it as an API on its free tier. What stands in
+is two things every forge has: the single-selects (Status, Priority,
+Workflow) as exclusive labels (`status/draft` on Forgejo, `status::draft`
+on GitLab Premium, plain labels kept exclusive by the pass on GitLab
+Free), and the text and number fields (Lead, Run, Branch, Why, News, the
+budgets) as one marked block in a comment the bot keeps on the item.
+`board_items` is then a search for labelled issues plus a comment each,
+which is a request per item where GitHub needs one for the board; the
+operator's queue is a search by assignee and label, which both forges
+have. They lose a sortable table and gain label noise. On GitLab
+Premium the native custom fields are the better implementation, behind
+the same trait. This is a design, not code (decision J; a read-only
+Forgejo pass to try it is
+[tracker#426](https://github.com/cgwalters-forge/tracker/issues/426)).
+
+**Status updates.** No equivalent. A comment on one pinned issue stands
+in, or nothing does.
+
+**Safe-outputs handlers.** gh-aw's handlers are JavaScript that runs in
+Actions against GitHub's API. Their input is not: `agent_output.json`
+is a plain schema. His position, on fullsend: "Forge agnostic I think
+does really want a `generic-safe-outputs` tool that has its own
+dedicated backends for gitlab/forgejo/etc", and of gh-aw's code that
+"it should be feasible to actually reuse the implementation code (mostly
+in Go) and this also means we reuse the *exact same schema*." What
+carries over is the schema and the validation. The handlers that write
+are the part that cannot: they are scripts run by Actions'
+`github-script` against GitHub's API (the Go he mentions is gh-aw's
+compiler and CLI). So off GitHub the applier is a direct `Outbox`
+behind a small command of ours, which reads the same file and writes
+through that forge's API, in a job apart from the one that decided. On
+GitHub gh-aw's handlers stay, as he asked on tracker#401. Types only GitHub has (`update_project`,
+`create_project_status_update`) are forge-native: the scheduler emits
+them there and the stand-in's labels and comment elsewhere. Unsolved:
+gh-aw's threat-detection job has no counterpart, and whether its
+validator (`collect_ndjson_output.cjs`) runs unchanged outside Actions
+is not tried (decision K,
+[tracker#427](https://github.com/cgwalters-forge/tracker/issues/427)).
+
+**A token minted per run.** GitHub's App installation token is what
+keeps a long-lived write credential out of CI. Forgejo's Authorized
+Integrations is close, and stores no key at all: the apply job's own
+identity token is the credential, scoped by configuration (read, not
+tried). GitLab has
+nothing like it: the job token cannot write what the protocol writes,
+so the apply job would hold a stored access token of a bot user. That
+is weaker than what he decided for GitHub, and is unsolved rather than
+accepted.
+
+**Actions OIDC for the broker.** Both forges issue a job identity
+token, so the mechanism carries over. The claims do not: the broker
+admits a run by GitHub's `job_workflow_ref`, and each forge names the
+workflow and ref in claims of its own. The broker's policy needs an
+issuer and a claim mapping per forge, which is not written. Joining a
+tailnet with such a token off GitHub is unverified.
+
+**Reusable workflows.** `workflow_call` is GitHub's packaging, with a
+Forgejo equivalent and a different thing on GitLab. So the portable
+unit of agent-run is its binary in a container, and each forge gets a
+thin wrapper around it (decision B). This also fits what he has said
+about other forges: "I have a somewhat strong opinion that generic
+forge support is actually going to best done by encouraging agent
+execution inside a Tekton pipeline or so." His stated preference there
+goes further than a wrapper per forge's CI: to "target Tekton as a
+baseline, which would drop the abstractions". A container is what a
+Tekton task runs, so this keeps that open without choosing it; that
+reading is mine.
+
+**Events.** GitLab cannot start a pipeline from a comment or an
+approval, and Forgejo cannot from a review. The schedule covers both,
+since the pass is level-triggered and an event only makes it sooner. On
+GitLab a project webhook can call the pipeline trigger URL itself, with
+no relay to run.
+
+**An approval of an exact head.** This is the protocol's one approval,
+and on GitLab an approval records no commit. Approving with a `sha`
+guards the moment of approval, not what is read back later, and
+removing approvals on a push is a paid setting. Comparing the approval
+time with the last push might do; it is not verified, and this is
+where a sign-off comes from. So no promote or sign-off on GitLab until
+it is solved.
+
+**Smaller ones.** No sub-issues on Forgejo: an ask names what it
+blocks in its body and with a dependency. No close reason outside
+GitHub: a label. No job summary: the report is an artifact only.
+
+#### agent-run stays forge-neutral
+
+By construction it should: a task in, safe outputs out, and nothing
+about boards or asks. Its interface is agentic-job's
+([devspace-agent-runs.md](devspace-agent-runs.md#agent-run-the-standalone-component)
+points at its plan), which lists what its binary still knows of GitHub:
+the identity-token request for a proxy that wants proof, the clone URL,
+and the check that the target is public. What it hands back needs no
+change: the types a worker is allowed
+(`create_pull_request`, `add_comment`, `noop`, `missing_tool`,
+`missing_data`) carry a patch, text and a target, with nothing of
+GitHub in them but their names.
+
+On a forge with no gh-aw its output is applied as above: the same
+file, that forge's `Outbox`, in a job of its own. agent-run does not
+change.
+
+#### The first slice, checked
+
+`crates/sched` as merged in homegit#169 had a `Forge` trait, but it was
+GitHub's REST API by path, and GitHub was in the core:
+
+- the snapshot held a Projects v2 reference (`orgs` or `users`, a
+  number) and built `api.github.com` paths from it;
+- an issue or PR was a `ContentUrl` that parsed only `github.com`
+  URLs, and a saved snapshot was read back through that parser;
+- `observe` decoded GitHub's JSON (`node_id`, `merged_at`, a
+  single-select's `name.raw`);
+- `action` held gh-aw's `update_project` next to the rules' own types.
+
+homegit#171 moved all of that behind the trait, as `forge::github`. The
+snapshot's schema is v2: the board is a URL and a reference is data
+(`ContentRef`) that only a forge makes from text. Which field means
+what stays in `observe`. A test runs a pass over an in-memory forge
+with a nested group and merge-request URLs, and another fails if the
+core's sources name GitHub.
+
+What is still GitHub-shaped, each with an issue:
+
+- **Writes have no seam.** `Outbox` is not built, nor `Inbox`; `emit`
+  is a function of the GitHub module that the command line and the
+  report call by name ([tracker#423](https://github.com/cgwalters-forge/tracker/issues/423)).
+- **The operator config** names a `forge_org` and a board by
+  `owner_type`, `owner` and `number`, and has no place to say which
+  forge or where it is
+  ([tracker#424](https://github.com/cgwalters-forge/tracker/issues/424)).
+- **`board_items` must come with each item's state**, which is free on
+  GitHub and a request per item elsewhere. It is the right contract for
+  a pass that reads once; a forge that pays for it should fail an item
+  softly, as linked PRs already do. Part of tracker#408.
+- **A reference's key is its lowercased URL**, on the belief that
+  every forge ignores case in owner and repository names. That is
+  checked for GitHub only.
+- `report` and `parity` run GitHub-only tools that are not ported, and
+  go with them.
+
+### What is there today
+
+`bin/` has 52 files and about 25,900 lines; `lib/` has 21 and 4,200;
+`tests/` has 20,500. Twelve of the 52 are the operator's own git and
+rpm helpers from 2010 to 2021, which no harness code calls; they are
+left out below and stay as they are. Every other tool was read, with its
+callers found by grep, for the table; a `lib/` file not named goes
+with the tool that uses it. "Scheduler" means it becomes part
+of the Rust below; "agent-run" that it belongs to the other half;
+"neither" that it is a tool for a person or an agent at a terminal.
+
+| Tool (lines) | What it is | Verdict |
+| --- | --- | --- |
+| `bot-reconcile` (547), `lib/reconcile.js` (800) | observes, runs 11 rules, applies 4 of them | scheduler: the model to keep. The rules are already pure functions of an observed state |
+| `bot-watch` (1,493 bash) | per-URL change detection over the board, and the runner of seven other steps | scheduler, rewritten as one observation: see below |
+| `bot-sweep` (602), `bot-poll-loop` (401 bash), `bot-supervisor` (281) | the timer's pass, the wait for news, the loop that starts a dispatcher | not carried over: the workflow run is all three |
+| `bot-board` (2,010 bash), `lib/assignees.js`, `board-status-update.js`, `board-archive-done.js` (860) | the board's fields, tracker issues and asks, and a key-value store in archived draft items | scheduler: the typed model and the `bot board` verbs. The key-value store goes |
+| `bot-pr` (3,273 bash), `bot-promote-due` (674), `bot-signoff-due` (244), `dco-detect.sh`, `review-state.sh` | fork PRs, promote, sign-off, rebase, inbox | scheduler, last and reviewed by the operator: it holds the sign-off rules |
+| `bot-runs` (1,720 bash), `lib/run-watch.js`, `run-health.js` (402) | dispatch, apply, show, and moving the board when a run ends | split: dispatch, reconcile and watch are scheduler; apply goes (gh-aw's handlers); show, log and diff are agent-run's |
+| `bot-capacity` (319), `bot-pace` (158), `lib/pools.js`, `pacing.js`, `capacity.js`, `budget.js` (837) | pool pace and budgets | scheduler: pure math, ported with its tables |
+| `bot-priority-health` (521), `bot-drive` (414), `bot-priority-propagate` (368) | P0 and P1 PR health, and next steps | scheduler, as rules over the snapshot |
+| `bot-notify` (1,273 bash), `bot-operator-activity` (444) | the bot's notifications, and the operator's events classified by a model | scheduler; stays on the workstation with the bot's token (step 8 of the plan). The model call leaves the pass |
+| `bot-heartbeat` (1,075), `lib/heartbeat-register.js` (186) | the liveness comment the review app reads | not carried over: derived from the run list, once the review app reads that |
+| `bot-cost` (876), `bot-actuals` (96), `bot-footer` (221) | token cost from transcripts and runs, written to the board and PR footers | scheduler, small: read from run summaries |
+| `bot-land` (486), `bot-git` (800 bash), `upstream-policy` (858), `bot-review-guide` (450) | landing on the bot's own repositories, the bot's git identity and commit lint, the upstream policy gate, review guides | scheduler's `bot` verbs. `bot-git rework` and the policy gate are security sensitive |
+| `bot-claude` (805), `bot-opencode` (583), `bot-work` (276 bash) | three ways to run a local agent job, sharing almost nothing | not carried over: a worker is an agent run. They stay until step 7 of the plan |
+| `bot-devspace` (769 bash) | interactive devspaces over SSH | neither: an operator's and agent's tool. It belongs with the devspace repository's own Rust (`devspace.rs`) |
+| `bot-retro` (928), `bot-feedback` (382 bash), `bot-tmt-number` (611), `dco-signoff` (550 bash) | transcript mining, reaction scanning, bootc's test numbers, the operator signing off by hand | neither. `bot-tmt-number` is one upstream project's and should not be in the core; `dco-signoff` is superseded by `bot-pr signoff` |
+| `bot-operator` (94), `lib/operator.js` (309), `operator.sh`, `gh-http.sh` | the operator config for Node and for shell, and a shell HTTP helper | go with their last caller; the loader in `crates/sched` is the one that stays |
+| `bot-board-migrate` (538 bash), `install.sh` | a finished one-off whose header says to delete it; a byte-for-byte copy of `install-dotfiles.sh` | delete |
+| `crates/bot-poll` (5,028 Rust, 1,078 of tests) | a poller that parses the text reports of `bot-watch`, `bot-notify` and `bot-pr inbox` | not carried over: see below |
+
+What is wrong with it, plainly:
+
+- **The interface between tools is prose.** `bot-watch` prints a report
+  for people, and `bot-poll-loop` (grep, sed, awk), the `drive` rule,
+  `bot-supervisor` and all of `bot-poll` parse it back; its source has
+  "keep the wording" comments for that reason. `bot-sweep` reads its
+  children's results with regular expressions on their stdout.
+- **`bot-poll` runs nowhere.** CI builds and tests it; no unit, tool or
+  workflow starts it, and it is not installed on the workstation. Most
+  of its 5,000 lines parse those reports.
+- **One decision, many copies.** "The operator approved this exact head"
+  is implemented seven times (a jq string in `bot-pr`, twice; JavaScript
+  in `bot-promote-due`, `bot-signoff-due`, `bot-drive` and `bot-land`;
+  Rust in `bot-poll`). An issue or PR URL is parsed by at least twelve
+  regular expressions, the operator's login compared in eight places
+  with two case rules, ETag caching written seven times, an atomic file
+  write about twenty, the operator config loaded by three loaders. The
+  review app copies the ask format and the verdict rules a further time,
+  and says so in its comments.
+- **Executables are libraries.** Six tools `require` `bin/bot-priority-health`
+  for its REST helpers; `bot-heartbeat` requires `bin/bot-cost`, and
+  `lib/heartbeat-register.js` requires `bin/bot-heartbeat` back.
+- **Logic lives in shell.** Six bash tools hold 10,170 lines, with jq
+  programs as strings. `bot-pr` decides sign-offs there.
+- **The tests mostly test a mock.** About 70% of the real test files
+  check a tool against a hand-written `gh` stub, a bash heredoc of 40
+  to 180 lines per test; about 10% test a pure function. 29 of the 57
+  `.sh` tests are eight-line wrappers around `node --test`.
+- **The board is read, thrown away and read again.** The board's REST
+  listing carries every item's issue or PR whole (state, head, labels,
+  assignees, requested reviewers, when it changed). `bot-board` keeps
+  the fields and drops that; `bot-watch` then asks for each of about 360
+  URLs again, about 200 seconds a sweep, and keeps its own state file
+  for them.
+- **Dead code**: `bot-board draft` only prints an error; `bot-board
+  assign-migrate`, `bot-priority-propagate --dedupe` and the legacy-state
+  paths in `bot-pr`, `bot-watch` and `bot-notify` are finished
+  migrations; grep finds no caller for `bot-pr repo-kind` and
+  `refresh-meta`.
+
+### Layout
+
+One crate, `crates/sched`, a library and two binaries:
+
+- **`bot-sched`**, the unattended pass: `observe`, `reconcile`, `emit`,
+  `report`, and `pass` for all of it. It is what the controller workflow
+  runs, and it never writes to the forge.
+- **`bot`**, the verbs a person or an agent types: `bot board ...`, `bot
+  pr ...`, `bot land`, `bot git check`. It replaces the `bot-*` tools
+  that are commands rather than steps, over the same library, and is the
+  only place that writes with a token of its own.
+
+The library's modules, each with one job: `operator` (the config;
+there since the first slice), `model` (the snapshot), `observe`,
+`rules` (a file per rule), `action` (actions and writes), `pace` (pool
+math), `approval` (the exact-head rule, once) and `markers` (every
+hidden marker and body format the review app reads, as types). None of
+those names a forge. `forge` holds the traits of
+[The trait](#the-trait) and one module per forge under it:
+`forge::github` has the REST client, the board's decoding, URL parsing,
+the gh-aw form of a write and, for the workstation, the direct writer.
+Two binaries and one crate are enough; `bot-poll` leaves when
+`bot-poll-loop` does, its ETag cache moved into `forge::github`.
+
+It stays in homegit while the old tools exist, because each step below
+deletes its original in the same commit, and moves to a repository of
+its own once nothing in `bin/` is left (decision C).
+
+### The model
+
+A pass reads the forge once into a **snapshot** and nothing after that
+touches the network. It is the protocol's state as one value, and holds
+nothing a forge would recognize as its own: an issue or PR is a
+reference the forge made (its URL, repository, kind and number), an id
+is an opaque string. `crates/sched/src/model.rs` has the start of it;
+the whole is:
+
+- **items**: a board item with its typed fields (`Status` as an enum
+  that keeps an unknown option as data, `Priority`, `Lead`, `Run`,
+  `Branch` as parsed PR URLs, `Why`, `News`, `Workflow`, the token
+  fields) and its **content**: the issue or PR with its state, head
+  commit, labels with who applied them, assignees and requested
+  reviewers. On GitHub all of it but the label events comes with the
+  board listing.
+- **pulls**: for the PRs the bot drives, the reviews (who, what, on
+  which commit, when), checks, mergeability and base. `approval(pull,
+  operator)` is the one function that says whether the operator
+  approved the exact head.
+- **runs**: the agent runs, with their caller id (the item), state,
+  and the summary of the ended ones.
+- **asks**: question and chore issues, parsed into a type: what each
+  blocks, its options, who must answer, whether and how they did. An
+  item that waits with no ask and no PR in the operator's queue is
+  found from this.
+- **pools**: each inference pool's usage and reset, from the broker's
+  `/usage`, with its target from the config.
+- **policies**: the upstream-policy record of each repository, from the
+  checkout.
+- **now**. The time is part of the snapshot, so a rule that asks how
+  old something is stays a pure function, and a recorded snapshot gives
+  the same answer tomorrow.
+
+What cannot be read is not guessed: the snapshot marks it unknown and
+lists it as a problem, and a rule treats unknown as "do nothing" (the
+first slice's `linked` states work this way).
+
+### The loop
+
+```
+observe(&dyn Forge, config) -> Snapshot
+reconcile(&Snapshot, &Config) -> Vec<Action>      // pure: every rule is fn(&Snapshot, &Config) -> Vec<Action>
+edge(&State, &[Action], now) -> (fired, State)    // pure: which actions are news
+outbox.send(&[Write]) -> Sent                     // to a file for the apply job, or directly for a tool with a token
+```
+
+An **action** has a stable key, a kind, the item, what to do in a
+sentence, and optionally a **write**: `SetFields`, `ClearField`,
+`AddLabels`, `RemoveLabels`, `Comment`, `CreateIssue`, `Assign`,
+`Archive`, `StatusUpdate`, `Dispatch`. A write says what the protocol
+wants changed, in its own terms. An action with a write needs no
+judgment. One without is for a reader: in the target, the input of the
+dispatcher's agent run.
+
+A write leaves in one of two ways, each an `Outbox` of the forge. In
+Actions, GitHub's emitting one turns writes into gh-aw safe-output items
+(`update_project`, `add_labels`, `dispatch_workflow` and the others in
+"What the writes become"), which the apply job's handlers carry out
+under the App token; the pass holds read access only. On the
+workstation during the migration, its direct one makes the same writes
+with the bot's token.
+A write with no safe-output type (clearing a field, archiving; see "No
+type today") is reported as such and applied only directly, until a
+handler exists. The first slice already emits `update_project` items
+for `closed-not-done` and reports `stale-lead`'s clear as having no
+type; `Outbox` itself is
+[tracker#423](https://github.com/cgwalters-forge/tracker/issues/423).
+
+### Crates
+
+- **HTTP**: for GitHub, `ureq` 3, synchronous, with a thin client of
+  ours inside `forge::github`: REST by
+  path, pagination, ETags, GitHub's refusals as typed errors, and a
+  plain POST for the few GraphQL queries REST lacks (only on the
+  direct-apply side; observing is REST only, since the GraphQL quota is
+  shared). Not `octocrab`: it brings an async runtime for a job that
+  makes a few hundred requests in sequence, has no Projects v2 REST
+  types, and hides the transport, which is exactly where conditional
+  requests and recording belong. Not `gh`: parsing `gh api -i` output,
+  as `bot-poll` does, is the kind of thing this rewrite ends. Fan-out
+  where needed is `std::thread::scope`. Another forge's module picks
+  its own when it is written; there is no forge-neutral Rust client to
+  adopt (`forgejo-api` and `gitlab` are per forge, and the Forgejo
+  community's F3 is a data format for mirroring with no Rust
+  implementation).
+- **Data, CLI, errors**: `serde`, `clap` derive, `anyhow`, as `bot-poll`
+  uses; typed errors only where a caller branches (a spent quota).
+- **Time**: `jiff` for new code; `chrono` leaves with `bot-poll`.
+- **Config**: `operator.json` through the loader now in `crates/sched`;
+  in Actions the file is written from a repository variable, as the
+  plan says. No config framework.
+
+### Tests
+
+Four kinds, none with a network or a fake `gh`:
+
+- **Rule tables**: `(snapshot, expected actions)` rows, the form
+  `lib/reconcile.js`'s tests already have; each port carries its table
+  over.
+- **Recorded passes**: `bot-sched observe --record FILE` saves GitHub's
+  answers by path, and `--recorded FILE` replays them, so a real board
+  that misbehaved becomes a fixture. A path outside the recording is an
+  error, so a test cannot read more than it shows. Recordings are a
+  forge module's own; the fixture every forge shares is a saved
+  snapshot.
+- **Neutrality**: a pass over an in-memory forge whose references look
+  like another forge's, and a check that the core's sources name no
+  forge (`tests/neutral.rs`).
+- **Parity while two copies exist**: a ported rule's old copy stays
+  until its write moves, and `bot-sched parity` runs both on one board
+  (in CI on the recorded one, hourly in the report on the live one).
+
+Formats the review app parses get shared case files that both sides
+test, as `tests/fixtures/operator/cases.json` already is for the config.
+
+### What stays outside Rust
+
+The workflow YAML, kept to steps that call a binary. gh-aw's safe-output
+handlers, which are upstream's JavaScript, reused and pinned, by the
+operator's decision. Skills and prompts. The upstream-policy records,
+which are data. The operator's own tools in `bin/`. Nothing else: the
+remaining shell is under ten lines or goes.
+
+### Order
+
+Each step lands with its original deleted and its callers switched.
+Sizes are of new Rust: S under 300 lines, M under 1,000, L under 2,500.
+"Parallel" means separate remote agent runs can do them at once, since
+they touch different files but for one line in a registry.
+
+| Step | What | Deletes | Size | When |
+| --- | --- | --- | --- | --- |
+| R0 | crate, config, board snapshot, two rules, emit, the report | `bot-controller-report` | M | done |
+| R1 | the forge trait: reading behind `Forge`, GitHub in `forge::github` | nothing | M | done (homegit#171) |
+| R1a | `forge::github` complete (ETags, typed refusals, GraphQL POST); `thread`, `pull` and content details in the trait and the snapshot; `approval()` with a shared case file | nothing yet | M | serial, first |
+| R1b | writes behind `Outbox`; the operator config says which forge | nothing | S | parallel with R1a |
+| R2 | the binaries reach the workstation (decision D) | the `install-crates` hand step | S | serial |
+| R3 | the rules, one per run: `heartbeat` and `lead-orphan`; `escalate`, `patch-ready` and `answer-unapplied` (with `asks`); `midstream`; pool pace and `capacity` (`pools.js`, `pacing.js`, `capacity.js`, `bot-capacity`); `dispatch` (the brief and its trust check, with who applied the label); a wait with no object; an item over budget as an ask | each rule's JavaScript, then `bot-reconcile` | S to L each, about 3,000 in all | parallel after R1 |
+| R4 | `bot board`: list and show on the model, then the writes and asks | `bot-board`, three `lib/` files, `bot-pace`, `bot-board-migrate` | L | parallel with R3 |
+| R5 | change detection as a diff of two snapshots; health and drive as rules | `bot-watch`, `bot-priority-health`, `bot-drive`, `bot-priority-propagate`, `bot-poll-loop`, `bot-sweep`, `crates/bot-poll` | L | serial, after R3 |
+| R6 | runs in the snapshot; `Dispatch` as a write | `bot-runs` (its apply goes at step 5 of the plan), `lib/run-watch.js` | M | after agentic-job's cutover (step 9 of its plan) |
+| R7 | `bot pr`, promote and sign-off on `approval()`; `bot land`, `bot git` | `bot-pr`, `bot-promote-due`, `bot-signoff-due`, `bot-land`, `bot-git`, `dco-detect.sh` | L, twice | serial, last, each PR reviewed by the operator |
+| R8 | notifications as an observation with routing rules | `bot-notify`, `bot-operator-activity` | L | parallel with R7 |
+| R9 | cost from run summaries; liveness from the run list | `bot-cost`, `bot-actuals`, `bot-footer`, `bot-heartbeat` | M | after the review app reads runs (decision G) |
+| R10 | stretch: a second forge, read-only (Forgejo), with the board's stand-in | nothing | L | after R5 and decisions I and J |
+| R11 | stretch: an applier for `agent_output.json` on a forge with no gh-aw | nothing | M | after R10 and decision K |
+
+R3 to R5 are the plan's steps 2 to 4 seen from the code: a rule ported
+with parity shown is a write ready to move. The local workers and
+`bot-supervisor` go at the plan's steps 6 and 7, with no Rust written
+for them. R10 and R11 are the stretch goal and block nothing: every
+step before them is written against the trait, which is what keeps them
+possible, and none of them waits for a second forge.
+
+How old and new avoid acting twice: every rule is in one of three modes,
+`off`, `report` or `act`, and exactly one side has `act`. A port lands
+in `report` (computed, listed, compared with the old tool); the commit
+that sets it to `act` is the commit that removes the old rule, or turns
+its step off locally when the write moves to Actions, as the plan's
+step 4 says. Rules are level-triggered and their writes set a field to
+a value, so a mistaken overlap repeats a write rather than doubling it;
+dispatch is guarded as the plan describes.
+
+### What is not carried over
+
+- Reports for people as the interface between programs, and every
+  parser of them, `bot-poll` first.
+- The key-value store in archived draft items (`bot-board state-get`,
+  `state-put`): the pass's memory is one file it carries over.
+- A cache, a lock and an atomic write per tool: one of each, in `forge`
+  and `state`.
+- `bot-supervisor`'s pending-batch recovery and `bot-poll-loop`'s
+  seen-sets. A level-triggered pass that failed runs again.
+- The heartbeat and usage comments, once the review app reads the run
+  list and the broker.
+- A model call inside the deterministic pass (`bot-operator-activity`).
+- `bot-work`'s launcher and its lease in a board item; three local job
+  runners; the finished migrations; `bot-board-migrate`; `install.sh`.
+- `bot-tmt-number`, which is bootc's and belongs with bootc's tooling
+  or a skill; `bot-retro`'s regular expressions over transcripts, to be
+  rethought on run summaries; `dco-signoff`.
+
+### Decisions for the operator
+
+Reworked with the protocol and the forge: B and E changed, I to K are
+new, and the rest stand as they were.
+
+**A. Where agent-run lives.** Decided 2026-10-06:
+cgwalters-forge/agentic-job, under that name.
+
+**B. How a workflow calls agent-run.** Decided 2026-10-06: the Rust
+binary is the interface and a reusable workflow wraps it on GitHub.
+Both are in agentic-job's plan (see devspace-agent-runs.md).
+
+**C. Where the scheduler lives.**
+1. `crates/sched` in homegit, two binaries (`bot-sched`, `bot`), moved
+   to its own repository when `bin/` is empty of harness tools
+   (recommended).
+2. Its own repository now.
+3. One binary for everything.
+
+**D. How the Rust reaches the workstation while tools still run there.**
+The first slice avoided the question by replacing a tool that only runs
+in Actions; R2 cannot.
+1. `bot-sweep`'s update step runs `make install-crates` when `crates/`
+   or `Cargo.lock` changed (recommended: no new trust path and a build
+   of about a minute; it bends the rule that nothing builds on the
+   workstation, which is his to bend).
+2. CI publishes a release binary per commit of `main` and the sweep
+   downloads it by commit.
+3. Nothing local is ported: each write moves to Actions first.
+
+**E. The HTTP client.** The first slice uses option 1, at the cost of
+34 packages in `Cargo.lock`. It is now a choice for GitHub's module
+only; another forge's is made when that module is written.
+1. `ureq` with a thin client of ours (recommended).
+2. `octocrab`.
+3. Keep shelling out to `gh`.
+
+**F. `crates/bot-poll`.**
+1. Delete it with `bot-poll-loop` at R5, keeping its ETag cache
+   (recommended).
+2. Finish it as the poller.
+
+**G. The heartbeat and usage comments**, which the review app reads.
+1. The review app reads the run list and the broker's `/usage`; then
+   `bot-heartbeat` is deleted (recommended).
+2. The scheduler keeps publishing them.
+
+**H. The order of the two halves.** The epic says agent-run first.
+1. Both in parallel: agentic-job is written in its own repository,
+   R1 to R5 touch nothing of it, and only R6 needs its cutover
+   (recommended).
+2. All of agent-run, then the scheduler.
+
+**I. How far forge-agnostic goes now.** He called it a stretch goal.
+1. The trait and a neutral core now (done for reading in homegit#171),
+   GitHub the only implementation, and one read-only pass on a second
+   forge (R10) as the proof once R5 is in (recommended: the trait costs
+   little while the code is being written anyway, and an abstraction
+   with one implementation is a guess until a second one tests it).
+2. Build a second forge fully now, before the rules are ported.
+3. No trait: write for GitHub and abstract when a second forge is
+   real.
+
+If 1 or 2, which forge second: Forgejo is the nearer (its API and
+Actions follow GitHub's, and it has OIDC and a per-run credential) but
+has no board API; GitLab is where the neighbouring projects are and
+lacks events, a per-run write token and an approval tied to a commit.
+Forgejo is recommended as the proof for that reason, not as a
+statement of where it will be used.
+
+**J. The board where a forge has no Projects API.**
+1. Exclusive labels for Status, Priority and Workflow, and the text
+   fields in a marked comment the bot keeps on each item (recommended).
+2. Labels only: no Why, News or Run; the reasons go in comments.
+3. Wait for Forgejo's projects API and GitLab's paid custom fields.
+
+**K. Applying safe outputs off GitHub.**
+1. A small applier of ours that reads gh-aw's schema, with a backend
+   per forge; GitHub keeps gh-aw's own handlers (recommended: it is his
+   stated position on fullsend#6614, and keeps the decision of
+   tracker#401).
+2. That applier on GitHub too, for one code path. Not recommended: it
+   gives up "reuse the GHA safe-outputs code directly".
+3. Off GitHub, apply directly with a stored bot token and no separate
+   job. Not recommended: it is the model tracker#401 moved away from.
+
 ## Open points
+
+What stands in on GitLab for an approval of an exact commit, and for a
+write token minted per run: both are unsolved, and listed with the
+other gaps under [The forge](#the-gaps-and-what-stands-in).
 
 Where the broker lives once nothing else needs Xenon. Whether
 `projects_v2_item` is an Actions trigger, to be checked at step 2 of the

@@ -15,6 +15,27 @@ needs the change), and keep both sides to it. `tests/bot-runs.sh`
 checks `bot-runs` against fixtures in `tests/fixtures/bot-runs/` that
 follow it.
 
+## agent-run: the standalone component
+
+The standalone component is
+[cgwalters-forge/agentic-job](https://github.com/cgwalters-forge/agentic-job),
+decided by the operator on 2026-10-06
+([tracker#405](https://github.com/cgwalters-forge/tracker/issues/405)).
+Its interface, what it replaces of the devspace repository's agent job
+and the steps to the cutover are in its
+[docs/plan.md](https://github.com/cgwalters-forge/agentic-job/blob/main/docs/plan.md)
+(in [agentic-job#1](https://github.com/cgwalters-forge/agentic-job/pull/1)
+until that merges), and are not repeated here: a Rust binary
+(`policy`, `sandbox`, `run`, `check`) with a reusable workflow around
+it, whose fourth job applies the checked outputs on a VM of its own.
+
+What that plan leaves in homegit is the scheduler's side: `bot-runs`
+dispatches the caller workflow and reads the run's artifacts, which
+keep the names and schemas below; `bot-runs apply` is deleted after
+the cutover. The rest of this document is the contract as it is today.
+The scheduler's half is in
+[scheduled-dispatcher.md](scheduled-dispatcher.md#the-scheduler-in-rust).
+
 ## Opencode runner profile
 
 `dotfiles/.config/opencode/opencode-runner.json` is an overlay on the shared
