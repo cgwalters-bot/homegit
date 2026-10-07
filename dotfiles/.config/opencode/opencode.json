@@ -23,6 +23,9 @@
         // needs "input" as well as "context" to take effect.
         // Sol is the GPT-6.1 frontier tier — cap at 200k
         "gpt-6.1-sol": { "limit": { "context": 200000, "input": 200000, "output": 128000 } },
+        // Astra is the GPT-6 reasoning tier, for high-level design work,
+        // used sparingly (the operator's ask); grunt work goes to Luna.
+        "gpt-6-astra": { "limit": { "context": 200000, "input": 200000, "output": 128000 } },
         // Luna is the GPT-6 cost-sensitive/nano tier — cheap/fast execution model
         "gpt-6-luna": { "limit": { "context": 200000, "input": 200000, "output": 65536 } }
       }
