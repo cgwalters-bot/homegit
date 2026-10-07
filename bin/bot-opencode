@@ -109,6 +109,9 @@ opencode logins are not read.
 
 Inference goes through the praxis broker and nothing else: a model of any
 other provider is refused, and no credential is read, written or copied.
+The broker admits a local client only with an operator token: name the file
+holding one in BOT_OPENCODE_KEY_FILE (absolute, mode 0600) and opencode is
+given a profile that refers to that file. Without it the broker answers 401.
 
   --task NAME     worktree name (default: a timestamp), under
                   ${WORK_ROOT}/NAME
@@ -320,6 +323,32 @@ function botIdentityEnv() {
   return { GIT_AUTHOR_NAME: name, GIT_AUTHOR_EMAIL: email, GIT_COMMITTER_NAME: name, GIT_COMMITTER_EMAIL: email };
 }
 
+// The praxis broker admits a local client only with an operator token (a
+// runner has its run token instead). BOT_OPENCODE_KEY_FILE names the file
+// holding one; the profile handed to opencode then refers to that file, so
+// the token itself is never read here, put in the environment or on a
+// command line. Without it the profile is homegit's own, and the broker
+// answers 401.
+const KEY_FILE_VAR = "BOT_OPENCODE_KEY_FILE";
+function runnerConfig() {
+  const keyFile = process.env[KEY_FILE_VAR];
+  if (!keyFile) return RUNNER_CONFIG;
+  if (!path.isAbsolute(keyFile)) throw new Fatal(`${KEY_FILE_VAR} must be an absolute path, not ${keyFile}`, EX_USAGE);
+  let st;
+  try {
+    st = fs.statSync(keyFile);
+  } catch (e) {
+    throw new Fatal(`cannot read the key file ${keyFile} named by ${KEY_FILE_VAR}: ${e.message}`);
+  }
+  if (!st.isFile() || (st.mode & 0o077) !== 0) throw new Fatal(`the key file ${keyFile} must be a regular file readable by its owner only (mode 0600)`);
+  const profile = JSON.parse(fs.readFileSync(RUNNER_CONFIG, "utf8"));
+  profile.provider = { ...profile.provider, praxis: { ...profile.provider?.praxis, options: { ...profile.provider?.praxis?.options, apiKey: `{file:${keyFile}}` } } };
+  const keyed = path.join(AGENT_HOME, "opencode-runner-keyed.json");
+  fs.mkdirSync(AGENT_HOME, { recursive: true });
+  fs.writeFileSync(keyed, `${JSON.stringify(profile, null, 2)}\n`, { mode: 0o600 });
+  return keyed;
+}
+
 // The agent's home: symlinks to the bot's own configuration (refreshed on
 // every run, so the checkout this tool runs from is what applies).
 function makeAgentHome() {
@@ -374,7 +403,7 @@ async function main() {
     // whatever the operator's login shell is.
     env: {
       ...inherited, ...botIdentityEnv(), HOME: makeAgentHome(), SHELL: "/bin/bash",
-      OPENCODE_CONFIG: RUNNER_CONFIG,
+      OPENCODE_CONFIG: runnerConfig(),
       OPENCODE_DISABLE_PROJECT_CONFIG: "1", OPENCODE_DISABLE_MODELS_FETCH: "1", OPENCODE_DISABLE_CLAUDE_CODE: "1",
       GIT_CONFIG_COUNT: "1", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: hooksDir,
       [TOKEN_VAR]: jobToken,
