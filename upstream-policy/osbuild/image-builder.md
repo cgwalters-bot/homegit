@@ -8,7 +8,7 @@ sources:
     sha: 28e6b400edfe109638255eceb938849c705ef111
   - repo: osbuild/image-builder
     path: CONTRIBUTING.md
-    sha: 366e3918b7b21f90431bc1fd0170cc867e1ca5df
+    sha: c10e626440de56632750fd77ca5f6f0d3daa4b3e
   - repo: osbuild/image-builder
     path: HACKING.image-builder.md
     sha: 1660732c5b87cbe3e7f5a2f5552e5a24efec7aff
@@ -36,7 +36,7 @@ sources:
   - repo: osbuild/osbuild.github.io
     path: docs/developer-guide/01-general/workflow.md
     sha: afe4c7f80c59133416e52ff67c6eee7dd8ef943d
-checked: 2026-10-02 by the policy-check subagent (coordinator session 929c7a64, re-check after CONTRIBUTING.md changed, HACKING.md was removed and AGENTS.md was added)
+checked: 2026-10-07 by the policy-check subagent (coordinator session 2026-10-07, re-check after CONTRIBUTING.md gained a tools/prepare-source.sh rule)
 rebase: conflicts-only
 ---
 
@@ -71,17 +71,22 @@ agent adds it, and only the human author may remove it.
 > — osbuild/image-builder AGENTS.md (28e6b400edfe), "Pretext"
 
 > "* The commits in the PR should be minimal and well documented:"
-> — osbuild/image-builder CONTRIBUTING.md (366e3918b7b2), "Creating a PR"
+> — osbuild/image-builder CONTRIBUTING.md (c10e626440de), "Creating a PR"
 
 > "* The commit message should start with the module you work on, like:
 >     `manifest:`, or `distro:`"
-> — osbuild/image-builder CONTRIBUTING.md (366e3918b7b2), "Creating a PR"
+> — osbuild/image-builder CONTRIBUTING.md (c10e626440de), "Creating a PR"
+
+>   "* You must run `./tools/prepare-source.sh` for every commit (this takes care of
+>   the earlier mentioned `go fmt ./...` and some bits related to dependencies and
+>   test configs) and amend any changes into the commit."
+> — osbuild/image-builder CONTRIBUTING.md (c10e626440de), "Creating a PR"
 
 > "This project uses a merge queue, and we manually approve CI runs from contributors
 > after we do an initial read-through of the code. Due to this please don't rebase your
 > PR if there are no conflicts with the branch it targets. Doing so retriggers the CI and
 > requires us to re-read the diff and trigger it again."
-> — osbuild/image-builder CONTRIBUTING.md (366e3918b7b2), "Maintaining a PR"
+> — osbuild/image-builder CONTRIBUTING.md (c10e626440de), "Maintaining a PR"
 
 > "1. Pull requests should be opened from a developer's own fork to avoid random branches on the origin."
 > — osbuild/osbuild.github.io docs/developer-guide/01-general/workflow.md (afe4c7f80c59), "Pull requests"
@@ -100,7 +105,9 @@ earlier record already held human-text conservatively for that reason;
 cgwalters is not a core maintainer here. AI trailers now have precedent on
 main (three of cgwalters' merged commits carry "Generated-by: AI"), which
 could someday support bot-ok if the maintainers say so, but nothing in the
-files does yet. PR titles are expected to reference a Jira ticket.
+files does yet. PR titles are expected to reference a Jira ticket. The
+2026-10-07 change to CONTRIBUTING.md only added the `tools/prepare-source.sh`
+per-commit rule, which says nothing about AI or authorship.
 
 ## Rebasing
 
