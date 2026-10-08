@@ -21,7 +21,7 @@ function world(session = OWNER) {
   const state = path.join(dir, "state", "bot-heartbeat", "last-publish.json");
   fs.writeFileSync(path.join(dir, "operator.json"), "{}");
   const env = { ...process.env, HOME: dir, XDG_STATE_HOME: path.join(dir, "state"), XDG_CACHE_HOME: path.join(dir, "cache"),
-    BOT_OPERATOR_CONFIG: path.join(dir, "operator.json"), BOT_HEARTBEAT_PROJECTS: path.join(dir, "projects"),
+    BOT_OPERATOR_CONFIG: path.join(dir, "operator.json"), BOT_HEARTBEAT_PROJECTS: path.join(dir, "projects"), BOT_CAPACITY_PRAXIS_USAGE: "",
     PATH: `${dir}:${process.env.PATH}`, WORLD: dir, STATE: state, CLAUDE_CODE_SESSION_ID: session };
   for (const key of ["GH_TOKEN", "GITHUB_TOKEN", "BOT_HEARTBEAT_NOW", "BOT_HEARTBEAT_STALE_HOURS"]) delete env[key];
   if (session === null) delete env.CLAUDE_CODE_SESSION_ID;

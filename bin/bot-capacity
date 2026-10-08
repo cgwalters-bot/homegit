@@ -316,4 +316,4 @@ if (require.main === module) {
     process.stderr.write(`${PROG}: error: ${e.stack || e.message}\n`);
     process.exit(1);
   });
-} else module.exports = { readRate, render };
+} else module.exports = { readRate, render, claudeReading, openaiReading };

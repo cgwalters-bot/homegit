@@ -17,7 +17,7 @@ const CACHE = fs.mkdtempSync(path.join(os.tmpdir(), "bot-heartbeat-usage-test-")
 const RATE_LIMITS = path.join(CACHE, "bot-heartbeat", "rate-limits.json");
 const NOW = "2026-09-28T20:00:00Z";
 const NOW_MS = Date.parse(NOW);
-const ENV = { ...process.env, XDG_CACHE_HOME: CACHE, BOT_HEARTBEAT_PROJECTS: PROJECTS, BOT_HEARTBEAT_NOW: NOW };
+const ENV = { ...process.env, XDG_CACHE_HOME: CACHE, BOT_HEARTBEAT_PROJECTS: PROJECTS, BOT_HEARTBEAT_NOW: NOW, BOT_CAPACITY_PRAXIS_USAGE: "" };
 
 // The module reads its environment once, at load.
 Object.assign(process.env, ENV);
@@ -149,5 +149,39 @@ test("validate keeps agent_ids out of the heartbeat", () => {
   assert.deepEqual([...agentIds], [["w", ["aw1", "ar1"]]]);
   for (const bad of [["../x"], "aw1", Array.from({ length: 9 }, (_, i) => `a${i}`)]) {
     assert.throws(() => hb.validate({ ...input, workers: [{ ...input.workers[0], agent_ids: bad }] }, NOW_MS), /agent_ids/);
+  }
+});
+
+test("publish includes both pool paces only in the private usage comment", () => {
+  saveRateLimits(null, { used_percentage: 41, resets_at: epoch("2026-10-03T13:00:00Z") });
+  const file = path.join(CACHE, "praxis.json");
+  const observed = epoch(NOW) - 7200;
+  const reset = epoch("2026-10-04T20:00:00Z");
+  const broker = { started_at: "private-epoch", codex: { secondary: {
+    used_percent: 31, window_minutes: 10080, reset_after_seconds: reset - observed, observed_at: observed,
+  }, counts: { requests: 123, tokens: { total: 456 } } }, private_data: "not-published" };
+  const input = JSON.stringify({ coordinator: { session: "s-1", loop_state: "sleeping" }, workers: [] });
+  const publish = (data) => {
+    fs.writeFileSync(file, typeof data === "string" ? data : JSON.stringify(data));
+    const out = execFileSync(TOOL, ["publish", "--dry-run"], {
+      env: { ...ENV, BOT_CAPACITY_PRAXIS_USAGE: file }, input, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
+    });
+    const [publicBody, privateBody] = out.split("<!-- cgwalters-forge/bot-ops#1 -->\n");
+    assert.doesNotMatch(publicBody, /pools|openai|used_percent/);
+    assert.doesNotMatch(privateBody, /private-epoch|not-published|456/);
+    return { snap: hb.parseComment(privateBody), body: privateBody };
+  };
+  const { snap, body } = publish(broker);
+  const { poolPace } = require("../lib/pools.js");
+  const config = require("../lib/operator.js").loadOrExit("test");
+  assert.equal(snap.pools.claude.used_percent, 41);
+  assert.deepEqual(snap.pools.openai, poolPace({ source: "praxis", observed_at: observed * 1000,
+    windows: [{ used_percent: 31, window_ms: 10080 * 60000, resets_at: reset * 1000 }] }, config.pacing.pools.openai, NOW_MS));
+  assert.equal(snap.pools.openai.observed_at, "2026-09-28T18:00:00.000Z");
+  assert.match(body, /openai: 31/);
+  for (const data of ["{broken", {}, { codex: { secondary: { ...broker.codex.secondary, reset_after_seconds: -1 } } }]) {
+    const result = publish(data).snap;
+    assert.equal(result.pools.openai, null);
+    assert.equal(result.pools.claude.used_percent, 41);
   }
 });
