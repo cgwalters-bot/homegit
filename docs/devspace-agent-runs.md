@@ -37,6 +37,47 @@ separate change to select this overlay explicitly after filtering inherited
 configuration overrides. Changing homegit does not select it for remote
 runs automatically. Restart opencode to pick up configuration changes.
 
+## Controller review and fix flow
+
+`node bin/bot-flow --help` describes the maintained review, fix, apply,
+collect and landing-queue commands. They capture subprocess output internally:
+the controller does not need to read a diff, artifact, review body or log.
+Dispatch uses `bot-runs dispatch`; collection and application use
+`bot-runs apply`, including its run-origin, artifact and safe-output checks.
+For non-patch outputs, `apply --json` includes the validated `base` and
+`base_commit`; comment outputs retain `target` and `issue_number` as well as
+their text, so collection can check the destination and reject stale reviews.
+
+Reviews begin with `VERDICT: APPROVE`, `VERDICT: CHANGES` or `VERDICT: REJECT`,
+then `REASON: ...` (the reviewer's own one-sentence reason, at most 200
+characters). Collect takes review TSV rows `repo<TAB>pr<TAB>run` and fix
+rows `repo<TAB>pr<TAB>branch<TAB>run`. It posts a validated review on its PR
+and prints just `repo#pr run-URL conclusion VERDICT reason`, one line per run.
+Failed, empty, malformed and stale reviews are not posted; their line says
+`none not posted: ...`. A repeat collection recognizes its own run-attempt
+marker. This avoids duplicate posts on sequential retries, not simultaneous
+collectors. An LLM verdict is not a human review or permission to merge.
+
+Fix reads a named comment directly from the PR. Apply refuses a patch not
+based on the current PR head or targeting the repository's default branch,
+and pushes with an explicit SHA lease; squash
+uses the PR base and preserves Agent-run trailers. Apply and land refuse
+upstream and midstream writes. Land maintains only PRs already authorized
+for auto-merge; it does not enable it or replace `bot-land`'s authorization
+policy. A behind PR is rebased only with the inspected head SHA as an
+expected-head precondition; a concurrent head replacement stops the queue.
+The new entry point can be invoked with Node without executable mode.
+
+Controller wait options must be finite and positive: `--timeout` is at most
+330 minutes, and `--poll` at most 300 seconds. Collect defaults to 200 minutes
+and land to 50 minutes, both polling every 20 seconds. Their deadline also
+caps subprocess waits, including validation and posting, not just polling.
+Every direct subprocess has a two-minute limit; child output remains suppressed
+on failure or timeout. This is not process-tree cancellation: descendants and
+remote mutations may continue after the direct child is killed. Inspect remote
+state before retrying. Default-branch metadata is rechecked before pushing,
+but GitHub offers no atomic default-branch precondition for a Git push.
+
 ## Dispatch
 
 `bot-runs dispatch` calls the REST
