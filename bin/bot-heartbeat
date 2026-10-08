@@ -181,6 +181,10 @@ of them), and of the coordinator's session in the 5-hour window. A
 failure to collect it is logged, and the heartbeat is published anyway.
 Without a status line reading from the last hour, a window is the last
 5 hours or 7 days. Sums are kept per ${BUCKET_MS / 60000} minutes in ${TRANSCRIPT_CACHE_FILE}.
+The pools object holds claude and openai in bot-capacity's poolPace shape
+(used_percent, allowed_percent, resets_at, observed_at and pacing metadata),
+or null without an unreset paced window. These readings remain lower bounds
+until reset even when old; observed_at is when read, not when published.
 
 The heartbeat comment names items only inside code, so that editing it never
 adds a "mentioned this" event to them.
@@ -628,6 +632,17 @@ function usageSnapshot(hb, agentIds, nowMs, inputWorkers = []) {
   };
 }
 
+// Share capacity's readers and pacing without its board lookup or cost-state
+// updates. Only the resulting aggregate pace is published, never broker data.
+async function collectPools(nowMs) {
+  const { claudeReading, openaiReading } = require("./bot-capacity");
+  const { poolPace } = require("../lib/pools.js");
+  return {
+    claude: poolPace(claudeReading(), CONFIG.pacing.pools.claude, nowMs),
+    openai: poolPace(await openaiReading(), CONFIG.pacing.pools.openai, nowMs),
+  };
+}
+
 // --- The comment --------------------------------------------------------
 
 // OWNER/REPO#N of an item URL.
@@ -676,6 +691,11 @@ function render(hb) {
 function renderUsage(snap) {
   const { fmtTokens } = costLib();
   const lines = [USAGE_MARKER, `${usageLine(snap)} Written by ${code(`${PROG} publish`)} in ${CONFIG.bot.homegit_repo}; the review app's ops view reads the JSON below.`, ""];
+  if (snap.pools) {
+    const { describe } = require("../lib/pools.js");
+    for (const [name, p] of Object.entries(snap.pools)) lines.push(describe(name, p, Date.parse(snap.updated_at)));
+    lines.push("");
+  }
   if (snap.workers.length) {
     lines.push("| Worker | Tokens |", "|---|---|");
     for (const w of snap.workers) lines.push(`| ${code(w.name)} | ${fmtTokens(totalTokens(w.tokens))} |`);
@@ -767,7 +787,7 @@ function readInput() {
   }
 }
 
-function cmdPublish(args) {
+async function cmdPublish(args) {
   let dryRun = false;
   let withUsage = true;
   let strictState = false;
@@ -777,7 +797,7 @@ function cmdPublish(args) {
     else if (a === "--require-saved-state") strictState = true;
     else throw new Exit(EX_USAGE, `unexpected argument '${a}'\n\n${usage()}`);
   }
-  publish(readInput(), { dryRun, withUsage, strictState });
+  await publish(readInput(), { dryRun, withUsage, strictState });
 }
 
 // publish(input, {dryRun, withUsage, existing, strictState}): validates and publishes
@@ -785,7 +805,7 @@ function cmdPublish(args) {
 // EXISTING is the heartbeat comment, when the caller just read it.
 // STRICTSTATE is for read/append registration: refuse stale local state and
 // fail if persistence fails, so another append cannot drop published workers.
-function publish(input, { dryRun = false, withUsage = true, existing, strictState = false } = {}) {
+async function publish(input, { dryRun = false, withUsage = true, existing, strictState = false } = {}) {
   const nowMs = now();
   const { hb: valid, agentIds } = validate(input, nowMs);
   const hb = dropPrivate(valid);
@@ -801,7 +821,9 @@ function publish(input, { dryRun = false, withUsage = true, existing, strictStat
   if (withUsage) {
     // Best effort: a heartbeat without usage beats none.
     try {
-      usageBody = renderUsage(usageSnapshot(valid, agentIds, nowMs, input.workers));
+      const snap = usageSnapshot(valid, agentIds, nowMs, input.workers);
+      snap.pools = await collectPools(nowMs);
+      usageBody = renderUsage(snap);
     } catch (e) {
       log(`no usage snapshot: ${e.message}`);
     }
@@ -881,7 +903,7 @@ function republish(last, nowMs, workers = last.input.workers) {
   const delta = nowMs - Date.parse(last.input.updated_at);
   const coordinator = { ...last.input.coordinator };
   if (coordinator.next_wake_at) coordinator.next_wake_at = iso(Date.parse(coordinator.next_wake_at) + delta);
-  publish({ ...last.input, updated_at: iso(nowMs), coordinator, workers }, { existing, strictState: true });
+  return publish({ ...last.input, updated_at: iso(nowMs), coordinator, workers }, { existing, strictState: true });
 }
 
 function cmdRefresh(args) {
@@ -893,7 +915,7 @@ function cmdRefresh(args) {
     log(`fresh: published ${Math.round(age / 60000)} min ago`);
     return;
   }
-  republish(last, nowMs);
+  return republish(last, nowMs);
 }
 
 // boardItems(file): the board's items (bot-board list --json, or FILE).
@@ -948,7 +970,7 @@ function cmdDone(args) {
   if (!require("../lib/heartbeat-register.js").deregister(args[0])) throw new Exit(EX_ERROR, `cannot remove worker ${args[0]}`);
 }
 
-function cmdPrune(args) {
+async function cmdPrune(args) {
   let dryRun = false;
   let boardFile = null;
   for (let i = 0; i < args.length; i++) {
@@ -966,7 +988,7 @@ function cmdPrune(args) {
     log(`would drop ${summary}`);
     return;
   }
-  republish(last, now(), workers.filter((w) => !(w.name in finished)));
+  await republish(last, now(), workers.filter((w) => !(w.name in finished)));
   log(`dropping ${summary}`);
 }
 
@@ -980,9 +1002,12 @@ function cmdShow(args) {
   if (!c) throw new Exit(EX_ERROR, `no ${t.what} comment on ${where(t)} yet`);
   process.stdout.write(`${JSON.stringify(parseComment(c.body), null, 2)}\n`);
 }
-function cmdUsage(args) {
+async function cmdUsage(args) {
   if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
-  process.stdout.write(`${JSON.stringify(collectUsage(now()).usage, null, 2)}\n`);
+  const nowMs = now();
+  const { usage } = collectUsage(nowMs);
+  usage.pools = await collectPools(nowMs);
+  process.stdout.write(`${JSON.stringify(usage, null, 2)}\n`);
 }
 
 // A status line command: save the rate limits, print a short line. It
@@ -1016,7 +1041,7 @@ function needIssue() {
   }
 }
 
-function main() {
+async function main() {
   let [cmd, ...args] = process.argv.slice(2);
   // All publications serialize with registration/cleanup, including a full
   // ordinary publish. --locked-state is internal: callers already holding
@@ -1063,13 +1088,11 @@ function main() {
 }
 
 if (require.main === module) {
-  try {
-    main();
-  } catch (e) {
+  main().catch((e) => {
     if (!(e instanceof Exit)) throw e;
     process.stderr.write(`${PROG}: ${e.message}\n`);
     process.exit(e.status);
-  }
+  });
 } else {
   module.exports = { validate, validateRunHealth, render, renderUsage, usageSnapshot, parseComment, rateLimitsOf, collectUsage, now, SCHEMA, MARKER, USAGE_MARKER };
 }

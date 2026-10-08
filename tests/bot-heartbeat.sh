@@ -25,6 +25,8 @@ readonly WORK
 trap 'rm -rf "${WORK}"' EXIT
 export FAKE=${WORK}/fake PATH=${WORK}/bin:${PATH}
 export BOT_HEARTBEAT_NOW=2026-09-28T20:00:00Z
+# Offline: never discover the machine's broker.
+export BOT_CAPACITY_PRAXIS_USAGE=
 # The usage snapshot reads these transcripts, and no status line reading.
 export BOT_HEARTBEAT_PROJECTS=${TESTS}/fixtures/bot-heartbeat/projects XDG_CACHE_HOME=${WORK}/cache
 # What publish saves for refresh, and no session of the one running the tests.
