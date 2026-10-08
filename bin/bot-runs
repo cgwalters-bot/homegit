@@ -1593,12 +1593,13 @@ cmd_apply() {
 $(jq -r '.errors[] | "  \(.)"' "${scratch}/verdict.json" 2>/dev/null)"
     verdict=$(<"${scratch}/verdict.json")
     pr=$(jq -c '[.items[] | select(.type == "create_pull_request")] | first // null' <<<"${verdict}")
-    others=$(jq -c '[.items[] | select(.type != "create_pull_request") | {type, text: (.message // .body // .reason // "")}]' <<<"${verdict}")
+    others=$(jq -c '[.items[] | select(.type != "create_pull_request") | {type, text: (.message // .body // .reason // "")} + (if .type == "add_comment" then {target: .target, issue_number: .issue_number} else {} end)]' <<<"${verdict}")
+    read -r commit < <(jq -r .commit "${scratch}/out/base.json")
     if test "${pr}" = null; then
         # Nothing to apply: say what the run did hand back.
         if ${json}; then
-            jq -n --argjson run "${run_id}" --arg url "${run_url}" --arg item "${item}" --argjson outputs "${others}" \
-                '{run_id: $run, run_url: $url, item: $item, applied: false, outputs: $outputs}'
+            jq -n --argjson run "${run_id}" --arg url "${run_url}" --arg item "${item}" --arg base "${base}" --arg commit "${commit}" --argjson outputs "${others}" \
+                '{run_id: $run, run_url: $url, item: $item, base: $base, base_commit: $commit, applied: false, outputs: $outputs}'
         else
             printf 'Run %s handed back no create_pull_request, so nothing was applied.\n' "${run_id}"
             jq -r '.[] | "  \(.type): \(.text)"' <<<"${others}"
@@ -1606,7 +1607,6 @@ $(jq -r '.errors[] | "  \(.)"' "${scratch}/verdict.json" 2>/dev/null)"
         return 0
     fi
 
-    read -r commit < <(jq -r .commit "${scratch}/out/base.json")
     # A fresh clone, its base commit on the declared base branch (never
     # fetched by id: GitHub serves forks' commits that way too).
     if test -n "${dir}"; then
