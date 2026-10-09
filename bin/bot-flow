@@ -96,7 +96,15 @@ function run(cmd, args, input, cwd) {
     const env = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith("GIT_")));
     Object.assign(env, { GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: "/dev/null", GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_COUNT: "2", GIT_CONFIG_KEY_0: "core.hooksPath", GIT_CONFIG_VALUE_0: "/dev/null", GIT_CONFIG_KEY_1: "core.fsmonitor", GIT_CONFIG_VALUE_1: "false" });
     return execFileSync(cmd, args, { input, cwd, env, timeout: Math.ceil(timeout), killSignal: "SIGKILL", encoding: "utf8", maxBuffer: 16 << 20, stdio: ["pipe", "pipe", "pipe"] }).trim();
-  } catch {
+  } catch (error) {
+    if (cmd === "git") {
+      const command = args.filter((arg, i) => arg !== "-c" && args[i - 1] !== "-c")[0];
+      const last = String(error.stderr || "").trim().split(/\r?\n/).at(-1);
+      const reason = (last || error.code || "unknown error")
+        .replace(/(https?:\/\/)[^\s/]*@/g, "$1[redacted]@")
+        .replace(/[\x00-\x1f\x7f\u2028\u2029]/g, " ").slice(0, 400);
+      throw new Error(`git ${command} failed: ${reason}`);
+    }
     // Child output can contain hostile review text or patches. Never relay it.
     throw new Error(`${path.basename(cmd)} ${args[0]} failed; no body or log displayed`);
   }
@@ -188,15 +196,21 @@ function collectWithinDeadline(opts, scratch, config) {
     const conclusion = meta?.conclusion || meta?.status || "unknown";
     if (kind === "fix") reason = "fix status only; no review posted";
     else if (meta?.status === "completed" && conclusion === "success") {
+      let phase = "validation";
       try {
         const result = JSON.parse(tool("bot-runs", ["apply", id, "--repo", repo, "--slug", `review-${id}`, "--message", path.join(scratch, "message"), "--outputs", "add_comment,noop,missing_data", "--json"]));
+        phase = "PR inspection";
         const current = pull(repo, pr);
-        if (current.state !== "open" || current.head.sha !== result.base_commit || current.head.ref !== result.base) throw new Error("stale review");
+        if (current.state !== "open" || current.head.sha !== result.base_commit || current.head.ref !== result.base) {
+          phase = "stale review (PR head changed or closed)";
+          throw new Error("stale review");
+        }
         const comments = result.outputs.filter((o) => o.type === "add_comment");
         const header = comments.length === 1 && String(comments[0].issue_number) === pr &&
           (comments[0].target == null || comments[0].target === repo || comments[0].target === `${repo}#${pr}` || comments[0].target === `https://github.com/${repo}/pull/${pr}`) && reviewHeader(comments[0].text);
         if (!header) reason = "not posted: empty or malformed review";
         else {
+          phase = "posting";
           const marker = `<!-- bot-flow-review:${runsRepo}:${id}:${meta.run_attempt || 1} -->`;
           const pages = JSON.parse(run("gh", ["api", "--paginate", "--slurp", `repos/${repo}/issues/${pr}/comments?per_page=100`]));
           const previous = pages.flat().find((c) => c.user?.login === config.bot.login && c.body?.includes(marker));
@@ -204,7 +218,7 @@ function collectWithinDeadline(opts, scratch, config) {
           if (!previous) api(["-X", "POST", `repos/${repo}/issues/${pr}/comments`, "--input", "-"], JSON.stringify({ body: `${marker}\n${comments[0].text}\n\nReview by an LLM, not a human review. Run: ${url}\nGenerated-by: AI` }));
           ({ verdict, reason } = header);
         }
-      } catch { reason = "not posted: validation or posting failed"; }
+      } catch { reason = `not posted: ${phase} failed`; }
     }
     console.log(`${repo}#${pr} ${url} ${conclusion} ${verdict} ${reason}`);
   }
@@ -236,7 +250,9 @@ function apply(opts, config) {
   if (fresh.state !== "open" || fresh.head.sha !== pr.head.sha || fresh.head.ref !== pr.head.ref || fresh.base.ref !== pr.base.ref) throw new Error("PR changed during apply; nothing pushed");
   tool("bot-git", ["check", `refs/remotes/origin/${pr.head.ref}..HEAD`], undefined, applied.dir);
   if (ownRepo(opts.repo, config).default_branch === pr.head.ref) throw new Error("PR head became the default branch; nothing pushed");
-  git(["push", "--quiet", `--force-with-lease=refs/heads/${pr.head.ref}:${pr.head.sha}`, "origin", `HEAD:refs/heads/${pr.head.ref}`]);
+  // Global Git configuration is disabled; select gh's credential helper
+  // explicitly rather than relying on the operator's global setup.
+  git(["-c", "credential.helper=", "-c", "credential.helper=!gh auth git-credential", "push", "--quiet", `--force-with-lease=refs/heads/${pr.head.ref}:${pr.head.sha}`, "origin", `HEAD:refs/heads/${pr.head.ref}`]);
   return `${opts.repo}#${opts.pr} applied run ${opts.run}`;
 }
 
