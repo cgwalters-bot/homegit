@@ -99,6 +99,9 @@ test("collect posts only successful validated reviews and exposes no body", (t) 
     const posts = h.calls.filter((c) => c.args.includes("POST"));
     assert.equal(posts.length, ["success", "posting-failed"].includes(variant) ? 1 : 0);
     if (variant === "success") assert.ok(posts[0].input.includes(body.replaceAll("\n", "\\n")));
+    if (variant === "stale") assert.ok(h.lines[0].includes("stale review"));
+    if (variant === "validation-failed") assert.ok(h.lines[0].includes("validation failed"));
+    if (variant === "posting-failed") assert.ok(h.lines[0].includes("posting failed"));
   }
 });
 
@@ -158,6 +161,35 @@ test("stack apply uses explicit head lease and isolated git environment", () => 
   assert.equal(push.cwd, "/worktree");
   assert.equal(push.env.GIT_CONFIG_GLOBAL, "/dev/null");
   assert.equal(push.env.GIT_DIR, undefined);
+  assert.ok(push.args.includes("credential.helper=!gh auth git-credential"));
+  assert.ok(push.args.includes("credential.helper="));
+});
+
+test("git failure identifies the command and only the final stderr line", () => {
+  for (const [stderr, expected] of [
+    ["private body\nfatal: Authentication failed\n", "git push failed: fatal: Authentication failed"],
+    ["fatal: unable to access 'https://user:password@example.invalid/repo'", "git push failed: fatal: unable to access 'https://[redacted]@example.invalid/repo'"],
+  ]) {
+    const pr = { state: "open", head: { sha: "old", ref: "topic", repo: { full_name: "forge/proj" } }, base: { ref: "main" } };
+    const h = harness((cmd, args) => {
+      if (cmd.endsWith("bot-runs")) return { head: "new", base_commit: "old", dir: "/worktree" };
+      if (cmd === "gh") return args[1].includes("pulls") ? pr : { full_name: "forge/proj", owner: { login: "forge" }, default_branch: "main" };
+      if (cmd === "git") throw Object.assign(new Error("private log"), { stderr });
+      return "";
+    });
+    assert.throws(() => h.tool.apply({ repo: "forge/proj", pr: "3", run: "12", slug: "fix", message: "message" }, config), (error) => error.message === expected);
+  }
+});
+
+test("squash reports a real git fetch failure without credentials", (t) => {
+  const dir = scratch(t);
+  const pr = { state: "open", head: { sha: "old", ref: "topic", repo: { full_name: "forge/proj" } }, base: { ref: "main" } };
+  const h = harness((cmd, args, opts) => {
+    if (cmd.endsWith("bot-runs")) return { head: "new", base_commit: "old", dir };
+    if (cmd === "gh") return args[1].includes("pulls") ? pr : { full_name: "forge/proj", owner: { login: "forge" }, default_branch: "main" };
+    return require("node:child_process").execFileSync(cmd, args, opts);
+  });
+  assert.throws(() => h.tool.apply({ repo: "forge/proj", pr: "3", run: "12", slug: "fix", message: "message", mode: "squash" }, config), /git fetch failed: fatal: not a git repository/);
 });
 
 test("squash apply preserves run provenance before lease push", () => {
