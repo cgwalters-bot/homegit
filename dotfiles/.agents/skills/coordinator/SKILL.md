@@ -283,7 +283,9 @@ do. Don't hand the waiting to a watcher subagent: a model isn't needed
 to rerun a command. It never sweeps either: each cycle it reads
 the sweep runs it hasn't read yet, applies its seen-sets to them, and runs
 `bot-reconcile` (see "Reconcile" below) against its actions state; every
-3 minutes it reads the operator's events feed, and runs
+minute it polls the bot's notifications for a new comment by the operator
+on a thread the bot tracks (waking as `news, fast` with the comment's
+URL: read it and act on it), reads the operator's events feed, and runs
 `bot-signoff-due --apply` and `bot-promote-due --apply` at once on a new
 approval, waking you only if they did something or the PR is one the
 bot tracks (its own, a fork PR, or on the board). It exits `ACTIONS (KINDS) at HHMM: WHERE` followed by
