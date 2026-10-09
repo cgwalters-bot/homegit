@@ -26,7 +26,9 @@ expect_eq() {
     test "$2" = "$3" || fail "$1: got '$2', want '$3'"
 }
 
-mkdir "${WORK}/bin" "${WORK}/dir" "${WORK}/state"
+mkdir "${WORK}/bin" "${WORK}/dir" "${WORK}/state" "${WORK}/home"
+# No installed user skills or tools: the launcher must supply the harness.
+export HOME=${WORK}/home
 # The fake claude: the brief (stdin) names the scenario on a 'Scenario:'
 # line. It records its arguments, working directory and environment, then
 # emits stream-json like the real one.
@@ -37,8 +39,19 @@ const brief = fs.readFileSync(0, "utf8");
 const scenario = (/^Scenario: (\S+)/m.exec(brief) || [])[1];
 fs.writeFileSync(`${process.env.FAKE_OUT}/${scenario}.invocation`, JSON.stringify({
   args: process.argv.slice(2), cwd: process.cwd(), brief,
-  env: Object.fromEntries(["CLAUDE_CODE_SHELL", "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_OAUTH_TOKEN", "GIT_AUTHOR_EMAIL"].map((k) => [k, process.env[k] || null])),
+  env: Object.fromEntries(["PATH", "CLAUDE_CODE_SHELL", "CLAUDE_CODE_SESSION_ID", "CLAUDECODE", "CLAUDE_CODE_OAUTH_TOKEN", "GIT_AUTHOR_EMAIL"].map((k) => [k, process.env[k] || null])),
 }));
+if (scenario === "ok") {
+  const assert = require("node:assert/strict");
+  const path = require("node:path");
+  const dotfiles = process.argv[process.argv.indexOf("--add-dir") + 1];
+  assert.match(fs.readFileSync(path.join(dotfiles, ".claude", "skills", "devspace-work", "SKILL.md"), "utf8"), /name: devspace-work/);
+  assert.ok(fs.existsSync(path.join(dotfiles, ".claude", "agents", "sonnet-worker.md")));
+  // Use the worker's actual shell environment, not absolute tool paths.
+  const probe = require("child_process").spawnSync(process.env.CLAUDE_CODE_SHELL,
+    ["-c", "bot-devspace --help && bot-claude --help"], { encoding: "utf8" });
+  assert.equal(probe.status, 0, probe.stderr);
+}
 const emit = (o) => process.stdout.write(JSON.stringify(o) + "\n");
 emit({ type: "system", subtype: "init", session_id: "sess-1", model: "claude-fake" });
 if (scenario === "hang") {
@@ -164,6 +177,8 @@ expect_eq "model default" "$(jq -r '.args | index("--model") as $i | .[$i + 1]' 
 expect_eq "stream-json" "$(jq -r '.args | index("--output-format") as $i | .[$i + 1]' "${inv}")" "stream-json"
 expect_eq "permission mode" "$(jq -r '.args | index("--permission-mode") as $i | .[$i + 1]' "${inv}")" "bypassPermissions"
 expect_eq "settings" "$(jq -r '.args | index("--settings") as $i | .[$i + 1] | endswith("dotfiles/.claude/settings.json")' "${inv}")" "true"
+expect_eq "harness directory" "$(jq -r '.args | index("--add-dir") as $i | .[$i + 1]' "${inv}")" "$(realpath "${TESTS}/../dotfiles")"
+expect_eq "worker PATH" "$(jq -r .env.PATH "${inv}")" "$(realpath "${TESTS}/../bin"):${PATH}"
 expect_eq "shell" "$(jq -r .env.CLAUDE_CODE_SHELL "${inv}")" "/bin/bash"
 expect_eq "session var dropped" "$(jq -r '.env.CLAUDE_CODE_SESSION_ID, .env.CLAUDECODE | tostring' "${inv}" | tr '\n' ' ')" "null null "
 expect_eq "oauth kept" "$(jq -r .env.CLAUDE_CODE_OAUTH_TOKEN "${inv}")" "oauth-kept"
@@ -178,7 +193,7 @@ inv=${WORK}/out/opts.invocation
 expect_eq "model" "$(jq -r '.args | index("--model") as $i | .[$i + 1]' "${inv}")" "sonnet"
 expect_eq "max-turns" "$(jq -r '.args | index("--max-turns") as $i | .[$i + 1]' "${inv}")" "5"
 expect_eq "effort" "$(jq -r '.args | index("--effort") as $i | .[$i + 1]' "${inv}")" "low"
-expect_eq "add-dir" "$(jq -r '.args | index("--add-dir") as $i | .[$i + 1]' "${inv}")" "${WORK}/bin"
+expect_eq "add-dir" "$(jq -r '.args | [range(length) as $i | select(.[$i] == "--add-dir") | .[$i + 1]] | .[1]' "${inv}")" "${WORK}/bin"
 expect_eq "mode" "$(jq -r '.args | index("--permission-mode") as $i | .[$i + 1]' "${inv}")" "plan"
 expect_eq "no duplicate item line" "$(jq -r .brief "${inv}" | grep -c '^Item:')" "1"
 
