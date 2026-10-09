@@ -23,7 +23,7 @@ readonly STALE_S=$((30 * 60)) SP_EVERY_S=3600
 readonly HEARTBEAT_FRESH_MIN=30
 # Cycles of FAST_S seconds after the first look (about 9 minutes), and
 # how long an unresolved action waits before it wakes again.
-readonly CYCLES=${BOT_POLL_LOOP_CYCLES:-3} FAST_S=${BOT_POLL_LOOP_FAST_S:-180}
+readonly CYCLES=${BOT_POLL_LOOP_CYCLES:-9} FAST_S=${BOT_POLL_LOOP_FAST_S:-60}
 readonly RESYNC_MIN=${BOT_POLL_LOOP_RESYNC_MIN:-120}
 # --until-actions: how long it waits at most by default (under the 30
 # minutes a Claude Code background command gets by default), and after
@@ -96,6 +96,12 @@ ${OP_FORGE_ORG} or ${OP_BOT_LOGIN}'s own, on the board (or in an item's
 Branch), or opened by ${OP_BOT_LOGIN}.
 
 The seen-sets and the actions state live in ${S}.
+Each cycle also conditionally polls the bot's notifications, respecting
+X-Poll-Interval across restarts. A latest comment verified as written by
+${OP_OPERATOR_LOGIN} on an open thread authored by or assigned to the bot,
+or on the board (including Branch PRs), wakes as news, fast, with its URL.
+It never marks threads read; failed reads retain the window, and a fresh
+state looks back ten minutes. The full sweep remains the safety net.
 EOF
 }
 
@@ -142,7 +148,9 @@ mkdir -p "${S}" || exit 1
 # reconcile, say) that holds the lock a little longer: wait for it.
 exec {lock_fd}>"${S}/lock" || exit 1
 flock -w "${BOT_POLL_LOOP_LOCK_WAIT:-60}" "${lock_fd}" || die "another $(basename "$0") run holds ${S}/lock"
-for k in ${KEYS} evapprove; do touch "${S}/${k}-now" "${S}/${k}-seen"; done
+for k in ${KEYS} evapprove comment; do touch "${S}/${k}-now" "${S}/${k}-seen"; done
+# shellcheck source=bin/poll-notifications.sh disable=SC1091
+source "${BIN}/poll-notifications.sh"
 
 # events: the operator's approving reviews in their public events feed.
 events() {
@@ -345,6 +353,17 @@ while :; do
     done
     refresh
     reconcile
+    notification_news=""
+    # Do not spend the notification budget delaying already pending actions.
+    if test -z "${hits}"; then
+        if ! notifications; then
+            echo "warning: notifications fast path failed; retrying next poll" >&2
+        fi
+    fi
+    if test -n "${notification_news}"; then
+        hits="news, fast${hits}"
+        wake "operator comments: $(tr '\n' ' ' <<<"${notification_news}")"
+    fi
     if why=$(sweep_problem); then
         hits="sweep-problem${hits}"
         wake "${why}"

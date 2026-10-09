@@ -118,6 +118,15 @@ test("event wakes are selected separately from reconcile payload", () => {
   assert.match(c.calls().find((x) => x.cmd === "start").brief, /Selected kinds: approval\n/);
 });
 
+test("operator comment fast wake dispatches immediately with its URL", () => {
+  const out = "ACTIONS (news, fast) at 1234: operator comments: https://github.com/o/r/issues/1#issuecomment-2\nObserved: nothing\n";
+  const c = setup({ polls: [{ out }] });
+  succeeded(c.once());
+  const brief = c.calls().find((x) => x.cmd === "start").brief;
+  assert.match(brief, /Selected kinds: news\n/);
+  assert.ok(brief.endsWith(out));
+});
+
 test("URL-less fired heartbeat actions use the payload too", () => {
   const c = setup({ polls: [{ out: report([{ kind: "heartbeat", fired: "new", url: null, do: "publish one" }], "actions: heartbeat") }] });
   succeeded(c.once());

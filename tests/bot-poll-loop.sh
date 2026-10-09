@@ -28,6 +28,32 @@ fail() {
 # of the events feed (the last one after that), as its --jq filter would.
 cat >"${WORK}/bin/gh" <<'EOF'
 #!/usr/bin/env bash
+if test "$2" = user; then echo cgwalters-bot; exit 0; fi
+if test "$2" = -i; then
+    if [[ "$3" == https://api.github.com/repos/* ]]; then
+        printf 'HTTP/2.0 200 OK\n\n'; cat "${FAKE}/comment.json"; exit 0
+    fi
+    if [[ "$3" == repos/*/issues/* ]]; then
+        printf 'HTTP/2.0 200 OK\n\n'; cat "${FAKE}/issue.json"; exit 0
+    fi
+    echo "$*" >>"${FAKE}/notification-calls"
+    if test -f "${FAKE}/notifications.json"; then
+        printf 'HTTP/2.0 200 OK\nDate: Fri, 09 Oct 2026 12:00:00 GMT\nLast-Modified: Fri, 09 Oct 2026 12:00:00 GMT\nX-Poll-Interval: 0\n\n'
+        cat "${FAKE}/notifications.json"
+    else
+        printf 'HTTP/2.0 304 Not Modified\nX-Poll-Interval: 0\n\n'
+        exit 1
+    fi
+    exit 0
+fi
+if [[ "$2" == https://api.github.com/* ]]; then
+    cat "${FAKE}/comment.json"
+    exit 0
+fi
+if [[ "$2" == repos/*/issues/* ]]; then
+    cat "${FAKE}/issue.json"
+    exit 0
+fi
 if [[ "$2" =~ ^repos/([^/]+)/([^/]+)/pulls/([0-9]+)$ ]]; then
     cat "${FAKE}/author-${BASH_REMATCH[1]}-${BASH_REMATCH[2]}-${BASH_REMATCH[3]}" 2>/dev/null || echo someone
     exit 0
@@ -364,6 +390,41 @@ for args in "--max-wait 90s" "--max-wait 25" "--max-wait 25m" "--max-wait 1h" "-
 done
 
 test "$("${LOOP}" --help | head -n1)" = "Usage: bot-poll-loop [--until-actions [--max-wait DURATION]]" || fail "--help"
+
+# Recorded API shapes: operator comments need neither mention nor ask label.
+for tracked in author assigned board branch unrelated closed stranger bot old; do
+    reset
+    sweep 20261002-100000-000 ""
+    cp "${TESTS}/fixtures/poll-notifications.json" "${FAKE}/notifications.json"
+    mkdir -p "${WORK}/state"
+    echo '2026-10-09T11:50:00Z' >"${WORK}/state/notification-since"
+    printf '%s\n' '{"user":{"login":"cgwalters","type":"User"},"html_url":"https://github.com/o/r/issues/1#issuecomment-2","updated_at":"2026-10-09T11:59:00Z","body":"B"}' >"${FAKE}/comment.json"
+    jq -n --arg mode "${tracked}" '{state: (if $mode == "closed" then "closed" else "open" end), html_url: "https://github.com/o/r/issues/1", user: {login: (if $mode == "author" or $mode == "closed" then "cgwalters-bot" else "someone" end)}, assignees: (if $mode == "assigned" then [{login:"cgwalters-bot"}] else [] end)}' >"${FAKE}/issue.json"
+    if test "${tracked}" = board; then
+        echo '[{"content":{"url":"https://github.com/o/r/issues/1"}}]' >"${FAKE}/board.json"
+    fi
+    if test "${tracked}" = branch; then
+        echo '[{"content":{"url":"https://github.com/o/r/issues/9"},"branch":"https://github.com/o/r/issues/1"}]' >"${FAKE}/board.json"
+    fi
+    case "${tracked}" in
+        stranger|bot|old)
+            jq --arg mode "${tracked}" '.user.login = (if $mode == "stranger" then "someone" else "cgwalters" end) | .user.type = (if $mode == "bot" then "Bot" else "User" end) | .updated_at = (if $mode == "old" then "2026-10-01T00:00:00Z" else .updated_at end)' "${FAKE}/comment.json" >"${FAKE}/comment.tmp"
+            mv "${FAKE}/comment.tmp" "${FAKE}/comment.json" ;;
+    esac
+    out=$(loop)
+    case "${tracked}" in
+        unrelated|closed|stranger|bot|old) expect_first "${out}" '^QUIET' ;;
+        *) expect_first "${out}" '^ACTIONS \(news, fast\)' ;;
+    esac
+    expect_first "$(loop)" '^QUIET'
+    grep -q 'If-Modified-Since:' "${FAKE}/notification-calls" || fail "no conditional request"
+done
+
+# The server's minimum interval survives a process restart.
+before=$(wc -l <"${FAKE}/notification-calls")
+echo "$(($(date +%s) + 300))" >"${WORK}/state/notification-due"
+expect_first "$(loop)" '^QUIET'
+test "$(wc -l <"${FAKE}/notification-calls")" = "${before}" || fail "poll interval lost on restart"
 
 if test "${failures}" -gt 0; then
     echo "${failures} failure(s)" 1>&2
