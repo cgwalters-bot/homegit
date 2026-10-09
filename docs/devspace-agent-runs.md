@@ -623,3 +623,35 @@ adds no redaction of its own and never uploads anything; it keeps what it
 downloads under `~/.local/state/bot-runs/` (summaries) and
 `~/.cache/bot-runs/` (HTTP caches, and unpacked transcripts, removed
 after 30 days).
+
+## Opt-in agentic-job caller
+
+The legacy `agent.yml` remains the default. To use agentic-job's shipped
+`dispatch.yml` on a caller's `main` branch:
+
+```sh
+bot-runs dispatch --backend agentic-job --caller OWNER/CALLER \
+  --repo OWNER/TARGET --item 458 --kind implement task.md --dry-run
+bot-runs show RUN --backend agentic-job --caller OWNER/CALLER
+bot-runs list --backend agentic-job --caller OWNER/CALLER
+bot-runs log RUN --backend agentic-job --caller OWNER/CALLER
+```
+
+`--item` is the target issue number (a PR number for `--kind review`), not a
+board item id. Kinds are `implement` (the default), `review`, `triage` and
+`research`. The caller supplies the preamble and fixed output routing. Its
+current dispatch interface exposes only `repo`, `item`, `kind` and `task`:
+model, agent, runner size, budget, timeout and caps are caller configuration.
+Explicit overrides are refused rather than dropped or sent as unknown inputs.
+This is a remaining caller-interface gap before per-run model/limit selection.
+The adapter does not write board fields for numeric issue identifiers.
+
+Readers use the caller's `dispatch-KIND-` artifacts and keep its cache separate
+from legacy runs. JSON includes the run's `applied.json`
+(`agentic-job-applied/v1`) as `applied` and an `application` status and URL.
+Only a successful `run / apply` job with a valid applied record reports
+`applied`, `partial` or `refused`; failed/skipped/missing apply is not delivery.
+The URLs come from that record, not the agent's proposed outcome. These records
+are display data, never permission to write. Local `apply` refuses this
+backend: its runs apply themselves. Board reconciliation and watch support
+are intentionally not part of this adapter.
