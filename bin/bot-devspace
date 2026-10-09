@@ -374,7 +374,7 @@ cmd_start() {
     test $# -eq 1 || fatal "usage: $(basename "$0") start [--ref REF] [--cores N] [--duration MIN] [--no-provision] [--keep-on-failure] NAME"
     name=$1
     validate_name "${name}"
-    one_of "${cores}" "${VALID_CORES[@]}" || fatal "--cores must be one of: ${VALID_CORES[*]} (got '${cores}')"
+    one_of "${cores}" "${VALID_CORES[@]}" || fatal "--cores must be one of: ${VALID_CORES[*]} (got '${cores}'); 8 is not supported; use 4 or 16 for a limit of 16 cores"
     local wanted=${duration}
     duration=$(round_duration "${wanted}") ||
         fatal "--duration must be a number of minutes up to ${VALID_DURATIONS[-1]}; the workflow allows ${VALID_DURATIONS[*]} (got '${wanted}')"

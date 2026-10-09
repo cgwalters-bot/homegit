@@ -109,6 +109,14 @@ esac
 EOF
 chmod +x "${WORK}/bin/gh" "${WORK}/bin/ssh"
 
+# Unsupported sizes must explain the choice within the worker's core limit,
+# before attempting a dispatch.
+rc=0
+"${BOT_DEVSPACE}" start --cores 8 t-eight >/dev/null 2>"${WORK}/err" || rc=$?
+test "${rc}" != 0 || fail "8 cores was accepted"
+grep -q '8 is not supported; use 4 or 16 for a limit of 16 cores' "${WORK}/err" || fail "missing core limit guidance"
+test ! -e "${FAKE}/runs.json" || fail "unsupported cores attempted a dispatch"
+
 # (users the devspace admits, the user start must pick, provision's mode)
 cases=(
     "runner-sandbox runner|runner-sandbox|check"

@@ -18,7 +18,8 @@ const { processIdentity, sameIdentity } = require("../lib/process-identity");
 const PROG = path.basename(process.argv[1] || "bot-claude");
 const SELF = fs.realpathSync(process.argv[1] || __filename);
 const BIN_DIR = path.dirname(SELF);
-const BOT_SETTINGS = path.join(BIN_DIR, "..", "dotfiles", ".claude", "settings.json");
+const DOTFILES_DIR = path.join(BIN_DIR, "..", "dotfiles");
+const BOT_SETTINGS = path.join(DOTFILES_DIR, ".claude", "settings.json");
 const CLAUDE = process.env.BOT_CLAUDE_CLAUDE || "claude";
 const ACTUALS = process.env.BOT_CLAUDE_ACTUALS || path.join(BIN_DIR, "bot-actuals");
 const HEARTBEAT = process.env.BOT_CLAUDE_HEARTBEAT || path.join(BIN_DIR, "bot-heartbeat");
@@ -118,7 +119,9 @@ Poll it with status and wait; nothing else is needed to follow a worker.
 
 The process is Claude Code with homegit's settings (CLAUDE_CODE_SHELL and
 the rest, passed with --settings) on top of the bot account's own
-configuration, with the coordinator session's CLAUDE_CODE_* variables
+configuration. homegit's bin/ is prepended to PATH and its dotfiles/ is
+added with --add-dir to load the harness skills and agents without a dotfiles
+install. The coordinator session's CLAUDE_CODE_* variables are
 removed (the OAuth token stays) and the bot's git identity from the
 operator config; the model defaults to ${DEFAULT_MODEL} (BOT_CLAUDE_MODEL), the
 permission mode to ${DEFAULT_PERMISSION_MODE} (unattended: nobody answers prompts), and the
@@ -562,12 +565,12 @@ function workerEnv() {
     if (DROPPED_VARS.includes(k) || (k.startsWith("CLAUDE_CODE_") && !KEPT_CLAUDE_VARS.includes(k))) continue;
     env[k] = v;
   }
-  return { ...env, ...botIdentityEnv(), CLAUDE_CODE_SHELL: WORKER_SHELL };
+  return { ...env, ...botIdentityEnv(), PATH: [BIN_DIR, env.PATH].filter(Boolean).join(path.delimiter), CLAUDE_CODE_SHELL: WORKER_SHELL };
 }
 
 function claudeArgs(job) {
   const args = ["-p", "--output-format", "stream-json", "--verbose", "--model", job.model, "--permission-mode", job.permission_mode,
-    "--settings", BOT_SETTINGS, "--name", `bot-claude ${job.job}`,
+    "--settings", BOT_SETTINGS, "--add-dir", DOTFILES_DIR, "--name", `bot-claude ${job.job}`,
     "--append-system-prompt", [APPEND_PROMPT, job.append_system_prompt].filter(Boolean).join("\n\n")];
   if (job.max_turns !== null) args.push("--max-turns", String(job.max_turns));
   if (job.effort) args.push("--effort", job.effort);
