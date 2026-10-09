@@ -70,6 +70,16 @@ its previous run, and the rest is recomputable from GitHub.
 
 ## Local supervisor
 
+The existing poll loop checks notifications about once a minute (respecting
+GitHub's X-Poll-Interval), with If-Modified-Since for unchanged polls. It
+reads the latest comment's API author, not mentions or quoted text, and
+wakes as `news, fast` for the configured operator on open threads authored
+by or assigned to the bot, or on its board (including Branch PRs). This
+read-only path never marks notifications read; local comment URL/timestamp
+seen-sets dedupe repeats and edits. Failed reads retain the polling window.
+A fresh state looks back ten minutes. The slower sweep remains the safety
+net for missed notifications and comments hidden by a later reply.
+
 Launch from the checkout with an interpreter:
 
 ```
