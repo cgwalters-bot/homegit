@@ -1,0 +1,9 @@
+{
+  "schema": "agentic-job-applied/v1",
+  "repo": "example/target",
+  "partial": false,
+  "made": [{"type": "create_pull_request", "repo": "example/target", "number": 7, "url": "https://github.com/example/target/pull/7"}],
+  "refused": false,
+  "pull_request": {"number": 7, "url": "https://github.com/example/target/pull/7"},
+  "handlers": {}
+}

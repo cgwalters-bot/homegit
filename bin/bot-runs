@@ -15,11 +15,38 @@ source "$(dirname "$(readlink -f "$0")")/gh-http.sh" || {
 # shellcheck source=bin/operator.sh disable=SC1091 # followed with shellcheck -x
 source "$(dirname "$(readlink -f "$0")")/operator.sh"
 
+# Backend selection is shared by dispatch and readers. A caller is a
+# repository shipping agentic-job's dispatch.yml, not the reusable workflow.
+backend=legacy caller="" args=()
+while test $# -gt 0; do
+    case "$1" in
+        --backend|--caller)
+            test $# -ge 2 || { echo "error: $1 requires a value" >&2; exit 1; }
+            printf -v "${1#--}" '%s' "$2"
+            shift 2 ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+set -- "${args[@]}"
+[[ "${backend}" = legacy || "${backend}" = agentic-job ]] || { echo "error: --backend must be legacy or agentic-job" >&2; exit 1; }
+if test "${backend}" = agentic-job; then
+    [[ "${caller}" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "error: --caller OWNER/REPO is required for agentic-job" >&2; exit 1; }
+    case "${caller}" in
+        ./*|../*|*/.|*/..) echo "error: --caller must not contain dot path components" >&2; exit 1 ;;
+    esac
+elif test -n "${caller}"; then
+    echo "error: --caller requires --backend agentic-job" >&2; exit 1
+fi
+
 readonly SUMMARY_SCHEMA=agent-run-summary/v1
-readonly RUNS_REPO=${BOT_RUNS_REPO:-${OP_DEVSPACE_REPO}}
-readonly RUNS_WORKFLOW=${BOT_RUNS_WORKFLOW:-agent.yml}
+RUNS_REPO=${BOT_RUNS_REPO:-${OP_DEVSPACE_REPO}}
+RUNS_WORKFLOW=${BOT_RUNS_WORKFLOW:-agent.yml}
 # agent.yml is on this branch until it lands on main.
-readonly RUNS_REF=${BOT_RUNS_REF:-bot/agent-run-praxis}
+RUNS_REF=${BOT_RUNS_REF:-bot/agent-run-praxis}
+if test "${backend}" = agentic-job; then
+    RUNS_REPO=${caller} RUNS_WORKFLOW=dispatch.yml RUNS_REF=main
+fi
+readonly RUNS_REPO RUNS_WORKFLOW RUNS_REF
 readonly SUMMARY_ARTIFACT=agent-run
 readonly TRANSCRIPT_ARTIFACT=agent-transcript
 # What a run hands back, as gh-aw's safe outputs: outputs.jsonl, a patch and
@@ -100,11 +127,11 @@ readonly DEFAULT_STATS_LIMIT=200
 readonly DEFAULT_STATS_SINCE=30d
 readonly PER_PAGE=100
 # Summaries of finished runs don't change: they are kept for good.
-readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-runs
+readonly STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/bot-runs${caller:+/callers/${caller}}
 readonly CACHE_DIR=${XDG_CACHE_HOME:-$HOME/.cache}/bot-runs
 readonly ETAG_DIR=${CACHE_DIR}/etags
 readonly ETAG_KEEP_DAYS=14
-readonly TRANSCRIPT_DIR=${CACHE_DIR}/transcripts
+readonly TRANSCRIPT_DIR=${CACHE_DIR}/transcripts${caller:+/callers/${caller}}
 readonly CHECKER_DIR=${CACHE_DIR}/safe-outputs
 readonly TRANSCRIPT_KEEP_DAYS=30
 # list --item reads at most this many runs to find LIMIT of the item's.
@@ -136,6 +163,12 @@ ${RUNS_REPO}. Their artifacts and summary.json follow
 docs/devspace-agent-runs.md in homegit.
 
 Commands:
+  dispatch --backend agentic-job --caller OWNER/REPO --repo OWNER/REPO
+           --item NUMBER --kind implement|review|triage|research [--dry-run] BRIEF
+      Use the shipped dispatch.yml on main. NUMBER is the target issue
+      (review: PR), not a board id. The caller owns model, limits and
+      preamble; overrides are refused, not silently dropped. These runs
+      apply themselves. Readers also take --backend agentic-job --caller.
   dispatch --item ITEM --repo OWNER/REPO [--base REF] [--agent AGENT]
            [--model MODEL] [--cores N] [--timeout MIN] [--budget AIC]
            [--max-requests N] [--max-tasks N]
@@ -289,7 +322,7 @@ def signed(f): if type != "number" then "-"
     elif . < 0 then "-" + (-. | f) elif . > 0 then "+" + (. | f) else "0" end;
 def fmt_pct: if type != "number" then "" else " (\(signed(tostring))%)" end;
 def orblank: if . == null or . == "" then "-" else tostring end;
-def title_parts: (.run.title // "") | (capture("^agent (?<item>\\S+) (?<repo>\\S+)") // {});
+def title_parts: (.run.title // "") | (capture("^agent (?<item>\\S+) (?<repo>\\S+)") // capture("^(?<kind>implement|review|triage|research) (?<repo>[^ ]+)#(?<item>[0-9]+)$") // {});
 def run_duration: if .run.status == "completed" and .run.started_at and .run.updated_at
     then (.run.updated_at | fromdate) - (.run.started_at | fromdate) else null end;
 def conclusion_result: {success: "success", failure: "failure", timed_out: "timeout",
@@ -297,12 +330,15 @@ def conclusion_result: {success: "success", failure: "failure", timed_out: "time
 def flat: (.summary // {}) as $s | title_parts as $t | {
     run_id: .run.id, url: .run.url, status: .run.status, conclusion: .run.conclusion,
     created_at: .run.created_at,
-    item: ($s.item // $t.item), repo: ($s.repo // $t.repo), base: $s.base,
+    item: (if .run.backend == "agentic-job" then $t.item else ($s.item // $t.item) end), repo: ($s.repo // $t.repo), base: $s.base,
     workflow: $s.workflow, agent: $s.agent, model: $s.model, cores: $s.cores,
-    result: ($s.result // (if .run.status == "completed" then conclusion_result else null end)),
+    result: (if .run.backend == "agentic-job" and .run.conclusion != "success" then conclusion_result
+        else ($s.result // (if .run.status == "completed" then conclusion_result else null end)) end),
     duration_s: ($s.duration_s // run_duration), turns: $s.turns, tokens: $s.tokens,
     aic: $s.aic, aic_budget: $s.aic_budget, aic_pricing: $s.aic_pricing,
-    outcome: $s.outcome, source: .source};
+    outcome: (if .run.backend == "agentic-job" then
+        {status: (.application.status // "missing"), url: (.application.url // null), why: null}
+        else $s.outcome end), applied: .applied, application: .application, source: .source};
 def io_tokens: if .tokens then (.tokens.input // 0) + (.tokens.output // 0) else null end;
 def fmt_tokens: if .tokens then "\(.tokens.input | fmt_num)/\(.tokens.output | fmt_num)" else "-" end;
 def fmt_outcome: if .outcome == null then (if .status != "completed" then .status else "-" end)
@@ -428,9 +464,11 @@ since_date() {
 }
 
 # run_meta: the fields a record keeps of a workflow run object, on stdin.
-# started_at is the start of the latest attempt.
+# started_at is the start of the latest attempt. Workflow identity, not
+# display text, selects the shipped agentic-job caller's artifact contract.
 readonly RUN_META='{id, attempt: (.run_attempt // 1), url: .html_url, title: .display_title,
-    status, conclusion, created_at, started_at: .run_started_at, updated_at}'
+    status, conclusion, created_at, started_at: .run_started_at, updated_at,
+    backend: (if .path == ".github/workflows/dispatch.yml" then "agentic-job" else "legacy" end)}'
 
 # fetch_runs LIMIT QUERY: prints up to LIMIT runs of the workflow (the
 # record's run part), newest first, one per line. QUERY is extra query
@@ -476,7 +514,12 @@ latest_artifact() {
     local body id started
     read -r id started < <(jq -r '"\(.id) \(.started_at // "")"' <<<"$1")
     body=$(rest_get "repos/${RUNS_REPO}/actions/runs/${id}/artifacts?per_page=${PER_PAGE}") || return
-    jq -c --arg n "$2" --arg t "${started}" '[.artifacts[] | select(.name == $n and (.created_at // "") >= $t)]
+    local name=$2 kind
+    if test "$(jq -r .backend <<<"$1")" = agentic-job; then
+        kind=$(jqlib -r '{run: .} | title_parts.kind' <<<"$1")
+        name=dispatch-${kind}-${name}
+    fi
+    jq -c --arg n "${name}" --arg t "${started}" '[.artifacts[] | select(.name == $n and (.created_at // "") >= $t)]
         | sort_by(.created_at) | last | select(. != null) | {id, expired, expires_at}' <<<"${body}"
 }
 
@@ -593,7 +636,9 @@ ensure_run_files() {
         fi
         rm -rf "${tmp}/zip"
     fi
-    if ! test -e "${tmp}/artifact"; then
+    if ! test -e "${tmp}/artifact" && test "$(jq -r .backend <<<"${meta}")" = agentic-job; then
+        touch "${tmp}/none"
+    elif ! test -e "${tmp}/artifact"; then
         ! ${footer_search_limited} || { rm -rf "${tmp}"; return 0; }
         rc=0
         footer=$(find_footer "${meta}") || rc=$?
@@ -640,7 +685,42 @@ record() {
 # load_record RUN_META: ensure_run_files, then record.
 load_record() {
     ensure_run_files "$1"
-    record "$1"
+    if test "$(jq -r .backend <<<"$1")" != agentic-job; then record "$1"; return; fi
+    local art rc=0 applied=null jobs application dir
+    dir=$(run_dir "$1")
+    if test "$(jq -r .status <<<"$1")" = completed; then
+        jobs=$(ghapi "repos/${RUNS_REPO}/actions/runs/$(jq -r .id <<<"$1")/jobs?per_page=${PER_PAGE}") || return
+        application=$(jq -c '[.jobs[] | select(.name == "run / apply")] | last | {status: (.conclusion // "missing"), url: null}' <<<"${jobs}")
+        if test -f "${dir}/applied.json"; then
+            applied=$(jq -c . "${dir}/applied.json")
+        else
+            art=$(latest_artifact "$1" applied) || rc=$?
+            pass_ratelimit "${rc}"
+            test "${rc}" -eq 0 || return "${rc}"
+            if test -n "${art}" && test "$(jq -r .expired <<<"${art}")" = false; then
+                rm -rf "${scratch}/applied"
+                mkdir "${scratch}/applied"
+                download_artifact "$(jq -r .id <<<"${art}")" "${scratch}/applied" || return
+                if test -f "${scratch}/applied/applied.json" && ! test -L "${scratch}/applied/applied.json" &&
+                    jq -se 'def url_ok: . == null or (type == "string" and test("^https://github.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/[A-Za-z0-9_./#?=%+-]+$"));
+                        length == 1 and (.[0] |
+                        type == "object" and .schema == "agentic-job-applied/v1"
+                        and (.repo | type) == "string"
+                        and (.made | type) == "array" and all(.made[]; type == "object" and (.url | url_ok))
+                        and (.refused | type) == "boolean" and (.partial | type) == "boolean"
+                        and (.pull_request == null or ((.pull_request | type) == "object" and (.pull_request.url | url_ok))))' "${scratch}/applied/applied.json" >/dev/null 2>&1; then
+                    applied=$(jq -c . "${scratch}/applied/applied.json")
+                    test ! -d "${dir}" || cp "${scratch}/applied/applied.json" "${dir}/applied.json"
+                else warn "invalid applied.json for run $(jq -r .id <<<"$1")"; fi
+            fi
+        fi
+        application=$(jq -nc --argjson a "${applied}" --argjson job "${application}" '$job
+            | if .status == "success" and $a != null then
+                .status = (if $a.refused then "refused" elif $a.partial then "partial" else "applied" end)
+                | .url = ($a.pull_request.url // ([$a.made[] | select(.type == "add_comment" or .type == "create_pull_request") | .url? | select(type == "string")] | first) // null)
+              elif .status == "success" then .status = "missing" else . end')
+    else application='{"status":"pending","url":null}'; fi
+    record "$1" | jq -c --argjson a "${applied}" --argjson app "${application}" '. + {applied: $a, application: $app}'
 }
 
 # --- dispatch ----------------------------------------------------------------
@@ -660,6 +740,7 @@ require_public_repo() {
 }
 
 cmd_dispatch() {
+    if test "${backend}" = agentic-job; then cmd_dispatch_agentic_job "$@"; return; fi
     local item="" repo="" base=main agent=${DEFAULT_AGENT} model="" cores=4 timeout=${DEFAULT_TIMEOUT}
     local budget="" workflow=branch brief_file="" dry_run=false json=false preamble=true
     local outputs="" max_outputs=${DEFAULT_MAX_OUTPUTS} max_requests="" max_tasks=""
@@ -773,6 +854,47 @@ cmd_dispatch() {
         "${BOT_RUNS_HEARTBEAT:-$(dirname "$(readlink -f "$0")")/bot-heartbeat}" \
         "$(jq -nc --arg e "${agent}" --arg m "${model}" '{location: "remote", engine: $e} + (if $m == "" then {} else {model: $m} end)')" ||
         warn "the run was dispatched, but registering its heartbeat failed; publish the workers with bot-heartbeat publish"
+}
+
+# The shipped caller deliberately exposes only these four inputs. Model,
+# runner and caps belong to its reviewed configuration, not the task text.
+cmd_dispatch_agentic_job() {
+    local item="" repo="" kind=implement brief_file="" dry_run=false json=false body resp rc=0
+    while test $# -gt 0; do
+        case "$1" in
+            --item|--repo|--kind)
+                test $# -ge 2 || fatal "$1 requires a value"
+                printf -v "${1#--}" '%s' "$2"; shift 2 ;;
+            --dry-run) dry_run=true; shift ;;
+            --json) json=true; shift ;;
+            -h|--help) usage; return ;;
+            -) test -z "${brief_file}" || fatal "only one BRIEF file"; brief_file=-; shift ;;
+            -*) fatal "$1 is not supported by the shipped agentic-job caller; model and limits are caller configuration" ;;
+            *) test -z "${brief_file}" || fatal "only one BRIEF file"; brief_file=$1; shift ;;
+        esac
+    done
+    [[ "${repo}" =~ ${REPO_RE} ]] || fatal "--repo must be OWNER/REPO"
+    if ! [[ "${item}" =~ ^[1-9][0-9]*$ ]] || ! jq -en --arg i "${item}" '$i | tonumber <= 9007199254740991' >/dev/null; then
+        fatal "--item must be a positive safe issue/PR number"
+    fi
+    [[ "${kind}" =~ ^(implement|review|triage|research)$ ]] || fatal "--kind must be implement, review, triage or research"
+    test -n "${brief_file}" || fatal "missing BRIEF (a file, or - for stdin)"
+    if test "${brief_file}" = -; then cat >"${scratch}/brief";
+    else test -r "${brief_file}" || fatal "cannot read ${brief_file}"; cp "${brief_file}" "${scratch}/brief"; fi
+    grep -q '[^[:space:]]' "${scratch}/brief" || fatal "the brief is empty"
+    body=$(jq -nc --arg ref "${RUNS_REF}" --arg repo "${repo}" --arg item "${item}" --arg kind "${kind}" --rawfile task "${scratch}/brief" \
+        '{ref: $ref, return_run_details: true, inputs: {repo: $repo, item: $item, kind: $kind, task: ($task | rtrimstr("\n"))}}')
+    test "$(jq '.inputs | tojson | length' <<<"${body}")" -le "${MAX_INPUTS_LEN}" || fatal "dispatch inputs exceed ${MAX_INPUTS_LEN}; shorten the brief"
+    if ${dry_run}; then
+        echo "POST repos/${RUNS_REPO}/actions/workflows/${RUNS_WORKFLOW}/dispatches"; jq . <<<"${body}"; return
+    fi
+    require_public_repo "${repo}"
+    resp=$(ghapi -X POST "repos/${RUNS_REPO}/actions/workflows/${RUNS_WORKFLOW}/dispatches" --input - <<<"${body}") || rc=$?
+    pass_ratelimit "${rc}"
+    test "${rc}" -eq 0 || fatal "dispatching ${RUNS_WORKFLOW} in ${RUNS_REPO} failed"
+    jq -e '.workflow_run_id? | type == "number"' <<<"${resp:-null}" >/dev/null 2>&1 || fatal "the run was dispatched, but no id returned; use list instead of dispatching again"
+    if ${json}; then jq '{run_id: .workflow_run_id, url: .html_url, api_url: .run_url}' <<<"${resp}";
+    else jq -r '"Dispatched run \(.workflow_run_id): \(.html_url)"' <<<"${resp}"; fi
 }
 
 # --- watch -------------------------------------------------------------------
@@ -1513,6 +1635,7 @@ apply_worktree() {
 }
 
 cmd_apply() {
+    test "${backend}" != agentic-job || fatal "agentic-job runs apply themselves; local apply is refused"
     local run_id="" slug="" dir="" source="" message_file="" json=false want_repo="" want_base="" outputs=${ALL_OUTPUTS}
     local run meta attempt run_url why rec item repo base workflow result summary_run commit branch files head backing managed chk verdict pr others
     while test $# -gt 0; do
@@ -1552,6 +1675,7 @@ cmd_apply() {
     # The run: a successful dispatch of the agent workflow, for the
     # declared repository.
     run=$(fetch_run_json "${run_id}")
+    test "$(jq -r "${RUN_META} | .backend" <<<"${run}")" != agentic-job || fatal "agentic-job runs apply themselves; local apply is refused"
     meta=$(jq -c "${RUN_META}" <<<"${run}")
     test "$(jq -r '.conclusion // .status' <<<"${meta}")" = success ||
         fatal "run ${run_id} is $(jq -r '.conclusion // .status' <<<"${meta}"), not success; only a successful run's change is applied"
@@ -1702,7 +1826,13 @@ case "${cmd}" in
     *) fatal "unknown command: ${cmd} (see --help)" ;;
 esac
 
-require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
+if test "${backend}" = agentic-job && [[ "${cmd}" = reconcile || "${cmd}" = watch ]]; then
+    fatal "${cmd} does not yet support self-applying agentic-job runs; use list/show/log"
+fi
+
+if ! { test "${cmd}" = dispatch && [[ " $* " == *" --dry-run "* ]]; }; then
+    require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
+fi
 require_cmd jq "install jq"
 case "${cmd}" in
     list|show|log|diff|stats|reconcile) require_cmd unzip "install unzip" ;;

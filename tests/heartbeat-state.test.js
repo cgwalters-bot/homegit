@@ -419,7 +419,7 @@ for (const mode of ["json", "text", "commit-fails"]) {
       // Exercise the real command's success/return paths; stub Git and the
       // remote/checker boundary, so no commit or network operation can run.
       const script = `set -euo pipefail
-scratch=$SCRATCH CACHE_DIR=$SCRATCH/cache ALL_OUTPUTS=all
+backend=legacy scratch=$SCRATCH CACHE_DIR=$SCRATCH/cache ALL_OUTPUTS=all
 REPO_RE='^[a-z]+/[a-z]+$' BASE_RE='^[a-z]+$' RUN_META='.' RUN_ORIGIN_JQ='""'
 RUNS_REPO=o/r RUNS_WORKFLOW=agent.yml OP_DEVSPACE_REPO=o/r OP_BOT_LOGIN=bot OP_OPERATOR_LOGIN=operator OP_FORGE_ORG=forge
 OP_BOT_GIT_NAME=bot OP_BOT_GIT_EMAIL=bot@example.com NO_PUSH_URL=disabled

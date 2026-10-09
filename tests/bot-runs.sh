@@ -115,7 +115,7 @@ case "${method} ${path%%\?*}" in
     "GET graphql")
         reply "$(jq -c --arg id "$(field id)" '{data: {node: (map(select(.id == $id)) | first)}}' "${store}/board.json")"
         ;;
-    "GET repos/${repo}/actions/workflows/agent.yml/runs")
+    "GET repos/${repo}/actions/workflows/agent.yml/runs"|"GET repos/${repo}/actions/workflows/dispatch.yml/runs")
         per=$(query per_page) page=$(query page)
         reply "$(jq -c --arg st "$(query status)" --arg c "$(query created)" --argjson per "${per:-30}" --argjson page "${page:-1}" '
             .workflow_runs | map(select($st == "" or .status == $st or .conclusion == $st)
@@ -129,13 +129,18 @@ case "${method} ${path%%\?*}" in
         id=${id%%/*}
         # Artifacts are uploaded at the end of the run (its latest attempt).
         created=$(jq -r --argjson id "${id}" '.workflow_runs[] | select(.id == $id) | .updated_at' "${runs}")
-        # Artifact ids are RUN * 10 + 1, 2, 3 in this order.
-        reply "$(k=0; for a in agent-run agent-transcript safe-outputs; do
+        # Artifact ids are RUN * 10 + 1, 2, 3, 4 in this order.
+        reply "$(k=0; for a in agent-run agent-transcript safe-outputs applied; do
                 k=$((k + 1)) n=$(( id * 10 + k ))
+                name=${a}
+                if test -e "${store}/agentic-job"; then
+                    kind=$(jq -r --argjson id "${id}" '.workflow_runs[] | select(.id == $id) | .display_title | split(" ")[0]' "${runs}")
+                    name=dispatch-${kind}-${a}
+                fi
                 if grep -qx "${id} ${a}" "${store}/expired.txt"; then
-                    jq -nc --argjson n "${n}" --arg a "${a}" --arg c "${created}" '{id: $n, name: $a, expired: true, created_at: $c, expires_at: "2026-09-24T10:45:00Z"}'
+                    jq -nc --argjson n "${n}" --arg a "${name}" --arg c "${created}" '{id: $n, name: $a, expired: true, created_at: $c, expires_at: "2026-09-24T10:45:00Z"}'
                 elif test -d "${store}/artifacts/${id}/${a}"; then
-                    jq -nc --argjson n "${n}" --arg a "${a}" --arg c "${created}" '{id: $n, name: $a, expired: false, created_at: $c, expires_at: "2026-12-19T10:45:00Z"}'
+                    jq -nc --argjson n "${n}" --arg a "${name}" --arg c "${created}" '{id: $n, name: $a, expired: false, created_at: $c, expires_at: "2026-12-19T10:45:00Z"}'
                 fi
             done | jq -sc --argjson id "${id}" --arg sha "${head_sha}" '{total_count: length,
                 artifacts: map(. + {size_in_bytes: 1000, workflow_run: {id: $id, head_sha: $sha, repository_id: 1}})}' | filtered artifacts)"
@@ -159,7 +164,7 @@ case "${method} ${path%%\?*}" in
         n=${path#repos/"${repo}"/actions/artifacts/}
         n=${n%/zip}
         id=$((n / 10))
-        case $((n % 10)) in 1) a=agent-run ;; 2) a=agent-transcript ;; *) a=safe-outputs ;; esac
+        case $((n % 10)) in 1) a=agent-run ;; 2) a=agent-transcript ;; 4) a=applied ;; *) a=safe-outputs ;; esac
         ! grep -qx "${id} ${a}" "${store}/expired.txt" || fail_http 410 "Artifact has expired"
         test -d "${store}/artifacts/${id}/${a}" || fail_http 404 "Not Found"
         cd "${store}/artifacts/${id}/${a}"
@@ -183,7 +188,7 @@ case "${method} ${path%%\?*}" in
         test -e "${f}" && reply "$(cat "${f}")"
         reply '{"total_count": 0, "items": []}'
         ;;
-    "POST repos/${repo}/actions/workflows/agent.yml/dispatches")
+    "POST repos/${repo}/actions/workflows/agent.yml/dispatches"|"POST repos/${repo}/actions/workflows/dispatch.yml/dispatches")
         cat "${input/#-//dev/stdin}" >"${store}/dispatch-body.json"
         # The answer before return_run_details: 204, no body.
         test -e "${store}/dispatch-204" && exit 0
@@ -1388,6 +1393,121 @@ test_reconcile_files_unreadable() {
     rm "${FAKE_GH}/artifacts-fail"
     out=$("${BOT_RUNS}" reconcile --apply)
     expect_eq "${out}" "Patch [In Progress] PVTI_patch: run 1001 succeeded, patch ready: set Draft (done)" "reconcile once readable"
+}
+
+# --- agentic-job caller -------------------------------------------------------
+
+agentic_fixture() {
+    export BOT_RUNS_REPO=example/caller
+    touch "${FAKE_GH}/agentic-job"
+    : >"${FAKE_GH}/calls"
+    set_json "${FAKE_GH}/runs.json" '.workflow_runs |= map(.path = ".github/workflows/dispatch.yml" | .display_title = "implement composefs/composefs-rs#1")'
+    cp "${FIXTURES}/agentic-jobs.jq" "${FAKE_GH}/filter-jobs.jq"
+    mkdir -p "${FAKE_GH}/artifacts/1001/applied"
+    cp "${FIXTURES}/applied.json" "${FAKE_GH}/artifacts/1001/applied/applied.json"
+    set_json "${FAKE_GH}/artifacts/1001/agent-run/summary.json" '.item = "composefs/composefs-rs#1" | .outcome.url = "https://github.com/example/wrong/pull/99"'
+}
+
+agentic_runs() {
+    "${BOT_RUNS}" "$@" --backend agentic-job --caller example/caller
+}
+
+test_agentic_dispatch() {
+    agentic_fixture
+    local kind out opt
+    echo 'Do this task' >"${WORK}/brief"
+    for kind in implement review triage research; do
+        out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --kind "${kind}" --dry-run "${WORK}/brief")
+        expect_lines "${out}" '^POST repos/example/caller/actions/workflows/dispatch.yml/dispatches$'
+        expect_json "$(tail -n +2 <<<"${out}" | jq -c .)" "$(jq -nc --arg kind "${kind}" '{ref: "main", return_run_details: true, inputs: {repo: "composefs/composefs-rs", item: "1", kind: $kind, task: "Do this task"}}')"
+    done
+    expect_eq "$(calls '^api')" 0 'dry run API calls'
+    for opt in --model --budget --timeout --max-requests --max-tasks --cores --max-outputs; do
+        out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs "${opt}" 1 "${WORK}/brief" 2>&1) && fail "ignored ${opt}"
+        expect_lines "${out}" 'not supported by the shipped agentic-job caller'
+    done
+    agentic_runs dispatch --item 1 --repo composefs/composefs-rs "${WORK}/brief" --json >/dev/null
+    expect_eq "$(calls 'POST repos/example/caller/actions/workflows/dispatch.yml/dispatches')" 1 'dispatch caller'
+    test ! -f "${FAKE_GH}/board-calls" || fail 'numeric item treated as board id'
+}
+
+test_agentic_read() {
+    agentic_fixture
+    local out record=${FAKE_GH}/artifacts/1001/applied/applied.json
+    out=$(agentic_runs show 1001 --json)
+    expect_json "$(jq -c '[.application.status, .flat.outcome.url]' <<<"${out}")" '["applied","https://github.com/example/target/pull/7"]'
+    out=$(agentic_runs list --json)
+    expect_eq "$(jq -r '.[] | select(.run_id == 1001) | .outcome.url' <<<"${out}")" https://github.com/example/target/pull/7
+    out=$(agentic_runs list --item 1 --json)
+    expect_eq "$(jq length <<<"${out}")" 5 'numeric item filter'
+    out=$(agentic_runs log 1001)
+    expect_eq "${out}" "$(cat "${FIXTURES}/artifacts/1001/agent-run/condensed.log")" 'caller transcript'
+    out=$(agentic_runs log 1004 --json)
+    expect_eq "$(jq -r .source <<<"${out}")" job-log 'caller-prefixed job log fallback'
+    # Comment output has the gh-aw manifest shape, not the agent's outcome URL.
+    set_json "${FAKE_GH}/runs.json" '.workflow_runs |= map(.display_title = "triage composefs/composefs-rs#1")'
+    set_json "${record}" '.pull_request = null | .made = [{type: "add_comment", repo: "example/target", url: "https://github.com/example/target/issues/1#issuecomment-7"}]'
+    rm -rf "${XDG_STATE_HOME}/bot-runs"
+    out=$(agentic_runs show 1001 --json)
+    expect_eq "$(jq -r .flat.outcome.url <<<"${out}")" https://github.com/example/target/issues/1#issuecomment-7
+    set_json "${record}" '.partial = true'
+    rm -rf "${XDG_STATE_HOME}/bot-runs"
+    out=$(agentic_runs show 1001 --json)
+    expect_eq "$(jq -r .application.status <<<"${out}")" partial
+}
+
+test_agentic_refused_failed() {
+    agentic_fixture
+    local out record=${FAKE_GH}/artifacts/1001/applied/applied.json
+    set_json "${record}" '.refused = true | .pull_request = null | .made = []'
+    out=$(agentic_runs show 1001 --json)
+    expect_json "$(jq -c '[.application.status, .flat.outcome.url]' <<<"${out}")" '["refused",null]'
+    set_json "${record}" '.refused = false'
+    echo '| .jobs |= map(if .name == "run / apply" then .conclusion = "failure" else . end)' >>"${FAKE_GH}/filter-jobs.jq"
+    rm -rf "${XDG_STATE_HOME}/bot-runs"
+    out=$(agentic_runs show 1001 --json)
+    expect_json "$(jq -c '[.application.status, .flat.outcome.url]' <<<"${out}")" '["failure",null]'
+    out=$(agentic_runs apply 1001 2>&1) && fail 'local apply accepted a new run'
+    expect_lines "${out}" 'agentic-job runs apply themselves; local apply is refused'
+}
+
+test_agentic_missing_bad_record() {
+    agentic_fixture
+    local out record=${FAKE_GH}/artifacts/1001/applied/applied.json bad
+    for bad in '.pull_request = "invalid"' '.made = [1]' '.pull_request.url = 42' '.pull_request.url = "https://example.com/not-a-forge-result"' '., .' '(.schema = "invalid"), .' 'empty'; do
+        jq "${bad}" "${FIXTURES}/applied.json" >"${record}"
+        rm -rf "${XDG_STATE_HOME}/bot-runs"
+        out=$(agentic_runs show 1001 --json 2>"${WORK}/err")
+        expect_json "$(jq -c '[.application.status, .flat.outcome.url]' <<<"${out}")" '["missing",null]'
+        expect_lines "$(cat "${WORK}/err")" 'invalid applied.json'
+        out=$(agentic_runs list --json 2>"${WORK}/err")
+        expect_eq "$(jq -r '.[] | select(.run_id == 1001) | .outcome.url' <<<"${out}")" null 'invalid delivery in list'
+    done
+    rm -rf "${FAKE_GH}/artifacts/1001/applied" "${FAKE_GH}/artifacts/1001/agent-run" "${XDG_STATE_HOME}/bot-runs"
+    echo '| .jobs |= map(if .name == "run / apply" then .conclusion = "skipped" else . end)' >>"${FAKE_GH}/filter-jobs.jq"
+    set_json "${FAKE_GH}/runs.json" '(.workflow_runs[] | select(.id == 1001)).conclusion = "failure"'
+    out=$(agentic_runs show 1001 --json)
+    expect_json "$(jq -c '[.application.status, .flat.result, .flat.outcome.url, .summary]' <<<"${out}")" '["skipped","failure",null,null]'
+    expect_eq "$(calls 'search/issues')" 0 'no legacy footer for refused caller run'
+}
+
+test_backend_workflow_identity() {
+    local out
+    set_json "${FAKE_GH}/runs.json" '.workflow_runs |= map(.display_title = "implement composefs/composefs-rs#1")'
+    out=$("${BOT_RUNS}" show 1001 --json)
+    expect_eq "$(jq -r .run.backend <<<"${out}")" legacy 'legacy workflow with caller title'
+    expect_eq "$(jq -r .source <<<"${out}")" artifact 'legacy artifacts with caller title'
+    out=$("${BOT_RUNS}" list --json)
+    expect_eq "$(jq -r '.[] | select(.run_id == 1001) | .source' <<<"${out}")" artifact 'legacy listing with caller title'
+    agentic_fixture
+    set_json "${FAKE_GH}/runs.json" '.workflow_runs |= map(.display_title = "agent PVTI_patch composefs/composefs-rs")'
+    out=$(agentic_runs show 1001 --json)
+    expect_eq "$(jq -r .run.backend <<<"${out}")" agentic-job 'caller workflow with unexpected title'
+    out=$(agentic_runs list --json)
+    expect_eq "$(jq -r '.[] | select(.run_id == 1001) | .outcome.url' <<<"${out}")" null 'no delivery from mismatched artifact prefix'
+    expect_eq "$(calls 'search/issues')" 0 'no legacy footer for caller workflow with legacy title'
+    out=$("${BOT_RUNS}" apply 1001 --repo composefs/composefs-rs --slug identity-test --message "${FIXTURES}/applied.json" 2>&1) && fail 'local apply accepted caller workflow with unexpected title'
+    expect_lines "${out}" 'agentic-job runs apply themselves; local apply is refused'
 }
 
 # --- runner -------------------------------------------------------------------
