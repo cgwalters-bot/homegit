@@ -2,6 +2,7 @@
 # Like `git verify-tag`, except require a specific key;
 # allowing any key in the user's default keyring is
 # rather easy to subvert.
+# --help prints usage without invoking git or creating temporary files.
 
 from __future__ import print_function
 

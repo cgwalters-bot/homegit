@@ -2,6 +2,7 @@
 
 # Copyright 2017 Colin Walters <walters@verbum.org>
 # Licensed under the new-BSD license (http://www.opensource.org/licenses/bsd-license.php)
+# --help prints usage without needing GitPython or opening a repository.
 
 import os, re, sys
 import subprocess
@@ -11,13 +12,13 @@ import argparse
 
 homure = re.compile(r'^Closes: #([0-9]+)\nApproved by:', re.MULTILINE)
 
-import git
-
 parser = argparse.ArgumentParser()
 parser.add_argument('spec', help="Revision range")
 parser.add_argument('--tolerate-unmatched', action='store_true',
                     help="Append unmatched commits rather than error out")
 args = parser.parse_args()
+
+import git
 
 repo = git.Repo(os.getcwd())
 
