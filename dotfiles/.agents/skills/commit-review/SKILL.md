@@ -28,7 +28,7 @@ git diff main..HEAD
 
 ### 2. Run the checklist
 
-Work through each section below. Fix issues before proceeding.
+First apply the `review-checklist` skill: it is the operator's review taste, and this skill defers to it for style (Rust idioms, blank lines between items, combinators, the 10-line shell limit, test style, formal-methods candidates). Then work through each section below. Fix issues before proceeding.
 
 ### 3. Fix and squash
 
