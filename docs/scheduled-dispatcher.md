@@ -6,9 +6,15 @@ runs `bot-poll-loop --until-actions` and starts a short Sonnet "dispatcher"
 coordinator is needed only for what the dispatcher escalates. The goal the operator set
 is to move this to a scheduled job that edge-activates on events ("don't
 block on me, improve dispatch, bear in mind our goal is to move this to a
-scheduled job alongside edge activation on events"). Nothing hosted
-exists yet; this note says how today's pieces map onto a GitHub Actions
-workflow, so that what is built now doesn't need redoing. It follows
+scheduled job alongside edge activation on events"), and on 2026-10-06,
+after a restart of the supervisor unit killed the toolbox every session
+and job ran in: "i want to get towards having the controller (you) just
+be a scheduled GHA job or so via the same remote agent running infra
+that's the real fix"
+([tracker#401](https://github.com/cgwalters-forge/tracker/issues/401)).
+Only [the read-only report](#the-read-only-report) is hosted so far; this
+note says how today's pieces map onto a GitHub Actions workflow, and
+[the plan](#moving-the-controller-to-actions) orders the move. It follows
 [tracker#265](https://github.com/cgwalters-forge/tracker/issues/265)
 (`agent.yml` and the gh-aw fork that is to replace it) and
 [tracker#270](https://github.com/cgwalters-forge/tracker/issues/270)
@@ -251,21 +257,20 @@ messages the dispatcher can't answer with a pointer take the same path.
 Questions only the operator can answer stay `bot-board question`s, in
 their queue, not escalations.
 
-## Credentials
+## What the job may hold
 
-The job needs only what the bot's session has today, held as repository
-or organization secrets and never given to a run's sandbox:
-
-- the bot's GitHub token (a fine-grained PAT, or a GitHub App's
-  installation token): contents and pull requests on the bot's and the
-  forge org's repositories, issues and labels on the tracker, write on the
-  org's Projects v2 board, and `actions: write` on the devspace repository
-  to dispatch `agent.yml`. The default `GITHUB_TOKEN` is not enough: events
-  its pushes cause don't start workflows.
-- model access for Sonnet and Opus. Through the praxis broker's per-run
-  tokens, as `agent.yml` does, rather than a raw API key on the runner.
-- never the operator's credentials or sign-off: `bot-pr promote` adds
-  their sign-off only after a verified approval of the exact head, as now.
+The operator decided this on tracker#401; it is laid out under
+[Credentials](#credentials) in the plan below. The job that reads and
+decides, model or not, holds only read access. Every write is a safe
+output, applied later in the same workflow run by gh-aw's own handlers
+under a GitHub App token minted for that run. That token needs contents
+and pull requests on the bot's and the forge org's repositories, issues
+and labels on the tracker, write on the org's Projects v2 board, and
+`actions: write` on the devspace repository to dispatch `agent.yml`; it
+is never given to a run's sandbox. The default `GITHUB_TOKEN` is not
+enough: it reaches one repository and no project. Model access is
+through the praxis broker's per-run tokens, as `agent.yml` does, never
+a raw API key on the runner.
 
 The apply step opens draft fork PRs or homegit PRs and never merges;
 merging stays with the review step: homegit and the devspace stack after
@@ -343,13 +348,373 @@ were identical; priority health had 9 of 16 lines, the other 7 being the
 epic board's; "Needs rebase" listed one PR more and the inbox 54 lines
 for 87, both for want of the state; operator activity had none of 10.
 
+## Moving the controller to Actions
+
+Nothing in this section is built except step 0. The statements about
+today were checked on 2026-10-06 against this repository, the units in
+`~/.config/systemd/user` on Xenon and `agent.yml` at
+`bot/agent-run-praxis`; those about gh-aw against its source at v0.88.2,
+which bootc-dev/gh-agentic-workflows pins, and at c6be697, the head of
+our fork (v0.90.1 plus four commits). What was read and not run is
+marked *not tried*.
+
+### What runs where today
+
+Everything that decides or writes runs on one workstation, Xenon, inside
+one interactive toolbox container:
+
+- `bot-sweep.timer` starts `bot-sweep` every 10 minutes. It re-executes
+  in the toolbox (`BOT_SWEEP_TOOLBOX`), reads the bot's token from a
+  file there, and both observes and applies: `bot-watch --apply`
+  rebases, signs off and promotes on the operator's approvals, moves
+  finished runs on and sets closed items Done.
+- `bot-supervisor.service` loops on `bot-poll-loop --until-actions`,
+  which reads the sweeps and runs `bot-reconcile --apply --state`, and
+  starts a ten-minute Sonnet dispatcher (`bot-claude`, local) for the
+  action kinds it is allowed. The dispatcher starts the local apply and
+  review workers, which hold the bot's token.
+- The coordinator, an interactive Claude Code session, takes what the
+  dispatcher escalates and whatever the operator types.
+- The praxis broker is also on Xenon, as podman units of the user
+  manager bound to the tailnet interface, outside the toolbox. It holds
+  the Claude and Codex subscription logins.
+
+What already runs elsewhere is the sandboxed agent run: `agent.yml` on
+CNCF RHEL 10 runners, with no repository secret. It joins the tailnet
+with the job's OIDC token and trades the same for a praxis run token.
+Its output comes back as an artifact that `bot-runs apply` commits on
+Xenon. So the runner half is remote and everything privileged is local,
+which is the "half way there" of [agent-runtimes.md](agent-runtimes.md)
+(homegit#156).
+
+### The target
+
+One controller workflow in this repository, level-triggered, with the
+triggers listed under [The workflow](#the-workflow). Each run has two
+jobs. The first does the deterministic pass with no model (sweep,
+reconcile, pacing, archive) holding read access only, and writes
+nothing: what it would change, it emits as safe-output items. The
+second holds a token minted for that run, runs gh-aw's safe-outputs
+handlers over those items, and decides nothing. Whatever needs judgment
+becomes a sandboxed agent run started by `workflow_dispatch`, with
+inference through praxis and no GitHub credential: the dispatcher pass,
+triage, review and the work itself. What an agent run produces is
+applied the same way, by the same handlers. State is the board, the
+issues and PRs, the run list and the run artifacts.
+
+What each local piece becomes:
+
+| Today, on Xenon | In the target |
+| --- | --- |
+| `bot-sweep.timer` and `bot-sweep` | the controller workflow's schedule and its first steps |
+| `bot-poll-loop`, `bot-reconcile --apply --state` | a step of the same job; the action state in a file the job carries over (below) |
+| `bot-supervisor.service` | gone: the workflow run is the supervisor, and a failed run is retried by the next trigger |
+| the Sonnet dispatcher (`bot-claude`) | an agent run with the `dispatcher` skill, started when actions remain, writing through safe outputs |
+| the coordinator session | an agent run on an `escalate` issue (see above); an interactive session is still how the operator talks to it, but nothing waits on one |
+| local apply (`bot-runs apply`) and review workers | gh-aw's safe-outputs handlers in a job of the workflow, and review as an agent run |
+| `bot-heartbeat` | derived from the run list; nothing to publish |
+| the praxis broker | unchanged, and still on a host of the operator's (below) |
+
+This agrees with agent-runtimes.md on every layer: gh-aw as the workflow
+layer for agent runs, the controller in homegit, admission by a
+deliberate `workflow_dispatch`. The operator's answer here is also its
+decision D6, as option A (a `safe_outputs` job with a forge-scoped
+GitHub App), extended from agent runs to the controller. It differs in
+three places:
+
+- Order. There, moving the controller is step 6, after the gh-aw
+  cutover. But the deterministic pass does not depend on the workflow
+  layer, and it is the part whose loss cost ten hours, so it moves
+  first, on `agent.yml` as it is.
+- The pass is not a compiled gh-aw workflow, since those always have an
+  agent job. It is a hand-written workflow that runs gh-aw's handlers,
+  as gh-aw's own maintenance workflow does (below).
+- "Apply in the workflow" (its step 5) no longer waits for the fork to
+  reach parity (its step 4): the handlers can apply `agent.yml`'s
+  output as it is today.
+
+One correction to that document: bootc-dev/gh-agentic-workflows pins
+gh-aw v0.88.2, not v0.90.1.
+
+### Credentials
+
+The operator's decision, on tracker#401: "we should be using the
+safe-outputs model - have the GHA run mint a new `GH_TOKEN` for the job
+but the agent (CI run) gets readonly except for what happens in
+safe-outputs processing which should run as part of that job", and "We
+should be able to reuse the GHA safe-outputs code directly".
+
+So no long-lived GitHub token is stored in Actions. Whatever reads and
+decides, a model or the deterministic pass, has read access only and
+hands back a list of requested writes. A step that runs gh-aw's
+handlers, and nothing of ours that decides, applies them in the same
+workflow run under a token minted for that run and revoked at its end.
+In gh-aw this processing is a separate job of the same run, so the
+token is never on the machine that ran the agent; "that job" is read
+here as "that run".
+
+#### What is reused from gh-aw
+
+gh-aw's `safe_outputs` job is four steps, none specific to its
+compiler: the `github/gh-aw-actions/setup` action, which unpacks gh-aw's
+scripts on the runner; a download of the artifact holding
+`agent_output.json`; `actions/create-github-app-token`; and an
+`actions/github-script` step calling `process_safe_outputs.cjs`. That
+script is the handler manager. Its whole interface is the file named by
+`GH_AW_AGENT_OUTPUT` (`{"items": [{"type": ...}, ...]}`), the JSON in
+`GH_AW_SAFE_OUTPUTS_HANDLER_CONFIG` (which types are enabled, with
+their caps, allowed repositories and optionally a token per type) and
+the token of the step. gh-aw itself runs it outside a compiled
+workflow: the `apply_safe_outputs` job of its maintenance workflow sets
+those two variables and calls the same manager
+(`apply_safe_outputs_replay.cjs`).
+
+Used as they are, pinned by commit:
+
+- the `setup` action and every handler it ships, for both the pass and
+  agent runs;
+- `collect_ndjson_output.cjs`, the validator that turns an agent's
+  JSONL into `agent_output.json`. `agent.yml`'s `Safe outputs` job runs
+  our vendored copy of it today; it takes the same file from the action
+  instead, and `vendor/gh-aw/` goes;
+- the handlers' staged mode (`staged: true` on a type), which prints
+  what would be written and writes nothing. Step 2 of the migration
+  uses it.
+
+Ours, and small: the workflow YAML around those steps, the handler
+configuration, the checks gh-aw does not make on a patch (listed in
+[devspace-agent-runs.md](devspace-agent-runs.md)), and an `--emit` mode
+for `bot-reconcile`, `bot-watch` and `bot-board`, next to `--apply`,
+that prints each write as an item. Gone: `bot-runs apply` and the local
+re-check. The handler configuration is what gh-aw's compiler generates,
+not a documented interface, so a pin bump is tested in staged mode
+first. Running the manager from a hand-written workflow with an App
+token is *not tried*; the replay job does it with `GITHUB_TOKEN`.
+
+When agent runs become compiled gh-aw workflows (agent-runtimes.md,
+step 4), their `safe_outputs` job is the stock one and only the
+controller's own workflow stays hand-written.
+
+#### How the token is minted
+
+Two tokens can be minted per run without storing one.
+
+The workflow's own `GITHUB_TOKEN` needs no setup and is narrowed by
+`permissions:`. It reaches only the repository the workflow is in,
+cannot touch a Projects v2 board at all, and is refused after about
+1000 requests an hour. It is what the read-only job holds; it can apply
+nothing outside homegit.
+
+A GitHub App installation token is what gh-aw's `github-app:` mints,
+with `actions/create-github-app-token`: the job presents the App's
+private key, held as a secret of an Actions environment, and gets a
+token that lasts an hour at most, limited to the repositories and
+permissions that step names, with a quota of its own (5000 requests an
+hour or more). It reaches what the App is installed on, and a token
+belongs to one installation: the tracker and the board (cgwalters-forge)
+and homegit (cgwalters-bot) are two installations, so two mint steps,
+the second given to its handlers as their per-type token. An App can
+write an organization's project (the "Projects" organization
+permission) but no user-owned one, so the epic board
+(`users/cgwalters-bot/2`) moves to the organization or is left out. It
+cannot act where it is not installed, which is every upstream
+repository, and it writes as `<app>[bot]`, not as cgwalters-bot.
+
+The private key is the one long-lived secret, and it is the App's, not
+the bot's: it can do only what the installations grant. gh-aw can also
+take a token minted by a step from the job's OIDC identity (octo-sts),
+which stores no key but puts someone else's App and service in the
+path; not proposed.
+
+#### What the operator sets up
+
+Creating and installing an App is his; the bot cannot and should not.
+
+1. Create a GitHub App, owned by cgwalters-forge, with no webhook,
+   installable on any account (an App limited to its owner cannot be
+   installed on cgwalters-bot or bootc-dev). Repository permissions:
+   Contents, Pull requests, Issues and Actions read and write, Workflows
+   write (GitHub refuses a push touching `.github/workflows` without
+   it), Metadata read. Organization permissions: Projects read and
+   write. Nothing else.
+2. Install it on cgwalters-forge (all repositories: the tracker,
+   review, the forks), on the cgwalters-bot account (homegit and the
+   bot's own repositories), and on bootc-dev limited to
+   cgwalters-devspace-sandbox, which is what dispatching `agent.yml`
+   from the controller needs.
+3. Put the client id in a variable (`CONTROLLER_APP_CLIENT_ID`) and a
+   private key in a secret (`CONTROLLER_APP_PRIVATE_KEY`) of an Actions
+   environment `controller`, restricted to the default branch, in
+   homegit (the controller) and in the devspace repository (applying
+   agent runs). The key never passes through the bot. No required
+   reviewer: the pass runs every ten minutes.
+
+Each mint step then asks for less than the App has: the pass's apply
+job gets issues and the project, an agent run's gets contents and pull
+requests on the one repository it was dispatched for.
+
+#### What the writes become
+
+| The controller's write | Safe-output type | Notes |
+| --- | --- | --- |
+| board fields (Status, Lead, Run, Why, News, budgets), adding an item | `update_project` | fields by name, on issues, PRs and draft items; needs the project token |
+| the periodic status update | `create_project_status_update` | body, status and dates |
+| questions, escalations, follow-up issues | `create_issue`, `link_sub_issue`, `set_issue_type` | |
+| comments on issues and PRs | `add_comment` | |
+| `dispatch`, `escalate` and other labels | `add_labels`, `remove_labels` | |
+| whose turn (assignees), review requests | `assign_to_user`, `unassign_from_user`, `add_reviewer` | |
+| closing and editing issues | `close_issue`, `update_issue` | |
+| a run's patch as a draft PR on a forge fork or in homegit | `create_pull_request` | `target-repo` and `allowed-repos`; who authors the commit is an open point |
+| a fix pushed to an open PR | `push_to_pull_request_branch` | appends; cannot rewrite the branch |
+| PR body, ready for review, a reviewer's verdict | `update_pull_request`, `mark_pull_request_as_ready_for_review`, `submit_pull_request_review` | |
+| dispatching `agent.yml` | `dispatch_workflow` | cross-repository with `target-repo`; Actions write there |
+
+A write that needs the result of another (the `Run` field needs the
+run that `dispatch_workflow` started) is left to the next pass, which
+reads the run list.
+
+No type today:
+
+- **Clearing a board field and archiving an item.** `update_project`
+  sets values only, so `stale-lead` and `archive-done` have no handler.
+  It also creates a missing single-select option instead of failing,
+  which the emit side must not rely on. These two are a small handler
+  to propose upstream, or a custom safe-output job in the meantime.
+- **Merging to the default branch.** `merge_pull_request` is
+  experimental and always refuses the default branch, so merging the
+  bot's own PRs has no handler. GitHub's auto-merge, enabled by a
+  custom job, is the likely answer.
+- **Rebasing a PR branch**, a force push.
+- **Promote.** Opening the upstream PR as cgwalters-bot with the
+  operator's `Signed-off-by` on his approval of the exact head: no
+  handler rewrites commits or adds a trailer, and no App can act as the
+  bot's user upstream. The same holds for a summoned reply upstream.
+- **Notifications**, which are a user's: no App reads or marks them.
+- Gists, and editing a comment in place (the heartbeat comment, which
+  goes away).
+
+Promote, summoned replies, notifications and rebase therefore stay
+where the bot's own token is, on Xenon, as a timer that needs no
+session and no model (`bot-promote-due`, `bot-notify`, `bot-pr
+rebase`). That token is not minted per run, so under this decision it
+does not go to Actions. The sign-off never moves under any design:
+`bot-pr promote` adds it only on his verified approval of the exact
+head.
+
+### Inference and usage readings
+
+Agent runs already reach praxis from a runner: `agent.yml` joins the
+tailnet with the job's OIDC identity (an OAuth client id and audience
+held as repository variables, no secret). The controller's own steps use no
+model. They need only the pools' usage, to pace dispatch, which is two
+readings today: OpenAI's from the broker's `/usage`, and Claude's from
+the statusline of the local session (`bot-heartbeat statusline`), which
+a headless controller does not have. The broker holds the Claude login
+as well, so it should report both; that is a change to the broker, and
+then `/usage` is the one source. The controller job reads it by joining
+the tailnet as `agent.yml` does, which needs the tailnet to trust
+homegit's workflow identity too. Without a reading a pool is unpaced
+(`bot-reconcile` already says so and holds nothing), so the pass
+degrades to the per-run caps rather than stopping.
+
+The broker itself stays on a machine of the operator's, and with it
+inference for every run. "Nothing depends on a workstation session"
+holds after this plan; "nothing depends on Xenon" does not, until the
+broker moves to a host that is meant to be always on. That is a
+separate decision and not a blocker here.
+
+### Local state
+
+| State | Where it is | What becomes of it |
+| --- | --- | --- |
+| `operator.json` | `~/.config/bot-harness`, absent on a runner | the defaults are this deployment's, except the four pacing values Xenon's file overrides (`agents`, `harness_agents`, `opencode_share`, `opencode_runs`), which the report's reconcile therefore lacks; it becomes a repository variable the job writes out, since it holds no secret |
+| reconcile's action state (`--state`) | a local file | the one file the job carries over: an artifact of its previous run, restored at the start, which needs no token beyond the job's own |
+| last-seen state of `bot-watch`, `bot-notify`, `bot-pr inbox` | archived draft items of the board, mirrored in `~/.local/state` | for `bot-watch` and `bot-pr inbox` it joins reconcile's state in the carried-over file: it is the pass's own memory, and keeping it off the board saves a write and a project read the job's token lacks. `bot-notify` stays local, and its state with it |
+| sweep runs | `~/.local/state/bot-sweep` | the run's artifact and summary, as the read-only report does now |
+| upstream-policy records | `upstream-policy/` in this repository; which remote branch of it was last accepted, and a merge-queue cache, under `~/.local/state` and `~/.cache` | the records are the job's checkout of `main`; the cache is recomputed |
+| `bot-claude` and `bot-opencode` job state | `~/.local/state` | gone with local jobs: a run's state is the Actions run |
+| pool readings | `~/.cache/bot-heartbeat`, `~/.local/state/bot-capacity` | the broker's `/usage` |
+| the heartbeat and usage comments | tracker#176, and a private repository | derived from the run list; the usage comment is replaced by `/usage` |
+| devspace SSH | keys on Xenon | not used by the controller; interactive devspaces stay a local tool |
+| the status-update lock | a local lock, one publisher per project | the workflow's concurrency group |
+
+### Runners
+
+The controller is small (a sweep is about four minutes of API calls)
+and its apply job holds a credential, so it does not belong on the CNCF
+runners, which are for CNCF projects and run the agents. A public
+repository's standard hosted runners cost nothing and are where the
+read-only report runs; that is enough for both jobs of the pass. Agent runs stay
+where they are until the self-hosted runners of tracker#287 exist; the
+controller can follow them there, which would also put it on the
+tailnet without federation.
+
+### Migration order
+
+Each step leaves a working system, and the local controller keeps
+running until the step that retires its part.
+
+0. **The read-only report** (done): the observing half, hourly, no
+   credential. It shows what a runner sees and what it cannot.
+1. **The App** (the operator): created, installed and its key stored,
+   as listed under [Credentials](#what-the-operator-sets-up). Nothing
+   changes behavior yet. Meanwhile the tools learn the App's login
+   next to the bot's, and the epic board moves to the organization.
+2. **Emit and stage.** The tools grow `--emit`, and the report
+   workflow gains the apply job with every type `staged`: it mints the
+   token, runs gh-aw's handlers and prints what they would write. The
+   read job stays on its own `GITHUB_TOKEN`, hourly because of that
+   token's quota. The staged output is compared with what the local
+   sweep wrote in the same hour; fix what differs. This also settles
+   the *not tried* points.
+3. **Full cadence and usage readings.** The read job gets a read-only
+   token from the App for its quota, then runs every 10 minutes and on
+   events. The broker reports both pools, and the tailnet trusts the
+   controller job.
+4. **Move the writes that cannot race first**: the ones keyed on forge
+   state and idempotent, in this order, each for a few days before the
+   next: `closed-not-done`, `fill-org` and `handback`, the status
+   update, then reconcile and dispatch. Each moves by taking `staged`
+   off its type in the same change that turns its step off locally (a
+   flag in the sweep's configuration), so that exactly one side owns
+   it. `stale-lead` and `archive-done` wait for a handler.
+5. **Apply agent runs in their workflow** (step 5 of
+   agent-runtimes.md, on `agent.yml` as it is): its `Safe outputs`
+   job takes gh-aw's scripts from the action, and an apply job with
+   the App token opens the draft PR. `bot-runs apply` and
+   `vendor/gh-aw/` go.
+6. **The dispatcher as an agent run**, emitting the same types,
+   started by the controller when actions remain.
+   `bot-supervisor.service` is then stopped for good, which also ends
+   tracker#400.
+7. **Escalations as agent runs**, as described above. The coordinator
+   session becomes optional.
+8. **What is left locally** is the timer for what has no type and no
+   mintable token: promote, summoned replies, notifications, rebase.
+
+How the two avoid acting twice, until step 6 ends the overlap: no
+action is ever enabled on both sides (step 4); the steps that are
+moved are idempotent on forge state, so a double run during a mistaken
+overlap sets a field to the value it has; dispatch is guarded by the
+`dispatch` label, removed before dispatching, and by the per-item
+concurrency group of `agent.yml`, so two controllers cannot start two
+runs for one item; and a type stays `staged` until its step comes.
+
 ## Open points
 
-The runners for the job itself are the self-hosted question of
-[tracker#287](https://github.com/cgwalters-forge/tracker/issues/287): the
-controller is cheap and holds credentials, so it should not run on the
-CNCF runners the agent runs use. The `projects_v2_item` trigger, and where
-the `--state` file lives (a state branch of the tracker, or an artifact),
-are decided when it is built.
+Where the broker lives once nothing else needs Xenon. Whether
+`projects_v2_item` is an Actions trigger, to be checked at step 2 of the
+plan. Whether the App's login can stand in for the bot's everywhere the
+tools compare logins, to be found by the staged run at step 2.
+
+Who authors a commit that `create_pull_request` makes: by default
+gh-aw recreates it through GitHub's API, signed and authored by the
+App, while `bot-git check` and promote expect the bot's `+llm`
+address. Whether `signed-commits: false` keeps the patch's author is
+not tried.
+
+How gh-aw's threat-detection job, which runs a model, gets inference
+when praxis is the only holder (also open in agent-runtimes.md). The
+hand-written pass has no such job, since no model produced its items.
 
 Trust is of an issue's author, not of whoever edited it last: a dispatched brief is read from the live issue, but an edit by a third party to the operator's issue is not detected. Tighten that if edits by others become common.
