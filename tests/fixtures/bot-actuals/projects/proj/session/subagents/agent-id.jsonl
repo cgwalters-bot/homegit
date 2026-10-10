@@ -1,0 +1,2 @@
+{"type":"user","timestamp":"2026-09-20T12:00:00Z","agentId":"id","message":{"role":"user","content":"Implement the focused tests.\nItem: PVTI_item1\nRead AGENTS.md."}}
+{"type":"assistant","timestamp":"2026-09-20T12:01:00Z","agentId":"id","message":{"id":"msg_id","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":100,"output_tokens":2000,"cache_read_input_tokens":50000,"cache_creation_input_tokens":10000,"cache_creation":{"ephemeral_5m_input_tokens":6000,"ephemeral_1h_input_tokens":4000}}}}
