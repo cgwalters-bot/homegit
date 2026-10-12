@@ -164,7 +164,7 @@ docs/devspace-agent-runs.md in homegit.
 
 Commands:
   dispatch --backend agentic-job --caller OWNER/REPO --repo OWNER/REPO
-           --item NUMBER --kind implement|review|triage|research [--dry-run] BRIEF
+           --item NUMBER --kind implement|review|triage|research|fix [--dry-run] BRIEF
       Use the shipped dispatch.yml on main. NUMBER is the target issue
       (review: PR), not a board id. The caller owns model, limits and
       preamble; overrides are refused, not silently dropped. These runs
@@ -322,7 +322,7 @@ def signed(f): if type != "number" then "-"
     elif . < 0 then "-" + (-. | f) elif . > 0 then "+" + (. | f) else "0" end;
 def fmt_pct: if type != "number" then "" else " (\(signed(tostring))%)" end;
 def orblank: if . == null or . == "" then "-" else tostring end;
-def title_parts: (.run.title // "") | (capture("^agent (?<item>\\S+) (?<repo>\\S+)") // capture("^(?<kind>implement|review|triage|research) (?<repo>[^ ]+)#(?<item>[0-9]+)$") // {});
+def title_parts: (.run.title // "") | (capture("^agent (?<item>\\S+) (?<repo>\\S+)") // capture("^(?<kind>implement|review|triage|research|fix) (?<repo>[^ ]+)#(?<item>[0-9]+)$") // {});
 def run_duration: if .run.status == "completed" and .run.started_at and .run.updated_at
     then (.run.updated_at | fromdate) - (.run.started_at | fromdate) else null end;
 def conclusion_result: {success: "success", failure: "failure", timed_out: "timeout",
@@ -877,7 +877,7 @@ cmd_dispatch_agentic_job() {
     if ! [[ "${item}" =~ ^[1-9][0-9]*$ ]] || ! jq -en --arg i "${item}" '$i | tonumber <= 9007199254740991' >/dev/null; then
         fatal "--item must be a positive safe issue/PR number"
     fi
-    [[ "${kind}" =~ ^(implement|review|triage|research)$ ]] || fatal "--kind must be implement, review, triage or research"
+    [[ "${kind}" =~ ^(implement|review|triage|research|fix)$ ]] || fatal "--kind must be implement, review, triage, research or fix"
     test -n "${brief_file}" || fatal "missing BRIEF (a file, or - for stdin)"
     if test "${brief_file}" = -; then cat >"${scratch}/brief";
     else test -r "${brief_file}" || fatal "cannot read ${brief_file}"; cp "${brief_file}" "${scratch}/brief"; fi

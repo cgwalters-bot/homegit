@@ -637,9 +637,11 @@ bot-runs list --backend agentic-job --caller OWNER/CALLER
 bot-runs log RUN --backend agentic-job --caller OWNER/CALLER
 ```
 
-`--item` is the target issue number (a PR number for `--kind review`), not a
-board item id. Kinds are `implement` (the default), `review`, `triage` and
-`research`. The caller supplies the preamble and fixed output routing. Its
+`--item` is the target issue number (a PR number for `--kind review` and
+`--kind fix`), not a board item id. Kinds are `implement` (the default),
+`review`, `triage`, `research` and `fix` (one commit pushed to the branch of a
+pull request that `apply` opened from the bot's fork). The caller supplies the
+preamble and fixed output routing. Its
 current dispatch interface exposes only `repo`, `item`, `kind` and `task`:
 model, agent, runner size, budget, timeout and caps are caller configuration.
 Explicit overrides are refused rather than dropped or sent as unknown inputs.

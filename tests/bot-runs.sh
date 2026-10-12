@@ -1416,11 +1416,13 @@ test_agentic_dispatch() {
     agentic_fixture
     local kind out opt
     echo 'Do this task' >"${WORK}/brief"
-    for kind in implement review triage research; do
+    for kind in implement review triage research fix; do
         out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --kind "${kind}" --dry-run "${WORK}/brief")
         expect_lines "${out}" '^POST repos/example/caller/actions/workflows/dispatch.yml/dispatches$'
         expect_json "$(tail -n +2 <<<"${out}" | jq -c .)" "$(jq -nc --arg kind "${kind}" '{ref: "main", return_run_details: true, inputs: {repo: "composefs/composefs-rs", item: "1", kind: $kind, task: "Do this task"}}')"
     done
+    out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --kind bogus --dry-run "${WORK}/brief" 2>&1) && fail 'accepted a bogus kind'
+    expect_lines "${out}" 'research or fix'
     expect_eq "$(calls '^api')" 0 'dry run API calls'
     for opt in --model --budget --timeout --max-requests --max-tasks --cores --max-outputs; do
         out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs "${opt}" 1 "${WORK}/brief" 2>&1) && fail "ignored ${opt}"
