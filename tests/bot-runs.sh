@@ -1493,6 +1493,27 @@ test_agentic_missing_bad_record() {
     expect_eq "$(calls 'search/issues')" 0 'no legacy footer for refused caller run'
 }
 
+# The apply job is found under any reusable-workflow nesting, never its
+# conclude sibling.
+test_agentic_apply_job_names() {
+    agentic_fixture
+    local out name want
+    while read -r name want; do
+        name=${name//_/ }
+        cp "${FIXTURES}/agentic-jobs.jq" "${FAKE_GH}/filter-jobs.jq"
+        echo '| .jobs |= map(if .name == "run / apply" then .name = "'"${name}"'" else . end)' >>"${FAKE_GH}/filter-jobs.jq"
+        rm -rf "${XDG_STATE_HOME}/bot-runs"
+        out=$(agentic_runs show 1001 --json)
+        expect_eq "$(jq -r .application.status <<<"${out}")" "${want}" "apply job named '${name}'"
+    done <<'EOF'
+run_/_apply applied
+apply_/_apply applied
+run_/_apply_/_apply applied
+run_/_apply_/_conclude missing
+run_/_check_/_check missing
+EOF
+}
+
 test_backend_workflow_identity() {
     local out
     set_json "${FAKE_GH}/runs.json" '.workflow_runs |= map(.display_title = "implement composefs/composefs-rs#1")'

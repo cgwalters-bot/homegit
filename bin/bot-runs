@@ -354,6 +354,10 @@ def fmt_tests: (.tests // []) as $tests | range(0; $tests | length) as $i
           and any($tests[$i + 1:][]; .command == $t.command and .exit_code == 0)
          then " (superseded by later success)" else "" end);
 def agent_model: [.agent, .model] | map(select(. != null)) | join("/") | orblank;
+# The apply job of a backend run: the last " / " segment is "apply" (run /
+# apply, apply / apply, run / apply / apply, whatever reusable-workflow
+# nesting prefixes it), so not its "conclude" sibling.
+def is_apply_job: .name | split(" / ") | last == "apply";
 def source_note: {artifact: "", footer: " (from the PR footer; partial)",
     none: " (no summary: artifact expired, no footer)", pending: ""}[.source] // "";
 '
@@ -690,7 +694,7 @@ load_record() {
     dir=$(run_dir "$1")
     if test "$(jq -r .status <<<"$1")" = completed; then
         jobs=$(ghapi "repos/${RUNS_REPO}/actions/runs/$(jq -r .id <<<"$1")/jobs?per_page=${PER_PAGE}") || return
-        application=$(jq -c '[.jobs[] | select(.name == "run / apply")] | last | {status: (.conclusion // "missing"), url: null}' <<<"${jobs}")
+        application=$(jqlib -c '[.jobs[] | select(is_apply_job)] | last | {status: (.conclusion // "missing"), url: null}' <<<"${jobs}")
         if test -f "${dir}/applied.json"; then
             applied=$(jq -c . "${dir}/applied.json")
         else
