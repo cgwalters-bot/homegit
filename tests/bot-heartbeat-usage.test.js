@@ -179,6 +179,12 @@ test("publish includes both pool paces only in the private usage comment", () =>
     windows: [{ used_percent: 31, window_ms: 10080 * 60000, resets_at: reset * 1000 }] }, config.pacing.pools.openai, NOW_MS));
   assert.equal(snap.pools.openai.observed_at, "2026-09-28T18:00:00.000Z");
   assert.match(body, /openai: 31/);
+  // No mistral key (an older broker): nothing is published for it. With one: its counters, not the rest.
+  assert.equal(snap.mistral, undefined);
+  assert.doesNotMatch(body, /mistral/);
+  const withMistral = publish({ ...broker, mistral: { counts: { requests: 2, unmetered: 1, tokens: { input: 41, total: 75 } }, private_data: "not-published" } });
+  assert.deepEqual(withMistral.snap.mistral, { requests: 3, tokens: 75 });
+  assert.match(withMistral.body, /mistral: 3 requests, 75 tokens since the broker started/);
   for (const data of ["{broken", {}, { codex: { secondary: { ...broker.codex.secondary, reset_after_seconds: -1 } } }]) {
     const result = publish(data).snap;
     assert.equal(result.pools.openai, null);

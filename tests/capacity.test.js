@@ -274,6 +274,21 @@ test("bot-capacity paces each pool on its own reading", () => {
     fs.writeFileSync(praxis, JSON.stringify(u));
     assert.equal(run(NOW).openai, null, drop);
   }
+  // Mistral has counters but no window: shown, never paced. A broker without it serves none.
+  const mistral = (counts) => { const u = JSON.parse(fs.readFileSync(praxis, "utf8")); u.mistral = counts && { counts }; fs.writeFileSync(praxis, JSON.stringify(u)); };
+  usage(NOW, 19, 7.5 * 3600e3, 2304);
+  for (const [counts, want, line] of [
+    [{ requests: 2, unmetered: 0, tokens: { total: 75 } }, { requests: 2, tokens: 75, epoch: 1 }, /^  mistral: 2 requests, 75 tokens since the broker started \(unpaced\)$/m],
+    [{ requests: 3, unmetered: 4, tokens: { total: 2.5e6 } }, { requests: 7, tokens: 2.5e6, epoch: 1 }, /^  mistral: 7 requests, 2\.5M tokens since/m],
+    [{ requests: 2 }, null, /^(?!.*mistral)/s],
+    [null, null, /^(?!.*mistral)/s],
+  ]) {
+    mistral(counts);
+    const out = execFileSync(path.join(BIN, "bot-capacity"), ["--json"], { env: { ...env, BOT_CAPACITY_NOW: new Date(NOW).toISOString() }, encoding: "utf8" });
+    assert.deepEqual(JSON.parse(out).mistral, want, JSON.stringify(counts));
+    assert.deepEqual(Object.keys(JSON.parse(out).pools), ["claude", "openai"]);
+    assert.match(run(NOW, []), line, JSON.stringify(counts));
+  }
   fs.rmSync(praxis);
   // A state file that is damaged is started over.
   claude(NOW, 50, DAY);

@@ -185,6 +185,8 @@ The pools object holds claude and openai in bot-capacity's poolPace shape
 (used_percent, allowed_percent, resets_at, observed_at and pacing metadata),
 or null without an unreset paced window. These readings remain lower bounds
 until reset even when old; observed_at is when read, not when published.
+A mistral object holds the broker's Mistral requests and tokens since the
+broker started: it has no window, so no pace, and is only displayed.
 
 The heartbeat comment names items only inside code, so that editing it never
 adds a "mentioned this" event to them.
@@ -633,13 +635,20 @@ function usageSnapshot(hb, agentIds, nowMs, inputWorkers = []) {
 }
 
 // Share capacity's readers and pacing without its board lookup or cost-state
-// updates. Only the resulting aggregate pace is published, never broker data.
+// updates. Only the resulting aggregate pace is published, never broker data,
+// but for Mistral's request and token counters (it has no pace): {pools,
+// mistral}, absent when the broker serves none.
 async function collectPools(nowMs) {
-  const { claudeReading, openaiReading } = require("./bot-capacity");
+  const { claudeReading, openaiReading, brokerUsage, mistralReading } = require("./bot-capacity");
   const { poolPace } = require("../lib/pools.js");
+  const broker = await brokerUsage();
+  const mistral = mistralReading(broker);
   return {
-    claude: poolPace(claudeReading(), CONFIG.pacing.pools.claude, nowMs),
-    openai: poolPace(await openaiReading(), CONFIG.pacing.pools.openai, nowMs),
+    pools: {
+      claude: poolPace(claudeReading(), CONFIG.pacing.pools.claude, nowMs),
+      openai: poolPace(await openaiReading(broker), CONFIG.pacing.pools.openai, nowMs),
+    },
+    ...(mistral ? { mistral: { requests: mistral.requests, tokens: mistral.tokens } } : {}),
   };
 }
 
@@ -694,6 +703,7 @@ function renderUsage(snap) {
   if (snap.pools) {
     const { describe } = require("../lib/pools.js");
     for (const [name, p] of Object.entries(snap.pools)) lines.push(describe(name, p, Date.parse(snap.updated_at)));
+    if (snap.mistral) lines.push(`mistral: ${snap.mistral.requests} requests, ${fmtTokens(snap.mistral.tokens)} tokens since the broker started (unpaced)`);
     lines.push("");
   }
   if (snap.workers.length) {
@@ -822,7 +832,7 @@ async function publish(input, { dryRun = false, withUsage = true, existing, stri
     // Best effort: a heartbeat without usage beats none.
     try {
       const snap = usageSnapshot(valid, agentIds, nowMs, input.workers);
-      snap.pools = await collectPools(nowMs);
+      Object.assign(snap, await collectPools(nowMs));
       usageBody = renderUsage(snap);
     } catch (e) {
       log(`no usage snapshot: ${e.message}`);
@@ -1006,7 +1016,7 @@ async function cmdUsage(args) {
   if (args.length) throw new Exit(EX_USAGE, `unexpected argument '${args[0]}'\n\n${usage()}`);
   const nowMs = now();
   const { usage } = collectUsage(nowMs);
-  usage.pools = await collectPools(nowMs);
+  Object.assign(usage, await collectPools(nowMs));
   process.stdout.write(`${JSON.stringify(usage, null, 2)}\n`);
 }
 

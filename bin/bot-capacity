@@ -166,23 +166,41 @@ function praxisSource() {
   return m ? new URL(PRAXIS_USAGE_PATH, m[1]).href : null;
 }
 
-// openaiReading(): the broker's codex windows as a pool reading, with its
-// request and token counters (which restart with the broker: epoch), or
-// null when there is none; a broker that can't be read is a warning.
-async function openaiReading() {
+// brokerUsage(): the broker's usage answer, or null when there is none; a
+// broker that can't be read is a warning.
+async function brokerUsage() {
   const src = praxisSource();
   if (!src) return null;
-  let usage;
   try {
     if (/^https?:\/\//.test(src)) {
       const res = await fetch(src, { signal: AbortSignal.timeout(PRAXIS_TIMEOUT_MS) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      usage = await res.json();
-    } else usage = JSON.parse(fs.readFileSync(src, "utf8"));
+      return await res.json();
+    }
+    return JSON.parse(fs.readFileSync(src, "utf8"));
   } catch (e) {
-    warn(`no openai reading: cannot read ${src}: ${e.cause ? e.cause.message : e.message}`);
+    warn(`no broker usage: cannot read ${src}: ${e.cause ? e.cause.message : e.message}`);
     return null;
   }
+}
+
+// mistralReading(usage): the broker's mistral counters, {requests, tokens,
+// epoch}, or null when it serves none (an older broker has no mistral key).
+// They have no window and so no pace: display only, since the broker started.
+function mistralReading(usage) {
+  const counts = usage && usage.mistral && usage.mistral.counts;
+  if (!counts) return null;
+  const requests = (counts.requests || 0) + (counts.unmetered || 0);
+  const tokens = counts.tokens && counts.tokens.total;
+  if (![requests, tokens].every(Number.isFinite)) return null;
+  return { requests, tokens, epoch: usage.started_at ?? null };
+}
+
+// openaiReading(usage): the broker's codex windows as a pool reading, with
+// its request and token counters (which restart with the broker: epoch), or
+// null when there is none.
+async function openaiReading(usage = undefined) {
+  if (usage === undefined) usage = await brokerUsage();
   const codex = usage && usage.codex;
   if (!codex) return null;
   const windows = CODEX_WINDOWS.map((name) => codex[name]).filter((w) => w && [w.used_percent, w.window_minutes, w.reset_after_seconds, w.observed_at].every(Number.isFinite) && w.window_minutes > 0)
@@ -262,7 +280,9 @@ function paceLines(r, now) {
 }
 
 function render(r, now) {
-  const out = [...paceLines(r, now), ""];
+  const out = [...paceLines(r, now)];
+  if (r.mistral) out.push(`  mistral: ${r.mistral.requests} requests, ${r.mistral.tokens < 1e3 ? r.mistral.tokens : tok(r.mistral.tokens)} tokens since the broker started (unpaced)`);
+  out.push("");
   const src = { statusline: "plan usage (statusline)", budget: "tokens over the budget", tokens: "tokens only (no statusline reading, no budget)" }[r.source];
   out.push(`Week (${src}): ${tok(r.used_tokens)} fresh tokens${r.used_percent === null ? "" : `, ${pct(r.used_percent)} used`}`);
   if (r.burn_per_day !== null) out.push(`Burn: ${pct(r.burn_per_day)}/day, ${tok(r.burn_tokens_per_day)} tokens/day`);
@@ -305,7 +325,9 @@ async function main(argv) {
   const claude = claudeReading();
   // The Claude pool's tokens: this week's, when its window is the one summed.
   if (claude && rate) claude.counters = { epoch: rate.resetsAt, tokens: weekTokens };
-  report.pools = poolReport({ claude, openai: await openaiReading() }, items, operator.loadOrExit(PROG), now,
+  const broker = await brokerUsage();
+  report.mistral = mistralReading(broker);
+  report.pools = poolReport({ claude, openai: await openaiReading(broker) }, items, operator.loadOrExit(PROG), now,
     readRunAgents(items.filter((it) => pace.isActive(it) && it.run).map((it) => it.run)));
   process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : render(report, now));
   return 0;
@@ -316,4 +338,4 @@ if (require.main === module) {
     process.stderr.write(`${PROG}: error: ${e.stack || e.message}\n`);
     process.exit(1);
   });
-} else module.exports = { readRate, render, claudeReading, openaiReading };
+} else module.exports = { readRate, render, claudeReading, openaiReading, brokerUsage, mistralReading };
