@@ -47,6 +47,8 @@ if test "${backend}" = agentic-job; then
     RUNS_REPO=${caller} RUNS_WORKFLOW=dispatch.yml RUNS_REF=main
 fi
 readonly RUNS_REPO RUNS_WORKFLOW RUNS_REF
+POOL_CHOICE=${BOT_RUNS_POOL_CHOICE:-$(dirname "$(readlink -f "$0")")/../lib/pool-choice.js}
+readonly POOL_CHOICE
 readonly SUMMARY_ARTIFACT=agent-run
 readonly TRANSCRIPT_ARTIFACT=agent-transcript
 # What a run hands back, as gh-aw's safe outputs: outputs.jsonl, a patch and
@@ -164,11 +166,16 @@ docs/devspace-agent-runs.md in homegit.
 
 Commands:
   dispatch --backend agentic-job --caller OWNER/REPO --repo OWNER/REPO
-           --item NUMBER --kind implement|review|triage|research|fix [--dry-run] BRIEF
+           --item NUMBER --kind implement|review|triage|research|fix
+           [--pool claude|openai|auto|none] [--dry-run] BRIEF
       Use the shipped dispatch.yml on main. NUMBER is the target issue
       (review: PR), not a board id. The caller owns model, limits and
       preamble; overrides are refused, not silently dropped. These runs
-      apply themselves. Readers also take --backend agentic-job --caller.
+      apply themselves. --pool picks the inference pool: auto (the
+      default) the one furthest under its pace by bot-capacity's readings,
+      or none if there are none; the choice is printed. The pool input is
+      sent only if the caller's dispatch.yml on its default branch declares
+      it. Readers also take --backend agentic-job --caller.
   dispatch --item ITEM --repo OWNER/REPO [--base REF] [--agent AGENT]
            [--model MODEL] [--cores N] [--timeout MIN] [--budget AIC]
            [--max-requests N] [--max-tasks N]
@@ -860,13 +867,70 @@ cmd_dispatch() {
         warn "the run was dispatched, but registering its heartbeat failed; publish the workers with bot-heartbeat publish"
 }
 
-# The shipped caller deliberately exposes only these four inputs. Model,
-# runner and caps belong to its reviewed configuration, not the task text.
+# caller_declares_pool: whether dispatch.yml on the caller's default branch
+# (no ref: the API serves that one) takes a pool input: status 0 if so, 1 if
+# not (a caller without it would refuse the dispatch for an unknown input),
+# 2 if it can't be read.
+caller_declares_pool() {
+    local yaml rc=0
+    yaml=$(ghapi -H 'Accept: application/vnd.github.raw' "repos/${RUNS_REPO}/contents/.github/workflows/${RUNS_WORKFLOW}") || rc=$?
+    pass_ratelimit "${rc}"
+    if test "${rc}" -eq "${EX_NOTFOUND}"; then return 1; fi
+    test "${rc}" -eq 0 || return 2
+    node "${POOL_CHOICE}" declares <<<"${yaml}" || { test $? -eq 1 && return 1; return 2; }
+}
+
+# choose_pool POOL: sets chosen_pool ("" for none) from --pool POOL, saying
+# on stderr which and why in one line. auto picks the pool furthest under its
+# pace, and sends none to a caller that doesn't declare the input or when
+# that can't be told; only an explicit pool is refused for want of the input.
+choose_pool() {
+    local pool=$1 choice rc=0
+    chosen_pool=""
+    case "${pool}" in
+        none) return ;;
+        claude|openai|auto) ;;
+        *) fatal "--pool must be claude, openai, auto or none" ;;
+    esac
+    require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
+    require_cmd node "install Node.js 22 or newer"
+    caller_declares_pool || rc=$?
+    if test "${rc}" -ne 0; then
+        if test "${pool}" != auto; then
+            test "${rc}" -eq 1 && fatal "${RUNS_REPO}'s ${RUNS_WORKFLOW} declares no pool input; use --pool none"
+            fatal "cannot read ${RUNS_WORKFLOW} of ${RUNS_REPO} to see if it takes a pool; use --pool none"
+        elif test "${rc}" -eq 1; then
+            echo "pool: none (${RUNS_REPO}'s ${RUNS_WORKFLOW} declares no pool input)" >&2
+        else
+            warn "cannot read ${RUNS_WORKFLOW} of ${RUNS_REPO}; sending no pool input"
+        fi
+        return
+    fi
+    if test "${pool}" != auto; then
+        chosen_pool=${pool}
+        echo "pool: ${pool} (--pool)" >&2
+        return
+    fi
+    if ! choice=$(node "${POOL_CHOICE}" choose); then
+        warn "cannot read the pools' pace; sending no pool input"
+        return
+    fi
+    chosen_pool=$(jq -r '.pool // ""' <<<"${choice}")
+    if test -z "${chosen_pool}"; then
+        warn "no pool chosen: $(jq -r .line <<<"${choice}"); sending no pool input"
+        return
+    fi
+    echo "pool: $(jq -r .line <<<"${choice}")" >&2
+}
+
+# The shipped caller exposes only these inputs (and pool, if it declares
+# it). Model, runner and caps belong to its reviewed configuration, not the
+# task text.
 cmd_dispatch_agentic_job() {
-    local item="" repo="" kind=implement brief_file="" dry_run=false json=false body resp rc=0
+    local item="" repo="" kind=implement brief_file="" pool=auto dry_run=false json=false body resp rc=0
     while test $# -gt 0; do
         case "$1" in
-            --item|--repo|--kind)
+            --item|--repo|--kind|--pool)
                 test $# -ge 2 || fatal "$1 requires a value"
                 printf -v "${1#--}" '%s' "$2"; shift 2 ;;
             --dry-run) dry_run=true; shift ;;
@@ -882,12 +946,14 @@ cmd_dispatch_agentic_job() {
         fatal "--item must be a positive safe issue/PR number"
     fi
     [[ "${kind}" =~ ^(implement|review|triage|research|fix)$ ]] || fatal "--kind must be implement, review, triage, research or fix"
+    [[ "${pool}" =~ ^(claude|openai|auto|none)$ ]] || fatal "--pool must be claude, openai, auto or none"
     test -n "${brief_file}" || fatal "missing BRIEF (a file, or - for stdin)"
     if test "${brief_file}" = -; then cat >"${scratch}/brief";
     else test -r "${brief_file}" || fatal "cannot read ${brief_file}"; cp "${brief_file}" "${scratch}/brief"; fi
     grep -q '[^[:space:]]' "${scratch}/brief" || fatal "the brief is empty"
-    body=$(jq -nc --arg ref "${RUNS_REF}" --arg repo "${repo}" --arg item "${item}" --arg kind "${kind}" --rawfile task "${scratch}/brief" \
-        '{ref: $ref, return_run_details: true, inputs: {repo: $repo, item: $item, kind: $kind, task: ($task | rtrimstr("\n"))}}')
+    choose_pool "${pool}"
+    body=$(jq -nc --arg ref "${RUNS_REF}" --arg repo "${repo}" --arg item "${item}" --arg kind "${kind}" --arg pool "${chosen_pool}" --rawfile task "${scratch}/brief" \
+        '{ref: $ref, return_run_details: true, inputs: ({repo: $repo, item: $item, kind: $kind, task: ($task | rtrimstr("\n"))} + (if $pool == "" then {} else {pool: $pool} end))}')
     test "$(jq '.inputs | tojson | length' <<<"${body}")" -le "${MAX_INPUTS_LEN}" || fatal "dispatch inputs exceed ${MAX_INPUTS_LEN}; shorten the brief"
     if ${dry_run}; then
         echo "POST repos/${RUNS_REPO}/actions/workflows/${RUNS_WORKFLOW}/dispatches"; jq . <<<"${body}"; return

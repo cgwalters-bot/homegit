@@ -1,6 +1,6 @@
 // Offline tests of lib/pools.js: the pace of an inference pool against an
 // even use of its target by the reset, what a run costs it, and how the
-// pools read in a line. Run with tests/pools.sh, or node --test
+// pools read in a line, and lib/pool-choice.js (the pool bot-runs asks for). Run with tests/pools.sh, or node --test
 // tests/pools.test.js.
 "use strict";
 
@@ -13,6 +13,7 @@ const test = require("node:test");
 
 const pools = require(path.join(__dirname, "..", "lib", "pools.js"));
 const operator = require(path.join(__dirname, "..", "lib", "operator.js"));
+const choice = require(path.join(__dirname, "..", "lib", "pool-choice.js"));
 
 const { HOUR_MS: HOUR, DAY_MS: DAY } = pools;
 const WEEK = 7 * DAY;
@@ -195,4 +196,45 @@ test("a pool in a line, and the engines' pools", () => {
   assert.deepEqual([{ run: "x" }, {}].map((it) => pools.engineOf(it)), ["opencode", "claude"]);
   assert.deepEqual([run(7).run, "x", undefined].map(pools.runId), ["7", null, null]);
   assert.deepEqual([{ labels: ["Urgent"] }, { labels: ["P0"] }, {}].map(pools.isUrgent), [true, false, false]);
+});
+
+test("pool-choice: the pool with the largest margin under its pace", () => {
+  const p = (used, allowed, extra = {}) => ({ used_percent: used, allowed_percent: allowed, hold: false, ...extra });
+  const cases = [
+    [{ claude: p(40, 48), openai: p(10, 48) }, "openai"],
+    [{ claude: p(10, 48), openai: p(40, 48) }, "claude"],
+    [{ claude: p(10, 30), openai: p(10, 48) }, "openai"],
+    [{ claude: p(10, 48), openai: p(10, 48) }, "claude"],
+    // Ahead of its pace is a negative margin, but a pool that is not held still wins over a held one.
+    [{ claude: p(60, 48, { hold: true }), openai: p(70, 48) }, "openai"],
+    [{ claude: p(10, 48, { hold: true, reason: "window" }), openai: p(70, 48) }, "openai"],
+    [{ claude: p(60, 48, { hold: true }), openai: p(70, 48, { hold: true }) }, "claude"],
+    // A pool without a reading is never chosen over one that has.
+    [{ claude: null, openai: p(90, 48) }, "openai"],
+    [{ claude: p(90, 48), openai: null }, "claude"],
+    [{ claude: null, openai: null }, null],
+  ];
+  for (const [paces, want] of cases) assert.equal(choice.choosePool(paces).pool, want, JSON.stringify(paces));
+  assert.equal(choice.choosePool({ claude: p(40, 47.5), openai: null }).line, "claude: no reading of openai (claude 40% used of 48% allowed, openai no reading)");
+  const line = (paces) => choice.choosePool(paces).line.split(" (")[0];
+  assert.equal(line({ claude: p(10, 48), openai: p(70, 48, { hold: true }) }), "claude: openai is over its pace");
+  assert.equal(line({ claude: p(60, 48, { hold: true }), openai: p(70, 48, { hold: true }) }), "claude: both over pace, least over");
+  assert.equal(line({ claude: p(40, 48), openai: p(10, 48) }), "openai: furthest under its pace");
+});
+
+test("pool-choice: whether a dispatch.yml declares the pool input", () => {
+  const wf = (inputs, extra = "") => `name: Dispatch\non:\n  workflow_dispatch:\n    inputs:\n${inputs}${extra}`;
+  const cases = [
+    [wf("      item:\n        required: true\n      pool:\n        type: choice\n        options: [claude, openai]\n"), true],
+    [wf("      pool: # claude or openai\n        type: string\n"), true],
+    [wf('      "pool":\n        type: string\n'), true],
+    [wf("      item:\n        required: true\n"), false],
+    // Not an input: a description, a nested key, another trigger's, or another section's.
+    [wf("      item:\n        description: the pool\n        pool: x\n"), false],
+    [wf("      item:\n        required: true\n", "  workflow_call:\n    inputs:\n      pool:\n        type: string\n"), false],
+    ["on:\n  push:\n    branches: [main]\npool: x\n", false],
+    ["env:\n  pool: x\non: workflow_dispatch\n", false],
+    ["", false],
+  ];
+  for (const [yaml, want] of cases) assert.equal(choice.declaresPool(yaml), want, yaml);
 });
