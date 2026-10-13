@@ -648,17 +648,21 @@ caller configuration. Explicit overrides are refused rather than dropped or
 sent as unknown inputs. This is a remaining caller-interface gap before
 per-run model/limit selection.
 
-`--pool claude|openai|auto|none` picks the inference pool, a closed set that
+`--pool claude|openai|mistral|auto|none` picks the inference pool, a closed set that
 the caller maps to its own agent and model; an empty `pool` leaves the choice
-to the caller's repository variables. `none` sends no input. `auto`, the
-default, asks the readings `bot-capacity` paces (`lib/pools.js`) and picks the
-pool with the largest margin, what its pace allows now minus what it has used
+to the caller's repository variables. `none` sends no input. `mistral` is the
+pool for toil and has no pace: `auto`, the default, picks it for `--kind
+triage` when the caller's `.github/agentic-job/pools.json` has a `mistral`
+entry, printing `pool: mistral: triage is toil, and the caller's pools.json
+has mistral`. For any other kind, or a caller without that entry, `auto`
+asks the readings `bot-capacity` paces (`lib/pools.js`) and picks the
+pool of `claude` and `openai` with the largest margin, what its pace allows now minus what it has used
 (a pool that holds new work only when neither is free; one without a reading
 never over one with); with no reading of either, it warns and sends none.
 Whatever the value, the input is sent only when `dispatch.yml` on the caller's
 default branch declares a `pool` input, so a caller without it keeps working:
 `auto` then sends none (as it does when the chooser or the file cannot be
-read, with a warning), and an explicit `claude` or `openai` is refused. The
+read, with a warning), and an explicit `claude`, `openai` or `mistral` is refused. The
 choice is printed on stderr in one line, for example `pool: openai: furthest
 under its pace (claude 40% used of 48% allowed, openai 10% used of 48%
 allowed)`, or `pool: claude: openai is over its pace (...)` when the other

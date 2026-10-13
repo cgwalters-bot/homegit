@@ -201,6 +201,11 @@ case "${method} ${path%%\?*}" in
         test -e "${store}/dispatch.yml" || fail_http 404 "Not Found"
         cat "${store}/dispatch.yml"
         ;;
+    # The caller's pools, if it has any: $FAKE_GH/pools.json.
+    "GET repos/${repo}/contents/.github/agentic-job/pools.json")
+        test -e "${store}/pools.json" || fail_http 404 "Not Found"
+        cat "${store}/pools.json"
+        ;;
     # A target repository: private-org's are private, gone's don't exist.
     "GET repos/"*/*)
         [[ "${path}" =~ ^repos/[^/]+/[^/]+$ ]] || { echo "fake gh: unexpected call: ${method} ${path}" 1>&2; exit 1; }
@@ -1476,8 +1481,28 @@ test_agentic_pool() {
 auto|40|10|openai|^pool: openai: furthest
 claude|90|10|claude|^pool: claude \(--pool\)$
 openai|10|90|openai|^pool: openai \(--pool\)$
+mistral|10|40|mistral|^pool: mistral \(--pool\)$
 none|10|40||^$
 CASES
+    # A triage run is toil: auto sends it to the mistral pool where the
+    # caller's pools.json has one, whatever the paced pools read, and
+    # chooses by pace as before where it has none or for another kind.
+    # pools.json | kind | pool sent | line on stderr
+    while IFS='|' read -r pools kind want line; do
+        pool_world 40 10
+        rm -f "${FAKE_GH}/pools.json"
+        test -z "${pools}" || echo "${pools}" >"${FAKE_GH}/pools.json"
+        err=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --kind "${kind}" --dry-run "${WORK}/brief" 2>&1 >"${WORK}/out") || fail "dispatch failed: ${err}"
+        expect_lines "${err}" "${line}"
+        expect_eq "$(tail -n +2 "${WORK}/out" | jq -r '.inputs.pool // ""')" "${want}" "pool sent for ${kind} with pools '${pools}'"
+    done <<'CASES'
+{"claude": {}, "mistral": {}}|triage|mistral|^pool: mistral: triage is toil, and the caller's pools.json has mistral$
+{"claude": {}, "mistral": {}}|fix|openai|^pool: openai: furthest under its pace
+{"claude": {}, "openai": {}}|triage|openai|^pool: openai: furthest under its pace
+|triage|openai|^pool: openai: furthest under its pace
+not json|triage|openai|^pool: openai: furthest under its pace
+CASES
+    rm -f "${FAKE_GH}/pools.json"
     # A caller that declares no pool input gets today's body, and says so.
     rm "${FAKE_GH}/dispatch.yml"
     err=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --dry-run "${WORK}/brief" 2>&1 >"${WORK}/out")
@@ -1504,8 +1529,8 @@ CASES
     rm "${FAKE_GH}/dispatch.yml"
     # A bad value is refused before anything is read or dispatched.
     : >"${FAKE_GH}/calls"
-    out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --pool mistral "${WORK}/brief" 2>&1) && fail 'accepted a bad pool'
-    expect_lines "${out}" '--pool must be claude, openai, auto or none'
+    out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --pool gemini "${WORK}/brief" 2>&1) && fail 'accepted a bad pool'
+    expect_lines "${out}" '--pool must be claude, openai, mistral, auto or none'
     expect_eq "$(calls .)" 0 'API calls for a bad pool'
     # A real dispatch sends the chosen pool.
     pool_world 40 10

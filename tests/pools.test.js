@@ -222,6 +222,25 @@ test("pool-choice: the pool with the largest margin under its pace", () => {
   assert.equal(line({ claude: p(40, 48), openai: p(10, 48) }), "openai: furthest under its pace");
 });
 
+test("pool-choice: toil goes to the mistral pool where the caller has one", () => {
+  const both = { claude: {}, openai: {}, mistral: { agent: "vibe" } };
+  // kind | the caller's pools.json | pool (null: choose by pace)
+  const cases = [
+    ["triage", both, "mistral"],
+    ["triage", { claude: {}, openai: {} }, null],
+    ["triage", null, null],
+    ["triage", "mistral", null],
+    ["triage", ["mistral"], null],
+    ...["implement", "review", "research", "fix", "toString", null, undefined].map((kind) => [kind, both, null]),
+  ];
+  for (const [kind, callerPools, want] of cases) {
+    assert.equal(choice.toilPool(kind, callerPools)?.pool ?? null, want, `${kind} ${JSON.stringify(callerPools)}`);
+  }
+  assert.equal(choice.toilPool("triage", both).line, "mistral: triage is toil, and the caller's pools.json has mistral");
+  // The toil pool is not a paced one: choosePool never names it.
+  assert.ok(!choice.POOLS.includes(choice.TOIL_POOL));
+});
+
 test("pool-choice: whether a dispatch.yml declares the pool input", () => {
   const wf = (inputs, extra = "") => `name: Dispatch\non:\n  workflow_dispatch:\n    inputs:\n${inputs}${extra}`;
   const cases = [
