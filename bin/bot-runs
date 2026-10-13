@@ -49,6 +49,9 @@ fi
 readonly RUNS_REPO RUNS_WORKFLOW RUNS_REF
 POOL_CHOICE=${BOT_RUNS_POOL_CHOICE:-$(dirname "$(readlink -f "$0")")/../lib/pool-choice.js}
 readonly POOL_CHOICE
+# The pools a caller's dispatch.yml takes, in its repository.
+readonly CALLER_POOLS_PATH=.github/agentic-job/pools.json
+readonly POOL_USAGE='claude, openai, mistral, auto or none'
 readonly SUMMARY_ARTIFACT=agent-run
 readonly TRANSCRIPT_ARTIFACT=agent-transcript
 # What a run hands back, as gh-aw's safe outputs: outputs.jsonl, a patch and
@@ -167,13 +170,15 @@ docs/devspace-agent-runs.md in homegit.
 Commands:
   dispatch --backend agentic-job --caller OWNER/REPO --repo OWNER/REPO
            --item NUMBER --kind implement|review|triage|research|fix
-           [--pool claude|openai|auto|none] [--dry-run] BRIEF
+           [--pool claude|openai|mistral|auto|none] [--dry-run] BRIEF
       Use the shipped dispatch.yml on main. NUMBER is the target issue
       (review: PR), not a board id. The caller owns model, limits and
       preamble; overrides are refused, not silently dropped. These runs
       apply themselves. --pool picks the inference pool: auto (the
-      default) the one furthest under its pace by bot-capacity's readings,
-      or none if there are none; the choice is printed. The pool input is
+      default) mistral for a triage run where the caller's pools.json has
+      it, else the one of claude and openai furthest under its pace by
+      bot-capacity's readings, or none if there are none; the choice is
+      printed. The pool input is
       sent only if the caller's dispatch.yml on its default branch declares
       it. Readers also take --backend agentic-job --caller.
   dispatch --item ITEM --repo OWNER/REPO [--base REF] [--agent AGENT]
@@ -880,17 +885,19 @@ caller_declares_pool() {
     node "${POOL_CHOICE}" declares <<<"${yaml}" || { test $? -eq 1 && return 1; return 2; }
 }
 
-# choose_pool POOL: sets chosen_pool ("" for none) from --pool POOL, saying
-# on stderr which and why in one line. auto picks the pool furthest under its
-# pace, and sends none to a caller that doesn't declare the input or when
+# choose_pool POOL KIND: sets chosen_pool ("" for none) from --pool POOL,
+# saying on stderr which and why in one line. auto picks the toil pool for a
+# KIND that is toil, where the caller's pools.json has it (lib/pool-choice.js;
+# a file that can't be read is one without it), else the pool furthest under
+# its pace, and sends none to a caller that doesn't declare the input or when
 # that can't be told; only an explicit pool is refused for want of the input.
 choose_pool() {
-    local pool=$1 choice rc=0
+    local pool=$1 kind=$2 choice rc=0
     chosen_pool=""
     case "${pool}" in
         none) return ;;
-        claude|openai|auto) ;;
-        *) fatal "--pool must be claude, openai, auto or none" ;;
+        claude|openai|mistral|auto) ;;
+        *) fatal "--pool must be ${POOL_USAGE}" ;;
     esac
     require_cmd gh "install the GitHub CLI (https://cli.github.com) and authenticate it"
     require_cmd node "install Node.js 22 or newer"
@@ -911,7 +918,9 @@ choose_pool() {
         echo "pool: ${pool} (--pool)" >&2
         return
     fi
-    if ! choice=$(node "${POOL_CHOICE}" choose); then
+    ghapi -H 'Accept: application/vnd.github.raw' "repos/${RUNS_REPO}/contents/${CALLER_POOLS_PATH}" >"${scratch}/caller-pools.json" || rc=$?
+    pass_ratelimit "${rc}"
+    if ! choice=$(node "${POOL_CHOICE}" choose --kind "${kind}" --caller-pools "${scratch}/caller-pools.json"); then
         warn "cannot read the pools' pace; sending no pool input"
         return
     fi
@@ -946,12 +955,12 @@ cmd_dispatch_agentic_job() {
         fatal "--item must be a positive safe issue/PR number"
     fi
     [[ "${kind}" =~ ^(implement|review|triage|research|fix)$ ]] || fatal "--kind must be implement, review, triage, research or fix"
-    [[ "${pool}" =~ ^(claude|openai|auto|none)$ ]] || fatal "--pool must be claude, openai, auto or none"
+    [[ "${pool}" =~ ^(claude|openai|mistral|auto|none)$ ]] || fatal "--pool must be ${POOL_USAGE}"
     test -n "${brief_file}" || fatal "missing BRIEF (a file, or - for stdin)"
     if test "${brief_file}" = -; then cat >"${scratch}/brief";
     else test -r "${brief_file}" || fatal "cannot read ${brief_file}"; cp "${brief_file}" "${scratch}/brief"; fi
     grep -q '[^[:space:]]' "${scratch}/brief" || fatal "the brief is empty"
-    choose_pool "${pool}"
+    choose_pool "${pool}" "${kind}"
     body=$(jq -nc --arg ref "${RUNS_REF}" --arg repo "${repo}" --arg item "${item}" --arg kind "${kind}" --arg pool "${chosen_pool}" --rawfile task "${scratch}/brief" \
         '{ref: $ref, return_run_details: true, inputs: ({repo: $repo, item: $item, kind: $kind, task: ($task | rtrimstr("\n"))} + (if $pool == "" then {} else {pool: $pool} end))}')
     test "$(jq '.inputs | tojson | length' <<<"${body}")" -le "${MAX_INPUTS_LEN}" || fatal "dispatch inputs exceed ${MAX_INPUTS_LEN}; shorten the brief"
