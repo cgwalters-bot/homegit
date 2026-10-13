@@ -12,8 +12,10 @@ Emojis should be used *sparingly*. Don't overuse bulleted lists; if a document i
 
 Keep PR descriptions and GitHub comments short and factual. The operator adds the human framing on nontrivial changes themselves; short bot text makes their edits visible as the human review, while long AI prose buries the signal.
 
-- **PR descriptions:** a brief what and why, the testing facts (what ran, where, linked results), and for a nontrivial change an empty `<!-- LOGIN: context/rationale -->` line (LOGIN being the operator's login) for them to fill (it renders invisibly if left). No essays or restated diffs.
+- **PR descriptions:** a brief what and why, one line on how it was verified, and for a nontrivial change an empty `<!-- LOGIN: context/rationale -->` line (LOGIN being the operator's login) for them to fill (it renders invisibly if left). No essays or restated diffs.
 - **Comments:** a few lines, verdict first. Put long analyses in a secret gist and link it, except in a reply or review where the operator summoned the bot: that stays on the thread (in a collapsed `<details>` block if long), since a gist linked from public text isn't secret.
+
+**Descriptions are brief.** A commit message or pull request description states the essentials: what changes and why, in a few sentences a reader can take in at a glance. Details belong in comments in the code, next to what they explain, not in the description. No file-by-file lists, no "What changed" sections, no restating the diff, no test transcripts; one line on how it was verified is enough. If a reader cannot tell from the first two sentences what the change does, rewrite them.
 
 Commit messages keep following "Commit Messages" below.
 
