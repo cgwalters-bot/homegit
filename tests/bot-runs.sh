@@ -195,6 +195,12 @@ case "${method} ${path%%\?*}" in
         cat "${store}/dispatch-response.json"
         ;;
     "GET repos/${repo}/actions/workflows/"*) fail_http 404 "Not Found" ;;
+    # The caller's dispatch.yml on its default branch: $FAKE_GH/dispatch.yml.
+    "GET repos/${repo}/contents/.github/workflows/dispatch.yml")
+        test ! -e "${store}/contents-fail" || fail_http 502 "Bad Gateway"
+        test -e "${store}/dispatch.yml" || fail_http 404 "Not Found"
+        cat "${store}/dispatch.yml"
+        ;;
     # A target repository: private-org's are private, gone's don't exist.
     "GET repos/"*/*)
         [[ "${path}" =~ ^repos/[^/]+/[^/]+$ ]] || { echo "fake gh: unexpected call: ${method} ${path}" 1>&2; exit 1; }
@@ -1423,7 +1429,7 @@ test_agentic_dispatch() {
     done
     out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --kind bogus --dry-run "${WORK}/brief" 2>&1) && fail 'accepted a bogus kind'
     expect_lines "${out}" 'research or fix'
-    expect_eq "$(calls '^api')" 0 'dry run API calls'
+    expect_eq "$(calls 'POST')" 0 'dry run dispatches'
     for opt in --model --budget --timeout --max-requests --max-tasks --cores --max-outputs; do
         out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs "${opt}" 1 "${WORK}/brief" 2>&1) && fail "ignored ${opt}"
         expect_lines "${out}" 'not supported by the shipped agentic-job caller'
@@ -1431,6 +1437,80 @@ test_agentic_dispatch() {
     agentic_runs dispatch --item 1 --repo composefs/composefs-rs "${WORK}/brief" --json >/dev/null
     expect_eq "$(calls 'POST repos/example/caller/actions/workflows/dispatch.yml/dispatches')" 1 'dispatch caller'
     test ! -f "${FAKE_GH}/board-calls" || fail 'numeric item treated as board id'
+}
+
+# pool_world POOL_CLAUDE POOL_OPENAI: dispatch.yml declares the pool input,
+# and the pools' readings are the percents used, in week-long windows half
+# over (so each pace allows 47.5%); an empty percent is no reading.
+pool_world() {
+    local now=2026-10-02T12:00:00Z
+    printf 'on:\n  workflow_dispatch:\n    inputs:\n      item:\n        required: true\n      pool:\n        type: choice\n' >"${FAKE_GH}/dispatch.yml"
+    export BOT_CAPACITY_NOW=${now} BOT_CAPACITY_RATE_FILE=${WORK}/rate.json BOT_CAPACITY_PRAXIS_USAGE=${WORK}/usage.json
+    rm -f "${BOT_CAPACITY_RATE_FILE}" "${BOT_CAPACITY_PRAXIS_USAGE}"
+    if test -n "$1"; then
+        jq -nc --arg n "${now}" --arg r 2026-10-06T00:00:00Z --argjson u "$1" '{observed_at: $n, seven_day: {used_percent: $u, resets_at: $r}}' >"${BOT_CAPACITY_RATE_FILE}"
+    fi
+    if test -n "$2"; then
+        jq -nc --argjson u "$2" '{codex: {primary: {used_percent: $u, window_minutes: 10080, reset_after_seconds: 302400, observed_at: 1790942400}}}' >"${BOT_CAPACITY_PRAXIS_USAGE}"
+    fi
+}
+
+test_agentic_pool() {
+    agentic_fixture
+    local out err want claude openai pool line
+    echo 'Do this task' >"${WORK}/brief"
+    # --pool | claude used | openai used | pool sent | line on stderr
+    while IFS='|' read -r pool claude openai want line; do
+        pool_world "${claude}" "${openai}"
+        err=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --dry-run ${pool:+--pool "${pool}"} "${WORK}/brief" 2>&1 >"${WORK}/out") || fail "dispatch failed: ${err}"
+        expect_lines "${err}" "${line}"
+        expect_eq "$(tail -n +2 "${WORK}/out" | jq -r '.inputs.pool // ""')" "${want}" "pool sent for '${pool}' ${claude}/${openai}"
+    done <<'CASES'
+|40|10|openai|^pool: openai: furthest under its pace \(claude 40% used of 48% allowed, openai 10% used of 48% allowed\)$
+|10|40|claude|^pool: claude: furthest under its pace
+|10||claude|^pool: claude: no reading of openai .*openai no reading
+||30|openai|^pool: openai: no reading of claude .*claude no reading
+|60|10|openai|^pool: openai: claude is over its pace
+|60|70|claude|^pool: claude: both over pace, least over
+|||||^warning: no pool chosen: no reading of either pool; sending no pool input$
+auto|40|10|openai|^pool: openai: furthest
+claude|90|10|claude|^pool: claude \(--pool\)$
+openai|10|90|openai|^pool: openai \(--pool\)$
+none|10|40||^$
+CASES
+    # A caller that declares no pool input gets today's body, and says so.
+    rm "${FAKE_GH}/dispatch.yml"
+    err=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --dry-run "${WORK}/brief" 2>&1 >"${WORK}/out")
+    expect_lines "${err}" "^pool: none \\(example/caller's dispatch.yml declares no pool input\\)$"
+    expect_json "$(tail -n +2 "${WORK}/out" | jq -c .)" "$(jq -nc '{ref: "main", return_run_details: true, inputs: {repo: "composefs/composefs-rs", item: "1", kind: "implement", task: "Do this task"}}')"
+    out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --pool claude --dry-run "${WORK}/brief" 2>&1) && fail 'sent a pool the caller does not declare'
+    expect_lines "${out}" 'declares no pool input'
+    # A chooser that fails, or a dispatch.yml that can't be read, costs the
+    # pool and nothing else, unless the pool was asked for.
+    pool_world 40 10
+    printf '#!/usr/bin/env node\nprocess.exit(process.argv[2] === "declares" ? 0 : 3);\n' >"${WORK}/chooser.js"
+    err=$(BOT_RUNS_POOL_CHOICE=${WORK}/chooser.js agentic_runs dispatch --item 1 --repo composefs/composefs-rs "${WORK}/brief" --json 2>&1 >/dev/null)
+    expect_lines "${err}" "^warning: cannot read the pools' pace; sending no pool input$"
+    expect_eq "$(jq -r '.inputs | has("pool")' "${FAKE_GH}/dispatch-body.json")" false 'pool sent after the chooser failed'
+    rm "${FAKE_GH}/dispatch.yml"
+    touch "${FAKE_GH}/contents-fail"
+    err=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs "${WORK}/brief" --json 2>&1 >/dev/null)
+    expect_lines "${err}" 'warning: cannot read dispatch.yml of example/caller; sending no pool input'
+    expect_eq "$(jq -r '.inputs | has("pool")' "${FAKE_GH}/dispatch-body.json")" false 'pool sent after dispatch.yml failed to read'
+    out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --pool claude --dry-run "${WORK}/brief" 2>&1) && fail 'sent a pool without reading dispatch.yml'
+    expect_lines "${out}" 'cannot read dispatch.yml of example/caller to see if it takes a pool'
+    rm "${FAKE_GH}/contents-fail"
+    pool_world 40 10
+    rm "${FAKE_GH}/dispatch.yml"
+    # A bad value is refused before anything is read or dispatched.
+    : >"${FAKE_GH}/calls"
+    out=$(agentic_runs dispatch --item 1 --repo composefs/composefs-rs --pool mistral "${WORK}/brief" 2>&1) && fail 'accepted a bad pool'
+    expect_lines "${out}" '--pool must be claude, openai, auto or none'
+    expect_eq "$(calls .)" 0 'API calls for a bad pool'
+    # A real dispatch sends the chosen pool.
+    pool_world 40 10
+    agentic_runs dispatch --item 1 --repo composefs/composefs-rs "${WORK}/brief" --json >/dev/null 2>&1
+    expect_eq "$(jq -r .inputs.pool "${FAKE_GH}/dispatch-body.json")" openai 'dispatched pool'
 }
 
 test_agentic_read() {

@@ -642,10 +642,27 @@ bot-runs log RUN --backend agentic-job --caller OWNER/CALLER
 `review`, `triage`, `research` and `fix` (one commit pushed to the branch of a
 pull request that `apply` opened from the bot's fork). The caller supplies the
 preamble and fixed output routing. Its
-current dispatch interface exposes only `repo`, `item`, `kind` and `task`:
-model, agent, runner size, budget, timeout and caps are caller configuration.
-Explicit overrides are refused rather than dropped or sent as unknown inputs.
-This is a remaining caller-interface gap before per-run model/limit selection.
+current dispatch interface exposes `repo`, `item`, `kind` and `task`, and
+optionally `pool`: model, agent, runner size, budget, timeout and caps are
+caller configuration. Explicit overrides are refused rather than dropped or
+sent as unknown inputs. This is a remaining caller-interface gap before
+per-run model/limit selection.
+
+`--pool claude|openai|auto|none` picks the inference pool, a closed set that
+the caller maps to its own agent and model; an empty `pool` leaves the choice
+to the caller's repository variables. `none` sends no input. `auto`, the
+default, asks the readings `bot-capacity` paces (`lib/pools.js`) and picks the
+pool with the largest margin, what its pace allows now minus what it has used
+(a pool that holds new work only when neither is free; one without a reading
+never over one with); with no reading of either, it warns and sends none.
+Whatever the value, the input is sent only when `dispatch.yml` on the caller's
+default branch declares a `pool` input, so a caller without it keeps working:
+`auto` then sends none (as it does when the chooser or the file cannot be
+read, with a warning), and an explicit `claude` or `openai` is refused. The
+choice is printed on stderr in one line, for example `pool: openai: furthest
+under its pace (claude 40% used of 48% allowed, openai 10% used of 48%
+allowed)`, or `pool: claude: openai is over its pace (...)` when the other
+pool is held, `no reading of` it, or `both over pace, least over`, and `--dry-run` shows it and the request.
 The adapter does not write board fields for numeric issue identifiers.
 
 Readers use the caller's `dispatch-KIND-` artifacts and keep its cache separate
